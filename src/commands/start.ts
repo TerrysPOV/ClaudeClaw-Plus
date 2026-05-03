@@ -1,6 +1,8 @@
 import { writeFile, unlink, mkdir } from "fs/promises";
+import { extractErrorDetail } from "../messaging";
 import { join } from "path";
 import { fileURLToPath } from "url";
+<<<<<<< HEAD
 import { run, runUserMessage, streamUserMessage, bootstrap, ensureProjectClaudeMd, loadHeartbeatPromptTemplate } from "../runner";
 import { initGatewayProcessor } from "../event-processor";
 import { writeState, type StateData } from "../statusline";
@@ -8,12 +10,20 @@ import { cronMatches, nextCronMatch } from "../cron";
 import { clearJobSchedule, loadJobs, resolveJobModel } from "../jobs";
 import { migrateLegacyAgentJobs } from "../migrations";
 import { ensureUserSymlinks } from "../install";
+=======
+import { run, runUserMessage, streamUserMessage, bootstrap, ensureProjectClaudeMd, loadHeartbeatPromptTemplate, isRateLimited, getRateLimitResetAt, wasRateLimitNotified, markRateLimitNotified } from "../runner";
+import { writeState, type StateData } from "../statusline";
+import { cronMatches, nextCronMatch } from "../cron";
+import { clearJobSchedule, loadJobs, snapshotJobFrontmatter } from "../jobs";
+>>>>>>> upstream/master
 import { writePidFile, cleanupPidFile, checkExistingDaemon } from "../pid";
 import { initConfig, loadSettings, reloadSettings, resolvePrompt, type HeartbeatConfig, type Settings } from "../config";
-import { getDayAndMinuteAtOffset } from "../timezone";
+import { getDayAndMinuteAtOffset, buildClockPromptPrefix } from "../timezone";
 import { startWebUi, type WebServerHandle } from "../web";
 import { initializeJobSystem } from "../orchestrator/resumable-jobs";
 import type { Job } from "../jobs";
+import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
+import { PluginManager, setPluginManager } from "../plugins";
 
 const CLAUDE_DIR = join(process.cwd(), ".claude");
 const HEARTBEAT_DIR = join(CLAUDE_DIR, "claudeclaw");
@@ -61,7 +71,11 @@ function fmt(ms) {
 function alive() {
   try {
     var pid = readFileSync(PID_FILE, "utf-8").trim();
-    process.kill(Number(pid), 0);
+    var parsedPid = Number(pid);
+    if (!Number.isFinite(parsedPid) || !Number.isInteger(parsedPid) || parsedPid <= 0) {
+      return false;
+    }
+    process.kill(parsedPid, 0);
     return true;
   } catch { return false; }
 }
@@ -369,7 +383,16 @@ export async function start(args: string[] = []) {
   let web: WebServerHandle | null = null;
   let discordStopGateway: (() => void) | null = null;
 
+  // Plugin system — initialize before gateway start
+  const pluginManager = new PluginManager(process.cwd());
+  if (Object.keys(settings.plugins).length > 0) {
+    await pluginManager.loadAll(settings.plugins);
+    setPluginManager(pluginManager);
+  }
+
   async function shutdown() {
+    await pluginManager.stopServices();
+    setPluginManager(null);
     if (discordStopGateway) discordStopGateway();
     if (web) web.stop();
     await teardownStatusline();
@@ -402,14 +425,26 @@ export async function start(args: string[] = []) {
   // --- Telegram ---
   let telegramSend: ((chatId: number, text: string) => Promise<void>) | null = null;
   let telegramToken = "";
+  let telegramReceiveEnabled = true;
 
-  async function initTelegram(token: string) {
+  async function initTelegram(token: string, receiveEnabled = true) {
     if (token && token !== telegramToken) {
       const { startPolling, sendMessage } = await import("./telegram");
-      startPolling(debugFlag);
+      if (receiveEnabled) startPolling(debugFlag);
       telegramSend = (chatId, text) => sendMessage(token, chatId, text);
       telegramToken = token;
-      console.log(`[${ts()}] Telegram: enabled`);
+      telegramReceiveEnabled = receiveEnabled;
+      console.log(`[${ts()}] Telegram: enabled${receiveEnabled ? "" : " (send-only)"}`);
+    } else if (token && token === telegramToken && receiveEnabled !== telegramReceiveEnabled) {
+      const { startPolling, stopPolling } = await import("./telegram");
+      if (receiveEnabled) {
+        startPolling(debugFlag);
+        console.log(`[${ts()}] Telegram: receive enabled`);
+      } else {
+        stopPolling();
+        console.log(`[${ts()}] Telegram: receive disabled (send-only)`);
+      }
+      telegramReceiveEnabled = receiveEnabled;
     } else if (!token && telegramToken) {
       telegramSend = null;
       telegramToken = "";
@@ -417,7 +452,7 @@ export async function start(args: string[] = []) {
     }
   }
 
-  await initTelegram(currentSettings.telegram.token);
+  await initTelegram(currentSettings.telegram.token, currentSettings.telegram.receiveEnabled);
   if (!telegramToken) console.log("  Telegram: not configured");
 
   // --- Gateway event processor ---
@@ -448,6 +483,24 @@ export async function start(args: string[] = []) {
 
   await initDiscord(currentSettings.discord.token);
   if (!discordToken) console.log("  Discord: not configured");
+
+  // Wire channel senders into plugin runtime so plugins can send messages
+  if (pluginManager.hasPlugins) {
+    pluginManager.setChannelSenders({
+      telegram: {
+        sendMessageTelegram: telegramSend
+          ? (chatId: number, text: string) => telegramSend!(chatId, text)
+          : () => Promise.resolve(),
+      },
+      discord: {
+        sendMessageDiscord: discordSendToUser
+          ? (userId: string, text: string) => discordSendToUser!(userId, text)
+          : () => Promise.resolve(),
+      },
+    });
+    await pluginManager.startServices();
+    await pluginManager.emit("gateway_start", {}, { workspaceDir: process.cwd() });
+  }
 
   function isAddrInUse(err: unknown): boolean {
     if (!err || typeof err !== "object") return false;
@@ -515,8 +568,13 @@ export async function start(args: string[] = []) {
             updateState();
             console.log(`[${ts()}] Jobs reloaded from Web UI`);
           },
-          onChat: async (message, onChunk, onUnblock) => {
-            await streamUserMessage("chat", message, onChunk, onUnblock);
+          onChat: async (message, onChunk, onUnblock, onAgentEvent) => {
+            const wizardCtx = { iface: "web" as const, scopeId: "default" };
+            if (isWizardTrigger(message) || hasActiveWizard(wizardCtx)) {
+              onChunk(await handleWizardInput(wizardCtx, message));
+              return;
+            }
+            await streamUserMessage("chat", message, onChunk, onUnblock, onAgentEvent);
           },
         });
       } catch (err) {
@@ -556,7 +614,7 @@ export async function start(args: string[] = []) {
     if (!telegramSend || currentSettings.telegram.allowedUserIds.length === 0) return;
     const text = result.exitCode === 0
       ? `${label ? `[${label}]\n` : ""}${result.stdout || "(empty)"}`
-      : `${label ? `[${label}] ` : ""}error (exit ${result.exitCode}): ${result.stderr || "Unknown"}`;
+      : `${label ? `[${label}] ` : ""}error (exit ${result.exitCode}): ${extractErrorDetail(result) || "Unknown"}`;
     for (const userId of currentSettings.telegram.allowedUserIds) {
       telegramSend(userId, text).catch((err) =>
         console.error(`[Telegram] Failed to forward to ${userId}: ${err}`)
@@ -568,7 +626,7 @@ export async function start(args: string[] = []) {
     if (!discordSendToUser || currentSettings.discord.allowedUserIds.length === 0) return;
     const text = result.exitCode === 0
       ? `${label ? `[${label}]\n` : ""}${result.stdout || "(empty)"}`
-      : `${label ? `[${label}] ` : ""}error (exit ${result.exitCode}): ${result.stderr || "Unknown"}`;
+      : `${label ? `[${label}] ` : ""}error (exit ${result.exitCode}): ${extractErrorDetail(result) || "Unknown"}`;
     for (const userId of currentSettings.discord.allowedUserIds) {
       discordSendToUser(userId, text).catch((err) =>
         console.error(`[Discord] Failed to forward to ${userId}: ${err}`)
@@ -595,6 +653,17 @@ export async function start(args: string[] = []) {
     );
 
     function tick() {
+      if (isRateLimited()) {
+        const resetAt = new Date(getRateLimitResetAt());
+        console.log(`[${ts()}] Heartbeat skipped (rate limited until ${resetAt.toISOString()})`);
+        if (!wasRateLimitNotified()) {
+          markRateLimitNotified();
+          const msg = `Usage limit hit. Pausing until ${resetAt.toUTCString()}. Heartbeats and jobs suspended.`;
+          forwardToTelegram("", { exitCode: 1, stdout: msg, stderr: "" });
+          forwardToDiscord("", { exitCode: 1, stdout: msg, stderr: "" });
+        }
+        return;
+      }
       if (isHeartbeatExcludedNow(currentSettings.heartbeat, currentSettings.timezoneOffsetMinutes)) {
         console.log(`[${ts()}] Heartbeat skipped (excluded window)`);
         nextHeartbeatAt = nextAllowedHeartbeatAt(
@@ -617,7 +686,8 @@ export async function start(args: string[] = []) {
             .filter((part) => part.length > 0)
             .join("\n\n");
           if (!mergedPrompt) return null;
-          return run("heartbeat", mergedPrompt);
+          const clock = buildClockPromptPrefix(new Date(), currentSettings.timezoneOffsetMinutes);
+          return run("heartbeat", `${clock}\n${mergedPrompt}`);
         })
         .then((r) => {
           if (!r) return;
@@ -715,7 +785,7 @@ export async function start(args: string[] = []) {
       currentJobs = newJobs;
 
       // Telegram changes
-      await initTelegram(newSettings.telegram.token);
+      await initTelegram(newSettings.telegram.token, newSettings.telegram.receiveEnabled);
 
       // Discord changes
       await initDiscord(newSettings.discord.token);
@@ -750,16 +820,53 @@ export async function start(args: string[] = []) {
 
   updateState();
 
-  setInterval(() => {
-    const now = new Date();
-    for (const job of currentJobs) {
-      if (cronMatches(job.schedule, now, currentSettings.timezoneOffsetMinutes)) {
+  // In-memory retry state: resets on daemon restart (no stale debt across restarts).
+  const jobRetryState = new Map<string, { failCount: number; retryAt: number }>();
+
+  function runJob(job: (typeof currentJobs)[0]) {
+    const timeoutMs = job.timeoutSeconds ? job.timeoutSeconds * 1000 : undefined;
+    snapshotJobFrontmatter(job.name)
+      .then((restoreFrontmatter) =>
         resolvePrompt(job.prompt)
+<<<<<<< HEAD
           .then(async (prompt) => {
             const modelOverride = await resolveJobModel(job);
             return run(job.name, prompt, job.agent, modelOverride ? { modelOverride } : undefined);
           })
           .then((r) => {
+=======
+          .then((prompt) => {
+            const clock = buildClockPromptPrefix(new Date(), currentSettings.timezoneOffsetMinutes);
+            return run(
+              job.name,
+              `${clock}\n${prompt}`,
+              job.agent ? `agent:${job.agent}` : job.name,
+              job.model,
+              timeoutMs,
+              job.agent,
+              "job"
+            );
+          })
+          .then(async (r) => {
+            const restored = await restoreFrontmatter();
+            if (restored) console.log(`[${ts()}] Restored frontmatter for job: ${job.name}`);
+            if (r.exitCode === 0) {
+              jobRetryState.delete(job.name);
+            } else if (job.retry && job.retry > 0) {
+              // Preserve existing state so failCount accumulates correctly across retries.
+              const state = jobRetryState.get(job.name) ?? { failCount: 0, retryAt: 0 };
+              state.failCount += 1;
+              if (state.failCount <= job.retry) {
+                const delayMs = (job.retryDelay ?? 300) * 1000;
+                state.retryAt = Date.now() + delayMs;
+                jobRetryState.set(job.name, state);
+                console.log(`[${ts()}] Job ${job.name} failed (attempt ${state.failCount}/${job.retry}), retrying in ${job.retryDelay ?? 300}s`);
+              } else {
+                jobRetryState.delete(job.name);
+                console.log(`[${ts()}] Job ${job.name} exhausted ${job.retry} retries`);
+              }
+            }
+>>>>>>> upstream/master
             if (job.notify === false) return;
             if (job.notify === "error" && r.exitCode === 0) return;
             const forwardLabel = job.agent && job.label ? `${job.agent}: ${job.label}` : job.name;
@@ -768,13 +875,35 @@ export async function start(args: string[] = []) {
           })
           .finally(async () => {
             if (job.recurring) return;
+            // Only clear one-shot schedule when no retry is pending.
+            if (jobRetryState.has(job.name)) return;
             try {
               await clearJobSchedule(job.name);
               console.log(`[${ts()}] Cleared schedule for one-time job: ${job.name}`);
             } catch (err) {
               console.error(`[${ts()}] Failed to clear schedule for ${job.name}:`, err);
             }
-          });
+          })
+      );
+  }
+
+  setInterval(() => {
+    if (!isRateLimited()) {
+      const now = new Date();
+      for (const job of currentJobs) {
+        // Fire pending retries before checking the cron schedule.
+        const retryState = jobRetryState.get(job.name);
+        if (retryState && retryState.retryAt <= Date.now()) {
+          // Push retryAt to sentinel so subsequent cron ticks don't re-fire while in flight.
+          // runJob's .then() handler overwrites this with the real next-retry time (or deletes it).
+          retryState.retryAt = Number.MAX_SAFE_INTEGER;
+          console.log(`[${ts()}] Retrying job: ${job.name} (attempt ${retryState.failCount + 1}/${job.retry})`);
+          runJob(job);
+          continue;
+        }
+        if (cronMatches(job.schedule, now, currentSettings.timezoneOffsetMinutes)) {
+          runJob(job);
+        }
       }
     }
     updateState();

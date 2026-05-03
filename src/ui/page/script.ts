@@ -1026,13 +1026,154 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
     }
 
     if (tabDashboardBtn) tabDashboardBtn.addEventListener("click", () => setActiveTab("dashboard"));
-    if (tabChatBtn) tabChatBtn.addEventListener("click", () => setActiveTab("chat"));
+    if (tabChatBtn) tabChatBtn.addEventListener("click", function() { setActiveTab("chat"); loadSessions(); });
+
+    // --- Session browser ---
+
+    var activeBrowseSessionId = null;
+    var browseOffset = 0;
+    var browseTotalCount = 0;
+    var BROWSE_PAGE = 10;
+
+    function escapeHtml(text) {
+      var d = document.createElement("div");
+      d.textContent = text;
+      return d.innerHTML;
+    }
+
+    function formatSessionTime(isoStr) {
+      if (!isoStr) return "";
+      try {
+        var d = new Date(isoStr);
+        var now = new Date();
+        if (d.toDateString() === now.toDateString()) {
+          return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+        }
+        return d.toLocaleDateString([], { month: "short", day: "numeric" });
+      } catch { return ""; }
+    }
+
+    async function loadSessions() {
+      var listEl = document.getElementById("session-list");
+      if (!listEl) return;
+      try {
+        var res = await fetch("/api/sessions");
+        var sessions = await res.json();
+        if (!Array.isArray(sessions) || sessions.length === 0) {
+          listEl.innerHTML = '<div class="session-loading">No sessions yet</div>';
+          return;
+        }
+        listEl.innerHTML = "";
+        sessions.forEach(function(s) {
+          var item = document.createElement("div");
+          item.className = "session-item" + (s.id === activeBrowseSessionId ? " active" : "");
+          var preview = escapeHtml(s.lastMessage || s.firstMessage || "(empty)");
+          var channel = s.channel && s.channel !== "web" ? s.channel : "";
+          item.innerHTML =
+            '<div class="session-item-header">'
+            + '<span class="session-agent">' + escapeHtml(s.agent || "global") + "</span>"
+            + (channel ? '<span class="session-channel">' + escapeHtml(channel) + "</span>" : "")
+            + "</div>"
+            + '<div class="session-preview">' + preview + "</div>"
+            + '<div class="session-time">' + formatSessionTime(s.lastUsedAt) + " · " + (s.turnCount || 0) + " turns</div>";
+          item.addEventListener("click", function() { browseSession(s.id); });
+          listEl.appendChild(item);
+        });
+      } catch (e) {
+        listEl.innerHTML = '<div class="session-loading">Failed to load</div>';
+      }
+    }
+
+    async function browseSession(sessionId) {
+      activeBrowseSessionId = sessionId;
+      browseOffset = 0;
+      browseTotalCount = 0;
+
+      // Update sidebar highlight
+      document.querySelectorAll(".session-item").forEach(function(el) {
+        el.classList.toggle("active", el.dataset && el.dataset.sid === sessionId);
+      });
+      // Re-render sidebar to apply active class correctly
+      loadSessions();
+
+      // Show history banner
+      var banner = document.getElementById("chat-history-banner");
+      if (banner) banner.hidden = false;
+
+      // Load messages
+      chatHistory = [];
+      renderChatHistory();
+      await loadBrowseMessages(sessionId, false);
+    }
+
+    async function loadBrowseMessages(sessionId, loadMore) {
+      var loadMoreContainer = document.getElementById("load-more-container");
+      var loadMoreBtn = document.getElementById("load-more-btn");
+      if (!loadMore) {
+        try {
+          // Single fetch: last N messages + total count in one response.
+          var res = await fetch("/api/sessions/" + sessionId + "/messages?limit=" + BROWSE_PAGE + "&offset=-1");
+          var data = await res.json();
+          var msgs = data.messages;
+          if (!Array.isArray(msgs)) return;
+          browseTotalCount = typeof data.total === "number" ? data.total : msgs.length;
+          browseOffset = Math.max(0, browseTotalCount - BROWSE_PAGE);
+          chatHistory = msgs.map(function(m) { return { role: m.role, text: m.text }; });
+          renderChatHistory();
+          if (loadMoreContainer) loadMoreContainer.hidden = browseOffset <= 0;
+          if (loadMoreBtn && browseOffset > 0) loadMoreBtn.textContent = "Load older (" + browseOffset + " more)";
+        } catch (e) {}
+      } else {
+        var newOffset = Math.max(0, browseOffset - BROWSE_PAGE);
+        var limit = browseOffset - newOffset;
+        if (limit <= 0) return;
+        try {
+          var res2 = await fetch("/api/sessions/" + sessionId + "/messages?limit=" + limit + "&offset=" + newOffset);
+          var data2 = await res2.json();
+          var older = data2.messages;
+          if (!Array.isArray(older)) return;
+          var chatMsgsEl = document.getElementById("chat-messages");
+          var scrollHeightBefore = chatMsgsEl ? chatMsgsEl.scrollHeight : 0;
+          chatHistory = older.map(function(m) { return { role: m.role, text: m.text }; }).concat(chatHistory);
+          browseOffset = newOffset;
+          renderChatHistory();
+          if (chatMsgsEl) chatMsgsEl.scrollTop = chatMsgsEl.scrollHeight - scrollHeightBefore;
+          if (loadMoreContainer) loadMoreContainer.hidden = browseOffset <= 0;
+          if (loadMoreBtn && browseOffset > 0) loadMoreBtn.textContent = "Load older (" + browseOffset + " more)";
+        } catch (e) {}
+      }
+    }
+
+    var newSessionBtn = document.getElementById("new-session-btn");
+    if (newSessionBtn) {
+      newSessionBtn.addEventListener("click", function() {
+        activeBrowseSessionId = null;
+        chatHistory = [];
+        renderChatHistory();
+        var banner = document.getElementById("chat-history-banner");
+        if (banner) banner.hidden = true;
+        var loadMoreContainer = document.getElementById("load-more-container");
+        if (loadMoreContainer) loadMoreContainer.hidden = true;
+        document.querySelectorAll(".session-item").forEach(function(el) { el.classList.remove("active"); });
+        if (chatInput) chatInput.focus();
+      });
+    }
+
+    var loadMoreBtn = document.getElementById("load-more-btn");
+    if (loadMoreBtn) {
+      loadMoreBtn.addEventListener("click", function() {
+        if (activeBrowseSessionId) loadBrowseMessages(activeBrowseSessionId, true);
+      });
+    }
+
+    // Load sessions on initial render
+    loadSessions();
 
     renderChatHistory();
 
     function saveChatHistory() {
       try {
-        var toSave = chatHistory.filter(function(m) { return !m.streaming; });
+        var toSave = chatHistory.filter(function(m) { return !m.streaming && m.agentStatus !== "running"; });
         localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(toSave));
       } catch (_) {}
     }
@@ -1083,6 +1224,26 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
     }
 
     function syncChatMessageEl(msgEl, msg, elapsedMs) {
+      // Agent bubbles: simple centered pill, no role/text structure
+      if (msg.role === "agent") {
+        var agentCls = "chat-msg chat-msg-agent" + (msg.agentStatus === "running" ? " chat-msg-agent-running" : " chat-msg-agent-done");
+        if (msgEl.className !== agentCls) msgEl.className = agentCls;
+        var agentPlainText = msg.text || "";
+        var existingSpinner = msgEl.querySelector(".chat-agent-spinner");
+        if (msgEl.dataset.agentText !== agentPlainText || msgEl.dataset.agentStatus !== msg.agentStatus) {
+          msgEl.textContent = agentPlainText;
+          msgEl.dataset.agentText = agentPlainText;
+          msgEl.dataset.agentStatus = msg.agentStatus || "";
+          if (msg.agentStatus === "running") {
+            var spinner = document.createElement("span");
+            spinner.className = "chat-agent-spinner";
+            spinner.textContent = "…";
+            msgEl.appendChild(spinner);
+          }
+        }
+        return;
+      }
+
       var roleEl = msgEl.querySelector(".chat-msg-role");
       var textEl = msgEl.querySelector(".chat-msg-text");
       if (!roleEl || !textEl) {
@@ -1219,6 +1380,25 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
                 setChatBusy(false);
                 chatHistory[assistantIdx].background = true;
                 renderChatHistory();
+              } else if (ev.type === "agent_spawn") {
+                chatHistory.push({ role: "agent", agentId: ev.id, text: "🤖 Sub-agent started: " + ev.description, agentStatus: "running" });
+                renderChatHistory();
+              } else if (ev.type === "agent_done") {
+                var agentBubble = null;
+                for (var k = chatHistory.length - 1; k >= 0; k--) {
+                  if (chatHistory[k].role === "agent" && chatHistory[k].agentId === ev.id) {
+                    agentBubble = chatHistory[k];
+                    break;
+                  }
+                }
+                if (agentBubble) {
+                  agentBubble.agentStatus = "done";
+                  agentBubble.text = "✅ Sub-agent done: " + ev.description;
+                } else {
+                  chatHistory.push({ role: "agent", agentId: ev.id, text: "✅ Sub-agent done: " + ev.description, agentStatus: "done" });
+                }
+                renderChatHistory();
+                saveChatHistory();
               } else if (ev.type === "done") {
                 chatHistory[assistantIdx].streaming = false;
                 chatHistory[assistantIdx].background = false;

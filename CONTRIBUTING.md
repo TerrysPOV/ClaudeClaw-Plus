@@ -1,13 +1,20 @@
+<<<<<<< HEAD
 # Contributing to ClaudeClaw+
 
 ClaudeClaw+ is the home for **heavy, opinionated, and architecturally significant work** that is out of scope for the lightweight upstream repo ([`moazbuilds/claudeclaw`](https://github.com/moazbuilds/claudeclaw)). If your idea fits comfortably in the upstream repo — contribute it there. Work submitted here that is actually lightweight or upstream-suitable won't be merged; it'll be redirected back upstream.
 
 Talk first, code second.
+=======
+# Contributing to ClaudeClaw
+
+Thanks for contributing. ClaudeClaw is a lightweight, open-source Claude Code daemon — keep that in mind when choosing where your work belongs.
+>>>>>>> upstream/master
 
 ---
 
 ## Where does your contribution belong?
 
+<<<<<<< HEAD
 Before opening anything, ask yourself:
 
 | This contribution is... | Contribute to |
@@ -20,11 +27,26 @@ Before opening anything, ask yourself:
 | Something that adds significant runtime weight or new dependencies | **ClaudeClaw+** |
 
 **If in doubt, open an issue here describing the idea.** We'll tell you quickly whether it fits ClaudeClaw+ or belongs upstream.
+=======
+Not everything should come here. ClaudeClaw has a sister project, [**ClaudeClaw+**](https://github.com/TerrysPOV/ClaudeClaw-Plus), for heavier and more opinionated work. Use this table to decide:
+
+| This contribution is... | Contribute to |
+|---|---|
+| A bug fix or small improvement | **ClaudeClaw** (you're in the right place) |
+| A new adapter or integration | **ClaudeClaw** |
+| Lightweight and broadly useful | **ClaudeClaw** |
+| A new subsystem (governance, orchestration, policy, persistent memory) | **[ClaudeClaw+](https://github.com/TerrysPOV/ClaudeClaw-Plus)** |
+| A large architectural change that adds significant runtime weight | **ClaudeClaw+** |
+| Something opinionated that most users wouldn't opt into | **ClaudeClaw+** |
+
+ClaudeClaw+ syncs from this repo daily, so everything here lands there too. If you're unsure, open an issue on either repo and we'll point you in the right direction.
+>>>>>>> upstream/master
 
 ---
 
 ## Before opening a PR
 
+<<<<<<< HEAD
 Open an [issue](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues) or [discussion](https://github.com/TerrysPOV/ClaudeClaw-Plus/discussions) first. Describe what you want to build and why. This keeps wasted effort near zero — if there's an existing design decision or conflict with in-progress work, better to know before you spend a week coding.
 
 For small, obviously-scoped changes (typos, single-function fixes, docs updates) you can skip this and go straight to a PR.
@@ -47,12 +69,30 @@ Before opening a PR:
 - [ ] `bunx tsc --noEmit` is clean
 - [ ] Any docs or setup guidance affected by the change is updated
 - [ ] If touching core daemon paths (`src/`, `commands/`): run a quick manual smoke test
+=======
+- Check the [open issues](https://github.com/moazbuilds/claudeclaw/issues) and existing PRs to avoid duplication
+- For anything beyond a small fix, open an issue first to discuss the approach
+- Keep the "lightweight" principle in mind: ClaudeClaw runs on low-spec machines, so avoid adding heavy dependencies or new long-lived processes without a strong reason
+
+---
+
+## Validation
+
+Before opening a PR:
+
+- [ ] Run the relevant checks locally
+- [ ] Update any docs or setup guidance affected by your change
+>>>>>>> upstream/master
 
 ---
 
 ## Plugin version bumps (CI-enforced)
 
+<<<<<<< HEAD
 If your PR changes shipped plugin files under `src/`, `commands/`, `prompts/`, or `.claude-plugin/`, the plugin metadata version **must** be bumped. The CI checks will fail if you skip this.
+=======
+If your PR changes shipped plugin files under `src/`, `commands/`, `prompts/`, or `.claude-plugin/`, bump the version metadata:
+>>>>>>> upstream/master
 
 ```bash
 bun run bump:plugin-version
@@ -63,6 +103,7 @@ Typical rule:
 - bump `.claude-plugin/plugin.json` when shipped plugin content changes
 - bump `.claude-plugin/marketplace.json` when marketplace metadata should reflect the new version
 
+<<<<<<< HEAD
 Docs-only and other non-shipped changes do not require these bumps.
 
 ---
@@ -98,11 +139,15 @@ Features under `src/governance/`, `src/policy/`, or anything touching the tool-c
 ## Proposing features for upstream
 
 Found something in Plus that you think belongs in the lightweight core too? Open a PR upstream at [`moazbuilds/claudeclaw`](https://github.com/moazbuilds/claudeclaw) and link it from here. @moazbuilds makes the call on what fits.
+=======
+Docs-only and other non-shipped changes do not require these bumps. (CI will tell you if you missed one.)
+>>>>>>> upstream/master
 
 ---
 
 ## Code of conduct
 
+<<<<<<< HEAD
 Be decent. Critique code, not people. If something isn't clear, ask — don't assume the worst.
 
 ---
@@ -110,3 +155,6 @@ Be decent. Critique code, not people. If something isn't clear, ask — don't as
 ## Questions?
 
 Open a [discussion](https://github.com/TerrysPOV/ClaudeClaw-Plus/discussions) or ping [@TerrysPOV](https://github.com/TerrysPOV) in an issue.
+=======
+Be decent. Critique code, not people.
+>>>>>>> upstream/master

@@ -1,15 +1,20 @@
-import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession } from "../runner";
+import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession, isRateLimited, getRateLimitResetAt } from "../runner";
+import { extractErrorDetail } from "../messaging";
 import { getSettings, loadSettings } from "../config";
-import { resetSession, peekSession } from "../sessions";
+import { transcribeAudioToText } from "../whisper";
+import { resetSession, resetFallbackSession, peekSession } from "../sessions";
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt, listSkills } from "../skills";
 import { fireJob, parseFireArgs } from "./fire";
 import { mkdir } from "node:fs/promises";
 import { extname, join } from "node:path";
+<<<<<<< HEAD
 import { submitTelegramToGateway } from "../gateway";
+=======
+import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
+>>>>>>> upstream/master
 
 // --- Markdown → Telegram HTML conversion (ported from nanobot) ---
 
@@ -340,10 +345,14 @@ function extractTelegramCommand(text: string): string | null {
 }
 
 async function callApi<T>(token: string, method: string, body?: Record<string, unknown>): Promise<T> {
+  // Add 15s buffer on top of Telegram's own long-poll timeout (default 30s)
+  const telegramTimeout = (body?.timeout as number | undefined) ?? 0;
+  const httpTimeout = Math.max(30_000, (telegramTimeout + 15) * 1000);
   const res = await fetch(`${API_BASE}${token}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(httpTimeout),
   });
   if (!res.ok) {
     throw new Error(`Telegram API ${method}: ${res.status} ${res.statusText}`);
@@ -449,12 +458,157 @@ function extractSendFileDirectives(text: string): {
   return { cleanedText, filePaths };
 }
 
+const VOICE_DIRECTIVE_RE = /\[voice:(\/[^\]\r\n]+)\]/gi;
+
+function extractVoiceDirectives(text: string): { cleanedText: string; voicePaths: string[] } {
+  const voicePaths: string[] = [];
+  const cleanedText = text
+    .replace(VOICE_DIRECTIVE_RE, (_match, path) => {
+      const p = String(path).trim();
+      if (p && existsSync(p)) voicePaths.push(p);
+      return "";
+    })
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return { cleanedText, voicePaths };
+}
+
+async function sendVoiceMessage(token: string, chatId: number, voicePath: string, threadId?: number): Promise<void> {
+  const form = new FormData();
+  form.append("chat_id", String(chatId));
+  if (threadId) form.append("message_thread_id", String(threadId));
+
+  const file = Bun.file(voicePath);
+  form.append("voice", file, voicePath.split("/").pop() ?? "voice.ogg");
+
+  const res = await fetch(`${API_BASE}${token}/sendVoice`, {
+    method: "POST",
+    body: form,
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Telegram sendVoice: ${res.status} ${res.statusText} — ${body}`);
+  }
+}
+
 async function sendReaction(token: string, chatId: number, messageId: number, emoji: string): Promise<void> {
   await callApi(token, "setMessageReaction", {
     chat_id: chatId,
     message_id: messageId,
     reaction: [{ type: "emoji", emoji }],
   });
+}
+
+// --- Inline buttons support ---
+
+/**
+ * Parse [buttons: Label A | Label B \n Label C | Label D] directives from Claude output.
+ * Each line of the directive becomes a row; pipes split buttons within a row.
+ * Returns button rows and the cleaned text with the directive removed.
+ */
+function extractButtonsDirective(text: string): { cleanedText: string; buttonRows: string[][] | null } {
+  let buttonRows: string[][] | null = null;
+  const cleanedText = text
+    .replace(/\[buttons:([^\]]+)\]/gi, (_match, raw) => {
+      const rows = String(raw)
+        .trim()
+        .split(/\r?\n/)
+        .map((row) => row.split("|").map((label) => label.trim()).filter(Boolean))
+        .filter((row) => row.length > 0);
+      if (rows.length > 0) buttonRows = rows;
+      return "";
+    })
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return { cleanedText, buttonRows };
+}
+
+// Map short button IDs to labels for callback routing (in-memory, per-process).
+// IDs are never recycled within a process lifetime — the counter is strictly monotonic.
+// Entries carry a creation timestamp so we can evict stale ones; otherwise a long-running
+// daemon would accumulate every button label ever generated and leak memory unbounded.
+type ButtonEntry = { label: string; createdAt: number };
+const buttonLabelMap = new Map<string, ButtonEntry>();
+let _buttonCounter = 0;
+const BUTTON_TTL_MS = 24 * 60 * 60 * 1000; // 24h is well past any reasonable user dwell
+const BUTTON_MAX_ENTRIES = 5000; // hard cap as a safety net for flood scenarios
+
+function pruneExpiredButtons(now: number = Date.now()): void {
+  for (const [id, entry] of buttonLabelMap) {
+    if (now - entry.createdAt > BUTTON_TTL_MS) {
+      buttonLabelMap.delete(id);
+    }
+  }
+  // Hard cap defense: if a flood fills the map within TTL, drop oldest insertions
+  // (Map preserves insertion order) until back under the cap.
+  if (buttonLabelMap.size > BUTTON_MAX_ENTRIES) {
+    const overflow = buttonLabelMap.size - BUTTON_MAX_ENTRIES;
+    let dropped = 0;
+    for (const id of buttonLabelMap.keys()) {
+      if (dropped >= overflow) break;
+      buttonLabelMap.delete(id);
+      dropped++;
+    }
+  }
+}
+
+function getButtonLabel(btnId: string): string | undefined {
+  const entry = buttonLabelMap.get(btnId);
+  if (!entry) return undefined;
+  if (Date.now() - entry.createdAt > BUTTON_TTL_MS) {
+    buttonLabelMap.delete(btnId);
+    return undefined;
+  }
+  return entry.label;
+}
+
+function makeButtonId(label: string): string {
+  // Per-button counter guarantees uniqueness within a process lifetime.
+  const id = `b${_buttonCounter++}`;
+  buttonLabelMap.set(id, { label, createdAt: Date.now() });
+  // Opportunistic eviction every 100 buttons — cheap O(n) sweep without a separate timer.
+  if (_buttonCounter % 100 === 0) pruneExpiredButtons();
+  return `btn:${id}`;
+}
+
+async function sendMessageWithButtons(
+  token: string,
+  chatId: number,
+  text: string,
+  buttonRows: string[][],
+  threadId?: number
+): Promise<void> {
+  const body = text.trim() || "\u200B"; // zero-width space when text is empty (buttons-only)
+  const normalized = normalizeTelegramText(body).replace(/\[react:[^\]\r\n]+\]/gi, "");
+  const html = markdownToTelegramHtml(normalized);
+  const inline_keyboard = buttonRows.map((row) =>
+    row.map((label) => ({ text: label, callback_data: makeButtonId(label) }))
+  );
+  const MAX_LEN = 4096;
+  // Send all chunks except the last without buttons; attach buttons only to the final chunk.
+  for (let i = 0; i < html.length; i += MAX_LEN) {
+    const isLast = i + MAX_LEN >= html.length;
+    const replyMarkup = isLast ? { inline_keyboard } : undefined;
+    try {
+      await callApi(token, "sendMessage", {
+        chat_id: chatId,
+        text: html.slice(i, i + MAX_LEN),
+        parse_mode: "HTML",
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+        ...(threadId ? { message_thread_id: threadId } : {}),
+      });
+    } catch {
+      // Fallback to plain text if HTML parse fails
+      await callApi(token, "sendMessage", {
+        chat_id: chatId,
+        text: normalized.slice(i, i + MAX_LEN),
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+        ...(threadId ? { message_thread_id: threadId } : {}),
+      });
+    }
+  }
 }
 
 let botUsername: string | null = null;
@@ -682,6 +836,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
 
   if (command === "/reset") {
     await resetSession();
+    await resetFallbackSession();
     await sendMessage(config.token, chatId, "Global session reset. Next message starts fresh.", threadId);
     return;
   }
@@ -831,6 +986,22 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     `[${new Date().toLocaleTimeString()}] Telegram ${label}${mediaSuffix}: "${text.slice(0, 60)}${text.length > 60 ? "..." : ""}"`
   );
 
+  // Plugin wizard: local control-plane logic — not subject to rate limiting
+  const wizardCtx = { iface: "telegram" as const, scopeId: String(chatId) };
+  if ((command && isWizardTrigger(command)) || hasActiveWizard(wizardCtx)) {
+    const reply = await handleWizardInput(wizardCtx, text.trim());
+    await sendMessage(config.token, chatId, reply, threadId);
+    return;
+  }
+
+  // If rate-limited, reply immediately without calling Claude
+  if (isRateLimited()) {
+    const resetAt = new Date(getRateLimitResetAt());
+    const resetStr = resetAt.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", timeZone: "UTC" });
+    await sendMessage(config.token, chatId, `Usage limit reached. Resets at ${resetStr} UTC. I'll be back after that.`, threadId);
+    return;
+  }
+
   // Keep typing indicator alive while queued/running
   const typingInterval = setInterval(() => sendTyping(config.token, chatId, threadId), 4000);
 
@@ -854,14 +1025,14 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       }
 
       if (voicePath) {
-        try {
-          debugLog(`Voice file saved: path=${voicePath}`);
-          voiceTranscript = await transcribeAudioToText(voicePath, {
-            debug: telegramDebug,
-            log: (message) => debugLog(message),
-          });
-        } catch (err) {
-          console.error(`[Telegram] Failed to transcribe voice for ${label}: ${err instanceof Error ? err.message : err}`);
+        debugLog(`Voice file saved: path=${voicePath}`);
+        const { delegateTool } = getSettings().stt;
+        if (!delegateTool) {
+          try {
+            voiceTranscript = await transcribeAudioToText(voicePath);
+          } catch (err) {
+            console.error(`[Telegram] Failed to transcribe voice for ${label}: ${err instanceof Error ? err.message : err}`);
+          }
         }
       }
     }
@@ -909,10 +1080,19 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     }
     if (voiceTranscript) {
       promptParts.push(`Voice transcript: ${voiceTranscript}`);
-      promptParts.push("The user attached voice audio. Use the transcript as their spoken message.");
+    } else if (voicePath) {
+      const { delegateTool } = getSettings().stt;
+      if (delegateTool) {
+        promptParts.push(`Voice file path: ${voicePath}`);
+        promptParts.push(`The user sent a voice message. Transcribe it by calling \`${delegateTool}\` with the file path above, then respond to the transcribed text as their spoken message.`);
+      } else {
+        promptParts.push(
+          "The user attached voice audio, but it could not be transcribed. Respond and ask them to resend a clearer clip."
+        );
+      }
     } else if (hasVoice) {
       promptParts.push(
-        "The user attached voice audio, but it could not be transcribed. Respond and ask them to resend a clearer clip."
+        "The user attached voice audio, but downloading it failed. Respond and ask them to resend."
       );
     }
     if (documentInfo) {
@@ -926,6 +1106,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
         "The user attached a document, but downloading it failed. Respond and ask them to resend."
       );
     }
+<<<<<<< HEAD
     // Check per-adapter feature flag for gateway routing
     if (process.env.USE_GATEWAY_TELEGRAM === "true") {
       const gatewayResult = await submitTelegramToGateway(message);
@@ -943,6 +1124,52 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       if (result.exitCode !== 0) {
         await sendMessage(config.token, chatId, `Error: ${result.stderr || "Unknown error"}`, threadId);
         return;
+=======
+    const prefixedPrompt = promptParts.join("\n");
+    const result = await runUserMessage("telegram", prefixedPrompt);
+
+    if (result.exitCode !== 0) {
+      const isTimedOut = result.exitCode === 124;
+      const errorMsg = isTimedOut
+        ? `⏱ Request timed out — the subprocess took too long and was killed. Try again or split into smaller steps.`
+        : `Error (exit ${result.exitCode}): ${extractErrorDetail(result) || "Unknown error"}`;
+      await sendMessage(config.token, chatId, errorMsg, threadId);
+    } else {
+      const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(result.stdout || "");
+      const hadVoiceDirective = /\[voice:\/[^\]\r\n]+\]/i.test(afterReact);
+      const { cleanedText: afterVoice, voicePaths } = extractVoiceDirectives(afterReact);
+      const { cleanedText: afterFile, filePaths } = extractSendFileDirectives(afterVoice);
+      const { cleanedText, buttonRows } = extractButtonsDirective(afterFile);
+      if (reactionEmoji) {
+        await sendReaction(config.token, chatId, message.message_id, reactionEmoji).catch((err) => {
+          console.error(`[Telegram] Failed to send reaction for ${label}: ${err instanceof Error ? err.message : err}`);
+        });
+      }
+      for (const vp of voicePaths) {
+        try {
+          await sendVoiceMessage(config.token, chatId, vp, threadId);
+          debugLog(`Voice sent: ${vp}`);
+        } catch (err) {
+          console.error(`[Telegram] Failed to send voice ${vp} for ${label}: ${err instanceof Error ? err.message : err}`);
+        }
+      }
+      if (buttonRows) {
+        // Route on buttonRows regardless of whether cleanedText is empty
+        await sendMessageWithButtons(config.token, chatId, cleanedText, buttonRows, threadId);
+      } else if (cleanedText) {
+        await sendMessage(config.token, chatId, cleanedText, threadId);
+      }
+      for (const fp of filePaths) {
+        try {
+          await sendDocumentToChat(config.token, chatId, fp, threadId);
+        } catch (err) {
+          console.error(`[Telegram] Failed to send document for ${label}: ${err instanceof Error ? err.message : err}`);
+          await sendMessage(config.token, chatId, `Failed to send file: ${fp.split("/").pop()}`, threadId);
+        }
+      }
+      if (!cleanedText && !buttonRows && filePaths.length === 0 && voicePaths.length === 0 && !hadVoiceDirective) {
+        await sendMessage(config.token, chatId, "(empty response)", threadId);
+>>>>>>> upstream/master
       }
 
       const responseText = result.stdout || "Done.";
@@ -963,6 +1190,16 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
 async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> {
   const config = getSettings().telegram;
   const data = query.data ?? "";
+
+  // Enforce allowlist on callback queries (same policy as regular messages)
+  const callbackUserId = query.from.id;
+  if (config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(callbackUserId)) {
+    await callApi(config.token, "answerCallbackQuery", {
+      callback_query_id: query.id,
+      text: "Unauthorized.",
+    }).catch(() => {});
+    return;
+  }
 
   // Secretary pattern: "sec_yes_<8hex>" or "sec_no_<8hex>"
   const secMatch = data.match(/^sec_(yes|no)_([0-9a-f]{8})$/);
@@ -996,6 +1233,75 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
       callback_query_id: query.id,
       text: answerText,
     }).catch(() => {});
+    return;
+  }
+
+  // Generic inline button press (btn:<id> pattern from [buttons: ...] directive)
+  if (data.startsWith("btn:")) {
+    const btnId = data.slice(4);
+    const label = getButtonLabel(btnId);
+
+    // Reject unknown/expired IDs — don't fall back to treating the raw ID as a label.
+    // IDs are process-local; after a daemon restart old buttons are always expired.
+    if (!label) {
+      await callApi(config.token, "answerCallbackQuery", {
+        callback_query_id: query.id,
+        text: "This button has expired. Please continue the conversation.",
+        show_alert: true,
+      }).catch(() => {});
+      return;
+    }
+
+    // Ack immediately so Telegram stops showing the loading spinner
+    await callApi(config.token, "answerCallbackQuery", {
+      callback_query_id: query.id,
+      text: label,
+    }).catch(() => {});
+
+    // Free the entry as soon as it's been consumed; buttons are one-shot.
+    buttonLabelMap.delete(btnId);
+
+    // Edit original message to mark the selected button visually
+    if (query.message) {
+      const originalText = query.message.text ?? "";
+      await callApi(config.token, "editMessageText", {
+        chat_id: query.message.chat.id,
+        message_id: query.message.message_id,
+        text: `${originalText}\n\n› ${label}`,
+      }).catch(() => {});
+    }
+
+    // Inject button press as a new user message to the running Claude session
+    const chatId = query.message?.chat.id ?? query.from.id;
+    const threadId = query.message?.message_thread_id;
+    try {
+      const result = await runUserMessage("telegram", `[Button pressed: ${label}]`);
+      if (result.exitCode === 0 && result.stdout) {
+        const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(result.stdout);
+        const { cleanedText: afterVoice, voicePaths } = extractVoiceDirectives(afterReact);
+        const { cleanedText: afterFile, filePaths } = extractSendFileDirectives(afterVoice);
+        const { cleanedText, buttonRows } = extractButtonsDirective(afterFile);
+        if (reactionEmoji && query.message) {
+          await sendReaction(config.token, chatId, query.message.message_id, reactionEmoji).catch(() => {});
+        }
+        for (const vp of voicePaths) {
+          await sendVoiceMessage(config.token, chatId, vp, threadId).catch(() => {});
+        }
+        if (buttonRows) {
+          await sendMessageWithButtons(config.token, chatId, cleanedText, buttonRows, threadId);
+        } else if (cleanedText) {
+          await sendMessage(config.token, chatId, cleanedText, threadId);
+        }
+        for (const fp of filePaths) {
+          await sendDocumentToChat(config.token, chatId, fp, threadId).catch(() => {});
+        }
+      } else if (result.exitCode !== 0) {
+        await sendMessage(config.token, chatId, `Error (exit ${result.exitCode}): ${result.stderr || "Unknown error"}`, threadId);
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      await sendMessage(config.token, chatId, `Error: ${errMsg}`, threadId);
+    }
     return;
   }
 
@@ -1049,8 +1355,13 @@ async function registerBotCommands(token: string): Promise<void> {
 
 let running = true;
 let isPolling = false;
+// Monotonically increasing counter. Each startPolling() call captures the
+// value at the time it starts. The poll loop checks it after every await so
+// a stale loop exits cleanly when stopPolling() or a subsequent startPolling()
+// increments the counter, even if a long-poll request is still in flight.
+let pollingGeneration = 0;
 
-async function poll(): Promise<void> {
+async function poll(generation: number): Promise<void> {
   const config = getSettings().telegram;
   let offset = 0;
   try {
@@ -1072,13 +1383,16 @@ async function poll(): Promise<void> {
   // Register available skills as bot command menu (non-blocking)
   registerBotCommands(config.token).catch(() => {});
 
-  while (running) {
+  while (running && pollingGeneration === generation) {
     try {
       const data = await callApi<{ ok: boolean; result: TelegramUpdate[] }>(
         config.token,
         "getUpdates",
         { offset, timeout: 30, allowed_updates: ["message", "my_chat_member", "callback_query"] }
       );
+
+      // Check generation after the in-flight long-poll request returns.
+      if (pollingGeneration !== generation) break;
 
       if (!data.ok || !data.result.length) continue;
 
@@ -1110,11 +1424,14 @@ async function poll(): Promise<void> {
         }
       }
     } catch (err) {
+      if (pollingGeneration !== generation) break;
       if (!running) break;
       console.error(`[Telegram] Poll error: ${err instanceof Error ? err.message : err}`);
       await Bun.sleep(5000);
     }
   }
+
+  if (pollingGeneration === generation) isPolling = false;
 }
 
 // --- Exports ---
@@ -1128,20 +1445,34 @@ process.on("SIGINT", () => { running = false; });
 /** Start polling in-process (called by start.ts when token is configured) */
 export function startPolling(debug = false): void {
   if (isPolling) return;
+  running = true;
   isPolling = true;
   telegramDebug = debug;
+  const gen = ++pollingGeneration;
   (async () => {
     await ensureProjectClaudeMd();
-    await poll();
+    await poll(gen);
   })().catch((err) => {
-    console.error(`[Telegram] Fatal: ${err}`);
-    isPolling = false;
+    if (pollingGeneration === gen) {
+      console.error(`[Telegram] Fatal: ${err}`);
+      isPolling = false;
+    }
   });
+}
+
+/** Stop polling in-process (called by start.ts when receiveEnabled is toggled off).
+ *  Increments the generation token so the in-flight long-poll loop exits as soon
+ *  as its current getUpdates call returns, even if running is briefly reset to true
+ *  by a concurrent startPolling() call. */
+export function stopPolling(): void {
+  pollingGeneration++;
+  running = false;
+  isPolling = false;
 }
 
 /** Standalone entry point (bun run src/index.ts telegram) */
 export async function telegram() {
   await loadSettings();
   await ensureProjectClaudeMd();
-  await poll();
+  await poll(++pollingGeneration);
 }

@@ -61,6 +61,13 @@ const sessions = new Map<string, SessionState>();
  * Register the start of a session.  Must be called with a real session ID
  * (not the "unknown" sentinel) so the runtime clock begins at the right time.
  * Safe to call multiple times — subsequent calls are no-ops.
+<<<<<<< HEAD
+=======
+ *
+ * Note: tracking is in-memory only. If the daemon restarts, the clock resets on
+ * the first resume — maxRuntimeSeconds will not catch sessions older than the
+ * current daemon process.
+>>>>>>> upstream/master
  */
 export function startSession(sessionId: string): void {
   if (!sessions.has(sessionId)) {

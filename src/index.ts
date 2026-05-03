@@ -4,6 +4,7 @@ import { clear } from "./commands/clear";
 import { status } from "./commands/status";
 import { telegram } from "./commands/telegram";
 import { discord } from "./commands/discord";
+import { slack } from "./commands/slack";
 import { send } from "./commands/send";
 import { runFireCommand } from "./commands/fire";
 
@@ -45,6 +46,8 @@ if (command === "--help" || command === "-h" || command === "help") {
   telegram();
 } else if (command === "discord") {
   discord();
+} else if (command === "slack") {
+  slack();
 } else if (command === "send") {
   send(args.slice(1));
 } else if (command === "fire") {
