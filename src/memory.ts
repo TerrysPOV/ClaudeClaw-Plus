@@ -297,9 +297,10 @@ export function indexSessionsBackground(opts?: MemorySearchSettings): void {
  *
  * @param query  free-text query
  * @param topK   max distinct sessions to return (default 5)
- * @param withSummary  if true, the Python CLI also runs `claude --print` to
- *                     summarize the hits (default false from this entry point —
- *                     callers like skills can opt in). Costs ~1-3s extra.
+ * @param withSummary  if false, skip the `claude --print` summarization step
+ *                     for ~1-3s less latency. Default true, matching the
+ *                     `memory-search recall` CLI default and the
+ *                     session-recall skill documentation.
  */
 export function searchSessions(
   query: string,
@@ -318,7 +319,7 @@ export function searchSessions(
   if (opts?.alpha !== undefined) {
     args.push("--alpha", String(opts.alpha));
   }
-  if (!opts?.withSummary) {
+  if (opts?.withSummary === false) {
     args.push("--no-summary");
   }
 
