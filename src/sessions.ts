@@ -57,7 +57,7 @@ export async function getSession(
   agentName?: string
 ): Promise<{ sessionId: string; turnCount: number; compactWarned: boolean } | null> {
   const existing = await loadSession(agentName);
-  if (existing) {
+  if (existing && existing.sessionId) {
     // Backfill missing fields from older session.json files
     if (typeof existing.turnCount !== "number") existing.turnCount = 0;
     if (typeof existing.compactWarned !== "boolean") existing.compactWarned = false;
