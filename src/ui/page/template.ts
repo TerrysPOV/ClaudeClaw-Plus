@@ -219,7 +219,6 @@ ${pageStyles}
           </div>
         </div><!-- chat-main -->
       </div><!-- chat-layout -->
-<<<<<<< HEAD
     </div>
     <div id="kanban-panel" hidden>
       <div class="kanban-board">
@@ -274,8 +273,6 @@ ${pageStyles}
           </div>
         </div>
       </div>
-=======
->>>>>>> upstream/master
     </div>
   </main>
 

@@ -1548,7 +1548,6 @@ export const pageStyles = String.raw`    :root {
   .chat-layout { flex-direction: column; }
   .chat-sidebar { width: 100%; min-width: 100%; max-height: 180px; border-right: none; border-bottom: 1px solid var(--border); }
 }
-<<<<<<< HEAD
 
 /* ── Tab nav ── */
 [hidden] { display: none !important; }
@@ -1770,6 +1769,3 @@ export const pageStyles = String.raw`    :root {
   padding: 7px 16px;
 }
 .kanban-btn-secondary:hover { color: rgba(255,255,255,0.7); }`;
-=======
-`;
->>>>>>> upstream/master

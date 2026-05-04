@@ -10,10 +10,7 @@ import { resolveSkillPrompt, listSkills } from "../skills";
 import { fireJob, parseFireArgs } from "./fire";
 import { mkdir } from "node:fs/promises";
 import { extname, join } from "node:path";
-<<<<<<< HEAD
 import { submitTelegramToGateway } from "../gateway";
-=======
->>>>>>> upstream/master
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
 
 // --- Markdown → Telegram HTML conversion (ported from nanobot) ---

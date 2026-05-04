@@ -11,11 +11,8 @@ import { resolveSkillPrompt } from "../skills";
 import { fireJob, parseFireArgs } from "./fire";
 import { mkdir } from "node:fs/promises";
 import { extname, join, basename, sep } from "node:path";
-<<<<<<< HEAD
 import { processEventWithFallback, setGatewayEnabled } from "../gateway";
 import { normalizeDiscordMessage, type NormalizedEvent } from "../gateway/normalizer";
-=======
->>>>>>> upstream/master
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
 
 // --- Discord API constants ---
@@ -322,95 +319,6 @@ function extractReactionDirective(text: string): { cleanedText: string; reaction
   cleanedText = cleanedText.trim();
 
   return { cleanedText, reactionEmoji };
-}
-
-// Matches absolute image file paths embedded in reply text so they can be
-// sent as Discord file attachments instead of appearing as raw paths.
-const IMAGE_PATH_RE = /(?<![^\s])(\/[^\s]+\.(?:png|jpe?g|gif|webp))(?=\s|$)/gi;
-const PATH_SKEW_MS = 30_000;
-
-function extractImagePaths(
-  text: string,
-  allowedRoots: string[],
-  requestStartedAt: number,
-): { paths: string[]; cleanedText: string } {
-  const roots = allowedRoots.length > 0 ? allowedRoots : [DEFAULT_IMAGE_OUTPUT_ROOT];
-  const canonRoots = roots.map((r) => {
-    try { return realpathSync(r); } catch { return r; }
-  });
-  const paths: string[] = [];
-  const cleanedText = text
-    .replace(IMAGE_PATH_RE, (match, p1) => {
-      let resolved: string;
-      try {
-        resolved = realpathSync(p1);
-      } catch {
-        return match;
-      }
-      const confined = canonRoots.some((root) => resolved === root || resolved.startsWith(root + sep));
-      if (!confined) return match;
-      try {
-        const { mtimeMs } = statSync(resolved);
-        if (mtimeMs < requestStartedAt - PATH_SKEW_MS) return match;
-      } catch {
-        return match;
-      }
-      paths.push(resolved);
-      return "";
-    })
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-  return { paths, cleanedText };
-}
-
-async function sendMessageWithImages(
-  token: string,
-  channelId: string,
-  text: string,
-  imagePaths: string[],
-): Promise<void> {
-  const chunks = discordMessageChunks(text || "​");
-  const uploadText = chunks.pop() ?? "​";
-  for (const chunk of chunks) {
-    await discordApi(token, "POST", `/channels/${channelId}/messages`, { content: chunk });
-  }
-
-  await uploadImageMessage(token, channelId, uploadText, imagePaths);
-}
-
-async function uploadImageMessage(
-  token: string,
-  channelId: string,
-  text: string,
-  imagePaths: string[],
-  attempt = 0,
-): Promise<void> {
-  const form = new FormData();
-  form.append("payload_json", JSON.stringify({ content: text }));
-  for (let i = 0; i < imagePaths.length; i++) {
-    const file = Bun.file(imagePaths[i]);
-    form.append(`files[${i}]`, file, basename(imagePaths[i]));
-  }
-  const res = await fetch(`${DISCORD_API}/channels/${channelId}/messages`, {
-    method: "POST",
-    headers: { Authorization: `Bot ${token}` },
-    body: form,
-  });
-  if (res.status === 429) {
-    if (attempt >= 3) {
-      throw new Error(`Discord rate limit exceeded after 3 retries on ${channelId}`);
-    }
-    const data = (await res.json().catch(() => ({}))) as { retry_after?: number };
-    const delay = typeof data.retry_after === "number" && isFinite(data.retry_after)
-      ? Math.ceil(data.retry_after * 1000)
-      : 5_000;
-    await Bun.sleep(delay);
-    return uploadImageMessage(token, channelId, text, imagePaths, attempt + 1);
-  }
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(`Discord image upload ${channelId}: ${res.status} ${errText}`);
-  }
 }
 
 // Matches absolute image file paths embedded in reply text so they can be
@@ -911,7 +819,6 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     // Skill routing: detect slash commands and resolve to SKILL.md prompts
     const command = cleanContent.startsWith("/") ? cleanContent.trim().split(/\s+/, 1)[0].toLowerCase() : null;
 
-<<<<<<< HEAD
     // /fire <agent>:<label> — manual fire, bypasses skill resolution
     if (command === "/fire") {
       const fireArgs = cleanContent.trim().slice("/fire".length).trim().split(/\s+/).filter(Boolean);
@@ -944,8 +851,6 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
       return;
     }
 
-=======
->>>>>>> upstream/master
     let skillContext: string | null = null;
     if (command) {
       try {
@@ -990,7 +895,6 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
       promptParts.push("The user attached a text file, but downloading it failed. Ask them to resend.");
     }
 
-<<<<<<< HEAD
     // Build the prompt for Claude
     const prompt = promptParts.join("\n");
     debugLog(`Prompt: ${prompt.slice(0, 100)}...`);
@@ -1032,9 +936,6 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     }
 
     const prefixedPrompt = prompt;
-=======
-    const prefixedPrompt = promptParts.join("\n");
->>>>>>> upstream/master
     // Guild channels (including threads) each get their own isolated session; DMs use the global session
     const sessionKey = isGuild ? channelId : undefined;
     const requestStartedAt = Date.now();

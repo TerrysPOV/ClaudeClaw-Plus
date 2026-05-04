@@ -10,7 +10,6 @@ import { fireJob } from "../commands/fire";
 import { readLogs } from "./services/logs";
 import { listSessions, readSessionMessages, listAgents } from "./services/sessions";
 import { runUserMessage } from "../runner";
-<<<<<<< HEAD
 import { readKanban, writeKanban, type KanbanBoard } from "./services/kanban";
 
 // --- Security: CSRF Protection ---
@@ -111,8 +110,6 @@ function requireCsrf(req: Request): Response | null {
   }
   return null;
 }
-=======
->>>>>>> upstream/master
 
 export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
   const server = Bun.serve({

@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 /**
  * Tests for jobs.ts — Phase 17 multi-job loader extension.
  *
@@ -252,26 +251,12 @@ describe("Phase 18: loadJobs invalid model rejection", () => {
 const TEST_ROOT = join(import.meta.dir, "../../test-sandbox-jobs");
 const LEGACY_JOBS_DIR = join(TEST_ROOT, ".claude", "claudeclaw", "jobs");
 const SANDBOX_AGENTS_DIR = join(TEST_ROOT, "agents");
-=======
-import { describe, test, expect, beforeEach, afterAll } from "bun:test";
-import { mkdir, writeFile, rm } from "fs/promises";
-import { join } from "path";
-
-const TEST_ROOT = join(import.meta.dir, "../../test-sandbox-jobs");
-const LEGACY_JOBS_DIR = join(TEST_ROOT, ".claude", "claudeclaw", "jobs");
-const AGENTS_DIR = join(TEST_ROOT, "agents");
->>>>>>> upstream/master
 
 async function resetSandbox() {
   await rm(TEST_ROOT, { recursive: true, force: true });
   await mkdir(LEGACY_JOBS_DIR, { recursive: true });
-<<<<<<< HEAD
   await mkdir(join(SANDBOX_AGENTS_DIR, "suzy", "jobs"), { recursive: true });
   await mkdir(join(SANDBOX_AGENTS_DIR, "reg", "jobs"), { recursive: true });
-=======
-  await mkdir(join(AGENTS_DIR, "suzy", "jobs"), { recursive: true });
-  await mkdir(join(AGENTS_DIR, "reg", "jobs"), { recursive: true });
->>>>>>> upstream/master
 }
 
 afterAll(async () => {
@@ -302,13 +287,7 @@ process.stdout.write(JSON.stringify(jobs));
   return JSON.parse(out || "[]");
 }
 
-<<<<<<< HEAD
 describe("loadJobs (sandbox integration)", () => {
-=======
-// ─── Integration tests ────────────────────────────────────────────────────
-
-describe("loadJobs", () => {
->>>>>>> upstream/master
   beforeEach(resetSandbox);
 
   test("empty dirs → zero jobs, no throw", async () => {
@@ -331,11 +310,7 @@ describe("loadJobs", () => {
 
   test("loads job from agents/<name>/jobs/ (Phase 17 path)", async () => {
     await writeFile(
-<<<<<<< HEAD
       join(SANDBOX_AGENTS_DIR, "suzy", "jobs", "daily-digest.md"),
-=======
-      join(AGENTS_DIR, "suzy", "jobs", "daily-digest.md"),
->>>>>>> upstream/master
       jobMd("0 9 * * *", "Summarise today's news")
     );
     const jobs = await loadJobsInSandbox();
@@ -350,11 +325,7 @@ describe("loadJobs", () => {
   test("directory location overrides frontmatter agent field", async () => {
     // Even if the .md file says agent: wrong, the enclosing dir wins.
     await writeFile(
-<<<<<<< HEAD
       join(SANDBOX_AGENTS_DIR, "reg", "jobs", "seo.md"),
-=======
-      join(AGENTS_DIR, "reg", "jobs", "seo.md"),
->>>>>>> upstream/master
       jobMd("30 10 * * *", "SEO review", "agent: wrong-agent")
     );
     const jobs = await loadJobsInSandbox();
@@ -364,11 +335,7 @@ describe("loadJobs", () => {
 
   test("enabled: false excludes job", async () => {
     await writeFile(
-<<<<<<< HEAD
       join(SANDBOX_AGENTS_DIR, "suzy", "jobs", "disabled.md"),
-=======
-      join(AGENTS_DIR, "suzy", "jobs", "disabled.md"),
->>>>>>> upstream/master
       jobMd("0 12 * * *", "Disabled", "enabled: false")
     );
     const jobs = await loadJobsInSandbox();
@@ -377,11 +344,7 @@ describe("loadJobs", () => {
 
   test("returns jobs from both legacy and agent-scoped locations together", async () => {
     await writeFile(join(LEGACY_JOBS_DIR, "nightly.md"), jobMd("0 3 * * *", "Nightly"));
-<<<<<<< HEAD
     await writeFile(join(SANDBOX_AGENTS_DIR, "suzy", "jobs", "morning.md"), jobMd("0 9 * * *", "Morning"));
-=======
-    await writeFile(join(AGENTS_DIR, "suzy", "jobs", "morning.md"), jobMd("0 9 * * *", "Morning"));
->>>>>>> upstream/master
     const jobs = await loadJobsInSandbox();
     const names = jobs.map((j) => j.name);
     expect(names).toContain("nightly");
@@ -389,33 +352,21 @@ describe("loadJobs", () => {
   });
 
   test("missing agents/ dir is silently ignored (no throw)", async () => {
-<<<<<<< HEAD
     await rm(SANDBOX_AGENTS_DIR, { recursive: true, force: true });
-=======
-    await rm(AGENTS_DIR, { recursive: true, force: true });
->>>>>>> upstream/master
     const jobs = await loadJobsInSandbox();
     expect(Array.isArray(jobs)).toBe(true);
   });
 
   test("agent dir without jobs/ subdir is skipped", async () => {
     // publisher/ exists but has no jobs/ subdirectory
-<<<<<<< HEAD
     await mkdir(join(SANDBOX_AGENTS_DIR, "publisher"), { recursive: true });
-=======
-    await mkdir(join(AGENTS_DIR, "publisher"), { recursive: true });
->>>>>>> upstream/master
     const jobs = await loadJobsInSandbox();
     expect(jobs.filter((j) => j.name.startsWith("publisher/"))).toEqual([]);
   });
 
   test("job file without schedule: field is skipped gracefully", async () => {
     await writeFile(
-<<<<<<< HEAD
       join(SANDBOX_AGENTS_DIR, "suzy", "jobs", "bad.md"),
-=======
-      join(AGENTS_DIR, "suzy", "jobs", "bad.md"),
->>>>>>> upstream/master
       "---\nprompt: test\n---\nNo schedule line.\n"
     );
     // Should not throw, should return other valid jobs
@@ -424,11 +375,7 @@ describe("loadJobs", () => {
   });
 });
 
-<<<<<<< HEAD
 // ─── Unit: Job type and session path assertions ───────────────────────────────
-=======
-// ─── Unit: Job type and session path assertions ───────────────────────────
->>>>>>> upstream/master
 
 describe("Job type", () => {
   test("includes agent, label, enabled fields", () => {
@@ -477,11 +424,7 @@ describe("sessions — agent-scoped paths", () => {
   });
 });
 
-<<<<<<< HEAD
 // ─── Unit: protection-bug validation (the core motivation) ───────────────────
-=======
-// ─── Unit: protection-bug validation (the core motivation) ───────────────
->>>>>>> upstream/master
 
 describe("write-protection bug validation", () => {
   test("agent-scoped job path is outside .claude/ (key property)", () => {
