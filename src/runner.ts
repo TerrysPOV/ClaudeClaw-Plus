@@ -91,6 +91,37 @@ function resolveClaudeExecutable(): string {
 }
 const CLAUDE_EXECUTABLE = resolveClaudeExecutable();
 
+/** Versions of the Claude Code CLI whose interactive TTY output the PTY parser
+ *  has been validated against (see .planning/pty-migration/SPEC.md §2 and the
+ *  golden fixture at .planning/pty-migration/fixtures/turn-boundary-sample.txt).
+ *  Other versions may still work — the parser also has a turnIdleTimeoutMs
+ *  safety net — but a mismatch here means we cannot guarantee turn-boundary
+ *  detection. Add a version after empirical validation. */
+const KNOWN_GOOD_CLAUDE_VERSIONS = ["2.1.141"];
+
+/** Probe `claude --version` at daemon startup and log the result. Warns if the
+ *  installed version isn't in the known-good list — does NOT block startup. */
+export async function probeClaudeCliVersion(): Promise<{ version: string | null; known: boolean }> {
+  try {
+    const proc = Bun.spawn([CLAUDE_EXECUTABLE, "--version"], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout] = await Promise.all([
+      new Response(proc.stdout).text(),
+      proc.exited,
+    ]);
+    // `claude --version` prints something like "2.1.141 (Claude Code)" — extract
+    // the leading semver-ish token. We don't enforce strict semver here.
+    const match = stdout.match(/(\d+\.\d+\.\d+)/);
+    const version = match ? match[1] : null;
+    const known = version !== null && KNOWN_GOOD_CLAUDE_VERSIONS.includes(version);
+    return { version, known };
+  } catch {
+    return { version: null, known: false };
+  }
+}
+
 /**
  * Compact configuration.
  * COMPACT_WARN_THRESHOLD: notify user that context is getting large.

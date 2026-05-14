@@ -4,7 +4,7 @@ import { homedir } from "os";
 import { extractErrorDetail } from "../messaging";
 import { join } from "path";
 import { fileURLToPath } from "url";
-import { run, runUserMessage, streamUserMessage, bootstrap, ensureProjectClaudeMd, loadHeartbeatPromptTemplate, isRateLimited, getRateLimitResetAt, wasRateLimitNotified, markRateLimitNotified } from "../runner";
+import { run, runUserMessage, streamUserMessage, bootstrap, ensureProjectClaudeMd, loadHeartbeatPromptTemplate, isRateLimited, getRateLimitResetAt, wasRateLimitNotified, markRateLimitNotified, probeClaudeCliVersion } from "../runner";
 import { initGatewayProcessor, registerGatewayDelivery, unregisterGatewayDelivery } from "../event-processor";
 import { writeState, type StateData } from "../statusline";
 import { cronMatches, nextCronMatch } from "../cron";
@@ -426,6 +426,18 @@ export async function start(args: string[] = []) {
 
   console.log("ClaudeClaw+ daemon started");
   console.log(`  PID: ${process.pid}`);
+  // Probe and log the Claude CLI version so operators see which `claude`
+  // the daemon is invoking. Mismatch against the parser's known-good list
+  // logs a warning but does NOT block startup — the PTY parser also has
+  // a turnIdleTimeoutMs safety net for unknown versions.
+  const cliProbe = await probeClaudeCliVersion();
+  if (cliProbe.version === null) {
+    console.warn(`  Claude CLI: could not probe (claude --version failed)`);
+  } else if (cliProbe.known) {
+    console.log(`  Claude CLI: ${cliProbe.version} (validated)`);
+  } else {
+    console.warn(`  Claude CLI: ${cliProbe.version} (NOT in PTY parser's known-good list; turn-boundary detection may degrade — check .planning/pty-migration/SPEC.md §2)`);
+  }
   console.log(`  Security: ${settings.security.level}`);
   if (settings.security.allowedTools.length > 0)
     console.log(`    + allowed: ${settings.security.allowedTools.join(", ")}`);
