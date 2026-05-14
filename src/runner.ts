@@ -1389,15 +1389,19 @@ async function execClaude(
       : agentName
         ? `agent:${agentName}`
         : "global";
-    // Phase D fix #3: thread the canonical securityArgs through to the PTY
-    // path so the operator's permissionMode is honoured (previously every
-    // PTY spawn unconditionally bypassed permissions).
+    // Phase D fixes #2 (CRITICAL-1) and #3 (MAJOR-2/3): thread the assembled
+    // --append-system-prompt payload AND the canonical securityArgs through
+    // to the PTY path so named agents keep their identity/memory and the
+    // operator's permissionMode is honoured (instead of always
+    // --dangerously-skip-permissions).
+    const appendSystemPrompt = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
     exec = await runOnPty(sessionKey, prompt, {
       timeoutMs,
       threadId,
       agentName,
       modelOverride: modelOverride ?? undefined,
       securityArgs,
+      appendSystemPrompt,
       onChunk,
       onToolEvent,
     });

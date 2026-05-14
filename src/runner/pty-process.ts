@@ -56,6 +56,14 @@ export interface PtyProcessOptions {
    * this to honour the operator's `permissionMode` and locked-mode Write tool
    * inclusion. (Phase D fix #3 for MAJOR-2/MAJOR-3.) */
   securityArgs?: string[];
+  /**
+   * Optional system prompt to append via `--append-system-prompt <text>`.
+   * The supervisor assembles this from the same parts execClaude builds for
+   * the legacy `claude -p` path (CLAUDE.md, MEMORY.md, agent IDENTITY.md /
+   * SOUL.md, dir-scope guard, update-memory instruction). Without this flag
+   * threaded through, named agents become naked Claude with no memory.
+   * (Phase D fix #2 for CRITICAL-1.) */
+  appendSystemPrompt?: string;
   /** Env vars to pass to the child. Caller is responsible for a sanitised env. */
   env: Record<string, string>;
   /** Initial PTY columns. Default 100. */
@@ -212,6 +220,14 @@ function buildClaudeArgs(opts: PtyProcessOptions): string[] {
   const model = (opts.modelOverride ?? "").trim();
   if (model.length > 0 && model.toLowerCase() !== "glm") {
     args.push("--model", model);
+  }
+
+  // Phase D fix #2 (CRITICAL-1): append the assembled system-prompt payload
+  // (CLAUDE.md, MEMORY.md, agent identity, dir-scope guard, etc.) so PTY-mode
+  // agents have the same context as the legacy `claude -p` path. Interactive
+  // claude accepts --append-system-prompt (verified via `claude --help`).
+  if (opts.appendSystemPrompt && opts.appendSystemPrompt.length > 0) {
+    args.push("--append-system-prompt", opts.appendSystemPrompt);
   }
 
   return args;

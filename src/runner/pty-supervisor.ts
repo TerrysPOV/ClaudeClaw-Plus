@@ -323,11 +323,14 @@ export function snapshotSupervisor(): SupervisorSnapshot {
  * Run a single turn on the PTY associated with `sessionKey`.
  * See SPEC §3.2 for the contract.
  *
- * Phase D addition:
+ * Phase D additions:
  *   - `securityArgs`: pre-built argv from runner.ts:buildSecurityArgs(), so
  *     the supervisor honours the operator's permissionMode + locked-mode
  *     Write tool. Without this, every PTY spawn unconditionally bypassed
  *     permissions via `--dangerously-skip-permissions`.
+ *   - `appendSystemPrompt`: the assembled `--append-system-prompt` payload
+ *     (CLAUDE.md + MEMORY.md + agent identity + dir-scope guard). Without
+ *     this, named agents lose their identity and memory under PTY mode.
  */
 export async function runOnPty(
   sessionKey: string,
@@ -339,6 +342,8 @@ export async function runOnPty(
     modelOverride?: string;
     /** Phase D fix #3: pre-built security argv from runner.ts:buildSecurityArgs. */
     securityArgs?: string[];
+    /** Phase D fix #2: assembled --append-system-prompt payload. */
+    appendSystemPrompt?: string;
     onChunk?: (text: string) => void;
     onToolEvent?: (line: string) => void;
   },
@@ -413,6 +418,7 @@ async function buildSpawnOptions(
   entry: PtyEntry,
   modelOverride: string | undefined,
   securityArgs: string[] | undefined,
+  appendSystemPrompt: string | undefined,
 ): Promise<PtyProcessOptions> {
   const settings = getSettings();
   const { security } = settings;
@@ -465,6 +471,7 @@ async function buildSpawnOptions(
     modelOverride: modelOverride ?? undefined,
     security: cloneSecurity(security),
     securityArgs: resolvedSecurityArgs,
+    appendSystemPrompt,
     env: cleanEnv(),
     cols: settings.pty.cols,
     rows: settings.pty.rows,
@@ -519,9 +526,15 @@ async function spawnEntry(
   entry: PtyEntry,
   modelOverride: string | undefined,
   securityArgs: string[] | undefined,
+  appendSystemPrompt: string | undefined,
 ): Promise<void> {
   const spawn = await ensureSpawnPty();
-  const spawnOpts = await buildSpawnOptions(entry, modelOverride, securityArgs);
+  const spawnOpts = await buildSpawnOptions(
+    entry,
+    modelOverride,
+    securityArgs,
+    appendSystemPrompt,
+  );
   entry.spawnOpts = spawnOpts;
   entry.pty = await spawn(spawnOpts);
 }
@@ -560,6 +573,7 @@ async function runTurnWithRetries(
     agentName?: string;
     modelOverride?: string;
     securityArgs?: string[];
+    appendSystemPrompt?: string;
     onChunk?: (text: string) => void;
     onToolEvent?: (line: string) => void;
   },
@@ -568,7 +582,12 @@ async function runTurnWithRetries(
   // Lazy spawn on first turn for this key.
   if (!entry.pty) {
     try {
-      await spawnEntry(entry, callOpts.modelOverride, callOpts.securityArgs);
+      await spawnEntry(
+        entry,
+        callOpts.modelOverride,
+        callOpts.securityArgs,
+        callOpts.appendSystemPrompt,
+      );
     } catch (err) {
       return errorResult(
         `[pty-supervisor] failed to spawn PTY for ${entry.sessionKey}: ${(err as Error).message}`,

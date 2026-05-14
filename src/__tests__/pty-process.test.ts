@@ -247,6 +247,46 @@ describe("PtyProcess — runTurn on closed PTY", () => {
 
 // ─── sessionId propagation ──────────────────────────────────────────────────
 
+describe("PtyProcess — buildClaudeArgs emits appendSystemPrompt (Phase D fix #2)", () => {
+  test("appendSystemPrompt produces --append-system-prompt <payload>", () => {
+    const payload = "CLAUDE.md content + MEMORY.md content + dir-scope guard";
+    const opts: PtyProcessOptions = {
+      sessionId: "",
+      cwd: "/tmp",
+      security: { level: "moderate", allowedTools: [], disallowedTools: [] },
+      appendSystemPrompt: payload,
+      env: {},
+    };
+    const args = __buildClaudeArgsForTests(opts);
+    const flagIdx = args.indexOf("--append-system-prompt");
+    expect(flagIdx).toBeGreaterThanOrEqual(0);
+    expect(args[flagIdx + 1]).toBe(payload);
+  });
+
+  test("empty appendSystemPrompt is NOT emitted (avoids `--append-system-prompt ''`)", () => {
+    const opts: PtyProcessOptions = {
+      sessionId: "",
+      cwd: "/tmp",
+      security: { level: "moderate", allowedTools: [], disallowedTools: [] },
+      appendSystemPrompt: "",
+      env: {},
+    };
+    const args = __buildClaudeArgsForTests(opts);
+    expect(args).not.toContain("--append-system-prompt");
+  });
+
+  test("omitted appendSystemPrompt is NOT emitted", () => {
+    const opts: PtyProcessOptions = {
+      sessionId: "",
+      cwd: "/tmp",
+      security: { level: "moderate", allowedTools: [], disallowedTools: [] },
+      env: {},
+    };
+    const args = __buildClaudeArgsForTests(opts);
+    expect(args).not.toContain("--append-system-prompt");
+  });
+});
+
 describe("PtyProcess — buildClaudeArgs honours securityArgs (Phase D fix #3)", () => {
   test("when securityArgs is provided, it's used verbatim instead of derived flags", () => {
     const explicitArgs = [

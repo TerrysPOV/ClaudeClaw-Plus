@@ -626,6 +626,30 @@ describe("pty-supervisor snapshot", () => {
   });
 });
 
+describe("pty-supervisor system-prompt threading (Phase D fix #2)", () => {
+  it("threads appendSystemPrompt through to PtyProcessOptions verbatim", async () => {
+    let captured: PtyProcessOptions | undefined;
+    const { spawn } = makeSpawnTracker((opts) => {
+      captured = opts;
+      return makeFakePty("system-prompt", {});
+    });
+    injectSpawnPty(spawn);
+    await initSupervisor();
+
+    const payload =
+      "You are running inside ClaudeClaw...\n\n## CLAUDE.md\n\n...\n\n## MEMORY.md\n\n...";
+
+    await runOnPty("agent:talon", "do a thing", {
+      timeoutMs: 1000,
+      agentName: "talon",
+      appendSystemPrompt: payload,
+    });
+
+    expect(captured).toBeDefined();
+    expect(captured!.appendSystemPrompt).toBe(payload);
+  });
+});
+
 describe("pty-supervisor security-args (Phase D fix #3)", () => {
   it("threads caller-supplied securityArgs through to PtyProcessOptions verbatim", async () => {
     let captured: PtyProcessOptions | undefined;
