@@ -231,6 +231,12 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full scope guide and how to decid
 
 Short version for ClaudeClaw+: open an issue first, then the PR. Large refactors fine. New subsystems fine. Multi-file stacks fine. Just talk first, code second.
 
+### Linting
+
+Linting and formatting are handled by [Biome](https://biomejs.dev/). One tool, no ESLint/Prettier split. Run `bun run lint` to check, `bun run lint:fix` to auto-fix safe rules, or `bun run format` for formatter-only. CI fails on ERROR-level findings via `.github/workflows/lint.yml`.
+
+A few rules are relaxed to `warn` because the patterns are pervasive and defensible: `noNonNullAssertion`, `noExplicitAny`, `useTemplate`, and `noUnusedVariables/Imports`. `noConsole` and `noUnusedFunctionParameters` are off entirely — the daemon legitimately logs to stdout, and interface implementations often accept parameters they don't use. See `biome.json` for the full config.
+
 ---
 
 ## Roadmap
