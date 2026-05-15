@@ -88,15 +88,27 @@ These features originated as PRs to `moazbuilds/claudeclaw` and have been closed
 
 ### PTY runner mode — interactive billing for the daemon (opt-in, beta)
 
-**Tracking issue: [#61](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues/61)**
+**Tracking issue: [#61](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues/61) · Merged PR: [#62](https://github.com/TerrysPOV/ClaudeClaw-Plus/pull/62)**
+
+> [!WARNING]
+> **DO NOT flip `pty.enabled: true` in production yet.**
+>
+> The PTY runner ships as code only in this release — the feature flag defaults to `false` and the daemon continues to use the existing `claude -p` path. Enabling PTY mode before the **MCP multiplexer** ships will cause per-PTY MCP-server process explosion (N × claude × M MCP servers), which OOMs even a modest Hetzner box at moderate concurrent-conversation counts.
+>
+> Two prerequisites before any production flip:
+> 1. **MCP multiplexer milestone** — shared MCP-server processes across PTYs. Tracked at the follow-up issue linked from #61.
+> 2. **OAuth refresh validation** — empirical test on a staging deployment: spawn a PTY, idle 90 minutes, send a prompt. If the second prompt 401s, the auth token doesn't auto-refresh in long-lived sessions and an OAuth refresh cron is required first.
+>
+> Until both land, PTY mode is safe to try in a **non-production** setting (a throwaway project with no MCP servers configured) to verify the parser + supervisor work end-to-end against your installed `claude` CLI version.
+
+#### Why this exists
 
 From 2026-06-15, Anthropic splits Claude Code billing: `claude -p` non-interactive calls draw from a separate Agent SDK credit pool (Pro $20 / Max-5 $100 / Max-20 $200) rather than your subscription. ClaudeClaw+ today invokes `claude -p` for every event, which after the split would exhaust the Agent SDK pool for any moderate-usage daemon.
 
 The PTY runner replaces per-event `claude -p` subprocesses with long-lived interactive `claude` PTY processes (one per named agent + on-demand for ad-hoc threads). Interactive billing applies → subscription pool covers all daemon work → Agent SDK pool stays untouched.
 
-**Status: opt-in, behind a feature flag (`settings.pty.enabled`, default `false`).** The runner is fully tested and audited, but production rollout depends on a follow-up MCP multiplexer to avoid per-PTY memory explosion (N × claude × M MCP servers). **Do not flip `pty.enabled: true` in production until the MCP multiplexer milestone ships.** Validate OAuth refresh and RAM footprint on a test deployment first.
+#### Settings block (defaults shown)
 
-Settings block (defaults shown):
 ```json
 "pty": {
   "enabled": false,
@@ -108,7 +120,13 @@ Settings block (defaults shown):
 }
 ```
 
-Architecture: [`.planning/pty-migration/SPEC.md`](.planning/pty-migration/SPEC.md). Phase D audit reports under the same directory.
+Hot-reload picks up `settings.json` changes within 30 seconds — no daemon restart needed to flip the flag in either direction.
+
+#### References
+
+- Architecture: [`.planning/pty-migration/SPEC.md`](.planning/pty-migration/SPEC.md)
+- Phase D audit reports: [`.planning/pty-migration/`](.planning/pty-migration/)
+- Tracking + follow-ups: [#61](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues/61)
 
 ---
 
