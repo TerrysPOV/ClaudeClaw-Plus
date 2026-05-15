@@ -154,6 +154,39 @@ describe("McpMultiplexerPlugin — active path", () => {
     }
   });
 
+  it("Codex PR #71 P2 #3 regression — sharedServerNames reports CLAIMED, not requested", async () => {
+    // Operator requests three shared servers but mcp-proxy.json only
+    // defines one. The other two are missing from the proxy config →
+    // the multiplexer logs "skipping … not present" and proceeds with
+    // only the present one. sharedServerNames() must reflect what we
+    // actually claim, NOT the operator's broader request — otherwise
+    // mcp-proxy._sharedActuallyClaimedByMultiplexer() would also skip
+    // the missing names, leaving them unreachable from BOTH paths.
+    const cfgPath = writeProxyConfig(tmpDir, ["alpha"]); // only alpha exists
+    const plugin = new McpMultiplexerPlugin({
+      configPath: cfgPath,
+      settingsView: makeSettingsView({
+        webEnabled: true,
+        shared: ["alpha", "missing-one", "missing-two"],
+        stateless: ["alpha", "missing-one"], // stateless must also intersect with claimed
+      }),
+    });
+
+    await plugin.start();
+
+    try {
+      expect(plugin.isActive()).toBe(true);
+      // Only alpha actually came up; sharedServerNames must NOT include
+      // missing-one or missing-two even though they were in settings.
+      expect(plugin.sharedServerNames()).toEqual(["alpha"]);
+      // Stateless filter applies to the claimed set, not the requested set.
+      const health = plugin.health() as { stateless: string[] };
+      expect(health.stateless).toEqual(["alpha"]);
+    } finally {
+      await plugin.stop();
+    }
+  });
+
   it("mounts a /mcp/<name> handler on the gateway for each shared server", async () => {
     const cfgPath = writeProxyConfig(tmpDir, ["alpha"]);
     const plugin = new McpMultiplexerPlugin({

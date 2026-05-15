@@ -198,9 +198,13 @@ export class McpMultiplexerPlugin {
       return;
     }
 
-    // Cache the activation state used by `isActive()` and the W2 contract.
-    this.cachedSharedNames = settings.shared.slice();
-    this.cachedStatelessNames = settings.stateless.slice();
+    // Cache the bridge URL used by W2 / the supervisor's synthesised
+    // --mcp-config. `cachedSharedNames` and `cachedStatelessNames` are
+    // populated AFTER the spawn loop so they reflect what we *actually*
+    // claim, not what the operator *requested*. Codex PR #71 P2 #3:
+    // a partial-start would otherwise report failed servers as claimed,
+    // and `mcp-proxy`'s `_sharedActuallyClaimedByMultiplexer()` would
+    // skip them too, leaving those servers unreachable from BOTH paths.
     this.cachedBridgeBaseUrl =
       this.bridgeBaseUrlOverride ?? `http://${settings.webHost}:${settings.webPort}`;
 
@@ -285,6 +289,18 @@ export class McpMultiplexerPlugin {
       this.cachedBridgeBaseUrl = "http://127.0.0.1:4632";
       return;
     }
+
+    // Codex PR #71 P2 #3: cache the names we ACTUALLY claimed (not the
+    // operator's requested set). `sharedServerNames()` is the public
+    // contract `mcp-proxy._sharedActuallyClaimedByMultiplexer()` reads
+    // when deciding which servers to skip; if a requested server failed
+    // to spawn, the proxy must still own it.
+    this.cachedSharedNames = claimed.slice();
+    // Stateless names are filtered to the intersection of declared
+    // stateless AND actually-claimed.
+    this.cachedStatelessNames = settings.stateless.filter((n) =>
+      claimed.includes(n),
+    );
 
     // Commit started AFTER we've claimed at least one server — a dormant
     // bail-out above leaves started=false so the operator can re-`start()`

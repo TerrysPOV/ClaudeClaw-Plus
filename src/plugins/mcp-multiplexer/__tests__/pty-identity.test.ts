@@ -89,7 +89,11 @@ describe("pty-identity", () => {
   it("verifyBearer rejects a tampered secret", () => {
     const id = issueIdentity("suzy");
     const hex = id.headers[AUTH_HEADER].slice("Bearer ".length);
-    const flipped = "0" + hex.slice(1);
+    // Deterministic flip: if the first nibble is "0", flip to "1";
+    // otherwise flip to "0". Previously `"0" + hex.slice(1)` collided
+    // 1-in-16 runs when the bearer happened to start with "0".
+    const flippedFirst = hex[0] === "0" ? "1" : "0";
+    const flipped = flippedFirst + hex.slice(1);
     expect(verifyBearer("suzy", `Bearer ${flipped}`)).toBe(false);
   });
 
