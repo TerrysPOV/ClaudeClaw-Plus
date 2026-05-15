@@ -122,8 +122,13 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
     fetch: async (req) => {
       const url = new URL(req.url);
 
-      // Plugin HTTP gateway — handles /api/plugin/* routes
-      if (url.pathname.startsWith('/api/plugin/')) {
+      // Plugin HTTP gateway — handles /api/plugin/* routes and
+      // /mcp/<server>/* multiplexer routes (registered by the
+      // McpMultiplexerPlugin at daemon startup).
+      if (
+        url.pathname.startsWith('/api/plugin/') ||
+        url.pathname.startsWith('/mcp/')
+      ) {
         try {
           const gatewayResp = await getHttpGateway().handleRequest(req, url);
           if (gatewayResp !== null) return gatewayResp;
