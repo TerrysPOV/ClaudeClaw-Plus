@@ -214,6 +214,25 @@ describe("parseSettings — mcp block (MCP multiplexer, SPEC §5)", () => {
     expect(mcp.shared).toEqual([]);
     expect(mcp.perPtyOnly).toEqual([]);
     expect(mcp.stateless).toEqual([]);
+    expect(mcp.healthProbeIntervalMs).toBe(30000);
+  });
+
+  it("accepts a custom healthProbeIntervalMs", async () => {
+    await writeRawSettings({ mcp: { healthProbeIntervalMs: 5000 } });
+    await reloadSettings();
+    expect(getSettings().mcp.healthProbeIntervalMs).toBe(5000);
+  });
+
+  it("disables the health probe when healthProbeIntervalMs is 0", async () => {
+    await writeRawSettings({ mcp: { healthProbeIntervalMs: 0 } });
+    await reloadSettings();
+    expect(getSettings().mcp.healthProbeIntervalMs).toBe(0);
+  });
+
+  it("clamps negative healthProbeIntervalMs to the default", async () => {
+    await writeRawSettings({ mcp: { healthProbeIntervalMs: -1 } });
+    await reloadSettings();
+    expect(getSettings().mcp.healthProbeIntervalMs).toBe(30000);
   });
 
   it("accepts a non-empty shared list", async () => {
@@ -280,6 +299,11 @@ describe("parseSettings — mcp block (MCP multiplexer, SPEC §5)", () => {
   it("round-trips an explicit empty mcp object", async () => {
     await writeRawSettings({ mcp: {} });
     await reloadSettings();
-    expect(getSettings().mcp).toEqual({ shared: [], perPtyOnly: [], stateless: [] });
+    expect(getSettings().mcp).toEqual({
+      shared: [],
+      perPtyOnly: [],
+      stateless: [],
+      healthProbeIntervalMs: 30000,
+    });
   });
 });

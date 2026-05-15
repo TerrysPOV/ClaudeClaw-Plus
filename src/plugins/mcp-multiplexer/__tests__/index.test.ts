@@ -45,6 +45,10 @@ function makeSettingsView(
     webPort: 4632,
     shared: [],
     stateless: [],
+    // Disable the health probe by default so unit tests don't deal with
+    // timer flakiness; the probe is exercised directly via
+    // `_sampleHealthForTests` in dedicated tests below.
+    healthProbeIntervalMs: 0,
     ...partial,
   };
   return () => view;
@@ -320,5 +324,101 @@ describe("McpMultiplexerPlugin — active path", () => {
     expect(plugin.isActive()).toBe(false);
     expect(getHttpGateway().hasMcpHandler("alpha")).toBe(false);
     expect(plugin.sharedServerNames()).toEqual([]);
+  });
+
+  describe("health probe (filed in response to Nibbler review on #64)", () => {
+    it("emits a degradation log + audit event when a shared server transitions to crashed", async () => {
+      const cfgPath = writeProxyConfig(tmpDir, ["alpha"]);
+      const plugin = new McpMultiplexerPlugin({
+        configPath: cfgPath,
+        settingsView: makeSettingsView({
+          webEnabled: true,
+          shared: ["alpha"],
+          // Probe stays disabled — we drive sampling synchronously via the
+          // test seam to avoid timer flakiness.
+          healthProbeIntervalMs: 0,
+        }),
+      });
+
+      await plugin.start();
+      expect(plugin.isActive()).toBe(true);
+
+      // Seed the baseline so the first sample is meaningful even though
+      // the probe wasn't started by the plugin (probe disabled in tests).
+      const proc = (plugin as unknown as {
+        servers: Map<string, { status: string }>;
+        lastObservedStatus: Map<string, string>;
+      }).servers.get("alpha")!;
+      (plugin as unknown as {
+        lastObservedStatus: Map<string, string>;
+      }).lastObservedStatus.set("alpha", proc.status);
+
+      // Force a transition: simulate the upstream child crashing.
+      const initial = proc.status;
+      (proc as { status: string }).status = "crashed";
+
+      // Capture audit events.
+      const audited: Array<{ event: string; payload: Record<string, unknown> }> = [];
+      const origAudit = getMcpBridge().audit.bind(getMcpBridge());
+      getMcpBridge().audit = (event: string, payload: Record<string, unknown>) => {
+        audited.push({ event, payload });
+        origAudit(event, payload);
+      };
+
+      try {
+        (plugin as unknown as { _sampleHealthForTests: () => void })._sampleHealthForTests();
+      } finally {
+        getMcpBridge().audit = origAudit;
+      }
+
+      const degradationEvent = audited.find((e) => e.event === "mcp_health_degraded");
+      expect(degradationEvent).toBeDefined();
+      expect(degradationEvent?.payload.server).toBe("alpha");
+      expect(degradationEvent?.payload.previous_status).toBe(initial);
+      expect(degradationEvent?.payload.current_status).toBe("crashed");
+
+      await plugin.stop();
+    });
+
+    it("does not emit duplicate events when status is stable across samples", async () => {
+      const cfgPath = writeProxyConfig(tmpDir, ["alpha"]);
+      const plugin = new McpMultiplexerPlugin({
+        configPath: cfgPath,
+        settingsView: makeSettingsView({
+          webEnabled: true,
+          shared: ["alpha"],
+          healthProbeIntervalMs: 0,
+        }),
+      });
+      await plugin.start();
+
+      const proc = (plugin as unknown as {
+        servers: Map<string, { status: string }>;
+        lastObservedStatus: Map<string, string>;
+      }).servers.get("alpha")!;
+      (plugin as unknown as {
+        lastObservedStatus: Map<string, string>;
+      }).lastObservedStatus.set("alpha", proc.status);
+
+      const audited: string[] = [];
+      const origAudit = getMcpBridge().audit.bind(getMcpBridge());
+      getMcpBridge().audit = (event: string, payload: Record<string, unknown>) => {
+        audited.push(event);
+        origAudit(event, payload);
+      };
+
+      try {
+        (plugin as unknown as { _sampleHealthForTests: () => void })._sampleHealthForTests();
+        (plugin as unknown as { _sampleHealthForTests: () => void })._sampleHealthForTests();
+      } finally {
+        getMcpBridge().audit = origAudit;
+      }
+
+      expect(
+        audited.filter((e) => e === "mcp_health_degraded" || e === "mcp_health_transition"),
+      ).toHaveLength(0);
+
+      await plugin.stop();
+    });
   });
 });

@@ -83,6 +83,9 @@ export interface MuxSettingsView {
   webPort: number;
   shared: string[];
   stateless: string[];
+  /** Health probe interval in milliseconds. 0 disables the probe. Default
+   *  derives from `settings.mcp.healthProbeIntervalMs` (30s). */
+  healthProbeIntervalMs: number;
 }
 
 function _readSettings(): MuxSettingsView {
@@ -92,12 +95,21 @@ function _readSettings(): MuxSettingsView {
   const mcpRaw = (s as unknown as { mcp?: unknown }).mcp;
   const shared = _stringArray(mcpRaw, "shared");
   const stateless = _stringArray(mcpRaw, "stateless");
+  const probeRaw =
+    mcpRaw && typeof mcpRaw === "object"
+      ? (mcpRaw as Record<string, unknown>).healthProbeIntervalMs
+      : undefined;
+  const healthProbeIntervalMs =
+    typeof probeRaw === "number" && Number.isFinite(probeRaw) && probeRaw >= 0
+      ? Math.floor(probeRaw)
+      : 30000;
   return {
     webEnabled: s.web?.enabled === true,
     webHost: s.web?.host ?? "127.0.0.1",
     webPort: typeof s.web?.port === "number" ? s.web.port : 4632,
     shared,
     stateless: stateless.filter((n) => shared.includes(n)),
+    healthProbeIntervalMs,
   };
 }
 
@@ -132,6 +144,12 @@ export class McpMultiplexerPlugin {
   private cachedSharedNames: string[] = [];
   private cachedStatelessNames: string[] = [];
   private cachedBridgeBaseUrl = "http://127.0.0.1:4632";
+  /** Periodic liveness sampler. Null when probe is disabled (intervalMs=0)
+   *  or the plugin is dormant. */
+  private healthProbeTimer: ReturnType<typeof setInterval> | null = null;
+  /** Previous observed status per shared server. Drives the transition
+   *  log/audit on each probe tick. */
+  private lastObservedStatus = new Map<string, string>();
 
   constructor(opts: McpMultiplexerPluginOpts = {}) {
     this.configPath =
@@ -256,13 +274,21 @@ export class McpMultiplexerPlugin {
       );
       this.cachedSharedNames = [];
       this.cachedStatelessNames = [];
+      return;
     }
+
+    // Start the periodic health probe. Closes the silent-degradation gap
+    // flagged on #64: when one shared MCP crashes all PTYs lose that tool
+    // simultaneously, and without an active probe the operator only finds
+    // out when something fails to respond.
+    this._startHealthProbe(settings.healthProbeIntervalMs);
   }
 
   async stop(): Promise<void> {
     if (!this.started) return;
     this.started = false;
     this.active = false;
+    this._stopHealthProbe();
     try {
       getMcpBridge().unregisterPlugin(PLUGIN_ID);
     } catch {}
@@ -278,6 +304,65 @@ export class McpMultiplexerPlugin {
     this.servers.clear();
     this.cachedSharedNames = [];
     this.cachedStatelessNames = [];
+  }
+
+  // ── Health probe ────────────────────────────────────────────────────
+
+  private _startHealthProbe(intervalMs: number): void {
+    if (intervalMs <= 0) return;
+    // Seed the baseline before the first tick so we don't fire transition
+    // events from `undefined` → `up` at startup.
+    for (const [name, proc] of this.servers) {
+      this.lastObservedStatus.set(name, proc.status);
+    }
+    this.healthProbeTimer = setInterval(() => this._sampleHealth(), intervalMs);
+    if (typeof this.healthProbeTimer.unref === "function") {
+      this.healthProbeTimer.unref();
+    }
+  }
+
+  private _stopHealthProbe(): void {
+    if (this.healthProbeTimer) {
+      clearInterval(this.healthProbeTimer);
+      this.healthProbeTimer = null;
+    }
+    this.lastObservedStatus.clear();
+  }
+
+  /** Sample `proc.status` for every shared server. On state transition,
+   *  emit a structured audit event and a console line. Degraded states
+   *  (`crashed`, `failed`) go to stderr with a `DEGRADED` tag so operators
+   *  can grep them from the daemon log. Exposed as `_sampleHealthForTests`
+   *  to avoid timer flakiness in unit tests. */
+  _sampleHealthForTests(): void {
+    this._sampleHealth();
+  }
+
+  private _sampleHealth(): void {
+    for (const [name, proc] of this.servers) {
+      const prev = this.lastObservedStatus.get(name);
+      const curr = proc.status as string;
+      if (prev === curr) continue;
+      const degraded = curr === "crashed" || curr === "failed";
+      const uptimeS = proc.startedAt
+        ? Math.floor((Date.now() - proc.startedAt.getTime()) / 1000)
+        : null;
+      try {
+        getMcpBridge().audit(
+          degraded ? "mcp_health_degraded" : "mcp_health_transition",
+          {
+            server: name,
+            previous_status: prev ?? "unknown",
+            current_status: curr,
+            uptime_s: uptimeS,
+          },
+        );
+      } catch {}
+      const line = `[mcp-multiplexer] HEALTH ${name}: ${prev ?? "unknown"} → ${curr}${degraded ? " (DEGRADED)" : ""}`;
+      if (degraded) console.warn(line);
+      else console.log(line);
+      this.lastObservedStatus.set(name, curr);
+    }
   }
 
   health(): Record<string, unknown> {

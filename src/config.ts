@@ -108,6 +108,7 @@ const DEFAULT_SETTINGS: Settings = {
     shared: [],
     perPtyOnly: [],
     stateless: [],
+    healthProbeIntervalMs: 30000,
   },
   watchdog: { maxConsecutiveTimeouts: null, maxRuntimeSeconds: null },
   session: { autoRotate: false, maxMessages: 50, maxAgeHours: 24, summaryPath: "" },
@@ -220,6 +221,18 @@ export interface McpConfig {
    * empty → assume every shared server is stateful (per-PTY session map).
    */
   stateless: string[];
+  /**
+   * Interval in milliseconds between health-probe samples of each shared
+   * MCP server. Set to 0 to disable. Default: 30000 (30s).
+   *
+   * The probe samples each `McpServerProcess.status` and emits a structured
+   * audit event + log line on transitions (e.g. `up` → `crashed`). Pairs
+   * with the per-server crash/failure events already emitted by the proxy
+   * substrate. Filed in response to Nibbler review on #64: the silent
+   * degradation mode (one shared MCP crashes → all PTYs lose that tool)
+   * needs an operator-visible signal before `pty.enabled: true` ships.
+   */
+  healthProbeIntervalMs: number;
 }
 
 export interface PtyConfig {
@@ -603,10 +616,18 @@ function parseMcpConfig(raw: any, webEnabled: unknown): McpConfig {
     );
   }
 
+  // Rule 4: health-probe interval is a non-negative integer; clamp+default.
+  const rawProbeMs = raw?.healthProbeIntervalMs;
+  const healthProbeIntervalMs =
+    typeof rawProbeMs === "number" && Number.isFinite(rawProbeMs) && rawProbeMs >= 0
+      ? Math.floor(rawProbeMs)
+      : 30000;
+
   return {
     shared: filteredShared,
     perPtyOnly,
     stateless: filteredStateless,
+    healthProbeIntervalMs,
   };
 }
 
