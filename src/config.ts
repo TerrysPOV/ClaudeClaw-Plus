@@ -89,7 +89,10 @@ const DEFAULT_SETTINGS: Settings = {
   sessionTimeoutMs: DEFAULT_SESSION_TIMEOUT_MS,
   timeouts: { telegram: 5, discord: 5, heartbeat: 15, job: 30, default: 5 },
   pty: {
-    enabled: true,
+    // Opt-in by default. Operators flip this to true ONLY after the MCP
+    // multiplexer follow-up lands and they've validated OAuth refresh on a
+    // test deployment. See README "PTY runner mode" + PR #62 rollout notes.
+    enabled: false,
     idleReapMinutes: 30,
     maxRetries: 5,
     backoffMs: [1000, 2000, 4000, 8000, 16000],
@@ -183,8 +186,10 @@ export interface TimeoutsConfig {
 }
 
 export interface PtyConfig {
-  /** Master switch. When false, runner falls back to today's `claude -p` path
-   *  for every callsite. Default: true (post-migration). */
+  /** Master switch. When false (default), runner uses today's `claude -p` path
+   *  for every callsite. Operators flip to true ONLY after the MCP multiplexer
+   *  follow-up ships and they've validated OAuth refresh on a test deployment.
+   *  See README "PTY runner mode". */
   enabled: boolean;
   /** Ad-hoc thread PTYs are disposed after this many minutes of inactivity.
    *  Named agents are NEVER reaped when namedAgentsAlwaysAlive is true.
@@ -465,7 +470,7 @@ function parseSettings(
       default: Number.isFinite(raw.timeouts?.default) && Number(raw.timeouts.default) > 0 ? Number(raw.timeouts.default) : 5,
     },
     pty: {
-      enabled: raw.pty?.enabled !== false, // default true
+      enabled: raw.pty?.enabled === true, // default false — opt-in (see DEFAULT_SETTINGS.pty)
       idleReapMinutes: Number.isFinite(raw.pty?.idleReapMinutes) && Number(raw.pty.idleReapMinutes) > 0
         ? Number(raw.pty.idleReapMinutes) : 30,
       maxRetries: Number.isFinite(raw.pty?.maxRetries) && Number(raw.pty.maxRetries) >= 0

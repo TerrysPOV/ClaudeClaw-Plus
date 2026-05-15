@@ -92,8 +92,16 @@ afterEach(async () => {
 });
 
 describe("pty.enabled flag — config-level", () => {
-  it("enabled=true (default) leaves the supervisor reachable", async () => {
+  it("default is false (opt-in) — supervisor only reachable when explicitly enabled", async () => {
     await writeRawSettings({});
+    await initConfig();
+    await loadSettings();
+    await reloadSettings();
+    expect(getSettings().pty.enabled).toBe(false);
+  });
+
+  it("enabled=true permits supervisor calls", async () => {
+    await writeRawSettings({ pty: { enabled: true } });
     await initConfig();
     await loadSettings();
     await reloadSettings();

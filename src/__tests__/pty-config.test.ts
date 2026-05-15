@@ -49,7 +49,7 @@ describe("parseSettings — pty defaults", () => {
     await writeRawSettings({});
     await reloadSettings();
     const { pty } = getSettings();
-    expect(pty.enabled).toBe(true);
+    expect(pty.enabled).toBe(false); // opt-in default — operators must explicitly enable
     expect(pty.idleReapMinutes).toBe(30);
     expect(pty.maxRetries).toBe(5);
     expect(pty.backoffMs).toEqual([1000, 2000, 4000, 8000, 16000]);
@@ -59,12 +59,24 @@ describe("parseSettings — pty defaults", () => {
     expect(pty.rows).toBe(30);
   });
 
+  it("respects an explicit pty.enabled = true", async () => {
+    await writeRawSettings({ pty: { enabled: true } });
+    await reloadSettings();
+    expect(getSettings().pty.enabled).toBe(true);
+    // Other fields remain defaults.
+    expect(getSettings().pty.idleReapMinutes).toBe(30);
+  });
+
   it("respects an explicit pty.enabled = false", async () => {
     await writeRawSettings({ pty: { enabled: false } });
     await reloadSettings();
     expect(getSettings().pty.enabled).toBe(false);
-    // Other fields remain defaults.
-    expect(getSettings().pty.idleReapMinutes).toBe(30);
+  });
+
+  it("treats a missing pty.enabled (object present, key absent) as false", async () => {
+    await writeRawSettings({ pty: { idleReapMinutes: 7 } });
+    await reloadSettings();
+    expect(getSettings().pty.enabled).toBe(false);
   });
 
   it("honours user-supplied numeric values", async () => {
