@@ -148,6 +148,12 @@ const DEFAULT_SETTINGS: Settings = {
     allowBots: [],
     allowBotIds: [],
   },
+<<<<<<< HEAD
+=======
+  telegram: { token: "", allowedUserIds: [], listenChats: [], receiveEnabled: true, dmIsolation: "shared" },
+  discord: { token: "", allowedUserIds: [], listenChannels: [], listenGuilds: [], imageOutputRoots: [], streaming: false },
+  slack: { botToken: "", appToken: "", allowedUserIds: [], listenChannels: [], allowBots: [], allowBotIds: [] },
+>>>>>>> upstream/master
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
   stt: { baseUrl: "", model: "" },
@@ -229,8 +235,13 @@ export interface SlackConfig {
   appToken: string; // xapp-... Socket Mode token
   allowedUserIds: string[];
   listenChannels: string[]; // Channel IDs where bot responds without @mention
+<<<<<<< HEAD
   allowBots: string[]; // Channel IDs where bot-posted messages are passed through
   allowBotIds: string[]; // Optional: Slack app/bot IDs (B...) that may post; empty = any bot in allowBots channel
+=======
+  allowBots: string[];    // Channel IDs where bot-posted messages are passed through
+  allowBotIds: string[];  // Optional: Slack app/bot IDs (B...) that may post; empty = any bot in allowBots channel
+>>>>>>> upstream/master
 }
 
 export type SecurityLevel = "locked" | "strict" | "moderate" | "unrestricted";
@@ -552,6 +563,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
       streaming: raw.discord?.streaming === true,
     },
     slack: {
+<<<<<<< HEAD
       botToken:
         process.env.SLACK_BOT_TOKEN?.trim() ||
         (typeof raw.slack?.botToken === "string" ? raw.slack.botToken.trim() : ""),
@@ -564,6 +576,12 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
       listenChannels: Array.isArray(raw.slack?.listenChannels)
         ? raw.slack.listenChannels.map(String)
         : [],
+=======
+      botToken: process.env.SLACK_BOT_TOKEN?.trim() || (typeof raw.slack?.botToken === "string" ? raw.slack.botToken.trim() : ""),
+      appToken: process.env.SLACK_APP_TOKEN?.trim() || (typeof raw.slack?.appToken === "string" ? raw.slack.appToken.trim() : ""),
+      allowedUserIds: Array.isArray(raw.slack?.allowedUserIds) ? raw.slack.allowedUserIds.map(String) : [],
+      listenChannels: Array.isArray(raw.slack?.listenChannels) ? raw.slack.listenChannels.map(String) : [],
+>>>>>>> upstream/master
       allowBots: Array.isArray(raw.slack?.allowBots) ? raw.slack.allowBots.map(String) : [],
       allowBotIds: Array.isArray(raw.slack?.allowBotIds) ? raw.slack.allowBotIds.map(String) : [],
     },
