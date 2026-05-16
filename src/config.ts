@@ -763,6 +763,16 @@ export interface GovernanceWatchdogConfig {
 
 export interface GovernanceConfig {
   watchdog: GovernanceWatchdogConfig;
+  evalFramework?: {
+    enabled: boolean;
+    evals_root: string;
+    database_path: string;
+    reports_dir: string;
+    default_max_cost_usd: number;
+    default_judge_model: string;
+    provider_credentials_env: Record<string, string>;
+    budget_guard_scope: string;
+  };
 }
 
 export interface AgenticMode {
