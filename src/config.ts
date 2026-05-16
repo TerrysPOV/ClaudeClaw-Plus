@@ -267,6 +267,21 @@ const DEFAULT_SETTINGS: Settings = {
     tiers: { fast: [], balanced: [], reasoning: [] },
     openRouterBaseUrl: "https://openrouter.ai/api/v1",
   },
+  evalFramework: {
+    enabled: false,
+    evals_root: "~/agent/evals",
+    database_path: "~/agent/evals/runs.db",
+    reports_dir: "~/agent/evals/reports",
+    default_max_cost_usd: 2.0,
+    default_judge_model: "claude-opus-4-7",
+    provider_credentials_env: {
+      anthropic: "ANTHROPIC_API_KEY",
+      openai: "OPENAI_API_KEY",
+      groq: "GROQ_API_KEY",
+      deepseek: "DEEPSEEK_API_KEY",
+    },
+    budget_guard_scope: "eval-framework",
+  },
 };
 
 export interface HeartbeatExcludeWindow {
