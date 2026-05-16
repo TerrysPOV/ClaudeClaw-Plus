@@ -330,6 +330,18 @@ export class McpHttpHandler {
    * (which still carries the OLD `mcp-session-id` header) routes to the
    * pre-installed bucket. Returns the new sessionId for audit payload
    * use; throws if the upstream child is not `up`.
+   *
+   * **`transport.sessionId` activation lag (Phase C finding):** immediately
+   * after this call returns, `bucket.transport.sessionId` is `undefined` —
+   * the SDK only materialises it when an `initialize` request actually
+   * hits the transport (`webStandardStreamableHttp.js` L433 in the SDK).
+   * Production is fine because the PTY-side claude's first request
+   * carries the cached `mcp-session-id` header, which triggers init and
+   * populates `transport.sessionId` with the persisted UUID via the
+   * armed generator. Tests that need to assert the sessionId is wired
+   * BEFORE a request lands should invoke `bucket.transport.sessionIdGenerator()`
+   * (the generator is pre-armed) rather than read `transport.sessionId`
+   * (which only activates on first init).
    */
   async installResumedBucket(ptyId: string, sessionId: string): Promise<string> {
     if (this.closed) {
