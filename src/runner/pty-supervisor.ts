@@ -239,6 +239,66 @@ let _sleep: (ms: number) => Promise<void> = (ms) => new Promise<void>((r) => set
  *  (Codex HIGH #2). */
 let _newSessionId: () => string = () => crypto.randomUUID();
 
+/**
+ * Issue #89: tells the supervisor whether `claude --resume <sessionId>`
+ * has a chance of succeeding for a given `(cwd, sessionId)` pair. claude
+ * persists each conversation as `~/.claude/projects/<mangled-cwd>/<id>.jsonl`
+ * — the directory may be created at spawn but the JSONL is only written
+ * once claude has actually logged a turn. If the JSONL is absent, the
+ * sessionId is a phantom (eager pre-allocation from a PTY whose first
+ * turn failed) and `--resume` will exit 1 with "No conversation found".
+ *
+ * The mangling rule: replace each `/` in the absolute path with `-`. So
+ * `/home/claw/project` → `-home-claw-project`. claude does this in its
+ * own filesystem layout and we match it.
+ *
+ * Injectable so tests can stub the filesystem layer.
+ */
+let _isSessionResumable: (cwd: string, sessionId: string) => Promise<boolean> = async (
+  cwd,
+  sessionId,
+) => {
+  try {
+    const { homedir } = await import("node:os");
+    const { resolve: resolvePath } = await import("node:path");
+    const { existsSync } = await import("node:fs");
+    const mangled = resolvePath(cwd).replace(/\//g, "-");
+    const jsonlPath = resolvePath(homedir(), ".claude", "projects", mangled, `${sessionId}.jsonl`);
+    return existsSync(jsonlPath);
+  } catch {
+    // Fail-closed: if anything goes wrong probing the filesystem, treat
+    // the session as non-resumable. We'd rather lose one turn's continuity
+    // than surface "max retries exhausted" to the user.
+    return false;
+  }
+};
+
+/** For tests only. Inject a deterministic resumability check. */
+export function injectIsSessionResumable(
+  fn: ((cwd: string, sessionId: string) => Promise<boolean>) | null,
+): void {
+  _isSessionResumable =
+    fn ??
+    (async (cwd, sessionId) => {
+      try {
+        const { homedir } = await import("node:os");
+        const { resolve: resolvePath } = await import("node:path");
+        const { existsSync } = await import("node:fs");
+        const mangled = resolvePath(cwd).replace(/\//g, "-");
+        const jsonlPath = resolvePath(
+          homedir(),
+          ".claude",
+          "projects",
+          mangled,
+          `${sessionId}.jsonl`,
+        );
+        return existsSync(jsonlPath);
+      } catch {
+        return false;
+      }
+    });
+}
+
 /** For tests only. Inject a fake spawnPty before any runOnPty call. */
 export function injectSpawnPty(fn: SpawnPty | null): void {
   _spawnPty = fn;
@@ -724,6 +784,27 @@ async function buildSpawnOptions(
     sessionId = g?.sessionId ?? "";
   }
 
+  // Issue #89: validate the stored sessionId is actually resumable BEFORE
+  // passing it to `claude --resume`. The Phase D eager-persistence (Codex
+  // HIGH #2) writes the UUID to sessions.json at spawn-time so a daemon
+  // crash between spawn and first turn doesn't lose the conversation —
+  // but if claude exits BEFORE writing its `.jsonl` (auth gate, parser
+  // bug, OOM, anything), the persisted UUID is now a phantom. Every
+  // subsequent `--resume <phantom>` errors with "No conversation found"
+  // and claude exits 1; the supervisor retries 5x and surfaces "max
+  // retries exhausted" to the user. Required three manual sessions.json
+  // cleanups during the 2026-05-16 PTY rollout.
+  //
+  // The resumability test: `<sessionId>.jsonl` exists in claude's project
+  // dir for `cwd`. Directory presence is not enough (claude creates the
+  // dir on startup but doesn't write the jsonl until it's logged at
+  // least one turn). Fail-closed: if we can't confirm, treat as phantom
+  // and allocate a fresh session. Worst case we lose continuity for one
+  // bad record; far better than user-visible "max retries exhausted".
+  if (sessionId && !(await _isSessionResumable(cwd, sessionId))) {
+    sessionId = "";
+  }
+
   // Phase D fix (Codex HIGH #2): no stored session ID for this key. Pre-allocate
   // a deterministic UUID and pass it via `--session-id` so the conversation
   // survives daemon restart / idle reap / `/kill` / crash. Without this, fresh
@@ -1154,15 +1235,22 @@ async function persistSessionId(entry: PtyEntry, sessionId: string): Promise<voi
   if (entry.spawnOpts?.sessionId && entry.spawnOpts.sessionId === sessionId) {
     return;
   }
-  // First-time capture — write to the right store and update our cached opts.
+  // Issue #89: if a record exists on disk but holds a DIFFERENT sessionId
+  // (e.g. a phantom left over from a prior PTY whose first turn failed),
+  // overwrite it with the fresh ID. createThreadSession / createSession
+  // both overwrite unconditionally, so we drop the prior `!existing`
+  // guard — that guard was the reason a stale-then-fresh sequence kept
+  // the on-disk sessionId pinned to the stale value across all subsequent
+  // messages, breaking conversation continuity even though the runtime
+  // recovered cleanly.
   if (entry.threadId) {
     const existing = await getThreadSession(entry.threadId);
-    if (!existing) {
+    if (!existing || existing.sessionId !== sessionId) {
       await createThreadSession(entry.threadId, sessionId);
     }
   } else {
     const existing = await getSession(entry.agentName);
-    if (!existing) {
+    if (!existing || existing.sessionId !== sessionId) {
       await createSession(sessionId, entry.agentName);
     }
   }

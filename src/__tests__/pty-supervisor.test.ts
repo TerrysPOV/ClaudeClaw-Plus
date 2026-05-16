@@ -25,6 +25,7 @@ import {
   injectMaxConcurrentForTests,
   injectMaxRetriesForTests,
   injectNewSessionId,
+  injectIsSessionResumable,
   killAllPtys,
   __resetSupervisorForTests,
   __isSupervisorInitialisedForTests,
@@ -169,6 +170,11 @@ beforeEach(async () => {
   await reloadSettings();
   // Stub the agent-dir resolver so we don't touch the real filesystem.
   injectEnsureAgentDir(async (name: string) => `/tmp/agents/${name}`);
+  // Issue #89: stub the resumability probe to return true by default so
+  // tests that seed sessions.json don't get them treated as phantoms.
+  // Individual tests that want to exercise the phantom path inject their
+  // own stub returning false.
+  injectIsSessionResumable(async () => true);
 });
 
 afterEach(async () => {
@@ -1059,7 +1065,9 @@ describe("pty-supervisor fresh-session persistence (Codex Phase D #2)", () => {
     let captured: PtyProcessOptions | null = null;
     const { spawn } = makeSpawnTracker((opts) => {
       captured = opts;
-      return makeFakePty("agent:alice", {});
+      // Honour the supervisor's pre-allocated --session-id (claude would
+      // create the session under that UUID).
+      return makeFakePty("agent:alice", { initialSessionId: opts.newSessionId });
     });
     injectSpawnPty(spawn);
     injectNewSessionId(() => "uuid-alice-fresh");
@@ -1085,7 +1093,9 @@ describe("pty-supervisor fresh-session persistence (Codex Phase D #2)", () => {
     let captured: PtyProcessOptions | null = null;
     const { spawn } = makeSpawnTracker((opts) => {
       captured = opts;
-      return makeFakePty("thread:t-fresh", {});
+      // Honour the supervisor's pre-allocated --session-id (claude would
+      // create the session under that UUID).
+      return makeFakePty("thread:t-fresh", { initialSessionId: opts.newSessionId });
     });
     injectSpawnPty(spawn);
     injectNewSessionId(() => "uuid-thread-fresh");
@@ -1109,7 +1119,11 @@ describe("pty-supervisor fresh-session persistence (Codex Phase D #2)", () => {
     let captured: PtyProcessOptions | null = null;
     const { spawn } = makeSpawnTracker((opts) => {
       captured = opts;
-      return makeFakePty("global", {});
+      // Honour the supervisor's pre-allocated --session-id (claude would
+      // create the session under that UUID). Without this, the fake PTY
+      // returns a different sessionId from runTurn and (post-#89)
+      // persistSessionId would overwrite the pre-allocated one.
+      return makeFakePty("global", { initialSessionId: opts.newSessionId });
     });
     injectSpawnPty(spawn);
     injectNewSessionId(() => "uuid-global-fresh");
@@ -1188,6 +1202,82 @@ describe("pty-supervisor fresh-session persistence (Codex Phase D #2)", () => {
 
     await runOnPty("global", "again", { timeoutMs: 60_000 });
     expect(captured!.sessionId).toBe("uuid-global-seed");
+    expect(captured!.newSessionId).toBeUndefined();
+  });
+
+  // Issue #89 regression: eager-persistence wrote a sessionId to disk
+  // for a PTY whose first turn failed (no `.jsonl` ever got created by
+  // claude). On the next boot the supervisor used to pass that phantom
+  // UUID to `--resume`, claude exited 1 with "No conversation found",
+  // supervisor retried 5x, daemon surfaced "max retries exhausted" to
+  // the user. Required three manual sessions.json cleanups during the
+  // 2026-05-16 PTY rollout.
+  //
+  // Post-fix: the supervisor validates resumability via
+  // `_isSessionResumable(cwd, sessionId)` before passing the stored ID
+  // to --resume. If the probe returns false (the `.jsonl` is missing),
+  // the stored ID is dropped and a fresh UUID is pre-allocated via
+  // `--session-id <new>` — exactly the same path as a brand-new
+  // sessionKey would take.
+  it("issue #89: stale persisted sessionId without a .jsonl is treated as no-session", async () => {
+    await resetSession();
+    // Seed the global session store as if a prior PTY had persisted a
+    // sessionId at spawn-time (Codex HIGH #2 path) but never logged a turn.
+    const { spawn: seedSpawn } = makeSpawnTracker(() =>
+      makeFakePty("global", { initialSessionId: "uuid-phantom" }),
+    );
+    injectSpawnPty(seedSpawn);
+    injectNewSessionId(() => "uuid-phantom");
+    await runOnPty("global", "seed-phantom", { timeoutMs: 60_000 });
+    expect((await getSession())?.sessionId).toBe("uuid-phantom");
+
+    // Daemon restart: in-memory supervisor state wiped, on-disk
+    // session.json still has uuid-phantom.
+    __resetSupervisorForTests();
+
+    // Simulate the phantom condition: the `.jsonl` for uuid-phantom does
+    // NOT exist (claude exited before writing it).
+    injectIsSessionResumable(async (_cwd, sessionId) => sessionId !== "uuid-phantom");
+
+    let captured: PtyProcessOptions | null = null;
+    const { spawn: spawn2 } = makeSpawnTracker((opts) => {
+      captured = opts;
+      return makeFakePty("global", { initialSessionId: opts.sessionId || opts.newSessionId });
+    });
+    injectSpawnPty(spawn2);
+    injectNewSessionId(() => "uuid-fresh-replacement");
+
+    await runOnPty("global", "next message", { timeoutMs: 60_000 });
+
+    // Supervisor must NOT have passed the phantom as sessionId to
+    // --resume. Instead it allocated a fresh session via --session-id.
+    expect(captured!.sessionId).toBe("");
+    expect(captured!.newSessionId).toBe("uuid-fresh-replacement");
+  });
+
+  it("issue #89: a resumable stored sessionId is honoured (no regression)", async () => {
+    await resetSession();
+    const { spawn: seedSpawn } = makeSpawnTracker(() =>
+      makeFakePty("global", { initialSessionId: "uuid-real" }),
+    );
+    injectSpawnPty(seedSpawn);
+    injectNewSessionId(() => "uuid-real");
+    await runOnPty("global", "seed", { timeoutMs: 60_000 });
+
+    __resetSupervisorForTests();
+    // Resumability probe returns true → existing happy path.
+    injectIsSessionResumable(async () => true);
+
+    let captured: PtyProcessOptions | null = null;
+    const { spawn: spawn2 } = makeSpawnTracker((opts) => {
+      captured = opts;
+      return makeFakePty("global", { initialSessionId: opts.sessionId });
+    });
+    injectSpawnPty(spawn2);
+    injectNewSessionId(() => "uuid-must-not-be-used");
+
+    await runOnPty("global", "again", { timeoutMs: 60_000 });
+    expect(captured!.sessionId).toBe("uuid-real");
     expect(captured!.newSessionId).toBeUndefined();
   });
 });

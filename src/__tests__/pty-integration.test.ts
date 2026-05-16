@@ -43,6 +43,7 @@ import {
   resetClock,
   injectSleep,
   resetSleep,
+  injectIsSessionResumable,
   __resetSupervisorForTests,
   __reapNowForTests,
   runOnPty,
@@ -189,6 +190,12 @@ beforeEach(async () => {
   resetSleep();
   // Stub ensureAgentDir so we don't pollute the repo's agents/ directory.
   injectEnsureAgentDir(async (name: string) => join(TEST_PROJECT_DIR, "agents", name));
+  // Issue #89: stub the resumability probe so tests that pre-seed
+  // session.json don't get them treated as phantoms (the probe checks
+  // for a `.jsonl` on disk under claude's projects dir, which fake-PTY
+  // tests never create). Tests that exercise the phantom path override
+  // this with their own stub.
+  injectIsSessionResumable(async () => true);
   // Default settings: PTY enabled, fast backoff so retry tests don't wait
   // wall-clock. turnIdleTimeoutMs is the per-turn hard-cap safety-net.
   // quietWindowMs / sentinelMaxWaitMs control the sentinel-echo round-trip
