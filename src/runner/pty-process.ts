@@ -4,26 +4,46 @@
  * Knows nothing about supervisors, sessions, or adapters. Stateless beyond
  * the PTY handle it owns. Implements the contract from SPEC §3.1 verbatim.
  *
- * OR-6 decision (newSessionId vs scrape):
- *   We use `--session-id <uuid>` for fresh spawns when `opts.newSessionId` is
- *   provided. The TUI does NOT print a session UUID at startup (verified
- *   against the v2.1.141 capture in turn-boundary-sample.txt — no
- *   UUID-shaped substring anywhere in the first 5530 bytes / pre-prompt
- *   region). Scraping would therefore require parsing a framed box ("/status"
- *   panel or similar) which is brittle and version-dependent. Pre-allocating
- *   the UUID via crypto.randomUUID() on the caller's side and passing it via
- *   `--session-id` is deterministic, supports persistence-before-first-turn,
- *   and avoids any TUI-dependent parsing for the session-ID path.
+ * ─── Turn detection: sentinel-echo round-trip (issue #81) ────────────────────
  *
- *   When neither sessionId nor newSessionId is provided, we spawn without
- *   any session flag — Claude allocates internally. PtyProcess.sessionId
- *   then remains an empty string until the supervisor (which knows the
- *   intended UUID, since it generated it) updates it. Callers that need the
- *   session ID before runTurn returns MUST pass newSessionId.
+ * Claude 2.1.89 dropped the OSC 9;4 progress markers earlier versions emitted
+ * around each turn. To detect turn completion without those markers, runTurn
+ * uses a sentinel-echo round-trip implemented in `pty-output-parser.ts`:
+ *
+ *   1. Write the user prompt + `\r` to the PTY (claude submits on Enter).
+ *   2. Accumulate every byte that comes back.
+ *   3. When the stream has been silent for `quietWindowMs` (default 500ms),
+ *      write a unique sentinel string into claude's prompt buffer WITHOUT a
+ *      trailing `\r`. claude's TUI echoes the bytes straight back into stdout.
+ *   4. When the echo is seen, the turn is complete. The response is the slice
+ *      from `turn-start.offset` up to `sentinel-found.offset`.
+ *   5. Send Ctrl-U (0x15, `kill-line`) to clear the sentinel from claude's
+ *      input buffer before the next turn.
+ *
+ * Fallback: if the sentinel never echoes back within `sentinelMaxWaitMs`
+ * (claude crashed, TUI stalled), the turn completes with `cleanBoundary=false`
+ * and whatever bytes were captured.
+ *
+ * ─── OR-6 decision (session-ID) ──────────────────────────────────────────────
+ *   Pre-allocate via `--session-id <uuid>` for fresh spawns when
+ *   `opts.newSessionId` is provided. The TUI does NOT print a session UUID at
+ *   startup. When neither `sessionId` nor `newSessionId` is provided, we spawn
+ *   without any session flag and Claude allocates internally.
  */
 import { spawn as ptySpawn, type IPty } from "bun-pty";
 import type { SecurityConfig } from "../config";
-import { createParser, feed, decodeTurn, type Parser } from "./pty-output-parser";
+import {
+  createParser,
+  decodeTurn,
+  encodeSentinel,
+  feed,
+  buildSentinel,
+  markSentinelWritten,
+  resetTurn,
+  startTurn,
+  tick,
+  type Parser,
+} from "./pty-output-parser";
 
 // ─── Public types (FROZEN per SPEC §3.1) ────────────────────────────────────
 
@@ -47,61 +67,59 @@ export interface PtyProcessOptions {
   /**
    * Pre-built argv produced by runner.ts:`buildSecurityArgs(security)`. When
    * provided, the PTY wrapper uses these flags verbatim instead of deriving
-   * them from `security`. This is the canonical path — the supervisor passes
-   * this to honour the operator's `permissionMode` and locked-mode Write tool
-   * inclusion. (Phase D fix #3 for MAJOR-2/MAJOR-3.) */
+   * them from `security`. (Phase D fix #3 for MAJOR-2/MAJOR-3.)
+   */
   securityArgs?: string[];
   /**
    * Optional system prompt to append via `--append-system-prompt <text>`.
-   * The supervisor assembles this from the same parts execClaude builds for
-   * the legacy `claude -p` path (CLAUDE.md, MEMORY.md, agent IDENTITY.md /
-   * SOUL.md, dir-scope guard, update-memory instruction). Without this flag
-   * threaded through, named agents become naked Claude with no memory.
-   * (Phase D fix #2 for CRITICAL-1.) */
+   * (Phase D fix #2 for CRITICAL-1.)
+   */
   appendSystemPrompt?: string;
   /** Env vars to pass to the child. Caller is responsible for a sanitised env. */
   env: Record<string, string>;
   /**
    * Absolute path to a synthesized `--mcp-config` JSON written by the
    * supervisor (see SPEC §4.5). When set, the PTY appends
-   * `--mcp-config <path>` to claude's argv so the child consults the
-   * multiplexer's shared MCP servers via local HTTP instead of stdio-spawning
-   * its own MCP children. When unset, claude falls back to its default MCP
-   * discovery (`~/.claude/mcp.json` etc.) — byte-identical to today's PTY
-   * behaviour when `settings.mcp.shared` is empty.
+   * `--mcp-config <path>` to claude's argv.
    */
   mcpConfigPath?: string;
   /** Initial PTY columns. Default 100. */
   cols?: number;
   /** Initial PTY rows. Default 30. */
   rows?: number;
-  /** Idle-timeout safety net for runTurn. Default 5000ms. */
+  /** Idle-timeout safety net for runTurn (cap on absolute response time when
+   *  the sentinel echo never arrives). Default 30000ms. */
   turnIdleTimeoutMs?: number;
+  /** Quiet window (ms) of inactivity before runTurn writes the sentinel.
+   *  Default: 500. */
+  quietWindowMs?: number;
+  /** Hard cap (ms) waiting for the sentinel echo after we write it. After
+   *  this elapses with no echo, the turn completes with cleanBoundary=false.
+   *  Default: 30_000. */
+  sentinelMaxWaitMs?: number;
   /**
    * INTERNAL TEST HOOK: command path to spawn instead of `claude`.
-   * Used by unit tests to substitute /bin/cat etc. NOT a public API and
-   * not part of the SPEC contract. If unset, defaults to "claude".
+   * Used by unit tests to substitute /bin/cat etc. NOT a public API.
    */
   _commandOverride?: string;
   /**
    * INTERNAL TEST HOOK: when true, do NOT append the standard claude flags
-   * (security, --resume, --session-id, --model). Used for tests that spawn
-   * non-claude binaries.
+   * (security, --resume, --session-id, --model).
    */
   _skipClaudeArgs?: boolean;
   /**
    * INTERNAL TEST HOOK: alternative arg list to use instead of the
-   * claude-args built from the options. Used in tests; not part of SPEC.
+   * claude-args built from the options.
    */
   _argsOverride?: string[];
   /**
-   * INTERNAL TEST HOOK: injectable clock for deterministic idle-timeout
-   * tests. Returns ms-epoch like Date.now(). Default: Date.now.
+   * INTERNAL TEST HOOK: injectable clock for deterministic timing tests.
+   * Returns ms-epoch like Date.now(). Default: Date.now.
    */
   _now?: () => number;
   /**
-   * INTERNAL TEST HOOK: injectable setTimeout for deterministic idle-timeout
-   * tests. Default: global setTimeout.
+   * INTERNAL TEST HOOK: injectable setTimeout for deterministic tests.
+   * Default: global setTimeout.
    */
   _setTimeout?: (cb: () => void, ms: number) => ReturnType<typeof setTimeout>;
   /**
@@ -109,10 +127,22 @@ export interface PtyProcessOptions {
    */
   _clearTimeout?: (handle: ReturnType<typeof setTimeout>) => void;
   /**
-   * INTERNAL TEST HOOK: skip waiting for first OSC-end at spawn (some test
-   * targets like /bin/cat never emit OSC sequences). Default false.
+   * INTERNAL TEST HOOK: injectable setInterval / clearInterval (for the
+   * quiet-tick poll). Defaults: global setInterval / clearInterval.
+   */
+  _setInterval?: (cb: () => void, ms: number) => ReturnType<typeof setInterval>;
+  _clearInterval?: (handle: ReturnType<typeof setInterval>) => void;
+  /**
+   * INTERNAL TEST HOOK: skip waiting for first bytes at spawn (some test
+   * targets like /bin/cat are silent on startup). Default false.
    */
   _skipReadySettle?: boolean;
+  /**
+   * INTERNAL TEST HOOK: override the per-turn sentinel UUID. When set, the
+   * supervisor uses this string instead of a fresh crypto.randomUUID(). Lets
+   * tests pin the exact sentinel bytes the PTY will write.
+   */
+  _sentinelUuidOverride?: () => string;
 }
 
 export interface PtyProcess {
@@ -170,17 +200,15 @@ export class PtyClosedError extends Error {
 
 // ─── Internal helpers ───────────────────────────────────────────────────────
 
-const DEFAULT_TURN_IDLE_TIMEOUT_MS = 5000;
+const DEFAULT_TURN_IDLE_TIMEOUT_MS = 30_000;
+const DEFAULT_QUIET_WINDOW_MS = 500;
+const DEFAULT_SENTINEL_MAX_WAIT_MS = 30_000;
+const DEFAULT_QUIET_TICK_MS = 50;
 const DEFAULT_COLS = 100;
 const DEFAULT_ROWS = 30;
 const DEFAULT_PERMISSION_MODE_ARGS = ["--dangerously-skip-permissions"];
 
-/** Build the argv for spawning `claude` based on options.
- *  When `opts.securityArgs` is provided (the canonical Phase D path), those
- *  flags are used verbatim — they come from runner.ts:`buildSecurityArgs`,
- *  which is the single source of truth for permission-mode + tool gating.
- *  Otherwise this falls back to a minimal local derivation kept for tests
- *  that exercise the security-config path directly. */
+/** Build the argv for spawning `claude` based on options. See header. */
 function buildClaudeArgs(opts: PtyProcessOptions): string[] {
   if (opts._argsOverride) return opts._argsOverride;
   if (opts._skipClaudeArgs) return [];
@@ -188,18 +216,11 @@ function buildClaudeArgs(opts: PtyProcessOptions): string[] {
   const args: string[] = [];
 
   if (opts.securityArgs && opts.securityArgs.length > 0) {
-    // Canonical path: trust runner.ts:buildSecurityArgs verbatim.
     args.push(...opts.securityArgs);
   } else {
-    // Fallback: legacy local derivation. Note this branch is reached only
-    // when callers (typically unit tests) skip the supervisor and pass a
-    // bare PtyProcessOptions. The supervisor ALWAYS sets securityArgs.
     args.push(...DEFAULT_PERMISSION_MODE_ARGS);
-
     switch (opts.security.level) {
       case "locked":
-        // Include Write so memory-persistence still works in locked mode —
-        // matches runner.ts:buildSecurityArgs.
         args.push("--tools", "Read,Grep,Glob,Write");
         break;
       case "strict":
@@ -225,20 +246,10 @@ function buildClaudeArgs(opts: PtyProcessOptions): string[] {
     args.push("--model", model);
   }
 
-  // Phase D fix #2 (CRITICAL-1): append the assembled system-prompt payload
-  // (CLAUDE.md, MEMORY.md, agent identity, dir-scope guard, etc.) so PTY-mode
-  // agents have the same context as the legacy `claude -p` path. Interactive
-  // claude accepts --append-system-prompt (verified via `claude --help`).
   if (opts.appendSystemPrompt && opts.appendSystemPrompt.length > 0) {
     args.push("--append-system-prompt", opts.appendSystemPrompt);
   }
 
-  // MCP multiplexer (SPEC §4.5): when the supervisor synthesized a per-PTY
-  // `--mcp-config` file, point claude at it so the child consults shared
-  // MCP-server HTTP endpoints instead of stdio-spawning its own children.
-  // Additive — Claude Code merges this with `~/.claude/mcp.json` (no
-  // `--strict-mcp-config`), so non-shared MCPs from the operator's global
-  // config still load per-PTY as today.
   if (opts.mcpConfigPath && opts.mcpConfigPath.length > 0) {
     args.push("--mcp-config", opts.mcpConfigPath);
   }
@@ -248,9 +259,7 @@ function buildClaudeArgs(opts: PtyProcessOptions): string[] {
 
 /**
  * Test-only re-export of `buildClaudeArgs`. NOT part of the SPEC §3.1 public
- * contract — exists so Phase D fixes #2 and #3 can pin the argv shape
- * deterministically (verifying `--append-system-prompt` is emitted, that
- * `securityArgs` is used verbatim, etc.).
+ * contract.
  */
 export function __buildClaudeArgsForTests(opts: PtyProcessOptions): string[] {
   return buildClaudeArgs(opts);
@@ -267,9 +276,14 @@ class PtyProcessImpl implements PtyProcess {
   private _lastTurnEndedAt: number = 0;
   private _pty: IPty;
   private readonly _idleTimeoutMs: number;
+  private readonly _quietWindowMs: number;
+  private readonly _sentinelMaxWaitMs: number;
   private readonly _now: () => number;
   private readonly _setTimeout: (cb: () => void, ms: number) => ReturnType<typeof setTimeout>;
   private readonly _clearTimeout: (handle: ReturnType<typeof setTimeout>) => void;
+  private readonly _setInterval: (cb: () => void, ms: number) => ReturnType<typeof setInterval>;
+  private readonly _clearInterval: (handle: ReturnType<typeof setInterval>) => void;
+  private readonly _sentinelUuidGen: () => string;
 
   /** Accumulated bytes for the in-flight turn, OR all bytes when no turn
    *  is in flight (kept so idle-fallback can produce a defensible response). */
@@ -277,16 +291,18 @@ class PtyProcessImpl implements PtyProcess {
   private _turnBufLen = 0;
   private _parser: Parser;
 
-  /** Last raw chunk arrival time, used for idle-timeout. */
-  private _lastChunkAt = 0;
   /** Whether we are currently inside a runTurn call. */
   private _turnInProgress = false;
   /** Resolver for the current runTurn promise. */
   private _turnResolve: ((result: PtyTurnResult) => void) | null = null;
   private _turnReject: ((err: Error) => void) | null = null;
   private _turnHardTimeoutHandle: ReturnType<typeof setTimeout> | null = null;
-  private _turnIdleTimerHandle: ReturnType<typeof setTimeout> | null = null;
+  private _quietTickHandle: ReturnType<typeof setInterval> | null = null;
+  private _sentinelDeadlineHandle: ReturnType<typeof setTimeout> | null = null;
   private _turnStartedAt = 0;
+  /** Sentinel state for the current turn. */
+  private _activeSentinelBytes: Uint8Array | null = null;
+  private _activeSentinelString = "";
   private _disposed = false;
   /** Listener disposables from bun-pty. */
   private _onDataDisposable: { dispose(): void } | null = null;
@@ -296,6 +312,9 @@ class PtyProcessImpl implements PtyProcess {
   private _onToolEvent?: (line: string) => void;
   /** Decoder shared across chunks for onChunk emission (UTF-8 stream). */
   private _streamDecoder = new TextDecoder("utf-8");
+  /** Tracks whether any data has been received since spawn — used by
+   *  `_waitForReadySettle` to flag a "TUI is alive" signal. */
+  private _firstDataAt = 0;
 
   constructor(pty: IPty, opts: PtyProcessOptions) {
     this._pty = pty;
@@ -305,10 +324,15 @@ class PtyProcessImpl implements PtyProcess {
     this.cwd = opts.cwd;
     this.label = `${opts.agentName ?? "pty"}:${pty.pid}`;
     this._idleTimeoutMs = opts.turnIdleTimeoutMs ?? DEFAULT_TURN_IDLE_TIMEOUT_MS;
+    this._quietWindowMs = opts.quietWindowMs ?? DEFAULT_QUIET_WINDOW_MS;
+    this._sentinelMaxWaitMs = opts.sentinelMaxWaitMs ?? DEFAULT_SENTINEL_MAX_WAIT_MS;
     this._now = opts._now ?? (() => Date.now());
     this._setTimeout = opts._setTimeout ?? ((cb, ms) => setTimeout(cb, ms));
     this._clearTimeout = opts._clearTimeout ?? ((h) => clearTimeout(h));
-    this._parser = createParser();
+    this._setInterval = opts._setInterval ?? ((cb, ms) => setInterval(cb, ms));
+    this._clearInterval = opts._clearInterval ?? ((h) => clearInterval(h));
+    this._sentinelUuidGen = opts._sentinelUuidOverride ?? (() => crypto.randomUUID());
+    this._parser = createParser({ quietWindowMs: this._quietWindowMs });
 
     this._onDataDisposable = pty.onData((data) => this._handleData(data));
     this._onExitDisposable = pty.onExit((info) => this._handleExit(info));
@@ -331,29 +355,20 @@ class PtyProcessImpl implements PtyProcess {
 
   private _handleData(data: string): void {
     // bun-pty delivers strings; re-encode for the byte-level parser.
-    // We do this once per chunk; chunks are typically small (kb-scale).
     const bytes = new TextEncoder().encode(data);
-    this._lastChunkAt = this._now();
+    const now = this._now();
+    if (this._firstDataAt === 0) this._firstDataAt = now;
 
     // Buffer for the current turn (so idle-fallback can return content).
     this._turnBuf.push(bytes);
     this._turnBufLen += bytes.length;
 
-    const events = feed(this._parser, bytes);
+    const events = feed(this._parser, bytes, now);
 
-    // onChunk streaming — opportunistic delta delivery. We strip ANSI
-    // per-chunk; this is not perfect mid-multibyte but TextDecoder handles
-    // UTF-8 streaming, so we keep the raw decode separate.
+    // onChunk streaming — opportunistic delta delivery.
     if (this._turnInProgress && this._onChunk) {
       const decoded = this._streamDecoder.decode(bytes, { stream: true });
-      // Strip ANSI inline so the callback sees plain text.
-      const stripped = decoded
-        // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI/OSC escape sequences require control bytes.
-        .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
-        // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI CSI escape stripper.
-        .replace(/\x1b\[[?0-9;]*[ -/]*[@-~]/g, "")
-        // biome-ignore lint/suspicious/noControlCharactersInRegex: catch-all ESC byte stripper.
-        .replace(/\x1b/g, "");
+      const stripped = stripAnsiInline(decoded);
       if (stripped.length > 0) {
         try {
           this._onChunk(stripped);
@@ -364,19 +379,10 @@ class PtyProcessImpl implements PtyProcess {
     }
 
     // onToolEvent — best-effort detection of `⏺ <ToolName>(<args>)` and
-    // `  ⎿ <result>` lines. We don't try to be clever here; v1 emits them
-    // as raw lines as they cross newlines.
+    // `  ⎿ <result>` lines.
     if (this._turnInProgress && this._onToolEvent) {
       const text = new TextDecoder().decode(bytes);
-      const stripped = text
-        // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI/OSC escape sequences require control bytes.
-        .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
-        // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI CSI escape stripper.
-        .replace(/\x1b\[[?0-9;]*[ -/]*[@-~]/g, "")
-        // biome-ignore lint/suspicious/noControlCharactersInRegex: catch-all ESC byte stripper.
-        .replace(/\x1b/g, "")
-        .replace(/\r\n/g, "\n")
-        .replace(/\r/g, "");
+      const stripped = stripAnsiInline(text).replace(/\r\n/g, "\n").replace(/\r/g, "");
       for (const line of stripped.split("\n")) {
         if (line.startsWith("⏺ ") || line.trim().startsWith("⎿ ")) {
           try {
@@ -388,15 +394,10 @@ class PtyProcessImpl implements PtyProcess {
       }
     }
 
-    // Reset idle timer on every chunk.
-    if (this._turnInProgress) {
-      this._resetIdleTimer();
-    }
-
-    // Did this chunk close out a turn?
+    // Did this chunk reveal the sentinel echo?
     for (const ev of events) {
-      if (ev.type === "turn-end" && this._turnInProgress) {
-        this._completeTurn(true);
+      if (ev.type === "sentinel-found" && this._turnInProgress) {
+        this._completeTurn(true, ev.offset);
         return;
       }
     }
@@ -407,9 +408,7 @@ class PtyProcessImpl implements PtyProcess {
     // NOTE: Do NOT dispose listeners here. bun-pty's EventEmitter iterates
     // its listener array by index inside `fire()`, and disposing a listener
     // from within its own callback mutates the array under the iterator,
-    // which causes subsequent listeners to be skipped (see
-    // node_modules/bun-pty/src/interfaces.ts EventEmitter.fire). Disposal
-    // happens lazily in `dispose()` once the process is gone.
+    // which causes subsequent listeners to be skipped.
 
     if (this._turnInProgress) {
       const err = new PtyClosedError(
@@ -450,13 +449,25 @@ class PtyProcessImpl implements PtyProcess {
     this._turnBufLen = 0;
     this._streamDecoder = new TextDecoder("utf-8");
     this._turnStartedAt = this._now();
-    this._lastChunkAt = this._turnStartedAt;
+
+    // Build the sentinel for this turn.
+    const uuid = this._sentinelUuidGen();
+    const sentinelString = buildSentinel(uuid);
+    const sentinelBytes = encodeSentinel(sentinelString);
+    this._activeSentinelString = sentinelString;
+    this._activeSentinelBytes = sentinelBytes;
+
+    // Tell the parser we're starting a turn (offset = current totalBytes).
+    startTurn(this._parser, uuid, sentinelBytes, this._turnStartedAt);
 
     // Write prompt + CR (TUI submits on Enter).
     try {
       this._pty.write(prompt + "\r");
     } catch (err) {
       this._turnInProgress = false;
+      this._activeSentinelBytes = null;
+      this._activeSentinelString = "";
+      resetTurn(this._parser);
       return Promise.reject(err instanceof Error ? err : new Error(String(err)));
     }
 
@@ -471,29 +482,97 @@ class PtyProcessImpl implements PtyProcess {
         }, opts.timeoutMs);
       }
 
-      this._resetIdleTimer();
+      // Tick the quiet timer until the parser fires `quiet`, then write the
+      // sentinel; once written, the timer continues to enforce the sentinel
+      // max-wait deadline.
+      this._quietTickHandle = this._setInterval(() => {
+        if (!this._turnInProgress) return;
+        const now = this._now();
+        const evs = tick(this._parser, now);
+        for (const ev of evs) {
+          if (ev.type === "quiet") {
+            this._writeSentinel();
+          }
+        }
+      }, DEFAULT_QUIET_TICK_MS);
     });
   }
 
-  /** Reset the idle-timeout countdown. Called on every chunk arrival. */
-  private _resetIdleTimer(): void {
-    if (this._turnIdleTimerHandle != null) {
-      this._clearTimeout(this._turnIdleTimerHandle);
+  /**
+   * Write the per-turn sentinel into claude's input buffer (no `\r`, so it
+   * stays in the prompt area). Schedule the max-wait deadline. Tell the
+   * parser to start scanning for the echo.
+   */
+  private _writeSentinel(): void {
+    if (!this._turnInProgress || !this._activeSentinelBytes) return;
+    if (this._parser.state !== "accumulating") return;
+    try {
+      this._pty.write(this._activeSentinelString);
+    } catch (err) {
+      this._rejectTurn(err instanceof Error ? err : new Error(String(err)));
+      return;
     }
-    if (this._idleTimeoutMs <= 0) return;
-    this._turnIdleTimerHandle = this._setTimeout(() => {
-      // Idle-timeout fired: complete the turn with cleanBoundary=false.
+    markSentinelWritten(this._parser);
+
+    // Arm the sentinel max-wait deadline. If the echo never lands, fall
+    // back to a non-clean completion using whatever bytes we have.
+    if (this._sentinelDeadlineHandle != null) {
+      this._clearTimeout(this._sentinelDeadlineHandle);
+    }
+    this._sentinelDeadlineHandle = this._setTimeout(() => {
       if (this._turnInProgress) {
-        this._completeTurn(false);
+        // Sentinel never came back — emit whatever we've got.
+        this._completeTurn(false, this._turnBufLen);
       }
-    }, this._idleTimeoutMs);
+    }, this._sentinelMaxWaitMs);
   }
 
-  private _completeTurn(cleanBoundary: boolean): void {
+  /**
+   * Send cleanup bytes to clear the sentinel from claude's input buffer
+   * before the next turn. We use Ctrl-U (0x15, `kill-line`) which claude's
+   * raw-mode input editor honours by wiping the pending input back to the
+   * start of the line — verified against claude 2.1.89 on Hetzner. Backspace
+   * × N also clears the cursor visually but leaves stale bytes in claude's
+   * TUI input state; Ctrl-U produces a cleaner state for the next turn.
+   *
+   * No trailing `\r` — the supervisor's next `runTurn` submits via its own
+   * prompt write.
+   */
+  private _writeSentinelCleanup(): void {
+    if (!this._activeSentinelBytes) return;
+    try {
+      this._pty.write("\x15");
+    } catch {
+      // PTY may have died; ignore — next turn will fail loudly.
+    }
+  }
+
+  private _completeTurn(cleanBoundary: boolean, responseEndOffset: number): void {
     if (!this._turnInProgress) return;
 
-    const bytes = concatBytes(this._turnBuf, this._turnBufLen);
-    const { text } = decodeTurn(bytes);
+    // Slice out the response: everything from turn start (just after our
+    // prompt write — which we never see because prompts go OUT, not back IN)
+    // up to the sentinel echo. We don't see our own prompt-write echo from
+    // claude either; claude submits on Enter and doesn't re-echo the line.
+    const turnStart = this._parser.turnStartOffset;
+    const allBytes = concatBytes(this._turnBuf, this._turnBufLen);
+    // turnStart is an offset into the stream; the buffer starts at the same
+    // origin (we cleared it at runTurn entry), so we slice directly.
+    const sliceStart = Math.max(0, turnStart - (this._parser.totalBytes - allBytes.length));
+    const sliceEnd = Math.max(
+      sliceStart,
+      Math.min(allBytes.length, responseEndOffset - (this._parser.totalBytes - allBytes.length)),
+    );
+    const responseBytes = allBytes.slice(sliceStart, sliceEnd);
+
+    let { text } = decodeTurn(responseBytes);
+    // Belt-and-braces: strip any leaked sentinel string from the extracted
+    // text (the response slice cuts BEFORE the sentinel, but if claude
+    // chunks bytes mid-sentinel and the carry-over math is off by a UTF-8
+    // boundary we'd rather show "" than the raw marker).
+    if (this._activeSentinelString && text.includes(this._activeSentinelString)) {
+      text = text.replace(this._activeSentinelString, "").trim();
+    }
 
     this._turnInProgress = false;
     this._lastTurnEndedAt = this._now();
@@ -504,14 +583,26 @@ class PtyProcessImpl implements PtyProcess {
       this._clearTimeout(this._turnHardTimeoutHandle);
       this._turnHardTimeoutHandle = null;
     }
-    if (this._turnIdleTimerHandle != null) {
-      this._clearTimeout(this._turnIdleTimerHandle);
-      this._turnIdleTimerHandle = null;
+    if (this._quietTickHandle != null) {
+      this._clearInterval(this._quietTickHandle);
+      this._quietTickHandle = null;
     }
+    if (this._sentinelDeadlineHandle != null) {
+      this._clearTimeout(this._sentinelDeadlineHandle);
+      this._sentinelDeadlineHandle = null;
+    }
+
+    // Send cleanup bytes to clear claude's prompt buffer.
+    this._writeSentinelCleanup();
+
+    // Reset parser for the next turn (preserves totalBytes counter).
+    resetTurn(this._parser);
+    this._activeSentinelBytes = null;
+    this._activeSentinelString = "";
 
     const result: PtyTurnResult = {
       text,
-      bytesCaptured: bytes.length,
+      bytesCaptured: responseBytes.length,
       cleanBoundary,
       sessionId: this._sessionId,
     };
@@ -530,10 +621,17 @@ class PtyProcessImpl implements PtyProcess {
       this._clearTimeout(this._turnHardTimeoutHandle);
       this._turnHardTimeoutHandle = null;
     }
-    if (this._turnIdleTimerHandle != null) {
-      this._clearTimeout(this._turnIdleTimerHandle);
-      this._turnIdleTimerHandle = null;
+    if (this._quietTickHandle != null) {
+      this._clearInterval(this._quietTickHandle);
+      this._quietTickHandle = null;
     }
+    if (this._sentinelDeadlineHandle != null) {
+      this._clearTimeout(this._sentinelDeadlineHandle);
+      this._sentinelDeadlineHandle = null;
+    }
+    resetTurn(this._parser);
+    this._activeSentinelBytes = null;
+    this._activeSentinelString = "";
     const reject = this._turnReject;
     this._turnResolve = null;
     this._turnReject = null;
@@ -546,24 +644,17 @@ class PtyProcessImpl implements PtyProcess {
     if (this._disposed) return;
     this._disposed = true;
 
-    // If a turn is in progress, reject it before killing.
     if (this._turnInProgress) {
       this._rejectTurn(new PtyClosedError(this.label, null, "SIGTERM"));
     }
 
     if (this._alive) {
-      // Wait for exit (SIGTERM first, SIGKILL after 2s if needed).
-      // We use a dedicated `_alive` watcher via the EXISTING onExit handler
-      // (which flips `_alive` to false). Polling here is bounded by SIGKILL.
       const exited = new Promise<void>((resolve) => {
         if (!this._alive) {
           resolve();
           return;
         }
-        // Add a fresh listener that resolves on exit. We do NOT dispose it
-        // from within its own callback (see _handleExit note).
         const sub = this._pty.onExit(() => resolve());
-        // Defensive: if exit somehow already happened in the gap, resolve.
         if (!this._alive) {
           resolve();
           try {
@@ -588,7 +679,6 @@ class PtyProcessImpl implements PtyProcess {
       this._clearTimeout(killTimer);
     }
 
-    // Now safe to clean up listeners — process is gone, no fire() in flight.
     try {
       this._onDataDisposable?.dispose();
     } catch {}
@@ -601,8 +691,12 @@ class PtyProcessImpl implements PtyProcess {
 
   // ─── internal: used only by spawnPty to await TUI settle ─────────────
 
-  /** Promise that resolves on the first OSC progress-END seen since spawn
-   *  (the "TUI is settled" signal), OR after `timeoutMs` if no END arrives. */
+  /**
+   * Resolve once the TUI shows signs of life — either the first chunk of
+   * data has arrived OR `timeoutMs` has elapsed. Without OSC 9;4 markers
+   * we can't distinguish "TUI fully painted" from "TUI starting paint", so
+   * we use first-byte arrival as a lightweight readiness proxy.
+   */
   _waitForReadySettle(timeoutMs: number): Promise<void> {
     return new Promise<void>((resolve) => {
       let resolved = false;
@@ -612,26 +706,37 @@ class PtyProcessImpl implements PtyProcess {
         resolve();
       };
 
-      const timer = this._setTimeout(done, timeoutMs);
+      if (this._firstDataAt > 0) {
+        // Data already arrived before this was called.
+        done();
+        return;
+      }
 
-      // Patch _handleData to also resolve once the parser sees the first END.
+      const timer = this._setTimeout(done, timeoutMs);
+      // Patch _handleData to resolve on first byte.
       const originalHandler = this._handleData.bind(this);
       this._handleData = (data: string) => {
         originalHandler(data);
-        // After original handler runs, check if the parser flipped working
-        // (it won't have, but the START/END markers reset its state) — we
-        // resolve once we've seen the first progress-END marker, which
-        // corresponds to the TUI's init paint completion.
-        // The parser ignores pre-turn ENDs while working===false, so we
-        // can't observe them via events; we look at totalBytes/markers via
-        // a probe on the raw bytes here.
-        if (data.includes("\x1b]9;4;0;\x07")) {
-          done();
+        if (this._firstDataAt > 0) {
           this._clearTimeout(timer);
+          done();
         }
       };
     });
   }
+}
+
+/** Inline ANSI strip used by onChunk / onToolEvent. */
+function stripAnsiInline(text: string): string {
+  return (
+    text
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI/OSC escape sequences require control bytes.
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI CSI escape stripper.
+      .replace(/\x1b\[[?0-9;]*[ -/]*[@-~]/g, "")
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: catch-all ESC byte stripper.
+      .replace(/\x1b/g, "")
+  );
 }
 
 /** Concatenate accumulated chunks into a single Uint8Array. */
@@ -648,18 +753,10 @@ function concatBytes(parts: Uint8Array[], totalLen: number): Uint8Array {
 // ─── Public entry point ─────────────────────────────────────────────────────
 
 /**
- * Spawn one Claude interactive PTY and wait for the TUI to settle (initial
- * render complete = first `]9;4;0;` OR 3 seconds, whichever sooner).
- *
- * On success, returns a ready-to-use PtyProcess. On failure (claude binary
- * missing, immediate crash), rejects with a descriptive Error.
- *
- * Caller is responsible for resolving cwd, sanitising env, and providing a
- * valid sessionId or newSessionId.
- *
- * This function does NOT touch session storage — persisting the session ID
- * is the supervisor's job after runTurn resolves and PtyProcess.sessionId
- * is populated.
+ * Spawn one Claude interactive PTY and wait for the TUI to settle. "Settled"
+ * is approximated as "the first byte of output has arrived OR 3 seconds
+ * elapsed", since claude 2.1.89 no longer emits OSC progress markers (issue
+ * #81). On success, returns a ready-to-use PtyProcess.
  */
 export function spawnPty(opts: PtyProcessOptions): Promise<PtyProcess> {
   return new Promise<PtyProcess>((resolve, reject) => {
@@ -688,13 +785,11 @@ export function spawnPty(opts: PtyProcessOptions): Promise<PtyProcess> {
 
     const proc = new PtyProcessImpl(pty, opts);
 
-    // If a test target has no concept of TUI settle, skip the wait entirely.
     if (opts._skipReadySettle) {
       resolve(proc);
       return;
     }
 
-    // Wait up to 3s for the TUI to paint, OR the first progress-END marker.
     proc._waitForReadySettle(3000).then(() => {
       if (!proc.isAlive()) {
         reject(new Error(`PTY for ${cmd} exited before TUI settled (pid=${pty.pid})`));

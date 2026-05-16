@@ -95,39 +95,90 @@ describe("PtyProcess — lifecycle", () => {
   });
 });
 
-// ─── runTurn: idle-timeout fallback (cleanBoundary=false) ───────────────────
+// ─── runTurn: sentinel-echo round-trip against /bin/cat ─────────────────────
+//
+// /bin/cat is the simplest live test for the sentinel flow: it echoes
+// everything we write straight back, so writing the sentinel to cat produces
+// the echo the parser scans for. Each test below proves a specific aspect of
+// the new flow without invoking real claude.
 
-describe("PtyProcess — runTurn idle timeout", () => {
-  test("runTurn against /bin/cat resolves via idle timeout with cleanBoundary=false", async () => {
+describe("PtyProcess — runTurn sentinel-echo (clean boundary)", () => {
+  test("cat echoes the sentinel back → cleanBoundary=true", async () => {
     const proc = await spawnPty(
       baseOpts({
         _commandOverride: "/bin/cat",
         _argsOverride: [],
-        turnIdleTimeoutMs: 150, // short timeout for test speed
+        quietWindowMs: 100,
+        sentinelMaxWaitMs: 5000,
       }),
     );
     const result = await proc.runTurn("hello world", { timeoutMs: 5000 });
-    expect(result.cleanBoundary).toBe(false);
-    // cat echoes the input; the captured text should mention "hello world".
-    // (We tolerate ANSI noise — extractResponseText falls back to the full
-    // stripped buffer when no `⏺` marker is present.)
+    expect(result.cleanBoundary).toBe(true);
+    // cat echoes the prompt; the response should contain it.
     expect(result.text.toLowerCase()).toContain("hello world");
     expect(result.bytesCaptured).toBeGreaterThan(0);
+    expect(proc.lastTurnEndedAt()).toBeGreaterThan(0);
     await proc.dispose();
   });
 
-  test("idle-timeout completes turn with all bytes captured so far", async () => {
+  test("long prompts are captured in full", async () => {
     const proc = await spawnPty(
       baseOpts({
         _commandOverride: "/bin/cat",
         _argsOverride: [],
-        turnIdleTimeoutMs: 150,
+        quietWindowMs: 100,
+        sentinelMaxWaitMs: 5000,
       }),
     );
     const longPrompt = "x".repeat(500);
     const result = await proc.runTurn(longPrompt, { timeoutMs: 5000 });
+    expect(result.cleanBoundary).toBe(true);
+    expect(result.text).toContain("x".repeat(20));
+    await proc.dispose();
+  });
+
+  test("onChunk fires for streaming deltas", async () => {
+    const proc = await spawnPty(
+      baseOpts({
+        _commandOverride: "/bin/cat",
+        _argsOverride: [],
+        quietWindowMs: 100,
+        sentinelMaxWaitMs: 5000,
+      }),
+    );
+    let chunkBytes = 0;
+    const result = await proc.runTurn("streaming-test-payload", {
+      timeoutMs: 5000,
+      onChunk: (s) => {
+        chunkBytes += s.length;
+      },
+    });
+    expect(result.cleanBoundary).toBe(true);
+    expect(chunkBytes).toBeGreaterThan(0);
+    await proc.dispose();
+  });
+});
+
+describe("PtyProcess — runTurn sentinel max-wait fallback", () => {
+  test("when the echo never comes, completes with cleanBoundary=false", async () => {
+    // We need a PTY target that produces output but does NOT echo our writes
+    // back. Pure `sleep` does this — emits nothing, ignores stdin entirely.
+    // The parser stays in `accumulating` (no bytes ever arrive), the quiet
+    // timer fires, the supervisor writes the sentinel, but `sleep` never
+    // echoes it. sentinelMaxWaitMs elapses → cleanBoundary=false.
+    //
+    // The PTY's kernel cooked-mode echo would still echo our writes, so we
+    // disable it via `stty -echo` first.
+    const proc = await spawnPty(
+      baseOpts({
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", "stty -echo; sleep 5"],
+        quietWindowMs: 50,
+        sentinelMaxWaitMs: 250,
+      }),
+    );
+    const result = await proc.runTurn("anything", { timeoutMs: 5000 });
     expect(result.cleanBoundary).toBe(false);
-    expect(result.text).toContain("x".repeat(20)); // at minimum a chunk
     await proc.dispose();
   });
 });
@@ -158,38 +209,24 @@ describe("PtyProcess — runTurn hard timeout", () => {
   });
 });
 
-// ─── runTurn: clean boundary via injected OSC markers ───────────────────────
+// ─── runTurn: sentinel UUID override (test-hook contract) ───────────────────
 
-describe("PtyProcess — runTurn clean boundary", () => {
-  test("clean OSC progress-start/end pair → cleanBoundary=true and onChunk fires", async () => {
-    // Use `printf` to emit a START marker, some text, then an END marker.
-    // The PTY echoes these bytes back to the parser via onData.
-    const oscScript =
-      "sleep 0.05; " +
-      'printf "\\033]9;4;3;\\007"; ' +
-      'printf "hello from the test\\n"; ' +
-      'printf "\\033]9;4;0;\\007"; ' +
-      "sleep 0.2";
+describe("PtyProcess — sentinel UUID override hook", () => {
+  test("_sentinelUuidOverride pins the sentinel string written into the PTY", async () => {
+    // cat echoes the sentinel back; we don't observe the wire bytes here,
+    // but we DO observe that runTurn completes cleanly, proving the override
+    // produced a valid sentinel the parser found.
     const proc = await spawnPty(
       baseOpts({
-        _commandOverride: "/bin/sh",
-        _argsOverride: ["-c", oscScript],
-        turnIdleTimeoutMs: 10_000,
+        _commandOverride: "/bin/cat",
+        _argsOverride: [],
+        quietWindowMs: 100,
+        sentinelMaxWaitMs: 5000,
+        _sentinelUuidOverride: () => "pinned-uuid-1234",
       }),
     );
-
-    let chunkBytes = 0;
-    const result = await proc.runTurn("", {
-      timeoutMs: 5000,
-      onChunk: (s) => {
-        chunkBytes += s.length;
-      },
-    });
-
+    const result = await proc.runTurn("hi", { timeoutMs: 5000 });
     expect(result.cleanBoundary).toBe(true);
-    expect(result.text.toLowerCase()).toContain("hello from the test");
-    expect(chunkBytes).toBeGreaterThan(0);
-    expect(proc.lastTurnEndedAt()).toBeGreaterThan(0);
     await proc.dispose();
   });
 });

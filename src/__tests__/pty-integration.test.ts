@@ -190,9 +190,10 @@ beforeEach(async () => {
   // Stub ensureAgentDir so we don't pollute the repo's agents/ directory.
   injectEnsureAgentDir(async (name: string) => join(TEST_PROJECT_DIR, "agents", name));
   // Default settings: PTY enabled, fast backoff so retry tests don't wait
-  // wall-clock; turnIdleTimeoutMs is the per-turn safety-net (only fires if
-  // no OSC progress-end is seen), kept at 30s so real-claude turns aren't
-  // truncated when Claude pauses between bursts.
+  // wall-clock. turnIdleTimeoutMs is the per-turn hard-cap safety-net.
+  // quietWindowMs / sentinelMaxWaitMs control the sentinel-echo round-trip
+  // (issue #81). quietWindowMs is set wide for real-claude tests so Claude's
+  // own mid-response pauses don't trigger a premature sentinel write.
   await writeRawSettings({
     pty: {
       enabled: true,
@@ -200,9 +201,11 @@ beforeEach(async () => {
       maxRetries: 2,
       backoffMs: [10, 20],
       namedAgentsAlwaysAlive: true,
-      turnIdleTimeoutMs: 30_000,
+      turnIdleTimeoutMs: 60_000,
       cols: 100,
       rows: 30,
+      quietWindowMs: 1500,
+      sentinelMaxWaitMs: 30_000,
     },
   });
   await initConfig();
@@ -746,6 +749,70 @@ describe("PTY integration — idle reap and respawn", () => {
     expect(suzy!.isAlive).toBe(true);
     expect(suzy!.kind).toBe("named");
   });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test case 5.5 — Sentinel-echo round-trip (issue #81).
+//
+// Real-claude tests for the new turn-completion mechanism. These exercise
+// the full sentinel-write + echo-detect + cleanup pipeline against a live
+// claude PTY. Gated on CLAUDECLAW_PTY_INTEGRATION_TESTS=1.
+//
+// We assert: (1) the response text contains the model's reply and NOT the
+// sentinel string itself, (2) a second turn in the same PTY also completes
+// — proving cleanup left the prompt buffer in a usable state.
+
+describe("PTY integration — sentinel-echo turn detection (real claude)", () => {
+  test.skipIf(!REAL_CLAUDE)(
+    "first turn parses cleanly and the sentinel does not leak into the response",
+    async () => {
+      const threadId = `it-sentinel-${Date.now()}`;
+      try {
+        const r = await runOnPty(`thread:${threadId}`, "Reply with exactly the single word: pong", {
+          timeoutMs: TURN_TIMEOUT_MS,
+          threadId,
+        });
+        expect(r.exitCode).toBe(0);
+        expect(r.rawStdout.length).toBeGreaterThan(0);
+        // The sentinel string is an implementation detail; the operator must
+        // NEVER see it in the response.
+        expect(r.rawStdout).not.toContain("<<<CCAW_TURN_END_");
+        // The model's response should appear.
+        expect(r.rawStdout.toLowerCase()).toContain("pong");
+      } finally {
+        await removeThreadSession(threadId).catch(() => {});
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test.skipIf(!REAL_CLAUDE)(
+    "two sequential turns on the same PTY both succeed (sentinel cleanup works)",
+    async () => {
+      const threadId = `it-sentinel-multi-${Date.now()}`;
+      try {
+        const r1 = await runOnPty(`thread:${threadId}`, "Reply with the single word: alpha", {
+          timeoutMs: TURN_TIMEOUT_MS,
+          threadId,
+        });
+        expect(r1.exitCode).toBe(0);
+        expect(r1.rawStdout.toLowerCase()).toContain("alpha");
+
+        const r2 = await runOnPty(`thread:${threadId}`, "Reply with the single word: bravo", {
+          timeoutMs: TURN_TIMEOUT_MS,
+          threadId,
+        });
+        expect(r2.exitCode).toBe(0);
+        expect(r2.rawStdout.toLowerCase()).toContain("bravo");
+        // Each response must not contain the other prompt's keyword echoed
+        // back, proving cleanup cleared the input buffer between turns.
+        expect(r2.rawStdout.toLowerCase()).not.toContain("alpha");
+      } finally {
+        await removeThreadSession(threadId).catch(() => {});
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
