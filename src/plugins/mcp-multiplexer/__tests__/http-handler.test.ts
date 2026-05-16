@@ -383,6 +383,47 @@ describe("McpHttpHandler — per-bearer rate limit (#72 item 1)", () => {
     expect(regAllowed.status).not.toBe(429);
   });
 
+  // Codex PR #91 P2: when an identity is released and re-issued for the
+  // same ptyId (the normal releaseIdentity → issueIdentity rotation on
+  // PTY respawn / operator-initiated revoke), the rate-limit window must
+  // NOT leak across the rotation — the fresh bearer is a fresh session
+  // and should start with an empty bucket.
+  it("releasePty clears the rate-limit window so a re-issued identity isn't pre-throttled", async () => {
+    let t = 1_000_000;
+    handler = new McpHttpHandler({
+      serverName: "test",
+      proc: proc!,
+      rateLimit: { maxRequestsPerWindow: 2, windowMs: 10_000 },
+      _now: () => t,
+    });
+    const send = (bearer: string) =>
+      handler!.handle(
+        rpcRequest(
+          { jsonrpc: "2.0", id: 1, method: "tools/list" },
+          { [PTY_ID_HEADER]: "suzy", [AUTH_HEADER]: bearer },
+        ),
+      );
+
+    // Exhaust the window under the first identity.
+    const id1 = issueIdentity("suzy");
+    await send(id1.headers[AUTH_HEADER]);
+    await send(id1.headers[AUTH_HEADER]);
+    const blocked1 = await send(id1.headers[AUTH_HEADER]);
+    expect(blocked1.status).toBe(429);
+
+    // Release the identity (mirrors plugin.releaseIdentity → handler.releasePty).
+    await handler.releasePty("suzy");
+    revokeIdentity("suzy");
+
+    // Issue a fresh identity for the same ptyId — same window has not
+    // elapsed yet (clock unchanged). Pre-fix the new bearer would still
+    // see the old 3 timestamps and get 429 immediately. Post-fix the
+    // bucket is empty and the first request is allowed.
+    const id2 = issueIdentity("suzy");
+    const fresh = await send(id2.headers[AUTH_HEADER]);
+    expect(fresh.status).not.toBe(429);
+  });
+
   it("rate-limit check runs AFTER bearer verification (bad bearer → 401, not 429)", async () => {
     let t = 1_000_000;
     handler = new McpHttpHandler({

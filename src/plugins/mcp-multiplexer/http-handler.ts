@@ -354,6 +354,15 @@ export class McpHttpHandler {
    *  not be replayed on next daemon start — the next time this ptyId
    *  appears the supervisor will mint fresh identity + sessionId. */
   async releasePty(ptyId: string): Promise<void> {
+    // Codex PR #91 P2: clear the per-PTY rate-limit window FIRST. When a
+    // PTY is reaped and a new identity is issued for the same ptyId
+    // (the normal `releaseIdentity` → `issueIdentity` rotation in
+    // index.ts), the fresh bearer would otherwise inherit the prior
+    // session's timestamps and immediately hit 429s based on traffic
+    // it didn't originate. Cleared unconditionally — stateless handlers
+    // still keyed the window by ptyId (we use `STATELESS_BUCKET` for
+    // the SDK session, but `_checkRateLimit` keys on the actual ptyId).
+    this._rlWindows.delete(ptyId);
     if (this.stateless) return; // no per-PTY bucket exists
     // Drop the persisted record FIRST so that even if the bucket's
     // already gone (race with transport_error path) the disk state is
