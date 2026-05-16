@@ -8,7 +8,9 @@ import {
   _resetIdentityStore,
   AUTH_HEADER,
   PTY_ID_HEADER,
+  PTY_TS_HEADER,
 } from "../pty-identity.js";
+import { _resetMcpBridge, _setMcpBridge } from "../../mcp-bridge.js";
 
 const MOCK_SERVER = fileURLToPath(
   new URL("../../../__tests__/fixtures/mock-mcp-server.ts", import.meta.url),
@@ -441,5 +443,119 @@ describe("McpHttpHandler — per-bearer rate limit (#72 item 1)", () => {
       ),
     );
     expect(resp.status).toBe(401);
+  });
+});
+
+// #72 item 5: include the client-asserted X-Claudeclaw-Ts header in the
+// `multiplexer_invoke` audit payload so operators can correlate calls
+// back to a specific identity-issuance window (forensics, replay
+// detection across rotations).
+describe("McpHttpHandler — multiplexer_invoke audit carries X-Claudeclaw-Ts (#72 item 5)", () => {
+  let proc: McpServerProcess | null = null;
+  let handler: McpHttpHandler | null = null;
+
+  beforeEach(async () => {
+    _resetIdentityStore();
+    proc = new McpServerProcess("test", makeServerConfig());
+    await proc.start();
+    handler = new McpHttpHandler({ serverName: "test", proc: proc! });
+  });
+
+  afterEach(async () => {
+    if (handler) await handler.stop();
+    if (proc) await proc.stop();
+    proc = null;
+    handler = null;
+    _resetIdentityStore();
+    _resetMcpBridge();
+  });
+
+  function captureAudits(events: Array<{ name: string; payload: Record<string, unknown> }>) {
+    _setMcpBridge({
+      audit: (name: string, payload: Record<string, unknown>) => {
+        events.push({ name, payload });
+      },
+      registerPluginTool: () => {},
+      unregisterPluginTool: () => {},
+      listTools: () => [],
+      invoke: async () => {
+        throw new Error("not in test");
+      },
+      // biome-ignore lint/suspicious/noExplicitAny: minimal test bridge
+    } as any);
+  }
+
+  it("includes client_ts (parsed epoch ms) on successful auth", async () => {
+    const id = issueIdentity("suzy");
+    // `issueIdentity` populates headers with X-Claudeclaw-Ts = issuance ms.
+    const issuedAtRaw = id.headers[PTY_TS_HEADER];
+    expect(issuedAtRaw).toBeTruthy();
+    const issuedAt = Number(issuedAtRaw);
+
+    const events: Array<{ name: string; payload: Record<string, unknown> }> = [];
+    captureAudits(events);
+
+    await handler!.handle(
+      rpcRequest(
+        { jsonrpc: "2.0", id: 1, method: "tools/list" },
+        {
+          [PTY_ID_HEADER]: "suzy",
+          [AUTH_HEADER]: id.headers[AUTH_HEADER],
+          [PTY_TS_HEADER]: issuedAtRaw,
+        },
+      ),
+    );
+
+    const invoke = events.find((e) => e.name === "multiplexer_invoke");
+    expect(invoke).toBeDefined();
+    expect(invoke!.payload.client_ts).toBe(issuedAt);
+    expect(invoke!.payload.pty_id).toBe("suzy");
+    expect(invoke!.payload.server).toBe("test");
+    revokeIdentity("suzy");
+  });
+
+  it("client_ts is null when the header is missing (defensive — never throws)", async () => {
+    const id = issueIdentity("suzy");
+    const events: Array<{ name: string; payload: Record<string, unknown> }> = [];
+    captureAudits(events);
+
+    // Pass auth headers but omit X-Claudeclaw-Ts. Pre-#71 clients
+    // wouldn't send it; we shouldn't break on the missing field.
+    await handler!.handle(
+      rpcRequest(
+        { jsonrpc: "2.0", id: 1, method: "tools/list" },
+        {
+          [PTY_ID_HEADER]: "suzy",
+          [AUTH_HEADER]: id.headers[AUTH_HEADER],
+        },
+      ),
+    );
+
+    const invoke = events.find((e) => e.name === "multiplexer_invoke");
+    expect(invoke).toBeDefined();
+    expect(invoke!.payload.client_ts).toBeNull();
+    revokeIdentity("suzy");
+  });
+
+  it("client_ts is null when the header is non-numeric (malformed input)", async () => {
+    const id = issueIdentity("suzy");
+    const events: Array<{ name: string; payload: Record<string, unknown> }> = [];
+    captureAudits(events);
+
+    await handler!.handle(
+      rpcRequest(
+        { jsonrpc: "2.0", id: 1, method: "tools/list" },
+        {
+          [PTY_ID_HEADER]: "suzy",
+          [AUTH_HEADER]: id.headers[AUTH_HEADER],
+          [PTY_TS_HEADER]: "not-a-number",
+        },
+      ),
+    );
+
+    const invoke = events.find((e) => e.name === "multiplexer_invoke");
+    expect(invoke).toBeDefined();
+    expect(invoke!.payload.client_ts).toBeNull();
+    revokeIdentity("suzy");
   });
 });

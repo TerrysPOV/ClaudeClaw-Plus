@@ -25,7 +25,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { randomUUID } from "node:crypto";
 import { getMcpBridge } from "../mcp-bridge.js";
 import type { McpServerProcess } from "../mcp-proxy/server-process.js";
-import { AUTH_HEADER, PTY_ID_HEADER, verifyBearer } from "./pty-identity.js";
+import { AUTH_HEADER, PTY_ID_HEADER, PTY_TS_HEADER, verifyBearer } from "./pty-identity.js";
 import type { SessionPersistenceStore } from "./session-persistence.js";
 
 /** Sentinel used when a server is declared stateless: all PTYs collapse
@@ -312,12 +312,21 @@ export class McpHttpHandler {
     // request stream (the transport needs to re-read it).
     const peek = await _readBody(safeReq);
 
+    // #72 item 5: include the client-asserted identity-issuance
+    // timestamp (`X-Claudeclaw-Ts`) in the invoke audit so the audit
+    // log can correlate calls back to the specific identity-issuance
+    // window. Stored as a number when parseable (epoch ms), null when
+    // the header is missing or malformed — never throws on bad input.
+    const tsRaw = safeReq.headers.get(PTY_TS_HEADER);
+    const tsNum = tsRaw != null && /^\d+$/.test(tsRaw) ? Number(tsRaw) : null;
+
     try {
       getMcpBridge().audit("multiplexer_invoke", {
         server: this.serverName,
         pty_id: ptyId,
         stateless: this.stateless,
         rpc_method: _peekRpcMethod(peek),
+        client_ts: tsNum,
       });
     } catch {}
 
