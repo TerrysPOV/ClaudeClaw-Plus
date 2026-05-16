@@ -487,22 +487,24 @@ export class SessionPersistenceStore {
     // Without this, one transient filesystem error bricks persistence for
     // this server until daemon restart.
     const prev = this.writeQueue.get(serverName) ?? Promise.resolve();
-    const next = prev.catch(() => undefined).then(async () => {
-      const current = (await this._readFile(serverName)) ?? {
-        version: CURRENT_VERSION,
-        serverName,
-        entries: [],
-      };
-      const updated = mutator(current);
-      if (updated === current) return; // no-op — short-circuit write
-      // Always normalise version + serverName even if mutator forgot.
-      const normalised: PersistedFile = {
-        version: CURRENT_VERSION,
-        serverName,
-        entries: updated.entries,
-      };
-      await this._atomicWrite(this._filePath(serverName), JSON.stringify(normalised));
-    });
+    const next = prev
+      .catch(() => undefined)
+      .then(async () => {
+        const current = (await this._readFile(serverName)) ?? {
+          version: CURRENT_VERSION,
+          serverName,
+          entries: [],
+        };
+        const updated = mutator(current);
+        if (updated === current) return; // no-op — short-circuit write
+        // Always normalise version + serverName even if mutator forgot.
+        const normalised: PersistedFile = {
+          version: CURRENT_VERSION,
+          serverName,
+          entries: updated.entries,
+        };
+        await this._atomicWrite(this._filePath(serverName), JSON.stringify(normalised));
+      });
     // Store the next-link so concurrent callers chain onto it; await it so the
     // current caller sees any error from THEIR mutation (the .catch above
     // swallows the predecessor's error so it can't leak into ours).

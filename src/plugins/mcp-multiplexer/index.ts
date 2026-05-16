@@ -296,8 +296,7 @@ export class McpMultiplexerPlugin {
         settings.sessionPersistencePath || join(homedir(), ".config", "claudeclaw", "mcp-sessions");
       const factory =
         this.persistenceFactory ??
-        ((opts: { storageRoot: string; maxAgeMs: number }) =>
-          new SessionPersistenceStore(opts));
+        ((opts: { storageRoot: string; maxAgeMs: number }) => new SessionPersistenceStore(opts));
       try {
         this.persistence = factory({
           storageRoot,

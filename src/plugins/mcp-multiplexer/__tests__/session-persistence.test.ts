@@ -464,7 +464,10 @@ describe("SessionPersistenceStore", () => {
         // @ts-expect-error — test-only access to private field
         const prev = store.writeQueue.get("graphiti") ?? Promise.resolve();
         // @ts-expect-error — test-only access to private field
-        store.writeQueue.set("graphiti", prev.then(() => fakeRejection));
+        store.writeQueue.set(
+          "graphiti",
+          prev.then(() => fakeRejection),
+        );
         try {
           // @ts-expect-error — await the rejection so subsequent calls
           // see a poisoned chain (without the fix).

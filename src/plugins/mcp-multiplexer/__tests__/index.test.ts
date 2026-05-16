@@ -759,9 +759,11 @@ describe("McpMultiplexerPlugin — session persistence wiring", () => {
       // test-seam getter; alternatively assert by behavioural side
       // effect — the storage root dir gets created lazily on first
       // mutation, so issue a fake bucket-record flow.
-      const persistence = (plugin as unknown as {
-        persistence: { record: (...a: unknown[]) => Promise<void> } | null;
-      }).persistence;
+      const persistence = (
+        plugin as unknown as {
+          persistence: { record: (...a: unknown[]) => Promise<void> } | null;
+        }
+      ).persistence;
       expect(persistence).not.toBeNull();
       // Smoke test: the real store accepts a record without throwing.
       await persistence!.record("alpha", "suzy", "sess-default");
