@@ -171,6 +171,17 @@ Net effect: you get the per-PTY process explosion the multiplexer was designed t
 - `stateless` — subset of `shared` for servers with no per-session state; one upstream session shared across all PTYs.
 - `rateLimit` — per-bearer (= per-PTY) sliding-window cap on `/mcp/<server>` requests. Defense-in-depth for a leaked bearer.
 
+#### Surface coverage: tools only (no resources / prompts / completions)
+
+The multiplexer currently proxies **`ListTools` + `CallTool` only**. MCP servers can also expose `resources/*`, `prompts/*`, and `completions/*` per the MCP spec — those surfaces are **not** forwarded through the multiplexer. If a shared server defines them, PTY claudes won't see them through the multiplexed `/mcp/<server>` route.
+
+**Practical impact:** none for the MCP servers we ship with by default (graphiti, codegraph, sentrux, etc. — all tool-only). Servers that depend on resource attachments (file-pinning workflows) or prompt templates won't surface that surface through a multiplexed mount.
+
+**Workarounds if you need resources / prompts from a specific server:**
+
+1. **Drop it from `settings.mcp.shared`** — claude will then spawn it per-PTY via the normal stdio path (the explosion concern applies; only worth it for the server that needs the extra surfaces).
+2. **Wait for the feature extension** — tracked as #72 item 12. Would require new `ListResourcesRequestSchema` / `ReadResourceRequestSchema` / `ListPromptsRequestSchema` / `GetPromptRequestSchema` handlers wired through the SDK transport. No design blockers, just unbuilt.
+
 #### References
 
 - Architecture: [`.planning/mcp-multiplexer/SPEC.md`](.planning/mcp-multiplexer/SPEC.md)
