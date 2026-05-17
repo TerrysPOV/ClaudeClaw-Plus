@@ -346,3 +346,152 @@ describe("withCleanProcessEnv", () => {
     }
   }, 5000);
 });
+
+// ─── shouldStripSpawnEnvKey (long-lived OAuth token exception) ──────────────
+//
+// Regression cover for the Hetzner activation flow. The original strip list
+// removed CLAUDE_CODE_OAUTH_TOKEN unconditionally to prevent short-lived
+// OAuth tokens (which expire ~daily and have no refresh path in PTY-mode
+// claudes) from being silently inherited by long-running PTY processes.
+// Long-lived `sk-ant-oat01-*` tokens minted via `claude setup-token` have a
+// 1-year hard expiry and a different leak profile — operators wire them
+// intentionally and want them to flow through to spawned claudes. This
+// helper carves out that single exception while leaving every other strip
+// (ANTHROPIC_API_KEY, CLAUDECODE, etc.) unconditional.
+describe("shouldStripSpawnEnvKey (long-lived OAuth exception)", () => {
+  it("keeps sk-ant-oat01-* OAuth tokens (returns false)", () => {
+    expect(
+      runnerMod.shouldStripSpawnEnvKey(
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "sk-ant-oat01-abc123_realistic-token-shape",
+      ),
+    ).toBe(false);
+  });
+
+  it("strips short-lived (non-oat01) OAuth tokens", () => {
+    expect(runnerMod.shouldStripSpawnEnvKey("CLAUDE_CODE_OAUTH_TOKEN", "some-session-oauth")).toBe(
+      true,
+    );
+    expect(
+      runnerMod.shouldStripSpawnEnvKey("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-something-else"),
+    ).toBe(true);
+  });
+
+  it("strips ANTHROPIC_API_KEY even if it happens to look oat01-ish", () => {
+    expect(
+      runnerMod.shouldStripSpawnEnvKey("ANTHROPIC_API_KEY", "sk-ant-oat01-not-the-right-key"),
+    ).toBe(true);
+  });
+
+  it("strips other strip-list keys unconditionally", () => {
+    expect(runnerMod.shouldStripSpawnEnvKey("CLAUDECODE", "1")).toBe(true);
+    expect(runnerMod.shouldStripSpawnEnvKey("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST", "true")).toBe(
+      true,
+    );
+  });
+
+  it("strips when value is undefined or empty (no false-positive keep)", () => {
+    expect(runnerMod.shouldStripSpawnEnvKey("CLAUDE_CODE_OAUTH_TOKEN", undefined)).toBe(true);
+    expect(runnerMod.shouldStripSpawnEnvKey("CLAUDE_CODE_OAUTH_TOKEN", "")).toBe(true);
+  });
+});
+
+describe("cleanSpawnEnv (oat01 exception wiring)", () => {
+  function withTempEnv<T>(seed: Record<string, string | undefined>, fn: () => T): T {
+    const snapshot: Record<string, string | undefined> = {};
+    for (const k of Object.keys(seed)) snapshot[k] = process.env[k];
+    for (const [k, v] of Object.entries(seed)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+    try {
+      return fn();
+    } finally {
+      for (const [k, v] of Object.entries(snapshot)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  }
+
+  it("keeps long-lived CLAUDE_CODE_OAUTH_TOKEN in the output env", () => {
+    withTempEnv(
+      {
+        CLAUDE_CODE_OAUTH_TOKEN: "sk-ant-oat01-test-long-lived",
+        ANTHROPIC_API_KEY: "sk-ant-api03-should-still-strip",
+        CLAUDECODE: "1",
+      },
+      () => {
+        const out = runnerMod.cleanSpawnEnv();
+        expect(out.CLAUDE_CODE_OAUTH_TOKEN).toBe("sk-ant-oat01-test-long-lived");
+        expect(out.ANTHROPIC_API_KEY).toBeUndefined();
+        expect(out.CLAUDECODE).toBeUndefined();
+      },
+    );
+  });
+
+  it("strips CLAUDE_CODE_OAUTH_TOKEN when not in oat01 shape", () => {
+    withTempEnv(
+      {
+        CLAUDE_CODE_OAUTH_TOKEN: "ephemeral-session-token",
+      },
+      () => {
+        const out = runnerMod.cleanSpawnEnv();
+        expect(out.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+      },
+    );
+  });
+});
+
+describe("withCleanProcessEnv (oat01 exception wiring)", () => {
+  const STRIP_KEYS = [
+    "ANTHROPIC_API_KEY",
+    "CLAUDECODE",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+  ] as const;
+
+  function snap(): Record<string, string | undefined> {
+    const out: Record<string, string | undefined> = {};
+    for (const k of STRIP_KEYS) out[k] = process.env[k];
+    return out;
+  }
+
+  function rest(s: Record<string, string | undefined>): void {
+    for (const [k, v] of Object.entries(s)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+
+  it("leaves sk-ant-oat01-* OAuth tokens visible to fn (does not strip)", () => {
+    const original = snap();
+    try {
+      const LONG_LIVED = "sk-ant-oat01-keep-me-visible";
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = LONG_LIVED;
+      process.env.ANTHROPIC_API_KEY = "sk-ant-api03-still-stripped";
+      const seen = runnerMod.withCleanProcessEnv(() => ({
+        oauth: process.env.CLAUDE_CODE_OAUTH_TOKEN,
+        api: process.env.ANTHROPIC_API_KEY,
+      }));
+      expect(seen.oauth).toBe(LONG_LIVED);
+      expect(seen.api).toBeUndefined();
+      expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe(LONG_LIVED);
+    } finally {
+      rest(original);
+    }
+  });
+
+  it("still strips short-lived (non-oat01) OAuth tokens", () => {
+    const original = snap();
+    try {
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = "session-style-token";
+      runnerMod.withCleanProcessEnv(() => {
+        expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+      });
+      expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe("session-style-token");
+    } finally {
+      rest(original);
+    }
+  });
+});
