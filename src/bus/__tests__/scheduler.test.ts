@@ -433,6 +433,46 @@ describe("BusScheduler.scheduleCron (cronExpr)", () => {
     clock.advance(20 * 60_000);
     expect(calls).toHaveLength(1);
   });
+
+  // Codex P2 fix on PR #117: malformed cron expressions used to be
+  // silently accepted (probe via nextCronMatch didn't throw on garbage).
+  // Now eager validation rejects fast on operator typos.
+  it("rejects malformed cron expressions instead of silently accepting", () => {
+    const { bus } = createFakeBus();
+    scheduler = createBusScheduler({ bus });
+
+    // Wrong field count.
+    expect(() =>
+      scheduler.scheduleCron({ agent_id: "a", cronExpr: "*/5 * *", prompt: "p" }),
+    ).toThrow(/expected 5 fields/);
+
+    // Non-numeric token.
+    expect(() =>
+      scheduler.scheduleCron({ agent_id: "a", cronExpr: "abc * * * *", prompt: "p" }),
+    ).toThrow(/invalid characters/);
+
+    // Out-of-range minute.
+    expect(() =>
+      scheduler.scheduleCron({ agent_id: "a", cronExpr: "75 * * * *", prompt: "p" }),
+    ).toThrow(/out of \[0,59\]/);
+
+    // Inverted range.
+    expect(() =>
+      scheduler.scheduleCron({ agent_id: "a", cronExpr: "0 10-5 * * *", prompt: "p" }),
+    ).toThrow(/inverted/);
+
+    // Zero step.
+    expect(() =>
+      scheduler.scheduleCron({ agent_id: "a", cronExpr: "*/0 * * * *", prompt: "p" }),
+    ).toThrow(/step must be > 0/);
+
+    // Valid expression — should NOT throw.
+    expect(() =>
+      scheduler
+        .scheduleCron({ agent_id: "a", cronExpr: "*/15 9-17 * * 1-5", prompt: "p" })
+        .cancel(),
+    ).not.toThrow();
+  });
 });
 
 /* ───────────────────────────────────────────────────────────────────── */

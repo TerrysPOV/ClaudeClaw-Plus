@@ -252,4 +252,11 @@ export interface SlackSocketLike {
  * leaving plenty of headroom for future correlation ids.
  */
 export const PERMISSION_ACTION_ID_PREFIX = "perm:";
-export const PERMISSION_ACTION_ID_REGEX = /^perm:(allow|deny):(.+)$/;
+/**
+ * `perm:<allow|deny>:<agent_id>:<request_id>` — `agent_id` embedded so
+ * the callback can look up the exact `${agent_id}:${channel_id}:
+ * ${request_id}` pendingPermissions key directly. PR #117 review (Codex
+ * P1): scanning by channel + suffix risks collision because request_id
+ * is a 5-char `[a-km-z]` string.
+ */
+export const PERMISSION_ACTION_ID_REGEX = /^perm:(allow|deny):([^:]+):(.+)$/;

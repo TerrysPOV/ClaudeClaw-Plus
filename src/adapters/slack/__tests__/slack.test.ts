@@ -286,28 +286,36 @@ afterEach(async () => {
 /* ────────────────────────────────────────────────────────────────────── */
 
 describe("buildPermissionBlocks", () => {
-  it("produces section + actions with two perm:* buttons", () => {
-    const blocks = buildPermissionBlocks({
-      request_id: "abcde",
-      tool_name: "bash",
-      description: "run `ls`",
-      input_preview: "ls -la",
-    });
+  it("produces section + actions with two perm:<behavior>:<agent>:<id> buttons", () => {
+    const blocks = buildPermissionBlocks(
+      {
+        request_id: "abcde",
+        tool_name: "bash",
+        description: "run `ls`",
+        input_preview: "ls -la",
+      },
+      "triage",
+    );
     expect(blocks).toHaveLength(2);
     expect(blocks[0]?.type).toBe("section");
     const actions = blocks[1];
     if (actions?.type !== "actions") throw new Error("expected actions block");
     expect(actions.elements).toHaveLength(2);
-    expect(actions.elements[0]?.action_id).toBe("perm:allow:abcde");
-    expect(actions.elements[1]?.action_id).toBe("perm:deny:abcde");
+    // Codex P1 fix on PR #117: agent_id embedded so the callback can
+    // look up the exact pendingPermissions composite key without scanning.
+    expect(actions.elements[0]?.action_id).toBe("perm:allow:triage:abcde");
+    expect(actions.elements[1]?.action_id).toBe("perm:deny:triage:abcde");
   });
 
-  it("PERMISSION_ACTION_ID_REGEX round-trips both behaviours", () => {
-    const allow = "perm:allow:xyzab".match(PERMISSION_ACTION_ID_REGEX);
+  it("PERMISSION_ACTION_ID_REGEX captures behavior, agent_id, request_id", () => {
+    const allow = "perm:allow:triage:xyzab".match(PERMISSION_ACTION_ID_REGEX);
     expect(allow?.[1]).toBe("allow");
-    expect(allow?.[2]).toBe("xyzab");
-    const deny = "perm:deny:xyzab".match(PERMISSION_ACTION_ID_REGEX);
+    expect(allow?.[2]).toBe("triage");
+    expect(allow?.[3]).toBe("xyzab");
+    const deny = "perm:deny:research:xyzab".match(PERMISSION_ACTION_ID_REGEX);
     expect(deny?.[1]).toBe("deny");
+    expect(deny?.[2]).toBe("research");
+    expect(deny?.[3]).toBe("xyzab");
   });
 });
 
@@ -573,8 +581,8 @@ describe("SlackAdapter — permission flow", () => {
     expect(sent?.blocks).toBeDefined();
     const actions = sent?.blocks?.[1];
     if (actions?.type !== "actions") throw new Error("expected actions block");
-    expect(actions.elements[0]?.action_id).toBe("perm:allow:abcde");
-    expect(actions.elements[1]?.action_id).toBe("perm:deny:abcde");
+    expect(actions.elements[0]?.action_id).toBe("perm:allow:triage:abcde");
+    expect(actions.elements[1]?.action_id).toBe("perm:deny:triage:abcde");
   });
 
   it("routes block_actions click through bus.ingestPermissionDecision", async () => {
@@ -600,7 +608,7 @@ describe("SlackAdapter — permission flow", () => {
         user: { id: "U42" },
         channel: { id: "C100" },
         message: { ts: "1700000000.000100" },
-        actions: [{ action_id: "perm:allow:qwert", type: "button", value: "allow" }],
+        actions: [{ action_id: "perm:allow:triage:qwert", type: "button", value: "allow" }],
       }),
     );
     await waitFor(() => bus.permissionDecisions.length > 0);
@@ -634,7 +642,7 @@ describe("SlackAdapter — permission flow", () => {
         type: "block_actions",
         user: { id: "U-stranger" },
         channel: { id: "C100" },
-        actions: [{ action_id: "perm:allow:stale", type: "button", value: "allow" }],
+        actions: [{ action_id: "perm:allow:triage:stale", type: "button", value: "allow" }],
       }),
     );
     await new Promise((r) => setTimeout(r, 30));
@@ -781,7 +789,7 @@ describe("SlackAdapter — composite keying (PR #113 review)", () => {
         type: "block_actions",
         user: { id: "U42" },
         channel: { id: "C100" },
-        actions: [{ action_id: "perm:allow:req-1", type: "button", value: "allow" }],
+        actions: [{ action_id: "perm:allow:triage:req-1", type: "button", value: "allow" }],
       }),
     );
     await waitFor(() => bus.permissionDecisions.length >= 1);
@@ -797,7 +805,7 @@ describe("SlackAdapter — composite keying (PR #113 review)", () => {
         type: "block_actions",
         user: { id: "U42" },
         channel: { id: "C200" },
-        actions: [{ action_id: "perm:deny:req-2", type: "button", value: "deny" }],
+        actions: [{ action_id: "perm:deny:research:req-2", type: "button", value: "deny" }],
       }),
     );
     await waitFor(() => bus.permissionDecisions.length >= 2);
@@ -949,5 +957,47 @@ describe("SlackAdapter — stop() cleanup", () => {
     socket.push(eventsEnvelope(msg({ text: "post-stop event" })));
     await new Promise((r) => setTimeout(r, 20));
     expect(bus.prompts).toHaveLength(0);
+  });
+});
+
+describe("SlackAdapter — start() rollback on socket failure (PR #117 review)", () => {
+  it("rolls back started state + tears down subscriptions when socket.start throws", async () => {
+    // Codex P2 fix on PR #117: an earlier socket.start() rejection
+    // left this.started=true and subscriptions registered, so retries
+    // returned immediately and never reconnected.
+    const failingSocket: SlackSocketLike = {
+      async start() {
+        throw new Error("transient auth glitch");
+      },
+      async stop() {},
+      onEnvelope() {
+        return () => {};
+      },
+      ack() {},
+    };
+
+    const opts: ConstructorParameters<typeof SlackAdapter>[0] = {
+      bus,
+      token: "fake-test-token",
+      signingSecret: "shh",
+      allowedUserIds: [],
+      routing: { channels: { C100: "triage" } },
+      api,
+      socket: failingSocket,
+      logger: SILENT_LOGGER,
+    };
+    const a = new SlackAdapter(opts);
+    await expect(a.start()).rejects.toThrow(/transient auth glitch/);
+
+    // After the failure, subscriptions should be cleared so the next
+    // retry can subscribe fresh + reconnect.
+    expect(bus.state().subscriberCount).toBe(0);
+
+    // And retrying start() with a working socket should now succeed.
+    const okSocket = new FakeSlackSocket();
+    const a2 = new SlackAdapter({ ...opts, socket: okSocket });
+    await a2.start();
+    expect(okSocket.started).toBe(true);
+    await a2.stop();
   });
 });

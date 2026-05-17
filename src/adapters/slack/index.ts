@@ -109,11 +109,37 @@ export class SlackAdapter {
     for (const agentId of this.uniqueAgentIds()) {
       this.subscribeForAgent(agentId);
     }
+    // Codex P2 fix on PR #117: if socket startup throws, roll back the
+    // started flag + tear down subscriptions so callers can retry. Without
+    // this, a transient socket auth/network failure leaves the adapter
+    // stuck in a permanently-started-but-not-running state.
     if (this.socket) {
-      this.socketOff = this.socket.onEnvelope((env) => {
-        void this.handleSocketEnvelope(env);
-      });
-      await this.socket.start();
+      try {
+        this.socketOff = this.socket.onEnvelope((env) => {
+          void this.handleSocketEnvelope(env);
+        });
+        await this.socket.start();
+      } catch (err) {
+        // Undo the partial bring-up.
+        try {
+          this.socketOff?.();
+        } catch {
+          /* ignore */
+        }
+        this.socketOff = null;
+        for (const subs of this.subscriptions.values()) {
+          for (const sub of subs) {
+            try {
+              sub.close();
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+        this.subscriptions.clear();
+        this.started = false;
+        throw err;
+      }
     }
   }
 
@@ -317,21 +343,19 @@ export class SlackAdapter {
     if (!match) return;
 
     const behavior = match[1] as "allow" | "deny";
-    const requestId = match[2];
-    if (!requestId) return;
+    const agentId = match[2];
+    const requestId = match[3];
+    if (!agentId || !requestId) return;
 
-    // Composite key lookup — two agents in same channel never collide.
-    let pendingKey: string | null = null;
-    let pending: PendingPermission | null = null;
-    for (const [key, value] of this.pendingPermissions.entries()) {
-      if (value.channel_id === channelId && key.endsWith(`:${requestId}`)) {
-        pendingKey = key;
-        pending = value;
-        break;
-      }
-    }
+    // Codex P1 fix on PR #117: look up the EXACT composite key carried
+    // on the wire (agent_id + channel_id + request_id). The earlier
+    // scan-and-suffix-match approach risked picking the wrong agent's
+    // pending request given the 5-char [a-km-z] request_id collision
+    // space.
+    const pendingKey = `${agentId}:${channelId}:${requestId}`;
+    const pending = this.pendingPermissions.get(pendingKey);
     // Stale button (e.g. restart) — silent skip; envelope already auto-acked.
-    if (!pending || !pendingKey) return;
+    if (!pending) return;
     this.pendingPermissions.delete(pendingKey);
 
     try {
@@ -404,7 +428,7 @@ export class SlackAdapter {
       return;
     }
 
-    const blocks = buildPermissionBlocks(req);
+    const blocks = buildPermissionBlocks(req, agentId);
     for (const channelId of channels) {
       this.pendingPermissions.set(`${agentId}:${channelId}:${req.request_id}`, {
         agent_id: agentId,

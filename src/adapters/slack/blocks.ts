@@ -19,12 +19,16 @@ import type { SlackBlock } from "./types";
  * Build the permission-prompt Block Kit payload. Pure function so the
  * test suite can assert on the exact shape without spinning up an adapter.
  *
- * The `action_id` format `perm:<allow|deny>:<request_id>` is the colon-
- * separated form chosen for Slack per SPRINT_4_PLAN.md. Telegram uses
- * the same format; Discord still uses `ccaw_perm_<…>_<…>` underscores —
- * convergence is a separate Sprint 4 task.
+ * The `action_id` format `perm:<allow|deny>:<agent_id>:<request_id>`
+ * includes `agent_id` on the wire so the callback can look up the exact
+ * pendingPermissions composite key directly. PR #117 review (Codex P1)
+ * caught that scan-by-channel + suffix match was collision-prone given
+ * the 5-char `[a-km-z]` request_id space.
+ *
+ * Telegram still uses `perm:<allow|deny>:<id>` (2-element); Discord
+ * still uses `ccaw_perm_<allow|deny>_<id>`. Sprint 4.5 unifies.
  */
-export function buildPermissionBlocks(req: PermissionRequest): SlackBlock[] {
+export function buildPermissionBlocks(req: PermissionRequest, agentId: string): SlackBlock[] {
   const lines = [`*Permission request*`, `Tool: \`${req.tool_name}\``];
   if (req.description) lines.push(req.description);
   if (req.input_preview) lines.push(`\`\`\`\n${req.input_preview}\n\`\`\``);
@@ -37,14 +41,14 @@ export function buildPermissionBlocks(req: PermissionRequest): SlackBlock[] {
         {
           type: "button",
           text: { type: "plain_text", text: "Allow" },
-          action_id: `perm:allow:${req.request_id}`,
+          action_id: `perm:allow:${agentId}:${req.request_id}`,
           value: "allow",
           style: "primary",
         },
         {
           type: "button",
           text: { type: "plain_text", text: "Deny" },
-          action_id: `perm:deny:${req.request_id}`,
+          action_id: `perm:deny:${agentId}:${req.request_id}`,
           value: "deny",
           style: "danger",
         },

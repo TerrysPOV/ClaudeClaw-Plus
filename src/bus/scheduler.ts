@@ -279,14 +279,13 @@ class BusSchedulerImpl implements BusScheduler {
     cronExpr: string,
     req: ScheduleCronRequest,
   ): ScheduledTrigger {
-    // Validate the expression eagerly — `nextCronMatch` will silently
-    // produce a "matches in 2 days" Date on garbage input, but at least
-    // it won't throw. We use a probe call to catch obvious junk.
-    try {
-      nextCronMatch(cronExpr, new Date(this.clock.now()), this.timezoneOffsetMinutes);
-    } catch (err) {
-      throw new Error(`scheduleCron: invalid cron expression "${cronExpr}": ${String(err)}`);
-    }
+    // Codex P2 fix on PR #117: validate the cron expression up-front
+    // instead of probing `nextCronMatch`. The probe was a no-op for many
+    // malformed expressions (non-numeric tokens, out-of-range numbers,
+    // wrong field count) — `nextCronMatch` silently returns a fallback
+    // Date past its scan window rather than throwing, so operator typos
+    // landed as jobs running at unintended times.
+    validateCronExpression(cronExpr);
 
     const arm = () => {
       const rec = this.timers.get(id);
@@ -346,6 +345,119 @@ class BusSchedulerImpl implements BusScheduler {
 
 function noopTrigger(): ScheduledTrigger {
   return { cancel: () => {} };
+}
+
+/* ───────────────────────────────────────────────────────────────────── */
+/* Cron expression validator (Codex P2 fix on PR #117)                   */
+/* ───────────────────────────────────────────────────────────────────── */
+
+/**
+ * Validate a 5-field cron expression (minute hour day month weekday).
+ * Throws on:
+ *   - wrong field count
+ *   - non-numeric / non-`*` / non-`,` / non-`-` / non-`/` characters
+ *     in any field
+ *   - out-of-range numbers for the field
+ *
+ * `*\/N` step + `M-N` range + `M,N,O` list are accepted. Single `*` is
+ * accepted. `?` and `L` / `W` extensions are NOT supported (matches the
+ * legacy `cronMatches` parser).
+ *
+ * `nextCronMatch` (the legacy 53-LOC implementation in `src/cron.ts`)
+ * silently returns a fallback Date for malformed input rather than
+ * throwing, so this validator runs up-front to fail fast on operator
+ * typos.
+ */
+const CRON_FIELD_RANGES: Array<[number, number]> = [
+  [0, 59], // minute
+  [0, 23], // hour
+  [1, 31], // day of month
+  [1, 12], // month
+  [0, 7], // day of week (0 and 7 both Sunday per cron convention)
+];
+
+export function validateCronExpression(cronExpr: string): void {
+  if (typeof cronExpr !== "string" || cronExpr.trim() === "") {
+    throw new Error(`scheduleCron: invalid cron expression: empty or non-string`);
+  }
+  const fields = cronExpr.trim().split(/\s+/);
+  if (fields.length !== 5) {
+    throw new Error(
+      `scheduleCron: invalid cron expression "${cronExpr}": expected 5 fields, got ${fields.length}`,
+    );
+  }
+  for (let i = 0; i < 5; i++) {
+    const field = fields[i];
+    const [min, max] = CRON_FIELD_RANGES[i];
+    validateCronField(field, min, max, cronExpr, i);
+  }
+}
+
+function validateCronField(
+  field: string,
+  min: number,
+  max: number,
+  cronExpr: string,
+  fieldIdx: number,
+): void {
+  const fieldName = ["minute", "hour", "day-of-month", "month", "day-of-week"][fieldIdx];
+  // Allowed characters: digits, `*`, `,`, `-`, `/`. Anything else is junk.
+  if (!/^[0-9*,\-/]+$/.test(field)) {
+    throw new Error(
+      `scheduleCron: invalid cron expression "${cronExpr}": ${fieldName} field "${field}" has invalid characters`,
+    );
+  }
+  for (const part of field.split(",")) {
+    let stepDivisor: number | null = null;
+    let range = part;
+    const slashIdx = part.indexOf("/");
+    if (slashIdx >= 0) {
+      range = part.slice(0, slashIdx);
+      const stepStr = part.slice(slashIdx + 1);
+      if (!/^\d+$/.test(stepStr)) {
+        throw new Error(
+          `scheduleCron: invalid cron expression "${cronExpr}": ${fieldName} step "${stepStr}" is not a positive integer`,
+        );
+      }
+      stepDivisor = Number(stepStr);
+      if (stepDivisor <= 0) {
+        throw new Error(
+          `scheduleCron: invalid cron expression "${cronExpr}": ${fieldName} step must be > 0`,
+        );
+      }
+    }
+    if (range === "*") continue;
+    const dashIdx = range.indexOf("-");
+    if (dashIdx >= 0) {
+      const lo = range.slice(0, dashIdx);
+      const hi = range.slice(dashIdx + 1);
+      if (!/^\d+$/.test(lo) || !/^\d+$/.test(hi)) {
+        throw new Error(
+          `scheduleCron: invalid cron expression "${cronExpr}": ${fieldName} range "${range}" not numeric`,
+        );
+      }
+      const loN = Number(lo);
+      const hiN = Number(hi);
+      if (loN < min || hiN > max || loN > hiN) {
+        throw new Error(
+          `scheduleCron: invalid cron expression "${cronExpr}": ${fieldName} range "${range}" out of [${min},${max}] or inverted`,
+        );
+      }
+      continue;
+    }
+    // Bare number.
+    if (!/^\d+$/.test(range)) {
+      throw new Error(
+        `scheduleCron: invalid cron expression "${cronExpr}": ${fieldName} value "${range}" not numeric`,
+      );
+    }
+    const n = Number(range);
+    if (n < min || n > max) {
+      throw new Error(
+        `scheduleCron: invalid cron expression "${cronExpr}": ${fieldName} value ${n} out of [${min},${max}]`,
+      );
+    }
+  }
 }
 
 /* ───────────────────────────────────────────────────────────────────── */
