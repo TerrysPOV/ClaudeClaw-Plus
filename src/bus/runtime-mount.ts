@@ -142,6 +142,15 @@ export async function mountBusRuntime(
     };
   } catch (err) {
     if (busStarted) {
+      // Mirror the happy-path teardown order documented on `stop()`:
+      // detach the slash handler first so any closure `wireSlashCommands`
+      // installed before throwing can't reach a torn-down SessionManager,
+      // then stop the bus. PR #117 5-agent review (Agent #2 #1).
+      try {
+        bus.setSlashCommandHandler(null);
+      } catch {
+        /* ignore — surfacing the original error matters more. */
+      }
       try {
         await bus.stop();
       } catch {
