@@ -190,6 +190,15 @@ describe("PtyProcess — _waitForReadySettle two-phase (issue #84)", () => {
 // the new flow without invoking real claude.
 
 describe("PtyProcess — runTurn sentinel-echo (clean boundary)", () => {
+  // NOTE: prompts include `✻` (U+273B, a claude spinner glyph)
+  // because the parser's activity-indicator gate (added in
+  // fix/pty-premature-sentinel) refuses to fire `quiet` until a
+  // spinner glyph has been seen. Marker glyphs (`●`/`⏺`) were dropped
+  // from the gate per Codex P1 on PR #124 — they appear in the TUI
+  // status-box row and in resumed scrollback. Real claude emits
+  // spinners while generating; `/bin/cat` doesn't, so we slip one
+  // into the prompt and let cat echo it back to satisfy the gate.
+
   test("cat echoes the sentinel back → cleanBoundary=true", async () => {
     const proc = await spawnPty(
       baseOpts({
@@ -199,7 +208,7 @@ describe("PtyProcess — runTurn sentinel-echo (clean boundary)", () => {
         sentinelMaxWaitMs: 5000,
       }),
     );
-    const result = await proc.runTurn("hello world", { timeoutMs: 5000 });
+    const result = await proc.runTurn("✻ hello world", { timeoutMs: 5000 });
     expect(result.cleanBoundary).toBe(true);
     // cat echoes the prompt; the response should contain it.
     expect(result.text.toLowerCase()).toContain("hello world");
@@ -217,7 +226,7 @@ describe("PtyProcess — runTurn sentinel-echo (clean boundary)", () => {
         sentinelMaxWaitMs: 5000,
       }),
     );
-    const longPrompt = "x".repeat(500);
+    const longPrompt = `✻ ${"x".repeat(500)}`;
     const result = await proc.runTurn(longPrompt, { timeoutMs: 5000 });
     expect(result.cleanBoundary).toBe(true);
     expect(result.text).toContain("x".repeat(20));
@@ -234,7 +243,7 @@ describe("PtyProcess — runTurn sentinel-echo (clean boundary)", () => {
       }),
     );
     let chunkBytes = 0;
-    const result = await proc.runTurn("streaming-test-payload", {
+    const result = await proc.runTurn("✻ streaming-test-payload", {
       timeoutMs: 5000,
       onChunk: (s) => {
         chunkBytes += s.length;
@@ -256,10 +265,16 @@ describe("PtyProcess — runTurn sentinel max-wait fallback", () => {
     //
     // The PTY's kernel cooked-mode echo would still echo our writes, so we
     // disable it via `stty -echo` first.
+    // `\xe2\x9c\xbb` = `✻` (U+273B) — one of claude's spinner glyphs,
+    // the only signal the parser's activity-indicator gate accepts
+    // (Codex P1 on PR #124 — markers were dropped from the gate
+    // because they appear in TUI status-box rows + scrollback). Without
+    // it, quiet would never fire and the test would time out at the
+    // hard timeoutMs instead of exercising the sentinel-max-wait path.
     const proc = await spawnPty(
       baseOpts({
         _commandOverride: "/bin/sh",
-        _argsOverride: ["-c", "stty -echo; sleep 5"],
+        _argsOverride: ["-c", "stty -echo; printf '\\xe2\\x9c\\xbb'; sleep 5"],
         quietWindowMs: 50,
         sentinelMaxWaitMs: 250,
       }),
@@ -284,12 +299,15 @@ describe("PtyProcess — runTurn sentinel max-wait fallback", () => {
     // writes don't trivially come back). `printf 'response-bytes'` emits
     // bytes that the parser accumulates AFTER the turn starts. Then sleep
     // burns time until sentinelMaxWaitMs fires.
+    // `\xe2\x9c\xbb` = `✻` (U+273B) — spinner glyph the parser's
+    // activity-indicator gate scans for. Markers (`●`/`⏺`) were
+    // dropped from the gate per Codex P1 on PR #124.
     const proc = await spawnPty(
       baseOpts({
         _commandOverride: "/bin/sh",
         _argsOverride: [
           "-c",
-          "echo BANNER_BANNER_BANNER_PRETURN; stty -echo; printf 'response-bytes-during-turn'; sleep 5",
+          "echo BANNER_BANNER_BANNER_PRETURN; stty -echo; printf '\\xe2\\x9c\\xbb response-bytes-during-turn'; sleep 5",
         ],
         quietWindowMs: 100,
         sentinelMaxWaitMs: 400,
@@ -346,7 +364,7 @@ describe("PtyProcess — sentinel UUID override hook", () => {
         _sentinelUuidOverride: () => "pinned-uuid-1234",
       }),
     );
-    const result = await proc.runTurn("hi", { timeoutMs: 5000 });
+    const result = await proc.runTurn("✻ hi", { timeoutMs: 5000 });
     expect(result.cleanBoundary).toBe(true);
     await proc.dispose();
   });
@@ -363,10 +381,14 @@ describe("PtyProcess — concurrency", () => {
         turnIdleTimeoutMs: 300,
       }),
     );
-    const t1 = proc.runTurn("first", { timeoutMs: 5000 });
+    // `✻` so cat's echo trips the activity-indicator gate (spinner-only
+    // per Codex P1 on PR #124); without it the first turn never
+    // completes and the test times out instead of exercising the
+    // concurrency rejection.
+    const t1 = proc.runTurn("✻ first", { timeoutMs: 5000 });
     let err: unknown;
     try {
-      await proc.runTurn("second", { timeoutMs: 5000 });
+      await proc.runTurn("✻ second", { timeoutMs: 5000 });
     } catch (e) {
       err = e;
     }
