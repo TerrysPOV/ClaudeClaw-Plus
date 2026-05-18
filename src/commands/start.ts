@@ -490,25 +490,47 @@ export async function start(args: string[] = []) {
         .map((r) => r.config)
         .filter((c): c is NonNullable<typeof c> => c !== null);
 
-      // Build BusCore + SessionManager eagerly so adapters can attach to
-      // the SAME instances mountBusRuntime then takes ownership of.
-      // Adapters subscribe in their `start()` — happy to be called
-      // before `bus.start()` since subscribe doesn't require the IPC
-      // server to be bound. socketPath is shared via `resolveDaemonSocketPath`
-      // so adapters, agents, and the IPC server all dial the same path.
+      // Boot order matters. PR #123 Codex P1+P2 fold-in:
+      //   1. Build BusCore + SessionManager (no I/O yet).
+      //   2. mountBusRuntime — starts the IPC server + spawns agents.
+      //      Bus is now live and addressable.
+      //   3. wireBusAdapters — adapters call `adapter.start()` which
+      //      kicks off their poll loops / opens HTTP listeners.
+      //      MUST come AFTER step 2 so prompts that arrive during the
+      //      adapter's first poll have a live bus + agents to dispatch
+      //      to (Codex P2: prompt-loss race).
+      //   4. handle.attachAdapters — the handle's stop() lifecycle now
+      //      owns the adapters; any error in step 5+ that falls
+      //      through to the catch tears them down (Codex P1: adapter
+      //      leak on partial mount failure).
       const socketPath = resolveDaemonSocketPath();
       const bus = new BusCoreImpl({ socketPath });
       const sessionManager = new SessionManager({ busSocketPath: socketPath });
-      const { adapters, errors } = await wireBusAdapters({ bus, settings });
-      for (const [name, msg] of Object.entries(errors)) {
-        console.warn(`[${ts()}] Bus adapter "${name}" failed to mount: ${msg}`);
-      }
       const handle = await mountBusRuntime({
         bus,
         sessionManager,
         agents: agentConfigs,
-        adapters,
       });
+      // The mount succeeded — from here on, ANY error must call
+      // handle.stop() before falling through to legacy, otherwise the
+      // bus IPC server + spawned agents leak.
+      try {
+        const { adapters, errors } = await wireBusAdapters({ bus, settings });
+        for (const [name, msg] of Object.entries(errors)) {
+          console.warn(`[${ts()}] Bus adapter "${name}" failed to mount: ${msg}`);
+        }
+        handle.attachAdapters(adapters);
+      } catch (wireErr) {
+        // Adapter wiring threw — stop the handle (which already owns
+        // the bus + agents) before re-throwing to the outer catch so
+        // the daemon falls back to legacy with everything torn down.
+        try {
+          await handle.stop();
+        } catch (stopErr) {
+          console.error(`[${ts()}] handle.stop() during wire rollback failed`, stopErr);
+        }
+        throw wireErr;
+      }
       busRuntimeHandle = handle;
       busRuntimeSpawnedAgents = handle.spawnedAgentIds;
       busRuntimeAdapterNames = handle.mountedAdapterNames;

@@ -494,3 +494,79 @@ describe("mountBusRuntime — stop() with agents", () => {
     expect(bus.stopCalls()).toBe(1);
   });
 });
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* attachAdapters — PR #123 Codex P1+P2 fold-in                            */
+/* ────────────────────────────────────────────────────────────────────── */
+
+describe("mountBusRuntime — attachAdapters", () => {
+  it("attached adapters are stopped on handle.stop in reverse registration order", async () => {
+    const bus = createFakeBus();
+    const sm = new FakeSessionManager();
+    const stopOrder: string[] = [];
+    const mk = (name: "discord" | "telegram" | "slack" | "webui") => ({
+      name,
+      stop: async () => {
+        stopOrder.push(name);
+      },
+    });
+    const handle = await mountBusRuntime({
+      bus,
+      sessionManager: sm,
+      logger: SILENT_LOGGER,
+    });
+    handle.attachAdapters([mk("discord"), mk("telegram")]);
+    handle.attachAdapters([mk("slack")]);
+    expect(handle.mountedAdapterNames).toEqual(["discord", "telegram", "slack"]);
+    await handle.stop();
+    // Reverse registration order: slack first, then telegram, then discord.
+    expect(stopOrder).toEqual(["slack", "telegram", "discord"]);
+  });
+
+  it("mixes opts.adapters with attachAdapters cleanly", async () => {
+    const bus = createFakeBus();
+    const sm = new FakeSessionManager();
+    const stopOrder: string[] = [];
+    const mk = (name: "discord" | "telegram" | "slack" | "webui") => ({
+      name,
+      stop: async () => {
+        stopOrder.push(name);
+      },
+    });
+    const handle = await mountBusRuntime({
+      bus,
+      sessionManager: sm,
+      adapters: [mk("discord")],
+      logger: SILENT_LOGGER,
+    });
+    handle.attachAdapters([mk("telegram")]);
+    expect(handle.mountedAdapterNames).toEqual(["discord", "telegram"]);
+    await handle.stop();
+    expect(stopOrder).toEqual(["telegram", "discord"]);
+  });
+
+  it("attachAdapters after stop() schedules teardown so adapters don't leak", async () => {
+    const bus = createFakeBus();
+    const sm = new FakeSessionManager();
+    const stopped: string[] = [];
+    const mk = (name: "discord" | "telegram" | "slack" | "webui") => ({
+      name,
+      stop: async () => {
+        stopped.push(name);
+      },
+    });
+    const handle = await mountBusRuntime({
+      bus,
+      sessionManager: sm,
+      logger: SILENT_LOGGER,
+    });
+    await handle.stop();
+    // Now attach AFTER stop — the handle isn't tracking lifecycles
+    // anymore, but it must still avoid leaking the late adapter.
+    handle.attachAdapters([mk("discord"), mk("telegram")]);
+    // Stop is scheduled on microtask queue; flush.
+    await new Promise((r) => setTimeout(r, 0));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(stopped.sort()).toEqual(["discord", "telegram"]);
+  });
+});

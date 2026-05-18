@@ -49,13 +49,25 @@ export interface BusRuntimeHandle {
    */
   spawnedAgentIds: readonly string[];
   /**
-   * The adapters successfully mounted by the daemon (Sprint 5.2b).
-   * `mountBusRuntime` itself doesn't construct adapters — the daemon
-   * does that via `wireBusAdapters` and passes the result in via
-   * `MountBusRuntimeOptions.adapters` so the lifecycle is centralised
-   * here. Empty when the caller didn't pass any.
+   * The adapters whose lifecycle is owned by this handle. Sprint 5.2b
+   * (PR #123) Codex P2 fold-in: the daemon now wires adapters AFTER
+   * `mountBusRuntime` returns (so adapters never poll before the bus
+   * IPC server + agents are live) and registers them via
+   * `attachAdapters` for `stop()` to tear down. Empty until at least
+   * one `attachAdapters` call.
    */
   mountedAdapterNames: readonly MountedAdapter["name"][];
+  /**
+   * Register adapters with the handle's stop lifecycle. Sprint 5.2b
+   * (PR #123) Codex P1/P2 fold-in: callers wire adapters AFTER the
+   * bus is mounted; this method lets the handle own teardown even
+   * though construction happened outside the mount function.
+   *
+   * Multiple calls accumulate — operators can register subsets in
+   * different phases if needed. Adapters are stopped in reverse
+   * REGISTRATION order on stop().
+   */
+  attachAdapters(adapters: readonly MountedAdapter[]): void;
   /**
    * Tear down adapters + agents + bus in reverse-construction order.
    * Idempotent; call as many times as you want.
@@ -199,7 +211,11 @@ export async function mountBusRuntime(
       }
     }
 
-    const adapters: readonly MountedAdapter[] = opts.adapters ?? [];
+    // Adapters list is now MUTABLE — Sprint 5.2b (PR #123) Codex P2
+    // fold-in lets the caller register adapters AFTER mount returns via
+    // `attachAdapters`. Backwards-compatible: `opts.adapters` still
+    // accepted for callers that wired before mount.
+    const adapters: MountedAdapter[] = opts.adapters ? [...opts.adapters] : [];
     const spawnedLabel = spawned.length === 0 ? "no agents" : `agents=[${spawned.join(", ")}]`;
     const adaptersLabel =
       adapters.length === 0
@@ -219,6 +235,21 @@ export async function mountBusRuntime(
       },
       get mountedAdapterNames() {
         return adapters.map((a) => a.name);
+      },
+      attachAdapters(more) {
+        if (stopped) {
+          // The handle has already torn down; tearing down the new
+          // adapters immediately is the safest reaction so they don't
+          // leak. Schedule on the microtask queue so the call itself
+          // stays sync.
+          for (const a of more) {
+            Promise.resolve()
+              .then(() => a.stop())
+              .catch((err) => logger.error(`[bus-runtime] post-stop attach: ${a.name}`, err));
+          }
+          return;
+        }
+        for (const a of more) adapters.push(a);
       },
       async stop() {
         if (stopped) return;
