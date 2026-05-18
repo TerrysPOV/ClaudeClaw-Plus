@@ -265,7 +265,7 @@ The Bus MCP receives the `permission_request` from Claude, forwards to the Bus c
 | `{type: 'pr-link', ...}` | `session.pr_link` | PR association. |
 | `{type: 'last-prompt', ...}` | `session.last_prompt` | Marker line. |
 | `{type: 'queue-operation', ...}` | `session.queue` | Internal Claude Code queue marker. |
-| `{type: 'system', subtype: <one-of>, ...}` | `system.<subtype>` | **`system` is a container; `subtype` is the real discriminator.** Subtypes observed in Spike 0.2: `compact_boundary`, `turn_duration`, `stop_hook_summary`, `away_summary`, `informational`, `local_command`, `scheduled_task_fire`, `bridge_status`, `api_error`. The full union is open — Sprint 1 enumerates exhaustively. |
+| `{type: 'system', subtype: <one-of>, ...}` | `system.<subtype>` | **`system` is a container; `subtype` is the real discriminator.** Subtypes observed in Spike 0.2: `compact_boundary`, `turn_duration`, `stop_hook_summary`, `away_summary`, `informational`, `local_command`, `scheduled_task_fire`, `bridge_status`, `api_error`. The full union is open — Sprint 1 enumerates exhaustively. **`stop_hook_summary` payload shape** (PR #112 cross-validation, claude 2.1.143): `{hookCount, hookInfos: [{command, durationMs}], hookErrors: [], preventedContinuation, stopReason, hasOutput, level, toolUseID, uuid, version}` — emit as `system.stop_hook_summary` for per-turn hook telemetry. |
 | Any line with a `usage` field containing `cache_read_input_tokens`, `cache_creation_input_tokens`, `input_tokens` | `usage` | Update cache-hit dashboard. Co-located with the assistant message. |
 
 **Session lifecycle markers — empirical findings (Spikes 0.2 + 0.5):**
@@ -275,7 +275,7 @@ The earlier hypothesis of named `session.init` / `session.end` / `session.compac
 | Event | JSONL signal | Detection mechanism |
 |---|---|---|
 | **`session.init`** | First non-empty line in a previously-empty `<session-id>.jsonl` file | `fs.watch('change')` on the file; emit `session.init` once on the first byte observed |
-| **`session.compact`** | `{type:'system', subtype:'compact_boundary', compactMetadata: {trigger, preTokens, postTokens, durationMs}}` appended to the JSONL | Bus topic `session.compact` is mapped 1:1 from `system.compact_boundary` |
+| **`session.compact`** | `{type:'system', subtype:'compact_boundary', compactMetadata: {trigger, preTokens, postTokens, durationMs, preservedSegment: {headUuid, anchorUuid, tailUuid}}}` appended to the JSONL | Bus topic `session.compact` is mapped 1:1 from `system.compact_boundary`. `preservedSegment.{head,anchor,tail}Uuid` (PR #112 cross-validation) lets the Tailer correlate pre/post-compact transcript ranges — useful for adapters that want to scroll back across a compact boundary without losing context. |
 | **`/clear` event** | **Rotation, not truncate.** A new `<new-session-id>.jsonl` file appears in the same project directory; the old file is frozen unchanged and carries no marker | `fs.watch('add')` on the project directory; treat as `session.end(old)` immediately followed by `session.init(new)`; re-bind subscribers to the new session_id |
 | **`session.end` (process exit)** | `<command-name>/exit</command-name>` envelope in the JSONL on `/quit`; otherwise no JSONL signal | Session Manager observes process exit (PTY `onExit` or `Bun.spawn` exit promise); emit `session.end` from there. The JSONL `/exit` envelope is informational, not the authoritative signal. |
 

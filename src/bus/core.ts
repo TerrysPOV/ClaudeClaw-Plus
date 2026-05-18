@@ -115,6 +115,13 @@ export interface BusCore {
   sendPrompt(req: SendPromptRequest): Promise<{ promise_id: string }>;
   subscribe(filter: SubscriptionFilter, handler: SubscriptionHandler): Subscription;
   invokeSlashCommand(agent_id: string, cmd: string): Promise<void>;
+  /**
+   * Install or replace the slash-command delegate. Sprint 4 wiring path
+   * (spec §6.3): a `BusCore` is constructed before the `SessionManager`
+   * is available, so the handler must be settable post-hoc rather than
+   * being a constructor-only option. Pass `null` to detach.
+   */
+  setSlashCommandHandler(handler: SlashCommandHandler | null): void;
   ingestReply(req: IngestReplyRequest): void;
   ingestSessionEvent(e: BusEvent): void;
   ingestPermissionDecision(req: IngestPermissionDecisionRequest): void;
@@ -134,7 +141,7 @@ export class BusCoreImpl implements BusCore {
   private readonly socketPath: string | null;
   private readonly ringbufferCapacity: number;
   private readonly eventLogAppend: EventLogAppendFn;
-  private readonly slashCommandHandler: SlashCommandHandler | null;
+  private slashCommandHandler: SlashCommandHandler | null;
   private readonly onError: (err: unknown, ctx?: Record<string, unknown>) => void;
 
   constructor(opts: BusCoreOptions = {}) {
@@ -234,6 +241,10 @@ export class BusCoreImpl implements BusCore {
       );
     }
     await this.slashCommandHandler(agent_id, cmd);
+  }
+
+  setSlashCommandHandler(handler: SlashCommandHandler | null): void {
+    this.slashCommandHandler = handler;
   }
 
   /* ─────────────────────────────── subscriptions ─────────────────────────────── */

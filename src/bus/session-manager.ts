@@ -406,6 +406,16 @@ export class SessionManager {
     return out;
   }
 
+  /**
+   * Look up the live `AgentProcess` for an agent id (or `undefined` if no
+   * such agent is currently spawned). Sprint 4 wiring (spec §6.3): the
+   * slash-relay handler needs read-only access to dispatch `send_slash`.
+   * Adding a small accessor keeps the spawn lifecycle untouched.
+   */
+  getAgent(agent_id: string): AgentProcess | undefined {
+    return this.agents.get(agent_id)?.proc;
+  }
+
   /** Test helper: list spawned agent_ids. Not part of the public spec. */
   _list(): string[] {
     return Array.from(this.agents.keys());
