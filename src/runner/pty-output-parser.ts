@@ -300,17 +300,69 @@ function indexOfBytes(haystack: Uint8Array, needle: Uint8Array): number {
 // ─── Response-text extraction ────────────────────────────────────────────────
 
 /**
+ * Cap on how many synthesised spaces a single CUF / CHA sequence can
+ * produce. Claude's TUI occasionally emits cursor moves like `\x1B[120C`
+ * to pad to the right column; converting those into 120 spaces would
+ * blow up the captured body. 128 covers any normal word/column padding
+ * (claude renders at ~100 cols) without enabling pathological inputs to
+ * produce megabytes of whitespace. Anything past the cap collapses to a
+ * single space so word boundaries are still visible.
+ */
+const CUF_MAX_SPACES = 128;
+
+/**
+ * Pre-pass that converts cursor-forward sequences into the spaces they
+ * visually represent.
+ *
+ * Why this exists: claude's TUI (2.1.140+) emits `\x1B[1C` (cursor-forward
+ * one column) BETWEEN words instead of a literal U+0020 space, and `\x1B[NC`
+ * for column padding. When `stripAnsi` strips all CSI sequences without
+ * understanding their semantics, the cursor moves are erased along with
+ * the visible "space" they represented — leaving body text like
+ * `Reviewpendingtasks,reminders,...` with every word run together. See
+ * the discussion in issue #119 + the golden fixture
+ * `.planning/pty-migration/fixtures/turn-boundary-sample.txt`.
+ *
+ * Handled:
+ *   - `\x1B[<n>C`  → CUF (Cursor Forward n columns) — emit min(n, CAP) spaces.
+ *   - `\x1B[C`     → CUF with default 1 — emit one space.
+ *
+ * Not handled (deliberately):
+ *   - `\x1B[<n>G`  → CHA (absolute column) — needs current column tracking
+ *     to compute the right padding; out of scope for a band-aid. Operators
+ *     hitting this case should validate on the Bus runtime (Sprint 5) which
+ *     reads JSONL instead of PTY rendering.
+ *   - `\x1B[<n>D`  → CUB (Cursor Back) — only matters for redraws, not
+ *     for first-pass word-boundary recovery.
+ *   - `\x1B[<r>;<c>H` → CUP (Cursor Position) — full terminal-emulation
+ *     territory; same JSONL-replacement rationale as CHA.
+ */
+export function expandCursorForwardToSpaces(text: string): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: CUF is an ANSI CSI sequence.
+  return text.replace(/\x1b\[(\d*)C/g, (_match, digits: string) => {
+    const n = digits.length === 0 ? 1 : parseInt(digits, 10);
+    if (!Number.isFinite(n) || n <= 0) return " ";
+    return " ".repeat(Math.min(n, CUF_MAX_SPACES));
+  });
+}
+
+/**
  * Strip ANSI control sequences from text. Removes:
  *   - OSC sequences:  ESC ] ... (BEL | ESC \)
  *   - CSI sequences:  ESC [ ... <final byte 0x40-0x7E>
  *   - Charset-select: ESC ( <byte>, ESC ) <byte>
  *   - Solo ESC bytes (defensive)
  *
+ * Before the general CSI stripper runs, `expandCursorForwardToSpaces`
+ * converts CUF (`\x1B[<n>C`) sequences to literal spaces so claude's
+ * cursor-forward-as-word-separator pattern (TUI 2.1.140+) doesn't lose
+ * inter-word spacing when the CSI stripper erases the sequence.
+ *
  * Preserves all non-ANSI Unicode (emoji, box-drawing, CJK, etc.).
  */
 export function stripAnsi(text: string): string {
   return (
-    text
+    expandCursorForwardToSpaces(text)
       // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI/OSC escape sequences require control bytes.
       .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
       // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI CSI escape stripper.

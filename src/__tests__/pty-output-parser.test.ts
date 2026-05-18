@@ -387,6 +387,31 @@ describe("stripAnsi", () => {
     const input = "日本語 \x1b[1mtext\x1b[0m 中文";
     expect(stripAnsi(input)).toBe("日本語 text 中文");
   });
+
+  // Regression for #119: claude's TUI (2.1.140+) emits `\x1B[1C` (cursor
+  // forward) between words instead of literal U+0020. Without the
+  // pre-pass these "spaces" vanished with the CSI stripper, producing
+  // body text like "Reviewpendingtasks,reminders,...".
+  test("recovers inter-word spaces from CUF sequences (regression for #119)", () => {
+    const input = "\x1b[38;2;116;199;236mOpus\x1b[1C4.7\x1b[1C(1M\x1b[1Ccontext)\x1b[39m";
+    expect(stripAnsi(input)).toBe("Opus 4.7 (1M context)");
+  });
+
+  test("converts \\x1B[C (no count) to a single space", () => {
+    expect(stripAnsi("foo\x1b[Cbar")).toBe("foo bar");
+  });
+
+  test("expands CUF with explicit count to that many spaces", () => {
+    expect(stripAnsi("left\x1b[5Cright")).toBe("left     right");
+  });
+
+  test("caps pathological CUF counts to avoid runaway whitespace", () => {
+    // \x1B[9999C would otherwise produce ~10kB of spaces per occurrence;
+    // the cap keeps capture sizes bounded for malformed input.
+    const out = stripAnsi("a\x1b[9999Cb");
+    // 128-space cap from CUF_MAX_SPACES.
+    expect(out).toBe(`a${" ".repeat(128)}b`);
+  });
 });
 
 describe("normaliseNewlines", () => {
