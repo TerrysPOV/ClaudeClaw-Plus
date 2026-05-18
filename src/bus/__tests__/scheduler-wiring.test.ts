@@ -111,7 +111,11 @@ describe("wireBusScheduler — heartbeat", () => {
     await handle.stop();
   });
 
-  it("warns but still schedules when excludeWindows are set (current limitation)", async () => {
+  it("schedules with shouldFire filter when excludeWindows are set (Sprint 5.2d)", async () => {
+    // No more warning — `wireBusScheduler` now honours excludeWindows
+    // via the scheduler's `shouldFire` filter. The log line includes
+    // the window count so operators can confirm it's wired.
+    const infos: string[] = [];
     const warnings: string[] = [];
     const handle = await wireBusScheduler({
       bus: stubBus(),
@@ -121,10 +125,15 @@ describe("wireBusScheduler — heartbeat", () => {
         excludeWindows: [{ start: "22:00", end: "07:00" }],
       }),
       jobs: [],
-      logger: { ...SILENT_LOGGER, warn: (m: string) => warnings.push(m) },
+      logger: {
+        ...SILENT_LOGGER,
+        warn: (m: string) => warnings.push(m),
+        info: (m: string) => infos.push(m),
+      },
     });
     expect(handle.scheduled).toHaveLength(1);
-    expect(warnings.some((w) => w.includes("excludeWindows"))).toBe(true);
+    expect(warnings).toHaveLength(0);
+    expect(infos.some((m) => m.includes("exclusion window"))).toBe(true);
     await handle.stop();
   });
 });

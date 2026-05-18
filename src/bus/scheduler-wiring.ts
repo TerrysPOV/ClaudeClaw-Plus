@@ -13,29 +13,42 @@
  *   - `settings.heartbeat.enabled === true` → one `scheduleHeartbeat`
  *     call against the default agent_id. The legacy heartbeat ran a
  *     single global session so "first agent" matches that behaviour.
+ *     `excludeWindows` is honoured via the scheduler's `shouldFire`
+ *     filter (Sprint 5.2d).
  *   - Each `Job` from `loadJobs()` → one `scheduleCron` call. Jobs with
- *     `enabled: false` are skipped (legacy parity).
- *     - `job.agent` overrides the default agent_id when set; otherwise
- *       the default applies.
- *     - The job's `prompt` is forwarded verbatim — model / timeout
- *       overrides aren't honoured under the Bus runtime yet (Sprint
- *       5.2c+ follow-up).
+ *     `enabled: false` are skipped (legacy parity). `job.agent`
+ *     overrides the default agent_id when set; otherwise the default
+ *     applies.
  *
- * Not handled (deliberately):
- *   - `settings.heartbeat.excludeWindows` — the BusScheduler doesn't
- *     model exclusion windows. The legacy `isHeartbeatExcludedNow`
- *     check lives in `start.ts`'s tick(); we'd need to add a
- *     scheduler-side filter for the Bus path. Tracked for Sprint
- *     5.2c+ follow-up; for now operators using exclusion windows stay
- *     on `runtime: pty`.
- *   - Hot-reload on settings change. The schedule survives until
- *     daemon restart.
+ * Paradigm shift for per-job model / timeout overrides:
+ *   Under the legacy runtime, `job.model` / `job.timeoutSeconds` would
+ *   spin up a one-shot `claude -p` with the override. Under the Bus
+ *   runtime, agents are LONG-LIVED PTY sessions with model + timeout
+ *   baked in at spawn time, so per-job overrides don't fit the model.
+ *
+ *   To route a job to a different model under `runtime: "bus"`:
+ *     1. Declare a second agent in `settings.agents` with the desired
+ *        model (operators set the model via the agent's launch args /
+ *        system-prompt-file rather than per-call).
+ *     2. Set `job.agent` to that agent's id.
+ *
+ *   This is a cleaner architectural fit than the legacy per-job
+ *   override (which was a workaround for there being only one global
+ *   agent) and lets operators co-locate model + budget + auth
+ *   decisions per-agent.
+ *
+ * Sprint 5.2d follow-up gaps:
+ *   - Bus-adapter hot-reload on settings change: still requires
+ *     daemon restart. The scheduler IS hot-reloaded by `start.ts`'s
+ *     30s reload loop (heartbeat / job changes rebuild the scheduler
+ *     in-process).
  */
 
 import type { BusCore } from "./core";
 import { createBusScheduler, type BusScheduler, type ScheduledTrigger } from "./scheduler";
 import type { HeartbeatConfig } from "../config";
 import type { Job } from "../jobs";
+import { isHeartbeatExcludedAt } from "../heartbeat-windows";
 
 export interface ScheduledItem {
   /** Stable label for logging — e.g. `"heartbeat"` or `"cron:auto-commit"`. */
@@ -91,23 +104,31 @@ export async function wireBusScheduler(opts: WireBusSchedulerOptions): Promise<B
 
   // Heartbeat: one trigger per daemon when enabled.
   if (opts.heartbeat.enabled && opts.defaultAgentId) {
-    if (opts.heartbeat.excludeWindows.length > 0) {
-      // Documented limitation — operators relying on this stay on
-      // `runtime: pty` until the scheduler grows exclusion-window
-      // support.
-      logger.warn(
-        "[bus-scheduler] settings.heartbeat.excludeWindows is set but the Bus scheduler doesn't honour it yet. The heartbeat will fire every interval regardless of windowing.",
-      );
-    }
+    // Sprint 5.2d (PR #126): excludeWindows is now honoured via a
+    // shouldFire filter on each tick. The filter captures the
+    // heartbeat config + timezone offset by reference — hot-reload
+    // (Sprint 5.2d follow-up) rebuilds the scheduler, so a stale
+    // capture isn't a concern.
+    const heartbeatCfg = opts.heartbeat;
+    const tzOffset = opts.timezoneOffsetMinutes ?? 0;
+    const shouldFire = (nowMs: number): boolean => {
+      if (heartbeatCfg.excludeWindows.length === 0) return true;
+      return !isHeartbeatExcludedAt(heartbeatCfg, tzOffset, new Date(nowMs));
+    };
     try {
       const trigger = scheduler.scheduleHeartbeat({
         agent_id: opts.defaultAgentId,
         interval_minutes: opts.heartbeat.interval,
         prompt: opts.heartbeat.prompt,
+        shouldFire,
       });
       scheduled.push({ label: "heartbeat", trigger });
+      const windowLabel =
+        opts.heartbeat.excludeWindows.length > 0
+          ? `, ${opts.heartbeat.excludeWindows.length} exclusion window(s) honoured`
+          : "";
       logger.info(
-        `[bus-scheduler] heartbeat scheduled every ${opts.heartbeat.interval}m for agent="${opts.defaultAgentId}"`,
+        `[bus-scheduler] heartbeat scheduled every ${opts.heartbeat.interval}m for agent="${opts.defaultAgentId}"${windowLabel}`,
       );
     } catch (err) {
       logger.warn(

@@ -37,6 +37,7 @@ import {
   type Settings,
 } from "../config";
 import { getDayAndMinuteAtOffset, buildClockPromptPrefix } from "../timezone";
+import { isHeartbeatExcludedAt, isHeartbeatExcludedNow } from "../heartbeat-windows";
 import { startWebUi, type WebServerHandle } from "../web";
 import { initializeJobSystem } from "../orchestrator/resumable-jobs";
 import type { Job } from "../jobs";
@@ -153,50 +154,9 @@ try {
 }
 `;
 
-const ALL_DAYS = [0, 1, 2, 3, 4, 5, 6];
-
-function parseClockMinutes(value: string): number | null {
-  const match = value.match(/^([01]\d|2[0-3]):([0-5]\d)$/);
-  if (!match) return null;
-  return Number(match[1]) * 60 + Number(match[2]);
-}
-
-function isHeartbeatExcludedNow(config: HeartbeatConfig, timezoneOffsetMinutes: number): boolean {
-  return isHeartbeatExcludedAt(config, timezoneOffsetMinutes, new Date());
-}
-
-function isHeartbeatExcludedAt(
-  config: HeartbeatConfig,
-  timezoneOffsetMinutes: number,
-  at: Date,
-): boolean {
-  if (!Array.isArray(config.excludeWindows) || config.excludeWindows.length === 0) return false;
-  const local = getDayAndMinuteAtOffset(at, timezoneOffsetMinutes);
-
-  for (const window of config.excludeWindows) {
-    const start = parseClockMinutes(window.start);
-    const end = parseClockMinutes(window.end);
-    if (start == null || end == null) continue;
-    const days = Array.isArray(window.days) && window.days.length > 0 ? window.days : ALL_DAYS;
-    const sameDay = start < end;
-
-    if (sameDay) {
-      if (days.includes(local.day) && local.minute >= start && local.minute < end) return true;
-      continue;
-    }
-
-    if (start === end) {
-      if (days.includes(local.day)) return true;
-      continue;
-    }
-
-    if (local.minute >= start && days.includes(local.day)) return true;
-    const previousDay = (local.day + 6) % 7;
-    if (local.minute < end && days.includes(previousDay)) return true;
-  }
-
-  return false;
-}
+// Sprint 5.2d (PR #126): exclusion-window logic extracted to
+// `src/heartbeat-windows.ts` so `wireBusScheduler` can reuse it. The
+// legacy heartbeat tick still imports + calls these.
 
 function nextAllowedHeartbeatAt(
   config: HeartbeatConfig,
@@ -443,7 +403,10 @@ export async function start(args: string[] = []) {
   let web: WebServerHandle | null = null;
   let discordStopGateway: (() => void) | null = null;
   let slackStopFn: (() => void) | null = null;
-  let busRuntimeHandle: { stop(): Promise<void> } | null = null;
+  // Full `BusRuntimeHandle` shape (rather than the narrow `{stop}`)
+  // so the hot-reload loop can reach `.bus` to rebuild the scheduler
+  // when heartbeat/jobs change. Sprint 5.2d.
+  let busRuntimeHandle: import("../bus/runtime-mount").BusRuntimeHandle | null = null;
 
   // Plugin system — initialize before gateway start
   const pluginManager = new PluginManager(process.cwd());
@@ -1174,7 +1137,7 @@ export async function start(args: string[] = []) {
           `[${ts()}] Config change detected — heartbeat: ${newSettings.heartbeat.enabled ? `every ${newSettings.heartbeat.interval}m` : "disabled"}`,
         );
         currentSettings = newSettings;
-        scheduleHeartbeat();
+        if (!skipLegacyAdapters) scheduleHeartbeat();
       } else {
         currentSettings = newSettings;
       }
@@ -1209,11 +1172,34 @@ export async function start(args: string[] = []) {
 
         // Slack changes
         await initSlack(newSettings.slack.botToken, newSettings.slack.appToken);
+      } else if (busRuntimeHandle && (hbChanged || jobNames !== oldJobNames)) {
+        // Sprint 5.2d: Bus-scheduler hot-reload for heartbeat + jobs.
+        // Adapter routing changes still require daemon restart — only
+        // the scheduler's per-trigger registration is cheap enough to
+        // rebuild in-process (cancel + create against the live bus).
+        try {
+          const { wireBusScheduler } = await import("../bus/scheduler-wiring");
+          const fresh = await wireBusScheduler({
+            bus: busRuntimeHandle.bus,
+            defaultAgentId: busRuntimeHandle.spawnedAgentIds[0] ?? null,
+            heartbeat: newSettings.heartbeat,
+            jobs: newJobs,
+            timezoneOffsetMinutes: newSettings.timezoneOffsetMinutes,
+          });
+          // attachScheduler stops the previous scheduler before
+          // replacing it (see runtime-mount.ts) so old triggers can't
+          // leak.
+          busRuntimeHandle.attachScheduler(fresh);
+          console.log(`[${ts()}] Bus scheduler reloaded — ${fresh.scheduled.length} trigger(s)`);
+        } catch (reErr) {
+          console.error(`[${ts()}] Bus scheduler hot-reload failed`, reErr);
+        }
       }
-      // Note: when `skipLegacyAdapters` is true, the Bus adapters are
-      // long-lived (mounted at boot via `wireBusAdapters`) and don't
-      // currently hot-reload on settings changes. Sprint 5.2c follow-up
-      // wires a settings-watcher into the Bus adapters too.
+      // Note: Bus ADAPTER changes (routing, tokens) still require a
+      // daemon restart. Hot-reloading running adapters with new
+      // routing would invalidate pending permission/ask maps; the
+      // restart is the safer move until we have a session-migration
+      // story.
     } catch (err) {
       console.error(`[${ts()}] Hot-reload error:`, err);
     }

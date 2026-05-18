@@ -55,6 +55,23 @@ export interface ScheduleHeartbeatRequest {
   interval_minutes: number;
   prompt: string;
   metadata?: Record<string, unknown>;
+  /**
+   * Optional fire-time filter. Evaluated synchronously at each tick BEFORE
+   * the `bus.sendPrompt` dispatch. Returning `false` skips the dispatch
+   * for that tick and reschedules the next one at the normal cadence —
+   * cadence is anchored to `startedAt`, so a skipped tick doesn't shift
+   * subsequent ones.
+   *
+   * Sprint 5.2d (PR #126): used by `wireBusScheduler` to honour
+   * `settings.heartbeat.excludeWindows`. The scheduler core stays
+   * agnostic to exclusion semantics; the operator-facing config lives
+   * in the wiring layer.
+   *
+   * Filter exceptions are routed to the scheduler's `onError` and the
+   * dispatch is skipped (fail-closed: if we can't decide, don't bug
+   * the operator at 3am).
+   */
+  shouldFire?: (now: number) => boolean;
 }
 
 export interface ScheduleCronRequest {
@@ -180,6 +197,24 @@ class BusSchedulerImpl implements BusScheduler {
       const nextTargetAbs = startedAt + (tickIndex + 1) * intervalMs;
       const delay = Math.max(0, nextTargetAbs - this.clock.now());
       rec.handle = this.clock.setTimeout(fire, delay);
+
+      // shouldFire gate (Sprint 5.2d). Evaluate BEFORE dispatch so an
+      // excluded window skips this tick cleanly. Cadence still anchored
+      // to startedAt, so a skip doesn't shift subsequent ticks. Filter
+      // exceptions fail-closed (skip dispatch) to avoid 3am surprises.
+      if (req.shouldFire) {
+        let allow = false;
+        try {
+          allow = req.shouldFire(this.clock.now());
+        } catch (err) {
+          this.onError(err, {
+            ctx: "scheduleHeartbeat.shouldFire",
+            agent_id: req.agent_id,
+            tick: tickIndex,
+          });
+        }
+        if (!allow) return;
+      }
 
       // Dispatch this tick. Failures are swallowed into onError — one
       // bad sendPrompt must not break the cadence.

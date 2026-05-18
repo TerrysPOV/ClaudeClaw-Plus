@@ -276,6 +276,95 @@ describe("BusScheduler.scheduleHeartbeat", () => {
       }),
     ).toThrow();
   });
+
+  // Sprint 5.2d (PR #126): shouldFire filter — used by wireBusScheduler
+  // to honour `settings.heartbeat.excludeWindows`. Cadence is anchored
+  // to startedAt, so a skipped tick doesn't shift subsequent ones.
+
+  it("shouldFire=false skips the dispatch but keeps the cadence", () => {
+    const { bus, calls } = createFakeBus();
+    const clock = makeFakeClock();
+    scheduler = createBusScheduler({ bus, clock });
+
+    let allow = true;
+    scheduler.scheduleHeartbeat({
+      agent_id: "alpha",
+      interval_minutes: 1,
+      prompt: "ping",
+      shouldFire: () => allow,
+    });
+
+    // Tick 1 fires (filter returns true).
+    clock.advance(60_000);
+    expect(calls).toHaveLength(1);
+
+    // Tick 2 is gated off.
+    allow = false;
+    clock.advance(60_000);
+    expect(calls).toHaveLength(1);
+
+    // Tick 3 also gated.
+    clock.advance(60_000);
+    expect(calls).toHaveLength(1);
+
+    // Tick 4 re-enabled — fires normally.
+    allow = true;
+    clock.advance(60_000);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("shouldFire receives the current scheduler clock time", () => {
+    const { bus, calls } = createFakeBus();
+    const clock = makeFakeClock(1_700_000_000_000);
+    scheduler = createBusScheduler({ bus, clock });
+
+    const seenTimes: number[] = [];
+    scheduler.scheduleHeartbeat({
+      agent_id: "alpha",
+      interval_minutes: 1,
+      prompt: "ping",
+      shouldFire: (now) => {
+        seenTimes.push(now);
+        return true;
+      },
+    });
+
+    clock.advance(60_000);
+    clock.advance(60_000);
+    expect(calls).toHaveLength(2);
+    expect(seenTimes).toEqual([1_700_000_060_000, 1_700_000_120_000]);
+  });
+
+  it("shouldFire that throws routes to onError and skips the dispatch", () => {
+    const { bus, calls } = createFakeBus();
+    const clock = makeFakeClock();
+    const errors: unknown[] = [];
+    scheduler = createBusScheduler({
+      bus,
+      clock,
+      onError: (err) => errors.push(err),
+    });
+
+    scheduler.scheduleHeartbeat({
+      agent_id: "alpha",
+      interval_minutes: 1,
+      prompt: "ping",
+      shouldFire: () => {
+        throw new Error("filter boom");
+      },
+    });
+
+    clock.advance(60_000);
+    // Dispatch suppressed (fail-closed) and the error surfaced via
+    // onError. The schedule continues — next tick still scheduled.
+    expect(calls).toHaveLength(0);
+    expect(errors).toHaveLength(1);
+
+    // Filter still throws next tick — dispatch still skipped.
+    clock.advance(60_000);
+    expect(calls).toHaveLength(0);
+    expect(errors).toHaveLength(2);
+  });
 });
 
 /* ───────────────────────────────────────────────────────────────────── */
