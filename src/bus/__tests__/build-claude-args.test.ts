@@ -9,7 +9,7 @@
  * no channel. Every previous test bypassed this by setting
  * `argsOverride: []` on the SessionManager seam.
  */
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
@@ -106,6 +106,27 @@ describe("writeBusMcpConfig", () => {
       mcpServers: Record<string, unknown>;
     };
     expect(Object.keys(cfg.mcpServers)).toEqual(["plus-bus"]);
+  });
+
+  it("creates the synthesised config with 0600 perms (no leak of operator secrets)", () => {
+    // Codex P2 on PR #131: operator `mcp_config` entries may carry
+    // credentials in `env`/`headers`; the synth copy lives in /tmp and
+    // must not be world-readable. Mirrors PR #72 item 2 for the PTY
+    // mcp-config writer.
+    const userCfgPath = join(tmp, "user-mcp.json");
+    writeFileSync(
+      userCfgPath,
+      JSON.stringify({
+        mcpServers: {
+          secret: { command: "bun", env: { GITHUB_TOKEN: "ghp_secret" } },
+        },
+      }),
+    );
+    const agent = makeAgent({ id: "perms-test", mcp_config: userCfgPath });
+    const path = writeBusMcpConfig(agent, { warn: () => {} });
+    // Lowest 9 bits = file permission bits; mask off type bits.
+    const mode = statSync(path).mode & 0o777;
+    expect(mode).toBe(0o600);
   });
 
   it("falls back to bus-only when operator mcp_config is malformed JSON", () => {

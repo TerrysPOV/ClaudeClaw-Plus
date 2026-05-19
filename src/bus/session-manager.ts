@@ -28,7 +28,7 @@
  */
 
 import { spawn as nodeSpawnChildProcess } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -207,7 +207,19 @@ export function writeBusMcpConfig(
   }
   mcpServers[PLUS_BUS_CHANNEL] = busEntry;
   const path = join(tmpdir(), `claudeclaw-bus-mcp-${process.pid}-${agent.id}.json`);
-  writeFileSync(path, JSON.stringify({ mcpServers }, null, 2));
+  // 0600 — operator mcp_config entries may carry credentials in `env` or
+  // `headers`; the synthesised copy must not be world-readable in /tmp.
+  // Belt-and-braces (same pattern as src/runner/pty-mcp-config-writer.ts:172):
+  // `writeFileSync({mode})` only takes effect on CREATE and a permissive
+  // umask can still widen bits — an explicit chmodSync after the write
+  // forces 0600 regardless of platform / umask / prior file state.
+  writeFileSync(path, JSON.stringify({ mcpServers }, null, 2), { mode: 0o600 });
+  try {
+    chmodSync(path, 0o600);
+  } catch {
+    // Best-effort. Some test/FUSE filesystems lack permission semantics;
+    // the writeFileSync mode already applied where supported.
+  }
   return path;
 }
 
