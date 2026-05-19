@@ -39,6 +39,7 @@ import {
 import { getDayAndMinuteAtOffset, buildClockPromptPrefix } from "../timezone";
 import { isHeartbeatExcludedAt, isHeartbeatExcludedNow } from "../heartbeat-windows";
 import { startWebUi, type WebServerHandle } from "../web";
+import { streamBusPrompt } from "../bus/webui-bridge";
 import { initializeJobSystem } from "../orchestrator/resumable-jobs";
 import type { Job } from "../jobs";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
@@ -435,6 +436,11 @@ export async function start(args: string[] = []) {
   // so the hot-reload loop can reach `.bus` to rebuild the scheduler
   // when heartbeat/jobs change. Sprint 5.2d.
   let busRuntimeHandle: import("../bus/runtime-mount").BusRuntimeHandle | null = null;
+  // The live BusCore once `runtime: "bus"` mounts. Hoisted so the
+  // webui can build a bridge that calls `bus.sendPrompt` for its
+  // trigger routes (jobs/fire, inject, chat) instead of spawning a
+  // sidecar PTY claude that would race the bus's own session.
+  let busCoreForWebUi: import("../bus/core").BusCore | null = null;
 
   // Plugin system — initialize before gateway start
   const pluginManager = new PluginManager(process.cwd());
@@ -539,6 +545,7 @@ export async function start(args: string[] = []) {
       busRuntimeHandle = handle;
       busRuntimeSpawnedAgents = handle.spawnedAgentIds;
       busRuntimeAdapterNames = handle.mountedAdapterNames;
+      busCoreForWebUi = bus;
     } catch (err) {
       console.error(
         `[${ts()}] Bus runtime: mount failed — falling back to legacy command surfaces only`,
@@ -550,10 +557,19 @@ export async function start(args: string[] = []) {
     }
   }
   // Legacy adapter gate (Sprint 5.2b): when the Bus mount succeeded, the
-  // legacy initTelegram / initDiscord / initSlack / legacy Web UI startup
-  // below MUST be skipped so each platform's inbound traffic is handled
-  // only by the Bus adapter. The variable is hoisted so the existing
+  // legacy initTelegram / initDiscord / initSlack startup below MUST be
+  // skipped so each platform's inbound traffic is handled only by the
+  // Bus adapter. The variable is hoisted so the existing
   // `await initTelegram(...)` call sites further down can guard on it.
+  //
+  // NOTE: web is NOT skipped any more. The legacy dashboard (sessions,
+  // logs, kanban, settings, job mgmt) is the documented operator UI
+  // and has feature parity for read paths; the trigger paths
+  // (/api/jobs/fire, /api/inject, /api/chat) route through
+  // `bus.sendPrompt` via the BusWebUiBridge so they don't sidestep the
+  // bus's per-agent claude. Sprint 5.2b's old behaviour (skip legacy
+  // web) left operators with a "not_found" page because the bus webui
+  // adapter at `/health` + `/prompt` is not a dashboard replacement.
   const skipLegacyAdapters = busRuntimeHandle !== null;
 
   let mcpProxyStarted: Promise<void> = Promise.resolve();
@@ -926,8 +942,46 @@ export async function start(args: string[] = []) {
               onChunk(await handleWizardInput(wizardCtx, message));
               return;
             }
+            // Bus runtime: route the chat through the bus's default
+            // agent so it lands in the same claude session every other
+            // surface (Discord/Telegram/cron) drives. Pass the chunk
+            // callback so each `response.text` event from the agent
+            // gets streamed back to the dashboard SSE in real time.
+            const bus = busCoreForWebUi;
+            const defaultAgent = busRuntimeSpawnedAgents[0];
+            if (bus && defaultAgent) {
+              await streamBusPrompt(bus, defaultAgent, message, {
+                origin: "webui",
+                originId: "chat",
+                onChunk,
+              });
+              onUnblock();
+              return;
+            }
             await streamUserMessage("chat", message, onChunk, onUnblock, onAgentEvent);
           },
+          bus:
+            busCoreForWebUi && busRuntimeSpawnedAgents[0]
+              ? {
+                  defaultAgentId: busRuntimeSpawnedAgents[0],
+                  sendPromptAndAwait: (agentId, text, sendOpts) =>
+                    streamBusPrompt(
+                      busCoreForWebUi as NonNullable<typeof busCoreForWebUi>,
+                      agentId,
+                      text,
+                      {
+                        // `BusWebUiBridge.sendPromptAndAwait`'s `origin` is
+                        // typed as `string` to keep `src/ui/types.ts`
+                        // independent of the bus types. The bus tagged
+                        // union is narrower; only webui callers reach
+                        // this path so the cast is safe at the seam.
+                        origin: sendOpts?.origin as import("../bus/types").BusOrigin | undefined,
+                        originId: sendOpts?.originId,
+                        timeoutMs: sendOpts?.timeoutMs,
+                      },
+                    ),
+                }
+              : undefined,
         });
       } catch (err) {
         lastError = err;
@@ -938,20 +992,23 @@ export async function start(args: string[] = []) {
     throw lastError;
   }
 
-  if (webEnabled && !skipLegacyAdapters) {
+  if (webEnabled) {
     currentSettings.web.enabled = true;
     web = startWebWithFallback(currentSettings.web.host, webPort);
     currentSettings.web.port = web.port;
     console.log(
-      `[${new Date().toLocaleTimeString()}] Web UI listening on http://${web.host}:${web.port}`,
+      `[${new Date().toLocaleTimeString()}] Web UI listening on http://${web.host}:${web.port}` +
+        (skipLegacyAdapters ? " (bus-aware)" : ""),
     );
-  } else if (webEnabled && skipLegacyAdapters) {
-    // The Bus Web UI adapter (when configured via `settings.web.bus`) is
-    // already mounted by `wireBusAdapters`. We skip the legacy dashboard
-    // to avoid two HTTP listeners trying to claim the same port.
-    console.log(
-      `[${new Date().toLocaleTimeString()}] Web UI: handled by Bus adapter${busRuntimeAdapterNames.includes("webui") ? "" : " (not configured)"}`,
-    );
+    if (skipLegacyAdapters && busRuntimeAdapterNames.includes("webui")) {
+      // Operator has BOTH the legacy dashboard AND the optional bus
+      // webui adapter mounted. They serve different surfaces (dashboard
+      // vs `/health` + `/prompt`) and live on different ports. Worth a
+      // one-line log so the operator isn't surprised by two listeners.
+      console.log(
+        `[${new Date().toLocaleTimeString()}] Web UI: bus adapter also mounted on ${currentSettings.web.bus?.bind ?? "(no bind configured)"}`,
+      );
+    }
   }
 
   // --- Helpers ---

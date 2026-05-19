@@ -298,7 +298,30 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
           if (!agent || !label) {
             return json({ ok: false, error: "agent and label are required" });
           }
-          const result = await fireJob(agent, label);
+          // Bus runtime: route the prompt through the live bus so claude
+          // is driven by the existing per-agent session rather than a
+          // sidecar PTY spawn (which would race the bus's own claude).
+          // Inject a runner that maps `runner(name, prompt, agent)` to
+          // `bus.sendPromptAndAwait(agent, prompt)` and keep `fireJob`'s
+          // existing storage-lookup + prompt-resolution logic intact.
+          const fireOpts = opts.bus
+            ? {
+                runner: async (name: string, prompt: string, jobAgent?: string) => {
+                  const target = jobAgent ?? agent;
+                  const out = await (opts.bus as NonNullable<typeof opts.bus>).sendPromptAndAwait(
+                    target,
+                    prompt,
+                    { origin: "webui", originId: `job:${name}` },
+                  );
+                  return {
+                    exitCode: out.exitCode,
+                    stdout: out.output,
+                    stderr: out.ok ? "" : (out.error ?? ""),
+                  };
+                },
+              }
+            : undefined;
+          const result = await fireJob(agent, label, fireOpts);
           return json({
             ok: result.success,
             success: result.success,
@@ -367,8 +390,26 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
           const body = await req.json();
           const message = typeof body.message === "string" ? body.message.trim() : "";
           if (!message) return json({ ok: false, error: "message is required" }, 400);
-          const result = await runUserMessage("inject", message);
-          const text = result.stdout.trim();
+          // Bus runtime: route the inject through the bus's default
+          // agent so it lands in the same claude session the heartbeat
+          // and adapters are driving. Legacy runtime falls back to the
+          // PTY runner — `inject` was its "send a prompt into the
+          // current session" path.
+          let stdout: string;
+          let exitCode: number;
+          if (opts.bus) {
+            const out = await opts.bus.sendPromptAndAwait(opts.bus.defaultAgentId, message, {
+              origin: "webui",
+              originId: "inject",
+            });
+            stdout = out.output;
+            exitCode = out.exitCode;
+          } else {
+            const result = await runUserMessage("inject", message);
+            stdout = result.stdout;
+            exitCode = result.exitCode;
+          }
+          const text = stdout.trim();
           const { telegram } = opts.getSnapshot().settings;
           if (text && telegram.token && telegram.allowedUserIds.length > 0) {
             const chatId = telegram.allowedUserIds[0];
@@ -378,7 +419,7 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
               body: JSON.stringify({ chat_id: chatId, text }),
             }).catch(() => {});
           }
-          return json({ ok: true, result: result.stdout, exitCode: result.exitCode });
+          return json({ ok: true, result: stdout, exitCode });
         } catch (err) {
           return json({ ok: false, error: String(err) }, 500);
         }
