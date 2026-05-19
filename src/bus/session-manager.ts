@@ -400,6 +400,25 @@ export class SessionManager {
       throw new Error(`unsupported supervision mode: ${mode satisfies never}`);
     }
 
+    // Register the proc + attach the cleanup `onExit` BEFORE awaiting
+    // the collision detector. Codex P1 on this PR: if the process exits
+    // during the detection window for a non-collision reason (auth
+    // error, missing config, claude crash) and we register after the
+    // await, our `proc.onExit` handler is pushed onto a handler array
+    // whose owning proc has already exited — `PtyAgentProcess.onExit` /
+    // `ChildAgentProcess.onExit` are push-only and don't replay past
+    // exits. The cleanup never fires, leaving a dead entry in
+    // `this.agents` that breaks the next `already spawned` guard.
+    const record: AgentRecord = { agent, origin, mode, proc };
+    this.agents.set(agent.id, record);
+    // Auto-cleanup: drop registry entry on exit so restart() can reuse the id.
+    proc.onExit(() => {
+      const current = this.agents.get(agent.id);
+      if (current && current.proc === proc) {
+        this.agents.delete(agent.id);
+      }
+    });
+
     // Watch the spawn for a session-id collision before handing the
     // process back to the caller. Returns true iff claude emitted the
     // marker AND exited with code 1 within the detection window; any
@@ -426,25 +445,29 @@ export class SessionManager {
         ((agentId: string, sessionId: string) => createSession(sessionId, agentId));
       await persist(agent.id, fresh);
       agent.session_id = fresh;
+      // The proc that emitted the collision marker has exited; clear
+      // its registry slot so the recursive respawn doesn't trip the
+      // `already spawned` guard (the `onExit` cleanup above may not
+      // have fired yet if the exit raced the detector's resolve).
+      const current = this.agents.get(agent.id);
+      if (current && current.proc === proc) {
+        this.agents.delete(agent.id);
+      }
       return this.spawnAgentInternal(agent, origin, retry + 1);
     }
     if (collision) {
       // Retried once and still colliding — surface a real error so the
-      // operator notices instead of silently looping.
+      // operator notices instead of silently looping. Same registry-
+      // slot cleanup as the rotation path.
+      const current = this.agents.get(agent.id);
+      if (current && current.proc === proc) {
+        this.agents.delete(agent.id);
+      }
       throw new Error(
         `agent ${agent.id}: session-id collision persisted after rotation (id=${agent.session_id}) — manual intervention required`,
       );
     }
 
-    const record: AgentRecord = { agent, origin, mode, proc };
-    this.agents.set(agent.id, record);
-    // Auto-cleanup: drop registry entry on exit so restart() can reuse the id.
-    proc.onExit(() => {
-      const current = this.agents.get(agent.id);
-      if (current && current.proc === proc) {
-        this.agents.delete(agent.id);
-      }
-    });
     return proc;
   }
 

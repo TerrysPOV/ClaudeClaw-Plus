@@ -480,4 +480,34 @@ describe("session-id collision rotation", () => {
     expect(persisted).toHaveLength(0);
     expect(agent.session_id).toBe(STALE);
   });
+
+  it("releases the registry slot when the proc exits during the detection window for a non-collision reason (Codex P1 on #135)", async () => {
+    // Regression for the race Codex flagged: process exits within the
+    // detection window for a NON-collision reason (auth fail, missing
+    // config, claude crash). If `proc.onExit` cleanup wasn't attached
+    // BEFORE the await, the dead entry stays in `this.agents` and the
+    // next spawn for the same agent throws "already spawned".
+    const STALE = "33333333-3333-3333-3333-333333333bad";
+    const mgr = new SessionManager({
+      commandOverride: "/bin/sh",
+      // Exit fast with no marker — simulates a non-collision crash
+      // inside the detection window.
+      argsOverride: ["-c", "echo non-collision crash; exit 1"],
+      busSocketPath: "/tmp/test-bus-rotate.sock",
+      sessionCollisionDetectMs: 300,
+      logger: { warn: () => {}, info: () => {}, error: () => {} },
+    });
+    const agent = mkAgent({ id: "rot-race", session_id: STALE });
+    // First spawn returns the (now-exited) proc — the manager should
+    // have cleaned up its registry slot via onExit, so a second call
+    // is allowed.
+    const proc1 = await mgr.spawnAgent(agent, "cron");
+    expect(proc1).toBeDefined();
+    // Tiny yield so any pending onExit microtasks settle.
+    await new Promise((r) => setTimeout(r, 50));
+    // If the registry slot wasn't released, the second spawn throws.
+    const proc2 = await mgr.spawnAgent(agent, "cron");
+    expect(proc2).toBeDefined();
+    await new Promise((r) => setTimeout(r, 50));
+  });
 });
