@@ -34,6 +34,7 @@ import { getMcpBridge } from "../mcp-bridge.js";
 import { McpServerProcess, type McpServerConfig } from "../mcp-proxy/server-process.js";
 import { getSettings } from "../../config.js";
 import { McpHttpHandler } from "./http-handler.js";
+import { getMetricsRegistry } from "./metrics.js";
 import {
   issueIdentity as _issueIdentity,
   revokeIdentity as _revokeIdentity,
@@ -99,6 +100,11 @@ export interface MuxSettingsView {
    *  start time" — multiplexer resolves to
    *  `~/.config/claudeclaw/mcp-sessions/`. */
   sessionPersistencePath: string;
+  /** Issue #68: cost-tracking metrics on dispatch path. Default false
+   *  (opt-in). When true, `MetricsRegistry` records per-tuple counters
+   *  + latency samples and the `/api/multiplexer/metrics` endpoint
+   *  returns aggregated data. */
+  metricsEnabled: boolean;
 }
 
 function _readSettings(): MuxSettingsView {
@@ -128,6 +134,7 @@ function _readSettings(): MuxSettingsView {
   const rawPath = mcpObj.sessionPersistencePath;
   const sessionPersistencePath =
     typeof rawPath === "string" && rawPath.length > 0 && rawPath.startsWith("/") ? rawPath : "";
+  const metricsEnabled = mcpObj.metricsEnabled === true;
   return {
     webEnabled: s.web?.enabled === true,
     webHost: s.web?.host ?? "127.0.0.1",
@@ -138,6 +145,7 @@ function _readSettings(): MuxSettingsView {
     sessionPersistenceEnabled,
     sessionMaxAgeSeconds,
     sessionPersistencePath,
+    metricsEnabled,
   };
 }
 
@@ -229,6 +237,14 @@ export class McpMultiplexerPlugin {
     if (this.started) return;
 
     const settings = this.settingsView();
+
+    // Issue #68: cost-tracking metrics. Reflect the settings flag onto
+    // the registry on every start() — covers daemon boot AND
+    // operator-driven re-start() after settings reload. Disabling at
+    // runtime stops new recordings; collected data stays until the
+    // process exits. Use the injected settingsView so tests can drive
+    // the flag without standing up real settings.
+    getMetricsRegistry().setEnabled(settings.metricsEnabled);
 
     // Refuse to expose MCP servers over a non-loopback gateway.
     if (settings.webHost !== "127.0.0.1" && settings.webHost !== "localhost") {

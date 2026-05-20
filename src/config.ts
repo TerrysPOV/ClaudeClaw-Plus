@@ -182,6 +182,11 @@ const DEFAULT_SETTINGS: Settings = {
     sessionPersistenceEnabled: true,
     sessionMaxAgeSeconds: 3600,
     sessionPersistencePath: "",
+    rateLimit: { maxRequestsPerWindow: 600, windowMs: 60_000 },
+    // Issue #68: cost-tracking metrics on the multiplexer dispatch
+    // path. Default OFF for MVP — operators opt in via settings once
+    // the schema is stable.
+    metricsEnabled: false,
   },
   watchdog: { maxConsecutiveTimeouts: null, maxRuntimeSeconds: null },
   session: { autoRotate: false, maxMessages: 50, maxAgeHours: 24, summaryPath: "" },
@@ -411,6 +416,16 @@ export interface McpConfig {
     /** Sliding-window length in milliseconds. */
     windowMs: number;
   };
+  /**
+   * Cost-tracking metrics on the multiplexer dispatch path (issue #68).
+   * Per-tuple `(serverName, bucketKey, toolName)` counters + latency
+   * samples (p50/p95/p99). Default `false` for MVP; flip on once the
+   * schema is stable.
+   *
+   * When `true`, metrics are exposed at `/api/multiplexer/metrics`
+   * (operator-only — bootstrap-token-authenticated).
+   */
+  metricsEnabled: boolean;
 }
 
 export interface PtyConfig {
@@ -1229,6 +1244,9 @@ function parseMcpConfig(raw: any, webEnabled: unknown): McpConfig {
     rateWindowMs = Math.max(100, Math.floor(rawRateWin));
   }
 
+  // Issue #68: cost-tracking metrics. Default off — operator opts in.
+  const metricsEnabled = raw?.metricsEnabled === true;
+
   return {
     shared: filteredShared,
     perPtyOnly,
@@ -1241,6 +1259,7 @@ function parseMcpConfig(raw: any, webEnabled: unknown): McpConfig {
       maxRequestsPerWindow: rateMaxRequestsPerWindow,
       windowMs: rateWindowMs,
     },
+    metricsEnabled,
   };
 }
 

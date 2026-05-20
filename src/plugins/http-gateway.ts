@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "n
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { getMcpBridge } from "./mcp-bridge.js";
+import { getMetricsRegistry } from "./mcp-multiplexer/metrics.js";
 
 const PluginManifestSchema = z.object({
   name: z.string().regex(/^[a-z][a-z0-9-]*$/, "name must be lowercase kebab-case"),
@@ -80,6 +81,15 @@ export class PluginHttpGateway {
 
     if (path === "/api/plugin/register" && method === "POST") return this.handleRegister(req);
     if (path === "/api/plugin/list" && method === "GET") return this.handleList(req);
+
+    // /api/multiplexer/metrics — operator-only metrics snapshot
+    // (issue #68). Authenticated with the bootstrap token, same
+    // pattern as plugin registration. Returns the current counters +
+    // latency percentiles for every (server, bucket, tool) tuple the
+    // multiplexer has dispatched against since start.
+    if (path === "/api/multiplexer/metrics" && method === "GET") {
+      return this.handleMultiplexerMetrics(req);
+    }
 
     // /api/plugin/:name/tools/:tool/invoke
     const invokeM = path.match(/^\/api\/plugin\/([^/]+)\/tools\/([^/]+)\/invoke$/);
@@ -427,6 +437,29 @@ export class PluginHttpGateway {
       last_health_check: p.lastHealthCheck ?? null,
     }));
     return json({ plugins: list, request_id: requestId });
+  }
+
+  /**
+   * /api/multiplexer/metrics — snapshot of multiplexer dispatch
+   * counters + latency percentiles. Issue #68. Bootstrap-token
+   * authenticated (same auth gate as `/api/plugin/register`).
+   *
+   * When `settings.mcp.metricsEnabled` is `false` (the default), the
+   * registry is disabled and the snapshot returns
+   * `{ enabled: false, tuples: [] }` — the endpoint stays reachable
+   * so operators can probe the flag from any tooling.
+   */
+  private async handleMultiplexerMetrics(req: Request): Promise<Response> {
+    const requestId = this.requestId(req);
+    const authToken = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/, "");
+    if (!this.verifyBootstrap(authToken)) {
+      return json(
+        this.errorBody("invalid_bootstrap", "Invalid or missing Bearer token", requestId),
+        401,
+      );
+    }
+    const snapshot = getMetricsRegistry().snapshot();
+    return json({ ...snapshot, request_id: requestId });
   }
 
   private async handleHealthCheck(req: Request, name: string): Promise<Response> {

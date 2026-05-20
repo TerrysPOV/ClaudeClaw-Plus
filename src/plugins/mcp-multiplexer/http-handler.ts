@@ -24,6 +24,7 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "node:crypto";
 import { getMcpBridge } from "../mcp-bridge.js";
+import { getMetricsRegistry } from "./metrics.js";
 import type { McpServerProcess } from "../mcp-proxy/server-process.js";
 import { AUTH_HEADER, PTY_ID_HEADER, PTY_TS_HEADER, verifyBearer } from "./pty-identity.js";
 import type { SessionPersistenceStore } from "./session-persistence.js";
@@ -56,7 +57,10 @@ export interface McpHttpHandlerOpts {
    *  `onsessioninitialized` callback; `releasePty` drops it; bucket
    *  reuse touches `lastUsedAt`. Stateless buckets are never persisted
    *  (no per-PTY identity to bind to). When undefined, the handler is
-   *  byte-identical to PR #71. */
+   *  behaviourally equivalent to PR #71 for the persistence axis —
+   *  observably identical until the post-#71 cost-tracking metrics
+   *  hook (issue #68) was added, which wraps the dispatch path with a
+   *  no-op timer when `mcp.metricsEnabled` is false (the default). */
   persistence?: SessionPersistenceStore;
   /** Optional per-bearer rate limit config (#72 item 1). When omitted or
    *  `maxRequestsPerWindow <= 0`, no limit is enforced. */
@@ -404,6 +408,11 @@ export class McpHttpHandler {
     // still keyed the window by ptyId (we use `STATELESS_BUCKET` for
     // the SDK session, but `_checkRateLimit` keys on the actual ptyId).
     this._rlWindows.delete(ptyId);
+    // Same hygiene for the cost-tracking metrics (issue #68): drop any
+    // tuples scoped to this PTY so stale percentiles from the reaped
+    // session don't bleed into the next bucket. 5-agent review on
+    // PR #cost-metrics flagged this class from PR #91 P2.
+    getMetricsRegistry().releasePty(this.serverName, ptyId);
     if (this.stateless) return; // no per-PTY bucket exists
     // Drop the persisted record FIRST so that even if the bucket's
     // already gone (race with transport_error path) the disk state is
@@ -549,17 +558,28 @@ export class McpHttpHandler {
           isError: true,
         };
       }
+      // Issue #68: cost-tracking metrics. `record()` returns a no-op
+      // timer when metrics are disabled, so this is zero-cost in the
+      // default path. The timer is started even before we know if the
+      // dispatch will succeed; `end(success)` is called in both arms
+      // so an exception path still records its latency + error count.
+      //
+      // Codex P2 on this PR: serialize the response FIRST, then
+      // `end(true)`. If `JSON.stringify(result)` throws (circular data,
+      // BigInt), control falls to the catch and `end(false)` records
+      // the error correctly. Calling `end(true)` before serialization
+      // would latch the timer as a success before the failure was
+      // observable — silently dropping the error increment.
+      const timer = getMetricsRegistry().record(this.serverName, bucketKey, name);
       try {
         const result = await this.proc.call(name, args ?? {});
+        const text = typeof result === "string" ? result : JSON.stringify(result);
+        timer.end(true);
         return {
-          content: [
-            {
-              type: "text",
-              text: typeof result === "string" ? result : JSON.stringify(result),
-            },
-          ],
+          content: [{ type: "text", text }],
         };
       } catch (err) {
+        timer.end(false);
         const message = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: "text", text: `Error: ${message}` }],

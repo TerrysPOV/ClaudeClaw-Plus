@@ -50,6 +50,8 @@ function makeSettingsView(partial: Partial<MuxSettingsView>): () => MuxSettingsV
     sessionPersistenceEnabled: false,
     sessionMaxAgeSeconds: 3600,
     sessionPersistencePath: "",
+    // Issue #68 — default OFF in tests; opt-in tests set true explicitly.
+    metricsEnabled: false,
     ...partial,
   };
   return () => view;
