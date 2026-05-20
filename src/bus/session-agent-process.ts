@@ -17,6 +17,7 @@
  */
 
 import type { ChildProcess } from "node:child_process";
+import { sanitizePtyPromptText } from "../runner/pty-process";
 import type { SupervisionMode } from "./types";
 
 export type ExitHandler = (code: number) => void;
@@ -118,7 +119,10 @@ export class PtyAgentProcess implements AgentProcess {
     // and the submitting CR in a single chunk is interpreted as a paste: the
     // text lands in the input box but is not submitted. So we write the text,
     // let the paste settle, then send the CR as a separate keystroke.
-    this.pty.write(line);
+    //
+    // Sanitize CR/LF in the prompt: an embedded `\r` would submit the prompt
+    // mid-line and corrupt the turn (Codex review P2 on PR #140).
+    this.pty.write(sanitizePtyPromptText(line));
     await new Promise((r) => setTimeout(r, 200));
     this.pty.write("\r");
   }

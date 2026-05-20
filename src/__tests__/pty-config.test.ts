@@ -326,6 +326,17 @@ describe("parseSettings — mcp block (MCP multiplexer, SPEC §5)", () => {
       sessionPersistenceEnabled: true,
       sessionMaxAgeSeconds: 3600,
       sessionPersistencePath: "",
+      rateLimit: { maxRequestsPerWindow: 600, windowMs: 60_000 },
+      // Issue #68 metrics + #69 response cache defaults (added after this
+      // test was written; sync explicit-empty expectation with the schema).
+      metricsEnabled: false,
+      cache: {
+        enabled: false,
+        ttlMs: 5_000,
+        maxEntries: 1_000,
+        cacheable: {},
+        defensiveInvalidation: true,
+      },
     });
   });
 });

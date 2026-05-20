@@ -11,6 +11,7 @@
 
 export {
   spawnPty,
+  sanitizePtyPromptText,
   PtyTurnTimeoutError,
   PtyClosedError,
   type PtyProcess,

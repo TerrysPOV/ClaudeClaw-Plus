@@ -1281,3 +1281,80 @@ describe("pty-supervisor fresh-session persistence (Codex Phase D #2)", () => {
     expect(captured!.newSessionId).toBeUndefined();
   });
 });
+
+describe("pty-supervisor housekeeping (issue #65)", () => {
+  it("admission lock serialises enforceMaxConcurrent → getOrCreateEntry under burst", async () => {
+    // Cap of 2. Three concurrent admissions racing for a fresh adhoc slot.
+    // Without the admission lock, two callers can observe `size < cap` during
+    // the eviction `await` window and both add entries — exceeding the cap.
+    injectMaxConcurrentForTests(2);
+    let now = 1_000_000;
+    injectClock(() => now);
+
+    const { spawn, spawned } = makeSpawnTracker(() => makeFakePty("burst", {}));
+    injectSpawnPty(spawn);
+    await initSupervisor();
+
+    // Seed at cap with two distinct adhoc threads.
+    await runOnPty("thread:a", "x", { timeoutMs: 1000, threadId: "a" });
+    now = 1_000_010;
+    await runOnPty("thread:b", "x", { timeoutMs: 1000, threadId: "b" });
+    expect(snapshotSupervisor().ptys.length).toBe(2);
+
+    // Three new threads race. Each requires eviction. The lock must serialise
+    // them so the cap is preserved (snapshot size stays ≤ cap).
+    now = 1_000_100;
+    await Promise.all([
+      runOnPty("thread:c", "x", { timeoutMs: 1000, threadId: "c" }),
+      runOnPty("thread:d", "x", { timeoutMs: 1000, threadId: "d" }),
+      runOnPty("thread:e", "x", { timeoutMs: 1000, threadId: "e" }),
+    ]);
+
+    // After all three land, only `cap` live PTYs remain. Without the
+    // admission lock, two concurrent admissions could both observe
+    // `size < cap` mid-eviction and both add — pushing past the cap.
+    const live = snapshotSupervisor().ptys.length;
+    expect(live).toBeLessThanOrEqual(2);
+    // Both seed entries (a, b) must have been disposed as part of the burst —
+    // their slots were taken by the newcomers.
+    expect(spawned[0].disposed).toBe(true);
+    expect(spawned[1].disposed).toBe(true);
+  });
+
+  it("reaps a PTY that never completed a first turn after the spawn grace period", async () => {
+    // Default idleReapMinutes = 30 → spawn grace cutoff = 90 minutes.
+    // A stuck PTY at lastTurnEndedAt=0 should survive 60 min but be reaped at 91 min.
+    let now = 1_000_000;
+    injectClock(() => now);
+
+    const { spawn, spawned } = makeSpawnTracker(() => makeFakePty("stuck", {}));
+    injectSpawnPty(spawn);
+    await initSupervisor();
+
+    await runOnPty("thread:hung", "ping", { timeoutMs: 1000, threadId: "hung" });
+    // Force the stuck-mid-spawn condition by zeroing out the fake's
+    // `lastTurnEndedAt` even though the synthetic turn already completed —
+    // mimics a real claude that hung before emitting a turn boundary.
+    spawned[0].setLastTurnEndedAt(0);
+    expect(snapshotSupervisor().ptys.length).toBe(1);
+
+    const mod = await import("../runner/pty-supervisor");
+    const reapNow = (
+      mod as unknown as {
+        __reapNowForTests: (clock: () => number) => Promise<void>;
+      }
+    ).__reapNowForTests;
+
+    // 60 min in — still under the 90-min grace. Should NOT reap.
+    now += 60 * 60_000;
+    await reapNow(() => now);
+    expect(snapshotSupervisor().ptys.length).toBe(1);
+    expect(spawned[0].disposed).toBe(false);
+
+    // 91 min in — past grace. Should reap.
+    now += 31 * 60_000;
+    await reapNow(() => now);
+    expect(snapshotSupervisor().ptys.length).toBe(0);
+    expect(spawned[0].disposed).toBe(true);
+  });
+});

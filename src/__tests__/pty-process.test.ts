@@ -1,6 +1,7 @@
 import { describe, test, expect } from "bun:test";
 import {
   spawnPty,
+  sanitizePtyPromptText,
   PtyTurnTimeoutError,
   PtyClosedError,
   type PtyProcessOptions,
@@ -609,5 +610,31 @@ describe("PtyProcess — sessionId", () => {
     );
     expect(proc.sessionId).toBe(sid);
     await proc.dispose();
+  });
+});
+
+describe("sanitizePtyPromptText (issue #65 item 3)", () => {
+  test("replaces embedded CR with space", () => {
+    expect(sanitizePtyPromptText("hello\rworld")).toBe("hello world");
+  });
+
+  test("replaces embedded LF with space", () => {
+    expect(sanitizePtyPromptText("line one\nline two")).toBe("line one line two");
+  });
+
+  test("replaces CRLF as a single separator (not two spaces)", () => {
+    expect(sanitizePtyPromptText("a\r\nb")).toBe("a b");
+  });
+
+  test("preserves text with no CR/LF", () => {
+    expect(sanitizePtyPromptText("plain prompt")).toBe("plain prompt");
+  });
+
+  test("handles multiple newlines and mixed terminators", () => {
+    expect(sanitizePtyPromptText("a\nb\r\nc\rd")).toBe("a b c d");
+  });
+
+  test("preserves an empty string", () => {
+    expect(sanitizePtyPromptText("")).toBe("");
   });
 });

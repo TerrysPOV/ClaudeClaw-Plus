@@ -228,7 +228,7 @@ export interface SupervisorSnapshot {
     cwd: string;
     isAlive: boolean;
     lastTurnEndedAt: number;
-    /** "named" → never reaped; "adhoc" → reaped after idle. */
+    /** "named" → never reaped when `namedAgentsAlwaysAlive` is on; "adhoc"/"global" → reaped after idle. */
     kind: "named" | "adhoc" | "global";
   }>;
 }
@@ -371,6 +371,7 @@ export function __resetSupervisorForTests(): void {
   }
   state.initialised = false;
   _initPromise = null;
+  _admissionLock = Promise.resolve();
   _spawnPty = null;
   _ensureAgentDir = null;
   _cleanSpawnEnv = null;
@@ -404,6 +405,9 @@ interface PtyEntry {
   /** Last time `runOnPty` was called against this key. Drives LRU eviction
    *  when `pty.maxConcurrent` is hit. Adhoc-only — named agents are exempt. */
   lastAccessedAt: number;
+  /** Wall-clock at entry creation. Used by `reapIdle` to time out PTYs that
+   *  never complete a first turn (issue #65 item 6). */
+  createdAt: number;
 }
 
 interface SupervisorState {
@@ -511,6 +515,7 @@ export async function shutdownSupervisor(): Promise<void> {
   state.ptys.clear();
   state.initialised = false;
   _initPromise = null;
+  _admissionLock = Promise.resolve();
 }
 
 /**
@@ -626,10 +631,12 @@ export async function runOnPty(
   // Phase D fix #5: enforce maxConcurrent cap with LRU eviction BEFORE
   // allocating a new entry. Named agents are exempt — they're always-alive
   // by design.
-  await enforceMaxConcurrent(sessionKey);
-
-  // Per-key serial lock. Different keys proceed in parallel.
-  const entry = await getOrCreateEntry(sessionKey, opts);
+  //
+  // Issue #65 item 2: enforce + create must be a single critical section.
+  // `enforceMaxConcurrent` awaits on `dispose()`, opening a window where two
+  // concurrent admissions can both see "under cap" and both add entries —
+  // exceeding the cap. Serialize through `_admissionLock`.
+  const entry = await admitEntry(sessionKey, opts);
   entry.lastAccessedAt = _clock();
   const previousLock = entry.lock;
   let release: () => void = () => {};
@@ -676,6 +683,7 @@ async function getOrCreateEntry(
   if (existing) return existing;
 
   const kind = classifyKey(sessionKey, opts.threadId, opts.agentName);
+  const now = _clock();
   const entry: PtyEntry = {
     sessionKey,
     kind,
@@ -684,7 +692,8 @@ async function getOrCreateEntry(
     pty: null,
     spawnOpts: null,
     lock: Promise.resolve(),
-    lastAccessedAt: _clock(),
+    lastAccessedAt: now,
+    createdAt: now,
   };
   state.ptys.set(sessionKey, entry);
   return entry;
@@ -708,16 +717,53 @@ export function injectMaxRetriesForTests(n: number | null): void {
 }
 
 /**
+ * Issue #65 item 2: single mutex serialising the
+ * `enforceMaxConcurrent → getOrCreateEntry` admission critical section. Without
+ * this, two concurrent `runOnPty` calls can both observe `state.ptys.size < cap`
+ * during the eviction `await` window and both add new entries, exceeding the
+ * cap. Held only across admission (cheap: at most one `dispose()`), then
+ * released so different keys proceed in parallel on the per-entry lock.
+ */
+let _admissionLock: Promise<void> = Promise.resolve();
+
+async function admitEntry(
+  sessionKey: string,
+  opts: {
+    threadId?: string;
+    agentName?: string;
+    modelOverride?: string;
+  },
+): Promise<PtyEntry> {
+  const prev = _admissionLock;
+  let release: () => void = () => {};
+  _admissionLock = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  try {
+    await prev;
+    await enforceMaxConcurrent(sessionKey);
+    return await getOrCreateEntry(sessionKey, opts);
+  } finally {
+    release();
+  }
+}
+
+/**
  * Phase D fix #5 (FA-3a): cap the number of concurrent live PTYs to
  * `settings.pty.maxConcurrent`. When the cap is hit, evict the
- * least-recently-accessed AD-HOC PTY (named agents are exempt — they're
- * marked `namedAgentsAlwaysAlive` by design). The evicted PTY is disposed
- * and its entry removed from the state map.
+ * least-recently-accessed AD-HOC PTY. Both `named` agents (always-alive
+ * by design) and `global` entries (per-cwd anonymous sessions used by the
+ * legacy non-bus runtime) are exempt — only `adhoc` is considered for
+ * eviction. The evicted PTY is disposed and its entry removed from the
+ * state map.
  *
- * If the cap is hit but EVERY entry is exempt (all named agents) or the
+ * If the cap is hit but EVERY entry is exempt (all named/global) or the
  * incoming key is for a named agent that doesn't yet exist, we let it through
  * — the operator's named-agent slate is the source of truth and shouldn't be
  * silently shrunk by a thread burst.
+ *
+ * Concurrency: callers must hold `_admissionLock` to serialise the check +
+ * eviction window. See `admitEntry`.
  */
 async function enforceMaxConcurrent(incomingKey: string): Promise<void> {
   let cap: number;
@@ -1265,15 +1311,25 @@ async function persistSessionId(entry: PtyEntry, sessionId: string): Promise<voi
 }
 
 async function reapIdle(opts: SupervisorOptions): Promise<void> {
-  const cutoff = _clock() - opts.idleReapMinutes * 60_000;
+  const now = _clock();
+  const cutoff = now - opts.idleReapMinutes * 60_000;
+  // Issue #65 item 6: PTYs that never complete a first turn used to be skipped
+  // forever, so a claude that crashed during spawn (or any case where
+  // `lastTurnEndedAt` stays 0) would hold a slot under `maxConcurrent`
+  // indefinitely. Give a generous grace period (3× idleReapMinutes) so slow
+  // first-turn cases aren't false-positives, then reap by `createdAt`.
+  const spawnGraceCutoff = now - opts.idleReapMinutes * 60_000 * 3;
   const toReap: PtyEntry[] = [];
   for (const entry of state.ptys.values()) {
     if (!entry.pty) continue;
     // Named agents stay alive forever when the flag is on.
     if (entry.kind === "named" && opts.namedAgentsAlwaysAlive) continue;
     const last = entry.pty.lastTurnEndedAt();
-    // A PTY that has never finished a turn is mid-spawn — leave it alone.
-    if (last === 0) continue;
+    if (last === 0) {
+      // Mid-spawn or stuck: reap only past the grace period.
+      if (entry.createdAt < spawnGraceCutoff) toReap.push(entry);
+      continue;
+    }
     if (last < cutoff) toReap.push(entry);
   }
   for (const entry of toReap) {
