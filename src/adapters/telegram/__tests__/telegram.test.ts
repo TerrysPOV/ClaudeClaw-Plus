@@ -841,8 +841,8 @@ describe("TelegramAdapter — stop()", () => {
     adapter = await startAdapter({
       routing: { chats: { "100": "triage", "200": "research" } },
     });
-    // Two agents × three topics = six subscriptions.
-    expect(bus.state().subscriberCount).toBe(6);
+    // Two agents × four topics (text, edit_text, permission, request_human) = eight.
+    expect(bus.state().subscriberCount).toBe(8);
     await adapter.stop();
     adapter = null;
     expect(bus.state().subscriberCount).toBe(0);

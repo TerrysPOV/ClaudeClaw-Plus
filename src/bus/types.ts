@@ -70,6 +70,7 @@ export type BusEventTopic =
   | "prompt"
   | "response.text"
   | "response.tool_use"
+  | "response.edit_text"
   | "response.thinking"
   | "tool_result"
   | "usage"
@@ -180,6 +181,7 @@ export type IpcMessage =
   | IpcHello
   | IpcPrompt
   | IpcReply
+  | IpcEditMessage
   | IpcAsk
   | IpcAskAnswer
   | IpcCancel
@@ -210,6 +212,17 @@ export interface IpcReply {
   agent_id: string;
   text: string;
   intent: "final" | "progress" | "tool_status";
+}
+
+/**
+ * Edit the agent's most-recent outbound message on its surface — for in-place
+ * progress updates. No message_id: the adapter remembers the last bot message
+ * it sent per agent and edits that, falling back to a new send if none exists.
+ */
+export interface IpcEditMessage {
+  type: "edit_message";
+  agent_id: string;
+  text: string;
 }
 
 export interface IpcAsk {

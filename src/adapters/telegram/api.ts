@@ -67,6 +67,12 @@ export function createTelegramApi(token: string): TelegramApi {
     async sendMessage(params) {
       return call("sendMessage", params as unknown as Record<string, unknown>);
     },
+    async editMessageText(params) {
+      return call("editMessageText", params as unknown as Record<string, unknown>);
+    },
+    async sendChatAction(params) {
+      return call("sendChatAction", params as unknown as Record<string, unknown>);
+    },
     async setMessageReaction(params) {
       return call("setMessageReaction", {
         chat_id: params.chat_id,

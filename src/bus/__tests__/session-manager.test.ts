@@ -175,13 +175,20 @@ describe("pty-stdin supervision", () => {
     expect(received).toContain("/compact");
   });
 
-  it("send_prompt_stream is rejected in pty-stdin mode", async () => {
-    const agent = mkAgent({ id: "pty-noprompt" });
+  it("send_prompt_stream types the prompt into the pty (pty-stdin mode)", async () => {
+    const agent = mkAgent({ id: "pty-prompt" });
     const proc = await mgr.spawnAgent(agent, "discord");
     spawned.push(proc);
-    await expect(proc.send_prompt_stream('{"type":"user","content":"hi"}')).rejects.toThrow(
-      /invalid for supervision=pty-stdin/,
-    );
+    let received = "";
+    proc.onData((chunk) => {
+      received += chunk;
+    });
+    // The /bin/cat stand-in echoes whatever is written to its PTY, so the
+    // prompt text shows up on the read side. Verifies the text reaches stdin
+    // (the CR submit is sent separately to defeat bracketed-paste buffering).
+    await proc.send_prompt_stream("hello world");
+    await waitFor(() => received.includes("hello world"));
+    expect(received).toContain("hello world");
   });
 
   it("emits onExit after the pty exits and clears registry", async () => {

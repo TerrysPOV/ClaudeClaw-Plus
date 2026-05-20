@@ -94,6 +94,15 @@ export type EventLogAppendFn = (entry: EventEntryInput) => Promise<EventRecord>;
  */
 export type SlashCommandHandler = (agent_id: string, cmd: string) => Promise<void>;
 
+/**
+ * Delivers an inbound prompt to an agent process as REPL input (PTY-stdin
+ * supervision). Wired by the Session Manager. When set, `sendPrompt` invokes
+ * it in addition to the `notifications/claude/channel` IPC notification, so
+ * headless (daemon-spawned) claudes — which don't start a turn from the MCP
+ * notification alone — receive the prompt as typed input and reliably respond.
+ */
+export type StreamPromptHandler = (agent_id: string, text: string) => Promise<void>;
+
 export interface BusCoreOptions {
   /** Path to bind the UDS server. If omitted, no IPC server is started. */
   socketPath?: string;
@@ -103,6 +112,8 @@ export interface BusCoreOptions {
   ringbufferCapacity?: number;
   /** Slash-command delegate (Agent C wires this). */
   slashCommandHandler?: SlashCommandHandler;
+  /** REPL prompt delegate for PTY-stdin agents. Wired by the Session Manager. */
+  streamPromptHandler?: StreamPromptHandler;
   /** Logger; defaults to console.error. */
   onError?: (err: unknown, ctx?: Record<string, unknown>) => void;
 }
@@ -122,6 +133,7 @@ export interface BusCore {
    * being a constructor-only option. Pass `null` to detach.
    */
   setSlashCommandHandler(handler: SlashCommandHandler | null): void;
+  setStreamPromptHandler(handler: StreamPromptHandler | null): void;
   ingestReply(req: IngestReplyRequest): void;
   ingestSessionEvent(e: BusEvent): void;
   ingestPermissionDecision(req: IngestPermissionDecisionRequest): void;
@@ -142,6 +154,7 @@ export class BusCoreImpl implements BusCore {
   private readonly ringbufferCapacity: number;
   private readonly eventLogAppend: EventLogAppendFn;
   private slashCommandHandler: SlashCommandHandler | null;
+  private streamPromptHandler: StreamPromptHandler | null;
   private readonly onError: (err: unknown, ctx?: Record<string, unknown>) => void;
   /**
    * Tracks the origin (surface + channel id) of the most recent prompt
@@ -159,6 +172,7 @@ export class BusCoreImpl implements BusCore {
     this.ringbufferCapacity = opts.ringbufferCapacity ?? DEFAULT_RINGBUFFER_CAPACITY;
     this.eventLogAppend = opts.eventLogAppend ?? eventLogAppend;
     this.slashCommandHandler = opts.slashCommandHandler ?? null;
+    this.streamPromptHandler = opts.streamPromptHandler ?? null;
     this.onError = opts.onError ?? ((err, ctx) => console.error("[bus]", err, ctx));
   }
 
@@ -256,6 +270,29 @@ export class BusCoreImpl implements BusCore {
         });
       }
     }
+
+    // PTY-stdin delivery for headless agents. Wrap the prompt as a
+    // <channel source=... chat_id=... user_id=... ts=... [meta...]>text</channel>
+    // block so the model knows it came from a surface and must respond with the
+    // `reply` tool (mirrors the inbound contract of aerolalit's reference channel
+    // plugin). Best-effort: a missing/failed handler never blocks the IPC path.
+    if (this.streamPromptHandler) {
+      const attrs = [
+        `source="${req.origin}"`,
+        `chat_id="${req.origin_id}"`,
+        `user_id="${req.user_id}"`,
+        `ts="${new Date().toISOString()}"`,
+      ];
+      if (req.metadata) {
+        for (const [k, v] of Object.entries(req.metadata)) {
+          attrs.push(`${k}="${String(v).replace(/"/g, "&quot;")}"`);
+        }
+      }
+      const wrapped = `<channel ${attrs.join(" ")}>${req.text}</channel>`;
+      void this.streamPromptHandler(req.agent_id, wrapped).catch((err) =>
+        this.onError(err, { ctx: "streamPromptHandler", agent_id: req.agent_id }),
+      );
+    }
     return { promise_id };
   }
 
@@ -270,6 +307,10 @@ export class BusCoreImpl implements BusCore {
 
   setSlashCommandHandler(handler: SlashCommandHandler | null): void {
     this.slashCommandHandler = handler;
+  }
+
+  setStreamPromptHandler(handler: StreamPromptHandler | null): void {
+    this.streamPromptHandler = handler;
   }
 
   /* ─────────────────────────────── subscriptions ─────────────────────────────── */
@@ -458,6 +499,20 @@ export class BusCoreImpl implements BusCore {
       case "reply":
         this.ingestReply({ agent_id: agentId, text: msg.text, intent: msg.intent });
         break;
+      case "edit_message": {
+        const origin = this.lastPromptOrigin.get(agentId);
+        this.publish({
+          ts: Date.now(),
+          agent_id: agentId,
+          session_id: "",
+          topic: "response.edit_text",
+          payload: {
+            text: msg.text,
+            ...(origin ? { origin: origin.origin, origin_id: origin.origin_id } : {}),
+          },
+        });
+        break;
+      }
       case "ask":
         // Surface as an event; the adapter is responsible for answering via
         // `ingestAskAnswer` (added in a later sprint). Sprint 1 emits the

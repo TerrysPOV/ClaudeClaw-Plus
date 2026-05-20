@@ -205,6 +205,15 @@ export async function mountBusRuntime(
     // invokes `bus.invokeSlashCommand`, the bus now knows how to route it
     // through the SessionManager's per-agent process handle.
     wireSlashCommands(bus, sessionManager);
+    // Wire PTY-stdin prompt delivery: route inbound prompts to the agent's
+    // REPL so headless claudes (which ignore the MCP channel notification)
+    // start a turn. No-op for agents whose process doesn't support streaming.
+    bus.setStreamPromptHandler(async (agentId, text) => {
+      const proc = sessionManager.getAgent(agentId);
+      if (proc && typeof proc.send_prompt_stream === "function") {
+        await proc.send_prompt_stream(text);
+      }
+    });
 
     // Auto-spawn declared agents. Sequential rather than parallel so
     // log output stays readable + spawn failures surface against a
@@ -318,6 +327,7 @@ export async function mountBusRuntime(
         // can't reach a torn-down SessionManager.
         try {
           bus.setSlashCommandHandler(null);
+          bus.setStreamPromptHandler(null);
         } catch (err) {
           logger.error("[bus-runtime] setSlashCommandHandler(null) failed", err);
         }
@@ -347,6 +357,7 @@ export async function mountBusRuntime(
       // belt-and-braces), then stop the bus.
       try {
         bus.setSlashCommandHandler(null);
+        bus.setStreamPromptHandler(null);
       } catch {
         /* ignore — surfacing the original error matters more. */
       }

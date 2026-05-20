@@ -203,6 +203,7 @@ const PLUGIN_MARKETPLACE_TAG = "inline";
  */
 const PLUS_BUS_TOOL_NAMES = [
   "mcp__plugin_claudeclaw-plus_plus-bus__reply",
+  "mcp__plugin_claudeclaw-plus_plus-bus__edit_message",
   "mcp__plugin_claudeclaw-plus_plus-bus__ask",
   "mcp__plugin_claudeclaw-plus_plus-bus__cancel",
   "mcp__plugin_claudeclaw-plus_plus-bus__request_human",
@@ -517,29 +518,27 @@ export class SessionManager {
         env,
       }),
     );
-    // Belt-and-braces: dismiss the WARNING: Loading development channels
-    // TUI dialog claude shows when `--dangerously-load-development-channels`
-    // is set AND the `tengu_harbor` feature flag is on for the account.
-    // Default selection is "I am using this for local development" so a
-    // single Enter accepts it. We send at 1.5s + 4s — the first covers
-    // a fast boot, the second is a no-op if the dialog has already been
-    // dismissed and a safety net for slow boots. With our current
-    // settings (no `channelsEnabled`) the dialog usually doesn't render
-    // at all; the writes are cheap insurance.
-    setTimeout(() => {
-      try {
-        pty.write("\r");
-      } catch {
-        /* pty may have exited already — non-fatal */
-      }
-    }, 1500);
-    setTimeout(() => {
-      try {
-        pty.write("\r");
-      } catch {
-        /* pty may have exited already — non-fatal */
-      }
-    }, 4000);
+    // Dismiss the WARNING: Loading development channels TUI dialog claude
+    // shows when `--dangerously-load-development-channels` is set AND the
+    // `tengu_harbor` feature flag is on for the account. Default selection is
+    // "I am using this for local development" so a single Enter accepts it.
+    //
+    // On accounts WITH the flag, the dialog blocks claude at boot — it never
+    // reaches the REPL, so no prompt ever lands and the surface looks dead.
+    // The original 1.5s + 4s pair was insufficient: on slower boots the dialog
+    // renders after 4s, so both writes land before it exists and are lost.
+    // Retry across a wider window. Each `\r` after the dialog is gone is an
+    // empty REPL submit (no-op turn), harmless. Accounts WITHOUT the flag
+    // never render the dialog and the writes are cheap insurance.
+    for (const ms of [1000, 2500, 5000, 8000]) {
+      setTimeout(() => {
+        try {
+          pty.write("\r");
+        } catch {
+          /* pty may have exited already — non-fatal */
+        }
+      }, ms);
+    }
     return new PtyAgentProcess(agent.id, pty);
   }
 

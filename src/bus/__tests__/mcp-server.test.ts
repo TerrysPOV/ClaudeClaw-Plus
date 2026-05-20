@@ -239,6 +239,20 @@ describe("BusMcpServer — outbound tools", () => {
     expect(reply.intent).toBe("progress");
   });
 
+  it("`edit_message` tool emits IpcEditMessage", async () => {
+    const result = await h.client.callTool({
+      name: "edit_message",
+      arguments: { message: "reading files..." },
+    });
+    expect(result.isError).toBeFalsy();
+    expect(h.ipc.sent.length).toBe(1);
+    const edit = take(h.ipc.sent[0], "edit_message");
+    expect(edit.type).toBe("edit_message");
+    if (edit.type !== "edit_message") throw new Error("type narrowing");
+    expect(edit.text).toBe("reading files...");
+    expect(edit.agent_id).toBe("agent-tools");
+  });
+
   it("`cancel` tool emits IpcCancel with reason when provided", async () => {
     await h.client.callTool({
       name: "cancel",

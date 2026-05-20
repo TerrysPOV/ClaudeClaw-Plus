@@ -309,6 +309,8 @@ export class BusMcpServer {
       switch (name) {
         case "reply":
           return this.handleReply(rawArgs);
+        case "edit_message":
+          return this.handleEditMessage(rawArgs);
         case "ask":
           return this.handleAsk(rawArgs);
         case "cancel":
@@ -450,6 +452,22 @@ export class BusMcpServer {
     };
   }
 
+  private handleEditMessage(raw: unknown) {
+    const args = raw as { message?: unknown };
+    if (typeof args.message !== "string") {
+      return {
+        content: [{ type: "text", text: "edit_message requires 'message' (string)" }],
+        isError: true,
+      };
+    }
+    this.ipc.send({
+      type: "edit_message",
+      agent_id: this.agentId,
+      text: args.message,
+    });
+    return { content: [{ type: "text", text: "edited" }] };
+  }
+
   private handleAsk(raw: unknown) {
     const args = AskArgsSchema.parse(raw ?? {});
     const askId = randomUUID();
@@ -531,10 +549,19 @@ export function buildMcpServer(): Server {
         },
       },
       instructions:
-        "ClaudeClaw+ Bus channel. Use `reply` to talk back to the originating surface; " +
-        "use `ask` for non-blocking clarifying questions; use `request_human` only when " +
-        "the agent loop must block on a human reply. Prompts arrive via " +
-        "notifications/claude/channel.",
+        "ClaudeClaw+ Bus channel. Messages from a surface (Telegram/Discord/Slack/Web) " +
+        "arrive as <channel source=\"...\" chat_id=\"...\" user_id=\"...\" ts=\"...\">text</channel> " +
+        "blocks typed into your REPL. Your transcript output is NOT visible to the user — " +
+        "only the `reply` and `edit_message` tools reach them. You MUST answer with `reply`.\n\n" +
+        "Pick ONE pattern per turn:\n" +
+        "  • DIRECT (chat / simple Q&A, no tools): a single `reply` intent:'final'.\n" +
+        "  • PROGRESSIVE (you'll run tools, read files, search or analyze): call `reply` " +
+        "    intent:'progress' first with a 1-line ack of what you're doing, then " +
+        "    `edit_message` to update that same message as you go (edits don't notify), " +
+        "    and finish with `reply` intent:'final' for the user-visible answer (this " +
+        "    push-notifies).\n" +
+        "Default to PROGRESSIVE whenever you use ANY tool; DIRECT only for pure chat. " +
+        "Use `ask` for non-blocking clarifying questions; `request_human` blocks the loop.",
     },
   );
 }
