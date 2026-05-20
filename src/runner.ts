@@ -1238,7 +1238,33 @@ export async function ensureProjectClaudeMd(): Promise<void> {
   }
 }
 
-export type PermissionMode = "plan" | "acceptEdits" | "bypassPermissions";
+/**
+ * Permission modes accepted by Claude Code's `--permission-mode` flag.
+ *
+ * Full-parity with the CLI choices (verified against `claude --help`
+ * 2026-05-20). Kept in sync with `VALID_PERMISSION_MODES` in
+ * `src/config.ts` and the union types in `src/bus/types.ts`. If any
+ * one of these three sites is updated, all three must move together —
+ * otherwise a value documented in one path will be silently rejected
+ * by another (Codex P2 on PR #145; 5-agent review Agent 2 on PR
+ * #expand-valid-permission-modes flagged this exact runner gap).
+ */
+export type PermissionMode =
+  | "default"
+  | "plan"
+  | "acceptEdits"
+  | "bypassPermissions"
+  | "dontAsk"
+  | "auto";
+
+const VALID_PERMISSION_MODES: ReadonlySet<PermissionMode> = new Set<PermissionMode>([
+  "default",
+  "plan",
+  "acceptEdits",
+  "bypassPermissions",
+  "dontAsk",
+  "auto",
+]);
 
 let cachedPermissionMode: PermissionMode | null = null;
 
@@ -1246,9 +1272,9 @@ export function getPermissionMode(): PermissionMode {
   if (cachedPermissionMode) return cachedPermissionMode;
   try {
     const raw = JSON.parse(readFileSync(PERMISSION_MODE_FILE, "utf8")) as { mode?: unknown };
-    if (raw.mode === "plan" || raw.mode === "acceptEdits" || raw.mode === "bypassPermissions") {
-      cachedPermissionMode = raw.mode;
-      return raw.mode;
+    if (typeof raw.mode === "string" && VALID_PERMISSION_MODES.has(raw.mode as PermissionMode)) {
+      cachedPermissionMode = raw.mode as PermissionMode;
+      return cachedPermissionMode;
     }
   } catch {}
   return "bypassPermissions";

@@ -945,7 +945,8 @@ const AGENT_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,35}$/;
  *
  * Validation:
  *   - `id` required, matches `AGENT_ID_PATTERN`, unique across the list.
- *   - `permission_mode` must be one of the valid trio (else drop and let
+ *   - `permission_mode` must be one of the six values accepted by
+ *     Claude Code's `--permission-mode` flag (else drop and let
  *     `resolveBusAgentConfig` apply the default of `"bypassPermissions"`,
  *     matching the documented headless contract).
  *   - `supervision` must be a known mode (else drop the field — internal

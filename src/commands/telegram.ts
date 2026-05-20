@@ -1446,15 +1446,31 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
 
   if (command === "/mode") {
     const arg = text.trim().slice("/mode".length).trim().toLowerCase();
+    // User-facing aliases → canonical PermissionMode. Keep the short
+    // labels stable for muscle memory; back them with the canonical
+    // mode names. The full set of canonical values is documented at
+    // `src/runner.ts` PermissionMode (full-parity with Claude Code's
+    // `--permission-mode` flag).
     const modeMap: Record<string, PermissionMode> = {
+      default: "default",
       plan: "plan",
       edit: "acceptEdits",
+      acceptedits: "acceptEdits",
       unrestricted: "bypassPermissions",
+      bypass: "bypassPermissions",
+      dontask: "dontAsk",
+      auto: "auto",
     };
+    // Inverse — used to render the canonical mode in a friendly label.
+    // Exhaustive on PermissionMode so any future expansion of the type
+    // surfaces a compile-time error here.
     const modeLabels: Record<PermissionMode, string> = {
+      default: "default",
       plan: "plan",
       acceptEdits: "edit",
       bypassPermissions: "unrestricted",
+      dontAsk: "dontAsk",
+      auto: "auto",
     };
 
     if (!arg) {
@@ -1469,6 +1485,9 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
           "- /mode plan - read-only planning",
           "- /mode edit - auto-accept file edits",
           "- /mode unrestricted - full permissions, no prompts",
+          "- /mode default - prompt per tool call",
+          "- /mode dontAsk - never prompt (alias of unrestricted, distinct semantics in Claude Code)",
+          "- /mode auto - Claude Code picks",
         ].join("\n"),
         threadId,
       );
@@ -1481,7 +1500,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       await sendMessage(
         config.token,
         chatId,
-        `Unknown mode: \`${safeArg}\`\n\nValid modes: plan, edit, unrestricted`,
+        `Unknown mode: \`${safeArg}\`\n\nValid modes: plan, edit, unrestricted, default, dontAsk, auto`,
         threadId,
       );
       return;
