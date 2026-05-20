@@ -126,7 +126,11 @@ interface SlackMessage {
   files?: SlackFile[];
   blocks?: SlackBlock[];
   attachments?: SlackAttachment[];
+<<<<<<< HEAD
   channel_type?: string; // "im" | "mpim" | "channel" | "group"
+=======
+  channel_type?: string;  // "im" | "mpim" | "channel" | "group"
+>>>>>>> upstream/master
 }
 
 interface SlackSocketPayload {
@@ -933,8 +937,12 @@ async function handleMessage(event: SlackMessage): Promise<void> {
   const allowBots = config.allowBots ?? [];
   const allowBotIds = config.allowBotIds ?? [];
   const channelAllowed = !!event.bot_id && allowBots.includes(event.channel);
+<<<<<<< HEAD
   const botIdAllowed =
     allowBotIds.length === 0 || (!!event.bot_id && allowBotIds.includes(event.bot_id));
+=======
+  const botIdAllowed = allowBotIds.length === 0 || (!!event.bot_id && allowBotIds.includes(event.bot_id));
+>>>>>>> upstream/master
   const isBotAllowed = channelAllowed && botIdAllowed;
 
   if (event.bot_id) {
@@ -942,12 +950,16 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     if (!isBotAllowed) return;
   }
   if (!event.bot_id && !event.user) return;
+<<<<<<< HEAD
   if (
     event.subtype &&
     event.subtype !== "file_share" &&
     !(isBotAllowed && event.subtype === "bot_message")
   )
     return;
+=======
+  if (event.subtype && event.subtype !== "file_share" && !(isBotAllowed && event.subtype === "bot_message")) return;
+>>>>>>> upstream/master
 
   // Deduplicate: Slack sends both message + app_mention for @mentions
   if (isDuplicate(event.channel, event.ts)) {
@@ -971,11 +983,15 @@ async function handleMessage(event: SlackMessage): Promise<void> {
   }
 
   // Authorization check — bot messages in allowBots channels bypass user-level auth
+<<<<<<< HEAD
   if (
     !isBotAllowed &&
     config.allowedUserIds.length > 0 &&
     !config.allowedUserIds.includes(userId ?? "")
   ) {
+=======
+  if (!isBotAllowed && config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(userId ?? "")) {
+>>>>>>> upstream/master
     if (isDirectMessage) {
       await sendMessage(config.botToken, channelId, "Unauthorized.");
     }
@@ -1204,6 +1220,7 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     }, 20_000);
 
     const agentName = sessionThreadId
+<<<<<<< HEAD
       ? (() => {
           try {
             return agentDirKey(`slack-${channelId}`, replyThreadTs);
@@ -1211,6 +1228,9 @@ async function handleMessage(event: SlackMessage): Promise<void> {
             return undefined;
           }
         })()
+=======
+      ? (() => { try { return agentDirKey(`slack-${channelId}`, replyThreadTs); } catch { return undefined; } })()
+>>>>>>> upstream/master
       : undefined;
 
     let result: Awaited<ReturnType<typeof runUserMessage>>;
