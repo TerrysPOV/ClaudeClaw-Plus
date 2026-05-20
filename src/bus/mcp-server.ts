@@ -531,10 +531,14 @@ export function buildMcpServer(): Server {
         },
       },
       instructions:
-        "ClaudeClaw+ Bus channel. Use `reply` to talk back to the originating surface; " +
-        "use `ask` for non-blocking clarifying questions; use `request_human` only when " +
-        "the agent loop must block on a human reply. Prompts arrive via " +
-        "notifications/claude/channel.",
+        "ClaudeClaw+ Bus channel. Messages from a surface (Telegram/Discord/Slack/Web) " +
+        "arrive as <channel source=\"...\" chat_id=\"...\" user_id=\"...\" ts=\"...\">text</channel> " +
+        "blocks typed into your REPL. You MUST answer with the `reply` tool — your " +
+        "transcript output is NOT visible to the user on the originating surface; only " +
+        "`reply` reaches them. End every turn that handled a <channel> message with at " +
+        "least one `reply` (intent:'final' for the user-visible answer). " +
+        "Use `ask` for non-blocking clarifying questions; use `request_human` only when " +
+        "the agent loop must block on a human reply.",
     },
   );
 }

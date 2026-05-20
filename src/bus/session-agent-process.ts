@@ -104,13 +104,23 @@ export class PtyAgentProcess implements AgentProcess {
     return Promise.resolve();
   }
 
-  send_prompt_stream(_line: string): Promise<void> {
-    return Promise.reject(
-      new Error(
-        `send_prompt_stream is invalid for supervision=pty-stdin (agent ${this.agent_id}); ` +
-          "prompts flow through the Bus MCP notifications/claude/channel path",
-      ),
-    );
+  async send_prompt_stream(line: string): Promise<void> {
+    if (this._exited) return Promise.reject(new Error(`agent ${this.agent_id} has exited`));
+    // Deliver an inbound prompt by typing it into claude's REPL via the PTY.
+    //
+    // Why not rely on `notifications/claude/channel` (the MCP path)? In a
+    // headless, daemon-spawned claude (no human at the TTY) that notification
+    // is accepted at the JSON-RPC layer but does NOT start a turn — claude
+    // stays idle. Typing into the PTY (exactly what an interactive user does)
+    // reliably fires a turn.
+    //
+    // claude's TUI enables bracketed-paste mode (ESC[?2004h). Writing the text
+    // and the submitting CR in a single chunk is interpreted as a paste: the
+    // text lands in the input box but is not submitted. So we write the text,
+    // let the paste settle, then send the CR as a separate keystroke.
+    this.pty.write(line);
+    await new Promise((r) => setTimeout(r, 200));
+    this.pty.write("\r");
   }
 
   onExit(handler: ExitHandler): void {
