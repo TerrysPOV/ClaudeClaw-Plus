@@ -559,7 +559,16 @@ export class TelegramAdapter {
 
   /** Braille spinner frames — classic CLI animation. */
   private static readonly SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-  private static readonly SPINNER_INTERVAL_MS = 1100;
+  private static readonly SPINNER_INTERVAL_MS = 2500;
+  /**
+   * Max animation ticks per turn. Bounds total `editMessageText` calls so a
+   * long claude turn can't fire an unbounded edit stream. At 1.1s/edit with no
+   * cap, a multi-minute turn issued ~100+ edits and triggered an escalated
+   * Telegram flood-ban (`retry_after` ~1730s) that blocked ALL replies. With
+   * a 2.5s interval and a 12-tick cap the spinner animates for ~30s then goes
+   * static; real text still arrives via `response.text` / `edit_message`.
+   */
+  private static readonly SPINNER_MAX_TICKS = 12;
 
   private stopSpinner(key: string): void {
     const s = this.spinnerState.get(key);
@@ -572,6 +581,7 @@ export class TelegramAdapter {
   private startSpinner(key: string, baseText: string, chat_id: number, message_id: number): void {
     this.stopSpinner(key);
     const FRAMES = TelegramAdapter.SPINNER_FRAMES;
+    let ticks = 0;
     this.spinnerState.set(key, {
       baseText,
       frame: 0,
@@ -580,6 +590,14 @@ export class TelegramAdapter {
       timer: setInterval(() => {
         const cur = this.spinnerState.get(key);
         if (!cur) return;
+        // Cap total animation so a long turn can't fire an unbounded edit
+        // stream (Telegram flood-ban risk). After the cap the message stays
+        // static; real text still arrives via response.text / edit_message.
+        ticks += 1;
+        if (ticks > TelegramAdapter.SPINNER_MAX_TICKS) {
+          this.stopSpinner(key);
+          return;
+        }
         cur.frame = (cur.frame + 1) % FRAMES.length;
         void this.api
           .editMessageText({
@@ -587,13 +605,12 @@ export class TelegramAdapter {
             message_id: cur.message_id,
             text: `${FRAMES[cur.frame]} ${cur.baseText}`,
           })
-          .catch((err) => {
-            // 429 is a transient rate-limit — keep animating. Any other
-            // error is terminal (e.g. 400 "message to edit not found"
-            // when the user deletes the placeholder); stop the spinner
-            // so the 1.1s interval doesn't hammer the API with a
-            // forever-failing edit loop.
-            if (!isTelegramRateLimit(err)) this.stopSpinner(key);
+          .catch(() => {
+            // Stop the spinner on ANY API error, 429 included. A periodic edit
+            // loop on a rate-limited chat self-sustains the 429 and starves the
+            // real reply; the per-chat flood cooldown in `createTelegramApi`
+            // then short-circuits further sends until it clears.
+            this.stopSpinner(key);
           });
       }, TelegramAdapter.SPINNER_INTERVAL_MS),
     });

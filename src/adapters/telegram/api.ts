@@ -35,11 +35,29 @@ const API_BASE = "https://api.telegram.org/bot";
  *     adapter's `safe*` wrappers can log a useful one-liner.
  */
 export function createTelegramApi(token: string): TelegramApi {
+  // Per-chat flood cooldown. Telegram answers a flooded chat with HTTP 429 and
+  // a `parameters.retry_after` (seconds). Until that window passes, every
+  // further send to that chat is rejected too — and each rejected attempt can
+  // extend the ban. We record the deadline and short-circuit subsequent sends
+  // to that chat WITHOUT hitting the API, so a misbehaving caller (e.g. a
+  // progress spinner) can't sustain the ban and it clears on its own.
+  const floodUntil = new Map<string, number>();
   async function call<T>(
     method: string,
     body: Record<string, unknown>,
     signal?: AbortSignal,
   ): Promise<T> {
+    const chatVal = (body as { chat_id?: unknown }).chat_id;
+    const chatKey = chatVal === undefined || chatVal === null ? "" : String(chatVal);
+    if (chatKey) {
+      const until = floodUntil.get(chatKey) ?? 0;
+      const remaining = until - Date.now();
+      if (remaining > 0) {
+        throw new Error(
+          `Telegram API ${method}: 429 flood cooldown, ${Math.ceil(remaining / 1000)}s remaining for chat ${chatKey}`,
+        );
+      }
+    }
     const res = await fetch(`${API_BASE}${token}/${method}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -47,7 +65,21 @@ export function createTelegramApi(token: string): TelegramApi {
       signal,
     });
     if (!res.ok) {
-      throw new Error(`Telegram API ${method}: ${res.status} ${res.statusText}`);
+      let retryAfter = 0;
+      try {
+        const errBody = (await res.json()) as { parameters?: { retry_after?: number } };
+        retryAfter = errBody?.parameters?.retry_after ?? 0;
+      } catch {
+        /* error body was not JSON — ignore */
+      }
+      if (res.status === 429 && chatKey && retryAfter > 0) {
+        floodUntil.set(chatKey, Date.now() + retryAfter * 1000);
+      }
+      throw new Error(
+        `Telegram API ${method}: ${res.status} ${res.statusText}${
+          retryAfter ? ` (retry_after ${retryAfter}s)` : ""
+        }`,
+      );
     }
     return (await res.json()) as T;
   }
