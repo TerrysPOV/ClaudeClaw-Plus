@@ -23,6 +23,14 @@ export interface RoutingConfig {
   channels: Record<string, string>;
   threads?: Record<string, string>;
   dmAgentId?: string;
+  /**
+   * Mirrors `DiscordBusRouting.primaryChannelByAgent`. Listed here so
+   * `uniqueAgentIds` can include agents that appear only in this map.
+   * Without that, an operator who sets a primary channel for an agent
+   * without listing the agent in `channels`/`threads`/`dmAgentId` would
+   * silently get no subscription (Codex P2 on PR #151).
+   */
+  primaryChannelByAgent?: Record<string, string>;
 }
 
 export interface RouteContext {
@@ -78,5 +86,11 @@ export function uniqueAgentIds(routing: RoutingConfig): string[] {
     for (const a of Object.values(routing.threads)) set.add(a);
   }
   if (routing.dmAgentId) set.add(routing.dmAgentId);
+  // Include agents that appear only in `primaryChannelByAgent`. The parser
+  // accepts that config shape, so the subscription set must too — otherwise
+  // outbound events for those agents would never reach the adapter.
+  if (routing.primaryChannelByAgent) {
+    for (const a of Object.keys(routing.primaryChannelByAgent)) set.add(a);
+  }
   return Array.from(set);
 }

@@ -246,6 +246,14 @@ export interface DiscordBusRouting {
   channels: Record<string, string>;
   threads?: Record<string, string>;
   dmAgentId?: string;
+  /**
+   * `agent_id → channel_id`. When a non-channel-driven origin
+   * ("cron" / "heartbeat" / "cli" / "rest" / no origin) fires for an agent
+   * that appears here, the event is delivered ONLY to this channel rather
+   * than fanning out to every channel routed to the agent. Opt-in: agents
+   * with no entry keep the legacy fan-out behaviour.
+   */
+  primaryChannelByAgent?: Record<string, string>;
 }
 
 /**
@@ -258,6 +266,13 @@ export interface SlackBusRouting {
   threadAgentId?: string;
   /** Optional override for the Events API signing secret. */
   signingSecret?: string;
+  /**
+   * `agent_id → channel_id`. Same semantics as `DiscordBusRouting`.
+   * When a non-channel-driven origin fires for an agent that appears here,
+   * deliver only to this channel instead of fanning out across every
+   * routed channel. Opt-in.
+   */
+  primaryChannelByAgent?: Record<string, string>;
 }
 
 /**
@@ -1126,13 +1141,23 @@ function parseDiscordBusRouting(raw: unknown): DiscordBusRouting | null {
   const channels = parseStringMap((raw as Record<string, unknown>).channels);
   const threads = parseStringMap((raw as Record<string, unknown>).threads);
   const dmAgentId = (raw as Record<string, unknown>).dmAgentId;
+  const primaryChannelByAgent = parseStringMap(
+    (raw as Record<string, unknown>).primaryChannelByAgent,
+  );
   const hasDm = typeof dmAgentId === "string" && dmAgentId.length > 0;
-  if (Object.keys(channels).length === 0 && Object.keys(threads).length === 0 && !hasDm) {
+  const hasPrimary = Object.keys(primaryChannelByAgent).length > 0;
+  if (
+    Object.keys(channels).length === 0 &&
+    Object.keys(threads).length === 0 &&
+    !hasDm &&
+    !hasPrimary
+  ) {
     return null;
   }
   const out: DiscordBusRouting = { channels };
   if (Object.keys(threads).length > 0) out.threads = threads;
   if (hasDm) out.dmAgentId = (dmAgentId as string).trim();
+  if (hasPrimary) out.primaryChannelByAgent = primaryChannelByAgent;
   return out;
 }
 
@@ -1144,12 +1169,17 @@ function parseSlackBusRouting(raw: unknown): SlackBusRouting | null {
   const channels = parseStringMap((raw as Record<string, unknown>).channels);
   const threadAgentId = (raw as Record<string, unknown>).threadAgentId;
   const signingSecret = (raw as Record<string, unknown>).signingSecret;
+  const primaryChannelByAgent = parseStringMap(
+    (raw as Record<string, unknown>).primaryChannelByAgent,
+  );
   const hasThread = typeof threadAgentId === "string" && threadAgentId.length > 0;
   const hasSigning = typeof signingSecret === "string" && signingSecret.length > 0;
-  if (Object.keys(channels).length === 0 && !hasThread && !hasSigning) return null;
+  const hasPrimary = Object.keys(primaryChannelByAgent).length > 0;
+  if (Object.keys(channels).length === 0 && !hasThread && !hasSigning && !hasPrimary) return null;
   const out: SlackBusRouting = { channels };
   if (hasThread) out.threadAgentId = (threadAgentId as string).trim();
   if (hasSigning) out.signingSecret = (signingSecret as string).trim();
+  if (hasPrimary) out.primaryChannelByAgent = primaryChannelByAgent;
   return out;
 }
 

@@ -188,6 +188,9 @@ async function mountSlack(
     routing: {
       channels: cfg.busRouting.channels,
       ...(cfg.busRouting.threadAgentId ? { threadAgentId: cfg.busRouting.threadAgentId } : {}),
+      ...(cfg.busRouting.primaryChannelByAgent
+        ? { primaryChannelByAgent: cfg.busRouting.primaryChannelByAgent }
+        : {}),
     },
     ...(cfg.appToken ? { appToken: cfg.appToken } : {}),
     logger,

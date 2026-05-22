@@ -107,6 +107,13 @@ export class SlackAdapter {
   private readonly selfUserId: string | null;
   private readonly channels: Record<string, string>;
   private readonly threadAgentId: string | undefined;
+  /**
+   * Optional `agent_id → channel_id` for narrowing non-channel-driven origin
+   * fan-out (cron / heartbeat / cli / rest / no origin) to a single channel
+   * per agent. Opt-in: agents without an entry fan out to every routed
+   * channel as before.
+   */
+  private readonly primaryChannelByAgent: Record<string, string> | undefined;
   private readonly logger: Pick<Console, "warn" | "info" | "error">;
 
   /** Active bus subscriptions, one collection per routed agent. */
@@ -175,6 +182,9 @@ export class SlackAdapter {
     }
     this.channels = { ...opts.routing.channels };
     this.threadAgentId = opts.routing.threadAgentId;
+    this.primaryChannelByAgent = opts.routing.primaryChannelByAgent
+      ? { ...opts.routing.primaryChannelByAgent }
+      : undefined;
     this.logger = opts.logger ?? console;
     this.maxSeenEventIds = opts.maxSeenEventIds ?? DEFAULT_MAX_SEEN_EVENT_IDS;
     this.maxThreadOwners = opts.maxThreadOwners ?? DEFAULT_MAX_THREAD_OWNERS;
@@ -606,7 +616,7 @@ export class SlackAdapter {
       payload.origin === "slack" && typeof payload.origin_id === "string"
         ? payload.origin_id
         : null;
-    const channels = originChannel ? [originChannel] : this.channelsForAgent(agentId);
+    const channels = this.resolveTargetChannels(agentId, originChannel);
     if (channels.length === 0) {
       this.logger.warn(`[slack-adapter] no channels for agent ${agentId}; dropping response.text`);
       return;
@@ -625,7 +635,7 @@ export class SlackAdapter {
 
     const originChannel =
       req.origin === "slack" && typeof req.origin_id === "string" ? req.origin_id : null;
-    const channels = originChannel ? [originChannel] : this.channelsForAgent(agentId);
+    const channels = this.resolveTargetChannels(agentId, originChannel);
     if (channels.length === 0) {
       this.logger.warn(
         `[slack-adapter] no channels for agent ${agentId}; dropping permission_request`,
@@ -663,7 +673,7 @@ export class SlackAdapter {
       payload.origin === "slack" && typeof payload.origin_id === "string"
         ? payload.origin_id
         : null;
-    const channels = originChannel ? [originChannel] : this.channelsForAgent(agentId);
+    const channels = this.resolveTargetChannels(agentId, originChannel);
     if (channels.length === 0) {
       this.logger.warn(`[slack-adapter] no channels for agent ${agentId}; dropping request_human`);
       return;
@@ -687,6 +697,12 @@ export class SlackAdapter {
     const set = new Set<string>();
     for (const agent of Object.values(this.channels)) set.add(agent);
     if (this.threadAgentId) set.add(this.threadAgentId);
+    // Include agents listed only in `primaryChannelByAgent`. Codex P2 on
+    // PR #151: parser accepts that shape; subscription set must too,
+    // otherwise outbound events never reach the adapter.
+    if (this.primaryChannelByAgent) {
+      for (const a of Object.keys(this.primaryChannelByAgent)) set.add(a);
+    }
     return Array.from(set);
   }
 
@@ -696,6 +712,25 @@ export class SlackAdapter {
       if (aid === agentId) out.push(chId);
     }
     return out;
+  }
+
+  /**
+   * Resolve the target channel set for an outbound event.
+   *
+   *   1. originChannel set      → that channel only (slack-originated reply)
+   *   2. primaryChannelByAgent  → that channel only (non-channel-driven origin,
+   *                                operator opted in for this agent)
+   *   3. fallback               → every channel routed to the agent (legacy
+   *                                fan-out, back-compat)
+   *
+   * The primary-channel path narrows cron/heartbeat/cli/rest broadcasts so
+   * they don't spam every channel routed to the agent. Opt-in.
+   */
+  private resolveTargetChannels(agentId: string, originChannel: string | null): string[] {
+    if (originChannel) return [originChannel];
+    const primary = this.primaryChannelByAgent?.[agentId];
+    if (primary) return [primary];
+    return this.channelsForAgent(agentId);
   }
 
   /**

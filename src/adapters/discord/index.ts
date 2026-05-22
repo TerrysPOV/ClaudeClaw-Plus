@@ -412,7 +412,20 @@ export class DiscordAdapter {
       origin === "discord" && typeof payloadWithOrigin?.origin_id === "string"
         ? payloadWithOrigin.origin_id
         : null;
-    const targetChannels = originChannel ? [originChannel] : this.channelsForAgent(agentId);
+    // For non-channel-driven origins (cron / heartbeat / cli / rest / no
+    // origin) prefer the operator-configured primary channel for the agent
+    // when one is set. Without this, a heartbeat fans out to every routed
+    // channel — observed in production as "heartbeat delivered to every
+    // channel routed to suzy", including `daily-digest-suzy`. Opt-in: agents
+    // without an entry keep the legacy fan-out behaviour.
+    const primaryChannel = !originChannel
+      ? this.routing.primaryChannelByAgent?.[agentId]
+      : undefined;
+    const targetChannels = originChannel
+      ? [originChannel]
+      : primaryChannel
+        ? [primaryChannel]
+        : this.channelsForAgent(agentId);
     if (targetChannels.length === 0) return;
 
     if (event.topic === "response.text") {

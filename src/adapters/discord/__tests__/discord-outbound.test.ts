@@ -135,6 +135,74 @@ describe("DiscordAdapter — outbound response.text", () => {
     expect(h.rest.sent.map((m) => m.channelId).sort()).toEqual(["ch-2", "th-1"]);
   });
 
+  it("routes non-channel-driven origins to primaryChannelByAgent when configured", async () => {
+    // Production bug 2026-05-21: every heartbeat fans out to every channel
+    // routed to the agent (e.g. both #general and #daily-digest-suzy for
+    // agent `suzy`). Opt-in primaryChannelByAgent narrows the fan-out to a
+    // single designated channel per agent.
+    adapter = await startAdapter(h, {
+      routing: {
+        channels: { "ch-2": "ops" },
+        threads: { "th-1": "ops" },
+        dmAgentId: "global",
+        primaryChannelByAgent: { ops: "ch-2" },
+      },
+    });
+    h.bus.emit({
+      ts: Date.now(),
+      agent_id: "ops",
+      session_id: "s",
+      topic: "response.text",
+      payload: { text: "heartbeat tick", origin: "heartbeat", origin_id: "hb" },
+    });
+    // Without the primary-channel narrowing, this would broadcast to BOTH
+    // "ch-2" and "th-1". With it, only "ch-2" gets the heartbeat.
+    expect(h.rest.sent.map((m) => m.channelId)).toEqual(["ch-2"]);
+  });
+
+  it("falls back to fan-out when primaryChannelByAgent is unset for the agent", async () => {
+    // Back-compat: agents without a primaryChannelByAgent entry keep the
+    // legacy fan-out behaviour.
+    adapter = await startAdapter(h, {
+      routing: {
+        channels: { "ch-2": "ops" },
+        threads: { "th-1": "ops" },
+        dmAgentId: "global",
+        primaryChannelByAgent: { other: "ch-1" }, // not for "ops"
+      },
+    });
+    h.bus.emit({
+      ts: Date.now(),
+      agent_id: "ops",
+      session_id: "s",
+      topic: "response.text",
+      payload: { text: "cron tick", origin: "cron", origin_id: "job:morning" },
+    });
+    expect(h.rest.sent.map((m) => m.channelId).sort()).toEqual(["ch-2", "th-1"]);
+  });
+
+  it("subscribes agents listed only in primaryChannelByAgent (Codex P2 #151)", async () => {
+    // An operator who sets a primary channel for an agent without listing
+    // the agent in channels/threads/dmAgentId must still get a subscription.
+    // Without this, the parser accepts the config but the adapter mounts
+    // with zero subscriptions and the routed event never arrives.
+    adapter = await startAdapter(h, {
+      routing: {
+        channels: { "ch-2": "ops" },
+        threads: { "th-1": "ops" },
+        primaryChannelByAgent: { "scheduler-only": "ch-9" },
+      },
+    });
+    h.bus.emit({
+      ts: Date.now(),
+      agent_id: "scheduler-only",
+      session_id: "s",
+      topic: "response.text",
+      payload: { text: "scheduler tick", origin: "cron", origin_id: "job:nightly" },
+    });
+    expect(h.rest.sent.map((m) => m.channelId)).toEqual(["ch-9"]);
+  });
+
   it("DROPS channel.permission_request whose origin belongs to another adapter", async () => {
     adapter = await startAdapter(h);
     h.bus.emit({

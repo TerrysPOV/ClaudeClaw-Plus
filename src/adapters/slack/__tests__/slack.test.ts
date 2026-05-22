@@ -564,6 +564,66 @@ describe("SlackAdapter — response.text outbound", () => {
     await new Promise((r) => setTimeout(r, 30));
     expect(api.sent).toHaveLength(0);
   });
+
+  it("routes non-channel-driven origins to primaryChannelByAgent when configured", async () => {
+    // Mirror of the discord fix: heartbeat/cron broadcasts to every routed
+    // channel was spamming users in multi-channel setups. Opt-in primary
+    // channel narrows the fan-out per agent.
+    adapter = await startAdapter({
+      routing: {
+        channels: { C100: "triage", C200: "triage" },
+        primaryChannelByAgent: { triage: "C100" },
+      },
+    });
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "heartbeat tick", origin: "heartbeat", origin_id: "hb" },
+    });
+    await waitFor(() => api.sent.length > 0);
+    expect(api.sent.map((m) => m.channel)).toEqual(["C100"]);
+  });
+
+  it("falls back to fan-out when primaryChannelByAgent is unset for the agent", async () => {
+    adapter = await startAdapter({
+      routing: {
+        channels: { C100: "triage", C200: "triage" },
+        primaryChannelByAgent: { other: "C100" }, // not for "triage"
+      },
+    });
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "cron tick", origin: "cron", origin_id: "job:morning" },
+    });
+    await waitFor(() => api.sent.length >= 2);
+    expect(api.sent.map((m) => m.channel).sort()).toEqual(["C100", "C200"]);
+  });
+
+  it("subscribes agents listed only in primaryChannelByAgent (Codex P2 #151)", async () => {
+    // Parser allows config that mentions an agent only in
+    // primaryChannelByAgent. Adapter must subscribe that agent or outbound
+    // events never reach Slack.
+    adapter = await startAdapter({
+      routing: {
+        channels: { C100: "triage" },
+        primaryChannelByAgent: { "scheduler-only": "C500" },
+      },
+    });
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "scheduler-only",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "scheduler tick", origin: "cron", origin_id: "job:nightly" },
+    });
+    await waitFor(() => api.sent.length > 0);
+    expect(api.sent.map((m) => m.channel)).toEqual(["C500"]);
+  });
 });
 
 /* ────────────────────────────────────────────────────────────────────── */
