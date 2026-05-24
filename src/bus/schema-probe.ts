@@ -140,7 +140,13 @@ function writeCache(path: string, entry: CacheEntry): void {
  */
 async function captureClaudeVersion(claudeBin: string, timeoutMs = 5000): Promise<string | null> {
   return new Promise((resolve) => {
-    const child = nodeSpawn(claudeBin, ["--version"], { stdio: ["ignore", "pipe", "pipe"] });
+    const child = nodeSpawn(claudeBin, ["--version"], {
+      stdio: ["ignore", "pipe", "pipe"],
+      // On Windows `claude` resolves to `claude.cmd`; since the CVE-2024-27980
+      // fix Node refuses to spawn a .cmd/.bat without a shell (EINVAL/EFTYPE),
+      // so route through the shell there. Args are static — no injection risk.
+      shell: process.platform === "win32",
+    });
     let out = "";
     let settled = false;
     const settle = (v: string | null): void => {

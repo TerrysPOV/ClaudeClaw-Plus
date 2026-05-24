@@ -292,7 +292,10 @@ describe("encodeCwd", () => {
 describe("predictJsonlPath", () => {
   it("composes ~/.claude/projects/<encoded>/<sessionId>.jsonl", () => {
     const out = predictJsonlPath("/home/me", "/private/tmp/x", "abc-def");
-    expect(out).toBe("/home/me/.claude/projects/-private-tmp-x/abc-def.jsonl");
+    // predictJsonlPath uses path.join, so the separator is platform-native.
+    // On Windows claude writes the session JSONL under a native backslash
+    // path (verified on a Win11 host), which is exactly what the tailer reads.
+    expect(out).toBe(join("/home/me", ".claude", "projects", "-private-tmp-x", "abc-def.jsonl"));
   });
 });
 
