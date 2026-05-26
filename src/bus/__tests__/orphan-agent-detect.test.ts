@@ -1,4 +1,7 @@
-import { describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it } from "bun:test";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { detectOrphanAgents, formatOrphanWarnings } from "../orphan-agent-detect";
 
 const IO = (dirs: Record<string, string[]>) => ({
@@ -62,6 +65,42 @@ describe("detectOrphanAgents", () => {
     });
     expect(r.orphanedDirs).toEqual([]);
     expect(r.orphanedDecls).toEqual([]);
+  });
+});
+
+describe("detectOrphanAgents — real FS (default I/O honours *.md filter, Codex P2 on #168)", () => {
+  const root = join(
+    tmpdir(),
+    `orphan-detect-fs-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+  );
+
+  afterAll(() => {
+    try {
+      rmSync(root, { recursive: true, force: true });
+    } catch {
+      /* best-effort */
+    }
+  });
+
+  it("ignores non-.md files in agents/<name>/jobs/ when counting", () => {
+    // Layout:
+    //   agents/reg/jobs/daily.md        ← counts
+    //   agents/reg/jobs/README          ← should NOT count
+    //   agents/reg/jobs/.gitkeep        ← should NOT count
+    //   agents/quiet/jobs/README        ← only non-.md → not orphaned
+    mkdirSync(join(root, "agents", "reg", "jobs"), { recursive: true });
+    writeFileSync(join(root, "agents", "reg", "jobs", "daily.md"), "# job");
+    writeFileSync(join(root, "agents", "reg", "jobs", "README"), "ignore me");
+    writeFileSync(join(root, "agents", "reg", "jobs", ".gitkeep"), "");
+    mkdirSync(join(root, "agents", "quiet", "jobs"), { recursive: true });
+    writeFileSync(join(root, "agents", "quiet", "jobs", "README"), "no schedulable jobs here");
+
+    const r = detectOrphanAgents([{ id: "default" }], root);
+    // reg is orphaned with EXACTLY 1 schedulable job (the .md), not 3 raw files.
+    expect(r.orphanedDirs).toEqual([{ name: "reg", jobCount: 1 }]);
+    // quiet has only README — it's NOT flagged as orphaned because it has
+    // no schedulable jobs (matches what the actual scheduler would load).
+    expect(r.orphanedDirs.find((o) => o.name === "quiet")).toBeUndefined();
   });
 });
 

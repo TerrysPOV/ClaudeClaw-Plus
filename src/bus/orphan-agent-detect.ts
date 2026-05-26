@@ -133,8 +133,13 @@ function defaultListDir(path: string): string[] {
 }
 
 function defaultCountJobs(jobsPath: string): number {
+  // Only count `*.md` files — that matches the filter the scheduler itself
+  // applies in `src/jobs.ts:loadJobs` (line 183), so the warning count is
+  // accurate. README, .gitkeep, editor backups etc. would otherwise inflate
+  // the count and trip the warning for dirs that have no schedulable jobs.
   try {
     return readdirSync(jobsPath).filter((name) => {
+      if (!name.endsWith(".md")) return false;
       try {
         return statSync(join(jobsPath, name)).isFile();
       } catch {
