@@ -532,6 +532,37 @@ export async function start(args: string[] = []) {
           timezoneOffsetMinutes: settings.timezoneOffsetMinutes,
         });
         handle.attachScheduler(schedulerHandle);
+
+        // Issue #166: write the daemon-generated architecture doc so the
+        // spawned agent reads its own runtime state at bootstrap.
+        //
+        // Codex P1 on PR #171: must run AFTER all bus startup steps
+        // (including wireBusScheduler) have succeeded. If we wrote earlier
+        // and a later step threw, the outer catch falls back to legacy
+        // surfaces but the on-disk doc still says `Mode: bus` — agents
+        // would diagnose against stale architecture. Place this at the
+        // tail of the try block so the file only persists when the bus
+        // really did boot end-to-end.
+        //
+        // Best-effort: failures here log but do not block startup. A
+        // missing arch doc degrades agent diagnostic quality but doesn't
+        // break operation.
+        try {
+          const { collectArchitectureSnapshot } = await import("../architecture-doc-snapshot");
+          const { writeArchitectureDoc, defaultArchitectureDocPath } = await import(
+            "../architecture-doc"
+          );
+          const snapshot = await collectArchitectureSnapshot({
+            settings,
+            spawnedAgentIds: handle.spawnedAgentIds,
+            adapters: adapters.map((a) => ({ name: a.name })),
+          });
+          const path = defaultArchitectureDocPath(process.cwd());
+          writeArchitectureDoc(snapshot, path);
+          console.log(`[${ts()}] wrote architecture doc: ${path}`);
+        } catch (docErr) {
+          console.warn(`[${ts()}] architecture doc write failed:`, docErr);
+        }
       } catch (wireErr) {
         // Adapter / scheduler wiring threw — stop the handle (which
         // already owns the bus + agents + whatever was attached
@@ -555,6 +586,22 @@ export async function start(args: string[] = []) {
       busRuntimeHandle = null;
       busRuntimeSpawnedAgents = [];
       busRuntimeAdapterNames = [];
+      // Issue #166 / Codex P1 on PR #171: a previous successful bus boot
+      // may have left a CCPLUS_ARCHITECTURE.md saying "Mode: bus" on disk.
+      // Now that we've fallen back to legacy, that doc is actively
+      // misleading — agents reading it would diagnose against a runtime
+      // that isn't actually running. Remove it best-effort.
+      try {
+        const { defaultArchitectureDocPath } = await import("../architecture-doc");
+        const { unlinkSync, existsSync } = await import("node:fs");
+        const docPath = defaultArchitectureDocPath(process.cwd());
+        if (existsSync(docPath)) {
+          unlinkSync(docPath);
+          console.log(`[${ts()}] removed stale architecture doc: ${docPath}`);
+        }
+      } catch (unlinkErr) {
+        console.warn(`[${ts()}] failed to remove stale architecture doc:`, unlinkErr);
+      }
     }
   }
   // Legacy adapter gate (Sprint 5.2b): when the Bus mount succeeded, the

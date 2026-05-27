@@ -4,3 +4,6 @@ node_modules
 AGENTS.md
 agents/*/session.json
 MEMORY.md
+# Daemon-generated runtime architecture description for the spawned agent.
+# Regenerated on every startup — must not be committed.
+CCPLUS_ARCHITECTURE.md
