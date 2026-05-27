@@ -825,11 +825,21 @@ export async function start(args: string[] = []) {
         // (spawned below) get a synthesized --mcp-config too. Only inside
         // this isActive() branch, so the dormant path stays byte-identical.
         if (busRuntimeHandle) {
+          // Codex P2 on PR #184: use the ACTUALLY claimed server names, not
+          // the operator's requested list. When the multiplexer starts
+          // partially (e.g. one shared server failed to claim, another
+          // succeeded), `plugin.isActive()` is true as soon as any one
+          // claimed, but `settings.mcp.shared` still lists the failures.
+          // Writing those names into bus agents' --mcp-config would point
+          // them at /mcp/<server> routes that were never registered. The
+          // multiplexer already caches the claimed set explicitly for this
+          // case (see `sharedServerNames()` + the "ACTUALLY claimed"
+          // comment in src/plugins/mcp-multiplexer/index.ts).
           busRuntimeHandle.sessionManager.setMcpConfigSynthesizer({
             issue: (ptyId) => plugin.issueIdentity(ptyId),
             revoke: (ptyId) => plugin.releaseIdentity(ptyId),
             bridgeBaseUrl: () => plugin.bridgeBaseUrl(),
-            sharedServers: settings.mcp.shared,
+            sharedServers: plugin.sharedServerNames(),
           });
         }
         console.log("[mcp-multiplexer] started");
