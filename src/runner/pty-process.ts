@@ -158,6 +158,28 @@ export interface PtyProcessOptions {
   _sentinelUuidOverride?: () => string;
 }
 
+/**
+ * Diagnostic snapshot captured when a PTY exits before its TUI settles.
+ * Issue #176 — before this existed, the error message was just "PTY for
+ * claude exited before TUI settled (pid=N)" with no signal as to *why*
+ * claude exited. Production saw 36 cron-job failures fitting this shape
+ * since 2026-05-19; we couldn't tell whether claude was hitting an auth
+ * error, an updater crash, an OOM, or a stale-JSONL refusal.
+ */
+export interface PtyExitInfo {
+  /** Exit code if the process exited with one. `null` when killed by signal. */
+  exitCode: number | null;
+  /** Signal name if the process was killed (`"SIGKILL"`, `"SIGTERM"`, …). */
+  signal: string | null;
+  /** Milliseconds between spawn and exit. */
+  elapsedMs: number;
+  /** Last ≤8 KB of PTY output before exit, ANSI-stripped, control-char
+   *  squashed, AND credential patterns (sk-*, Bearer, JWT, GitHub PATs,
+   *  Slack tokens) replaced with `<redacted>`. Operator-facing diagnostic;
+   *  not a precise machine record. */
+  tail: string;
+}
+
 export interface PtyProcess {
   readonly label: string;
   readonly pid: number;
@@ -165,6 +187,9 @@ export interface PtyProcess {
   readonly cwd: string;
   isAlive(): boolean;
   lastTurnEndedAt(): number;
+  /** Diagnostic snapshot of how the PTY exited. Returns `null` while the
+   *  process is still alive; populated as soon as `_handleExit` fires. */
+  exitInfo(): PtyExitInfo | null;
   runTurn(
     prompt: string,
     opts: {
@@ -219,6 +244,49 @@ const DEFAULT_QUIET_TICK_MS = 50;
 const DEFAULT_COLS = 100;
 const DEFAULT_ROWS = 30;
 const DEFAULT_PERMISSION_MODE_ARGS = ["--dangerously-skip-permissions"];
+/**
+ * Hard cap on the tail ring buffer that captures pre-settle PTY output for
+ * the issue #176 diagnostic snapshot. 8 KiB is enough to hold a typical
+ * claude error message (auth failure, missing binary, updater crash, …)
+ * without bloating per-PTY memory. Anything older slides off.
+ */
+const SETTLE_TAIL_MAX_BYTES = 8 * 1024;
+
+/**
+ * Patterns redacted from `_readTailSnapshot()` before the tail is exposed
+ * via `exitInfo().tail` or interpolated into the supervisor's "exited
+ * before TUI settled" error message. Issue #176 security-review follow-up:
+ * a misbehaving claude printing an auth-failure message with the leaked
+ * token attached would otherwise land it in stderr → journald / Sentry.
+ * The patterns are intentionally broad — false positives ("redacted" in
+ * place of an innocent UUID) are cheap; false negatives are a credential
+ * leak.
+ */
+const TAIL_REDACTION_PATTERNS: ReadonlyArray<RegExp> = [
+  // Anthropic API keys, long-lived OAuth tokens, session tokens — anything
+  // starting with `sk-` followed by ≥ 20 token chars.
+  /sk-[A-Za-z0-9_-]{20,}/g,
+  // Generic `Bearer <token>` header values.
+  /\bBearer\s+[A-Za-z0-9_.-]{16,}/g,
+  // JWTs: `header.payload.sig` shape with base64url tokens.
+  /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g,
+  // GitHub personal-access tokens.
+  /\bghp_[A-Za-z0-9]{36}\b/g,
+  // GitHub fine-grained personal-access tokens.
+  /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
+  // Slack bot / app / user tokens (xoxb / xoxa / xoxp / xoxs).
+  /\bxox[bapso]-[A-Za-z0-9-]{10,}/g,
+];
+
+/** Replace matches of any `TAIL_REDACTION_PATTERNS` with `<redacted>` so
+ *  the tail can be safely logged without leaking credentials. */
+function redactSecretsInTail(text: string): string {
+  let out = text;
+  for (const pattern of TAIL_REDACTION_PATTERNS) {
+    out = out.replace(pattern, "<redacted>");
+  }
+  return out;
+}
 
 /** Build the argv for spawning `claude` based on options. See header. */
 function buildClaudeArgs(opts: PtyProcessOptions): string[] {
@@ -326,6 +394,17 @@ class PtyProcessImpl implements PtyProcess {
   /** Tracks whether any data has been received since spawn — used by
    *  `_waitForReadySettle` to flag a "TUI is alive" signal. */
   private _firstDataAt = 0;
+  /** Wall-clock at construction time. Used to compute elapsed-ms on exit
+   *  for the issue #176 diagnostic snapshot. */
+  private readonly _spawnedAt: number;
+  /** Tail ring buffer for early PTY output, capped at SETTLE_TAIL_MAX_BYTES.
+   *  Captures the last N bytes so that if claude exits before the TUI
+   *  settles, the operator can see whatever claude printed (auth error,
+   *  updater crash, stale-JSONL refusal, …). Issue #176. */
+  private _tailBuf: Uint8Array[] = [];
+  private _tailBufLen = 0;
+  /** Diagnostic snapshot, populated when `_handleExit` fires. */
+  private _exitInfo: PtyExitInfo | null = null;
 
   constructor(pty: IPty, opts: PtyProcessOptions) {
     this._pty = pty;
@@ -342,6 +421,7 @@ class PtyProcessImpl implements PtyProcess {
     this._setInterval = opts._setInterval ?? ((cb, ms) => setInterval(cb, ms));
     this._clearInterval = opts._clearInterval ?? ((h) => clearInterval(h));
     this._sentinelUuidGen = opts._sentinelUuidOverride ?? (() => crypto.randomUUID());
+    this._spawnedAt = this._now();
     this._parser = createParser({ quietWindowMs: this._quietWindowMs });
 
     this._onDataDisposable = pty.onData((data) => this._handleData(data));
@@ -360,6 +440,62 @@ class PtyProcessImpl implements PtyProcess {
   lastTurnEndedAt(): number {
     return this._lastTurnEndedAt;
   }
+  exitInfo(): PtyExitInfo | null {
+    return this._exitInfo;
+  }
+
+  /**
+   * Append bytes to the tail ring buffer, dropping the oldest chunks once
+   * the buffer exceeds `SETTLE_TAIL_MAX_BYTES`. Cheap O(1) per chunk in the
+   * common case; the loop runs at most a handful of iterations when a very
+   * chatty pre-settle PTY pushes us past the cap. Issue #176.
+   *
+   * Edge case (confidence-82 finding from the 5-agent review): when a
+   * single chunk alone exceeds the cap (bun-pty buffering, high-bandwidth
+   * child), the "drop oldest" loop can't help — there's only one element
+   * to drop. Slice it down to keep just the trailing bytes so the buffer
+   * stays bounded.
+   */
+  private _appendToTail(bytes: Uint8Array): void {
+    this._tailBuf.push(bytes);
+    this._tailBufLen += bytes.length;
+    while (this._tailBufLen > SETTLE_TAIL_MAX_BYTES) {
+      if (this._tailBuf.length === 1) {
+        // Single oversized chunk: slice to keep only the trailing
+        // SETTLE_TAIL_MAX_BYTES — preserves the most-recent bytes, which
+        // are the most diagnostically useful (closest to the crash).
+        const chunk = this._tailBuf[0];
+        const keep = chunk.subarray(chunk.length - SETTLE_TAIL_MAX_BYTES);
+        this._tailBuf[0] = keep;
+        this._tailBufLen = keep.length;
+        break;
+      }
+      const dropped = this._tailBuf.shift();
+      if (dropped) this._tailBufLen -= dropped.length;
+    }
+  }
+
+  /**
+   * Snapshot the tail ring buffer as a UTF-8 string with ANSI escapes
+   * stripped and stray NUL/control bytes replaced. The result is meant for
+   * operator-facing diagnostics — not a precise record of every byte.
+   */
+  private _readTailSnapshot(): string {
+    if (this._tailBuf.length === 0) return "";
+    const combined = new Uint8Array(this._tailBufLen);
+    let offset = 0;
+    for (const chunk of this._tailBuf) {
+      combined.set(chunk, offset);
+      offset += chunk.length;
+    }
+    const decoded = new TextDecoder("utf-8", { fatal: false }).decode(combined);
+    // Strip ANSI, squash remaining control chars (NUL, BS, DEL …) so the
+    // operator sees printable text, then redact common credential patterns
+    // before the snapshot can be logged. Newlines are preserved.
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping control bytes by design
+    const stripped = stripAnsiInline(decoded).replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "");
+    return redactSecretsInTail(stripped);
+  }
 
   // ─── data flow ────────────────────────────────────────────────────────
 
@@ -372,6 +508,12 @@ class PtyProcessImpl implements PtyProcess {
     // Buffer for the current turn (so idle-fallback can return content).
     this._turnBuf.push(bytes);
     this._turnBufLen += bytes.length;
+
+    // Issue #176: maintain a separate rolling tail of recent bytes so we
+    // can diagnose "PTY exited before TUI settled" failures. _turnBuf gets
+    // reset between turns; the tail buffer persists across the spawn → exit
+    // window, which is exactly when we need it.
+    this._appendToTail(bytes);
 
     const events = feed(this._parser, bytes, now);
 
@@ -415,6 +557,17 @@ class PtyProcessImpl implements PtyProcess {
 
   private _handleExit(info: { exitCode: number; signal?: number | string }): void {
     this._alive = false;
+    // Issue #176: capture a diagnostic snapshot the moment the PTY exits.
+    // Reading the tail ring buffer now is cheap and avoids the
+    // _onDataDisposable race (data events still flush before exit on
+    // bun-pty). The snapshot is exposed via `exitInfo()` so the supervisor
+    // can include the WHY in its "exited before TUI settled" error message.
+    this._exitInfo = {
+      exitCode: info.exitCode ?? null,
+      signal: info.signal != null ? String(info.signal) : null,
+      elapsedMs: Math.max(0, this._now() - this._spawnedAt),
+      tail: this._readTailSnapshot(),
+    };
     // NOTE: Do NOT dispose listeners here. bun-pty's EventEmitter iterates
     // its listener array by index inside `fire()`, and disposing a listener
     // from within its own callback mutates the array under the iterator,
@@ -855,7 +1008,29 @@ export function spawnPty(opts: PtyProcessOptions): Promise<PtyProcess> {
 
     proc._waitForReadySettle(3000).then(() => {
       if (!proc.isAlive()) {
-        reject(new Error(`PTY for ${cmd} exited before TUI settled (pid=${pty.pid})`));
+        // Issue #176: include the captured exit info in the error message so
+        // the supervisor's "respawn failed" path (and any operator tailing
+        // stderr) sees *why* claude exited within the 3-second settle
+        // window. Without this the message is just "exited before TUI
+        // settled" — we can't tell an auth failure from an updater crash
+        // from a stale-JSONL refusal.
+        const info = proc.exitInfo();
+        let detail = "";
+        if (info) {
+          const fragments: string[] = [];
+          if (info.exitCode !== null) fragments.push(`exitCode=${info.exitCode}`);
+          if (info.signal !== null) fragments.push(`signal=${info.signal}`);
+          fragments.push(`elapsed=${info.elapsedMs}ms`);
+          if (info.tail.length > 0) {
+            // Trim leading/trailing whitespace and collapse runs of newlines
+            // so a long banner doesn't dominate the log line. The tail is
+            // already capped at 8 KiB by `_appendToTail`.
+            const trimmed = info.tail.trim().replace(/\n{3,}/g, "\n\n");
+            fragments.push(`tail=${JSON.stringify(trimmed)}`);
+          }
+          detail = ` (${fragments.join(", ")})`;
+        }
+        reject(new Error(`PTY for ${cmd} exited before TUI settled (pid=${pty.pid})${detail}`));
         return;
       }
       resolve(proc);

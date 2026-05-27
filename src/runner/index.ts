@@ -17,6 +17,7 @@ export {
   type PtyProcess,
   type PtyProcessOptions,
   type PtyTurnResult,
+  type PtyExitInfo,
 } from "./pty-process";
 
 export {

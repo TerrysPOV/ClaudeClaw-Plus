@@ -73,6 +73,163 @@ describe("PtyProcess — lifecycle", () => {
     await proc.dispose();
   });
 
+  test("exitInfo() is null while the process is alive", async () => {
+    const proc = await spawnPty(baseOpts({ _commandOverride: "/bin/cat", _argsOverride: [] }));
+    expect(proc.exitInfo()).toBeNull();
+    await proc.dispose();
+  });
+
+  test("exitInfo() captures exitCode + elapsedMs after natural exit (#176)", async () => {
+    // `sh -c 'exit 0'` exits cleanly with code 0.
+    const proc = await spawnPty(
+      baseOpts({ _commandOverride: "/bin/sh", _argsOverride: ["-c", "exit 0"] }),
+    );
+    // Wait for the natural exit + ensure handler ran.
+    await new Promise<void>((r) => setTimeout(r, 200));
+    expect(proc.isAlive()).toBe(false);
+    const info = proc.exitInfo();
+    expect(info).not.toBeNull();
+    if (!info) throw new Error("type narrowing");
+    expect(info.exitCode).toBe(0);
+    expect(info.elapsedMs).toBeGreaterThanOrEqual(0);
+    expect(info.elapsedMs).toBeLessThan(5000);
+    await proc.dispose();
+  });
+
+  test("exitInfo() captures non-zero exit code (#176)", async () => {
+    const proc = await spawnPty(
+      baseOpts({ _commandOverride: "/bin/sh", _argsOverride: ["-c", "exit 1"] }),
+    );
+    await new Promise<void>((r) => setTimeout(r, 200));
+    const info = proc.exitInfo();
+    expect(info).not.toBeNull();
+    if (!info) throw new Error("type narrowing");
+    expect(info.exitCode).toBe(1);
+    await proc.dispose();
+  });
+
+  test("exitInfo() captures tail output before exit (#176)", async () => {
+    // `sh -c 'echo claude-error-message; exit 7'` prints + exits.
+    const proc = await spawnPty(
+      baseOpts({
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", "echo this-is-the-error-text; exit 7"],
+      }),
+    );
+    await new Promise<void>((r) => setTimeout(r, 200));
+    const info = proc.exitInfo();
+    expect(info).not.toBeNull();
+    if (!info) throw new Error("type narrowing");
+    expect(info.exitCode).toBe(7);
+    // PTYs typically convert \n to \r\n on output; we strip control chars
+    // including the bare CR, so the trimmed text should contain the
+    // payload regardless.
+    expect(info.tail).toContain("this-is-the-error-text");
+    await proc.dispose();
+  });
+
+  test("exitInfo().tail stays bounded even when a single chunk exceeds 8 KiB (#176 review)", async () => {
+    // 5-agent review confidence-82 finding: the eviction loop's `length > 1`
+    // guard fails to evict an oversized single chunk. Reproduce: print
+    // 32 KiB in one shot, then exit. The tail must still be <= 8 KiB.
+    //
+    // We use `head -c 32768 /dev/zero | tr "\\0" "x"` to emit a contiguous
+    // 32 KiB block of 'x' bytes followed by an exit — bun-pty typically
+    // delivers this in one chunk on the PTY read.
+    const proc = await spawnPty(
+      baseOpts({
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", "head -c 32768 /dev/zero | tr '\\0' 'x'; echo done; exit 4"],
+      }),
+    );
+    await new Promise<void>((r) => setTimeout(r, 300));
+    const info = proc.exitInfo();
+    expect(info).not.toBeNull();
+    if (!info) throw new Error("type narrowing");
+    expect(info.exitCode).toBe(4);
+    // The cap is 8 KiB; after control-byte stripping + redaction the
+    // snapshot may be slightly shorter but should never exceed the raw cap.
+    expect(info.tail.length).toBeLessThanOrEqual(8 * 1024);
+    // Diagnostic content should still survive: the trailing "done" marker
+    // is within the last 8 KiB and should be visible.
+    expect(info.tail).toContain("done");
+    await proc.dispose();
+  });
+
+  test("exitInfo().tail redacts secrets (sk-/Bearer/JWT/GitHub/Slack tokens) (#176)", async () => {
+    // Security follow-up from the 5-agent + security review on #176: a
+    // misbehaving claude that prints an auth-failure with the leaked token
+    // attached would otherwise land the token in stderr/journald via the
+    // new error message. Verify the redaction patterns fire.
+    //
+    // Tokens are constructed at runtime from a base + suffix so the literal
+    // string never appears in source (pre-commit hooks otherwise reject
+    // legitimate-looking token shapes in test fixtures).
+    const skPrefix = "sk" + "-";
+    const fakeSk = skPrefix + "ant-oat01-" + "A".repeat(25);
+    const fakeBearer = "abcdefghijklmnop1234";
+    const fakeJwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.signaturepart";
+    const ghpPrefix = "ghp" + "_";
+    const fakeGhp = ghpPrefix + "z".repeat(36);
+    const slackPrefix = "xox" + "b-";
+    const fakeSlack = slackPrefix + "1234567890" + "-abcdefghijkl";
+    const proc = await spawnPty(
+      baseOpts({
+        _commandOverride: "/bin/sh",
+        _argsOverride: [
+          "-c",
+          [
+            `echo 'auth fail: ${fakeSk}'`,
+            `echo 'Authorization: Bearer ${fakeBearer}'`,
+            `echo 'token: ${fakeJwt}'`,
+            `echo 'gh: ${fakeGhp}'`,
+            `echo 'slack: ${fakeSlack}'`,
+            "exit 9",
+          ].join("; "),
+        ],
+      }),
+    );
+    await new Promise<void>((r) => setTimeout(r, 200));
+    const info = proc.exitInfo();
+    expect(info).not.toBeNull();
+    if (!info) throw new Error("type narrowing");
+    expect(info.exitCode).toBe(9);
+    // None of the original token bytes should survive into the tail.
+    expect(info.tail).not.toContain(fakeSk);
+    expect(info.tail).not.toContain(`Bearer ${fakeBearer}`);
+    expect(info.tail).not.toContain(fakeJwt);
+    expect(info.tail).not.toContain(fakeGhp);
+    expect(info.tail).not.toContain(fakeSlack);
+    // The redaction marker should appear.
+    expect(info.tail).toContain("<redacted>");
+    await proc.dispose();
+  });
+
+  test("'PTY exited before TUI settled' error includes exitCode + tail (#176)", async () => {
+    // Run the full settle path against a binary that immediately prints
+    // an error and exits. The settle wait should observe a dead process
+    // and reject with an enriched error message.
+    let err: unknown;
+    try {
+      await spawnPty(
+        baseOpts({
+          _commandOverride: "/bin/sh",
+          _argsOverride: ["-c", "echo Failed to authenticate; exit 1"],
+          _skipReadySettle: false,
+        }),
+      );
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const msg = (err as Error).message;
+    expect(msg).toContain("exited before TUI settled");
+    expect(msg).toContain("exitCode=1");
+    expect(msg).toContain("elapsed=");
+    expect(msg).toContain("tail=");
+    expect(msg).toContain("Failed to authenticate");
+  });
+
   test("spawnPty rejects when binary is missing", async () => {
     let err: unknown;
     try {
