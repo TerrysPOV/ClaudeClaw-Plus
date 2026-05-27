@@ -9,7 +9,7 @@ import { join } from "path";
 import { mkdir, copyFile, unlink } from "fs/promises";
 import { existsSync } from "fs";
 
-import { reloadSettings, getSettings } from "../config";
+import { DEFAULT_SESSION_TIMEOUT_MS, reloadSettings, getSettings } from "../config";
 
 const SETTINGS_DIR = join(process.cwd(), ".claude", "claudeclaw");
 const SETTINGS_FILE = join(SETTINGS_DIR, "settings.json");
@@ -281,5 +281,49 @@ describe("parseSettings — bus routing (Sprint 5.2b)", () => {
     });
     await reloadSettings();
     expect(getSettings().discord.busRouting).toEqual({ channels: { valid: "agent-a" } });
+  });
+});
+
+describe("parseSettings — sessionTimeoutMs default (#179)", () => {
+  it("defaults DEFAULT_SESSION_TIMEOUT_MS to 120 minutes", () => {
+    // 120 * 60 * 1000 = 7,200,000 ms
+    expect(DEFAULT_SESSION_TIMEOUT_MS).toBe(120 * 60 * 1000);
+  });
+
+  it("falls back to the 120-minute default when the field is absent", async () => {
+    await writeRawSettings({});
+    await reloadSettings();
+    expect(getSettings().sessionTimeoutMs).toBe(120 * 60 * 1000);
+  });
+
+  it("honours an explicit positive sessionTimeoutMs override", async () => {
+    await writeRawSettings({ sessionTimeoutMs: 90_000 });
+    await reloadSettings();
+    expect(getSettings().sessionTimeoutMs).toBe(90_000);
+  });
+
+  it("falls back to the default when sessionTimeoutMs is zero or negative", async () => {
+    await writeRawSettings({ sessionTimeoutMs: 0 });
+    await reloadSettings();
+    expect(getSettings().sessionTimeoutMs).toBe(120 * 60 * 1000);
+
+    await writeRawSettings({ sessionTimeoutMs: -1 });
+    await reloadSettings();
+    expect(getSettings().sessionTimeoutMs).toBe(120 * 60 * 1000);
+  });
+
+  it("falls back to the default when sessionTimeoutMs is the wrong type", async () => {
+    await writeRawSettings({ sessionTimeoutMs: "120000" });
+    await reloadSettings();
+    expect(getSettings().sessionTimeoutMs).toBe(120 * 60 * 1000);
+  });
+
+  it("falls back to the default when sessionTimeoutMs is Infinity or NaN", async () => {
+    // JSON serialises Infinity/NaN as null on write but operators editing
+    // the file by hand might attempt them as bare tokens. The parser must
+    // reject them either way — `Number.isFinite` guards both cases.
+    await writeRawSettings({ sessionTimeoutMs: null });
+    await reloadSettings();
+    expect(getSettings().sessionTimeoutMs).toBe(120 * 60 * 1000);
   });
 });
