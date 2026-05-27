@@ -1155,18 +1155,48 @@ async function spawnEntry(
   }
 }
 
-async function respawnEntry(entry: PtyEntry): Promise<void> {
+async function respawnEntry(
+  entry: PtyEntry,
+  respawnOpts: { dropResume?: boolean } = {},
+): Promise<void> {
   if (!entry.spawnOpts) {
     throw new Error(
       `[pty-supervisor] cannot respawn ${entry.sessionKey} — no cached spawn options`,
     );
   }
-  // Always resume against the last-known session ID — Claude Code keeps the
+  // Normally resume against the last-known session ID — Claude Code keeps the
   // JSONL on disk after a crash, so --resume <id> picks up where we left off.
+  //
+  // Issue #177 corrupted-session escape hatch: when the retry loop signals
+  // `dropResume: true` (the final attempt after prior failures), abandon
+  // --resume and let claude start a fresh session. Trade the conversation
+  // state for an unstuck agent. The persistSessionId post-turn path will
+  // record the fresh id once the new claude completes its first turn.
+  //
+  // Why only on prior failures: firing on the very first respawn attempt
+  // would abandon sessions even when respawnRetries=1 (the operator opt-out
+  // for fast-fail behaviour, see #175), silently breaking conversation
+  // continuity. The caller (respawnEntryWithRetries) only sets
+  // `dropResume: true` when `i > 0` AND `i === attempts - 1`.
   const lastSessionId = entry.pty?.sessionId ?? entry.spawnOpts.sessionId;
+  // `!!lastSessionId` guard: no point abandoning a resume if there's no
+  // session id to abandon — silently no-op rather than logging an empty id.
+  const abandonResume = !!respawnOpts.dropResume && !!lastSessionId;
+  if (abandonResume) {
+    process.stderr.write(
+      `[pty-supervisor] dropping --resume for ${entry.sessionKey} on final respawn attempt — corrupted-session escape hatch; abandoned sessionId=${lastSessionId} (inspect or remove ~/.claude/projects/<cwd-slug>/${lastSessionId}.jsonl if the crash recurs)\n`,
+    );
+  }
   const opts: PtyProcessOptions = {
     ...entry.spawnOpts,
-    sessionId: lastSessionId ?? "",
+    sessionId: abandonResume ? "" : (lastSessionId ?? ""),
+    // When abandoning the resume, ALSO clear `newSessionId`. Otherwise
+    // `buildClaudeArgs` (pty-process.ts:251-253) falls back to passing
+    // `--session-id <newSessionId>` for an empty `sessionId`, which would
+    // re-bind the "fresh" claude to the SAME UUID that owns the corrupted
+    // JSONL we just tried to abandon. The post-turn `persistSessionId`
+    // path will pick up whatever fresh id claude generates on its own.
+    ...(abandonResume ? { newSessionId: undefined } : {}),
   };
 
   // MCP multiplexer (SPEC §4.5 "Respawn behaviour"): rotate the bearer token
@@ -1231,20 +1261,28 @@ async function respawnEntry(entry: PtyEntry): Promise<void> {
  * loop wraps the thrown error in a "respawn failed after N attempts"
  * message and returns `errorResult(...)` for the operator.
  *
- * Issue #177 (separate) tracks dropping `--resume <sessionId>` on the final
- * attempt as a corrupted-session escape hatch. This helper does the retry
- * envelope; the resume fallback is layered on top.
+ * Issue #177 (corrupted-session escape hatch): when at least one attempt has
+ * already failed and we're entering the final attempt, signal `respawnEntry`
+ * to drop `--resume <sessionId>` and start a fresh claude. A poisoned session
+ * JSONL would otherwise make every retry hit the same crash; trading the
+ * conversation state for an unstuck agent is the right call. We only fire the
+ * fallback when there were prior failures (`i > 0`) so `respawnRetries=1`
+ * (the documented pre-#175 opt-out) keeps its original behaviour and never
+ * abandons the session unilaterally.
  */
 async function respawnEntryWithRetries(entry: PtyEntry, opts: SupervisorOptions): Promise<void> {
   const attempts = Math.max(1, opts.respawnRetries);
   let lastErr: unknown = new Error("respawnEntryWithRetries: no attempts made");
   for (let i = 0; i < attempts; i++) {
+    const isFinalAttempt = i === attempts - 1;
+    const hadPriorFailures = i > 0;
+    const dropResume = isFinalAttempt && hadPriorFailures;
     try {
-      await respawnEntry(entry);
+      await respawnEntry(entry, { dropResume });
       return;
     } catch (err) {
       lastErr = err;
-      if (i === attempts - 1) break;
+      if (isFinalAttempt) break;
       const delay = pickBackoff(opts.backoffMs, i);
       await _sleep(delay);
     }

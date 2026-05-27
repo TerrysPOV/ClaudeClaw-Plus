@@ -629,6 +629,159 @@ describe("pty-supervisor retry and backoff", () => {
     expect(spawnIndex).toBe(2); // initial + 1 respawn attempt
   });
 
+  it("drops --resume on final respawn attempt after prior failures (#177)", async () => {
+    // Issue #177 corrupted-session escape hatch: if respawn keeps failing
+    // because the resumed JSONL is poisoned, the FINAL attempt must drop
+    // `--resume <sessionId>` so a fresh claude can come up.
+    injectSleep(async () => {});
+    injectMaxRetriesForTests(1);
+    injectRespawnRetriesForTests(3);
+
+    let spawnIndex = 0;
+    const spawnedSessionIds: string[] = [];
+    const spawnedNewSessionIds: Array<string | undefined> = [];
+    const spawn: SpawnPty = async (opts) => {
+      spawnedSessionIds.push(opts.sessionId ?? "");
+      spawnedNewSessionIds.push(opts.newSessionId);
+      const idx = spawnIndex++;
+      if (idx === 0) {
+        return makeFakePty("seeded", {
+          initialSessionId: "old-session-id",
+          onTurn: async () => {
+            throw new PtyClosedError("seeded", 1, null);
+          },
+        });
+      }
+      // Inner respawn attempts 1 and 2 (idx 1, 2) throw fast.
+      if (idx < 3) {
+        throw new Error("PTY for claude exited before TUI settled");
+      }
+      // Final inner attempt (idx === 3) — fresh-session path. Succeeds and
+      // the next runTurn completes the turn.
+      return makeFakePty("fresh", {
+        onTurn: async (prompt) => ({
+          text: `fresh-recovered:${prompt}`,
+          bytesCaptured: 0,
+          cleanBoundary: true,
+          sessionId: "brand-new-session-id",
+        }),
+      });
+    };
+    injectSpawnPty(spawn);
+    await initSupervisor();
+
+    const result = await runOnPty("global", "hi", { timeoutMs: 1000 });
+    expect(result.exitCode).toBe(0);
+    expect(result.rawStdout).toBe("fresh-recovered:hi");
+    // Initial spawn (idx 0) + 3 inner respawn attempts (idx 1, 2, 3).
+    expect(spawnIndex).toBe(4);
+    // Inner attempts 1 and 2 must NOT drop --resume — they carry the
+    // last-known session id so the conversation can resume on the first
+    // success. (The exact id may be the old session or the pre-allocated
+    // newSessionId depending on which was last cached on spawnOpts — both
+    // are non-empty, which is the invariant.)
+    expect(spawnedSessionIds[1]).not.toBe("");
+    expect(spawnedSessionIds[2]).not.toBe("");
+    // FINAL inner attempt (idx 3) must drop --resume — empty sessionId.
+    // This is the corrupted-session escape hatch from issue #177.
+    expect(spawnedSessionIds[3]).toBe("");
+    // Critical: the final attempt must ALSO clear newSessionId — otherwise
+    // pty-process.ts:251-253 falls back to `--session-id <newSessionId>`
+    // and re-binds the "fresh" claude to the same pre-allocated UUID that
+    // owns the corrupted JSONL. This was a confidence-92 finding in the
+    // 5-agent review; the regression test is the fix verification.
+    expect(spawnedNewSessionIds[3]).toBeUndefined();
+  });
+
+  it("does NOT drop --resume when respawnRetries=1 (preserves pre-#175 opt-out)", async () => {
+    // The pre-#175 opt-out (respawnRetries=1) means "give up fast like the
+    // old code did". Dropping --resume on the very first attempt would
+    // change behaviour vs. the documented opt-out, so we only fire the
+    // escape hatch when there were prior failures (i > 0).
+    injectSleep(async () => {});
+    injectMaxRetriesForTests(1);
+    injectRespawnRetriesForTests(1);
+
+    let spawnIndex = 0;
+    const spawnedSessionIds: string[] = [];
+    const spawn: SpawnPty = async (opts) => {
+      spawnedSessionIds.push(opts.sessionId ?? "");
+      const idx = spawnIndex++;
+      if (idx === 0) {
+        return makeFakePty("seeded", {
+          initialSessionId: "old-session-id",
+          onTurn: async () => {
+            throw new PtyClosedError("seeded", 1, null);
+          },
+        });
+      }
+      throw new Error("respawn fail");
+    };
+    injectSpawnPty(spawn);
+    await initSupervisor();
+
+    const result = await runOnPty("global", "hi", { timeoutMs: 1000 });
+    expect(result.exitCode).toBe(1);
+    // Only 1 respawn attempt. The session id must be carried through —
+    // dropResume is NOT signalled because there were no prior failures.
+    expect(spawnIndex).toBe(2);
+    expect(spawnedSessionIds[1]).toBe("old-session-id");
+  });
+
+  it("does NOT drop --resume on the very first inner attempt (only on final after failure)", async () => {
+    // Defence in depth: even with respawnRetries=3, the FIRST inner respawn
+    // attempt must keep --resume. Only the final attempt — and only after
+    // earlier attempts have failed — should drop it.
+    injectSleep(async () => {});
+    injectMaxRetriesForTests(1);
+    injectRespawnRetriesForTests(3);
+
+    let spawnIndex = 0;
+    const spawnedSessionIds: string[] = [];
+    let turnsRunOnFresh = 0;
+    const spawn: SpawnPty = async (opts) => {
+      spawnedSessionIds.push(opts.sessionId ?? "");
+      const idx = spawnIndex++;
+      if (idx === 0) {
+        return makeFakePty("seeded", {
+          initialSessionId: "old-session-id",
+          onTurn: async () => {
+            throw new PtyClosedError("seeded", 1, null);
+          },
+        });
+      }
+      // First inner respawn attempt (idx 1) — succeeds, but the prompt
+      // replay fails again (so we DO NOT reach attempt 2 or 3).
+      if (idx === 1) {
+        return makeFakePty("first-respawn", {
+          initialSessionId: "old-session-id",
+          onTurn: async () => {
+            turnsRunOnFresh++;
+            return {
+              text: "ok",
+              bytesCaptured: 0,
+              cleanBoundary: true,
+              sessionId: "old-session-id",
+            };
+          },
+        });
+      }
+      throw new Error("should not reach idx > 1");
+    };
+    injectSpawnPty(spawn);
+    await initSupervisor();
+
+    const result = await runOnPty("global", "hi", { timeoutMs: 1000 });
+    expect(result.exitCode).toBe(0);
+    expect(result.rawStdout).toBe("ok");
+    // First inner attempt carried --resume (NOT dropped on i=0 even though
+    // attempts=3 — the dropResume signal requires hadPriorFailures).
+    expect(spawnedSessionIds[1]).toBe("old-session-id");
+    // Sanity: we didn't reach the final attempt.
+    expect(spawnIndex).toBe(2);
+    expect(turnsRunOnFresh).toBe(1);
+  });
+
   it("does NOT retry on non-retryable errors", async () => {
     const sleeps: number[] = [];
     injectSleep(async (ms) => {
