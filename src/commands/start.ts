@@ -39,6 +39,7 @@ import {
 import { getDayAndMinuteAtOffset, buildClockPromptPrefix } from "../timezone";
 import { isHeartbeatExcludedAt, isHeartbeatExcludedNow } from "../heartbeat-windows";
 import { startWebUi, type WebServerHandle } from "../web";
+import { getOrCreateWebToken } from "../ui/auth";
 import { streamBusPrompt } from "../bus/webui-bridge";
 import { initializeJobSystem } from "../orchestrator/resumable-jobs";
 import type { Job } from "../jobs";
@@ -1128,6 +1129,15 @@ export async function start(args: string[] = []) {
 
   if (webEnabled) {
     currentSettings.web.enabled = true;
+    // Issue #164 item 1: mint + persist a 256-bit web token at
+    // .claude/claudeclaw/web.token (0600) on first start. PR A only
+    // provisions the file; enforcement on /api/* + the dashboard
+    // auto-token UX land in PR B (with a browser soak test).
+    try {
+      await getOrCreateWebToken();
+    } catch (err) {
+      console.warn(`[${ts()}] could not provision web.token: ${extractErrorDetail(err)}`);
+    }
     web = startWebWithFallback(currentSettings.web.host, webPort);
     currentSettings.web.port = web.port;
     console.log(

@@ -62,31 +62,42 @@ export async function buildState(snapshot: WebSnapshot) {
   };
 }
 
+/**
+ * Field names whose values are secrets and must never leave the daemon
+ * unredacted. Matched case-insensitively against every key at every
+ * depth (issue #164 item 5, ported from upstream #185). The previous
+ * implementation only redacted a hand-enumerated set of top-level +
+ * one-level-nested fields, so a secret under a new/renamed key (or
+ * deeper nesting) would leak through `/api/technical-info`.
+ */
+const SECRET_KEY_NAMES = new Set([
+  "token",
+  "api",
+  "apikey",
+  "apitoken",
+  "bottoken",
+  "apptoken",
+  "password",
+  "secret",
+]);
+
+/**
+ * Recursively replace any field whose name matches {@link SECRET_KEY_NAMES}
+ * with `<redacted:N chars>` (N = original string length, or `0` for
+ * empty/non-string). Returns a deep copy — never mutates the input.
+ * Arrays are walked element-wise; primitives pass through untouched.
+ */
 function redactSettings(raw: unknown): unknown {
+  if (Array.isArray(raw)) return raw.map(redactSettings);
   if (!raw || typeof raw !== "object") return raw;
-  const s = raw as Record<string, unknown>;
-  const out: Record<string, unknown> = { ...s };
-  if ("apiToken" in out) out.apiToken = out.apiToken ? "[redacted]" : undefined;
-  if ("api" in out) out.api = out.api ? "[redacted]" : undefined;
-  if (out.fallback && typeof out.fallback === "object") {
-    const fb = out.fallback as Record<string, unknown>;
-    out.fallback = { ...fb, api: fb.api ? "[redacted]" : undefined };
-  }
-  if (out.telegram && typeof out.telegram === "object") {
-    const t = out.telegram as Record<string, unknown>;
-    out.telegram = { ...t, token: t.token ? "[redacted]" : "" };
-  }
-  if (out.discord && typeof out.discord === "object") {
-    const d = out.discord as Record<string, unknown>;
-    out.discord = { ...d, token: d.token ? "[redacted]" : "" };
-  }
-  if (out.slack && typeof out.slack === "object") {
-    const sl = out.slack as Record<string, unknown>;
-    out.slack = {
-      ...sl,
-      botToken: sl.botToken ? "[redacted]" : "",
-      appToken: sl.appToken ? "[redacted]" : "",
-    };
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (SECRET_KEY_NAMES.has(key.toLowerCase())) {
+      const len = typeof value === "string" ? value.length : 0;
+      out[key] = `<redacted:${len} chars>`;
+    } else {
+      out[key] = redactSettings(value);
+    }
   }
   return out;
 }

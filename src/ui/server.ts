@@ -122,6 +122,43 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
     fetch: async (req) => {
       const url = new URL(req.url);
 
+      // Issue #164 item 2: DNS-rebinding defense via Host header
+      // validation. A wildcard bind (0.0.0.0 / ::) means the operator
+      // opted into remote access and the browser Host won't match the
+      // bind address, so the check is skipped there. For a specific
+      // bind (loopback / LAN IP) we enforce an allowlist. Runs before
+      // the plugin gateway so /mcp/* and /api/plugin/* are covered too;
+      // the local MCP bridge calls with Host `127.0.0.1:<port>`, which
+      // is in the allowlist.
+      const host = req.headers.get("host") ?? "";
+      const isWildcardBind = opts.host === "0.0.0.0" || opts.host === "::";
+      if (!isWildcardBind) {
+        const expectedHosts = new Set([
+          `127.0.0.1:${opts.port}`,
+          `localhost:${opts.port}`,
+          `[::1]:${opts.port}`,
+          `${opts.host}:${opts.port}`,
+        ]);
+        if (!expectedHosts.has(host)) {
+          return new Response("Bad Host", { status: 421 });
+        }
+      }
+
+      // Issue #164 item 3: CSRF defense-in-depth — reject cross-origin
+      // state-changing requests. Only fires when an Origin header is
+      // present (browsers set it on POST/DELETE; the local MCP bridge
+      // and CLI clients don't, so they pass). This layers under the
+      // existing per-session CSRF-token check (PR #75).
+      if (req.method === "POST" || req.method === "DELETE") {
+        const origin = req.headers.get("origin");
+        if (origin) {
+          const allowedOrigins = new Set([`http://${host}`, `https://${host}`]);
+          if (!allowedOrigins.has(origin)) {
+            return new Response("Bad Origin", { status: 403 });
+          }
+        }
+      }
+
       // Plugin HTTP gateway — handles /api/plugin/* routes and
       // /mcp/<server>/* multiplexer routes (registered by the
       // McpMultiplexerPlugin at daemon startup).
