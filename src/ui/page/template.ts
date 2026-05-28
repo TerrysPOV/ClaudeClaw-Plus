@@ -18,6 +18,15 @@ export function htmlPage(): string {
 <html lang="en">
 <head>
   <meta charset="utf-8" />
+  <!-- Issue #164 PR B (Codex P1): the dashboard bootstraps with the web
+       token in ?token=. This MUST be the first head element so the
+       no-referrer policy is in force before the Google Fonts preconnect /
+       stylesheet below fire — otherwise a browser defaulting to
+       no-referrer-when-downgrade would leak the full URL (token included)
+       to fonts.googleapis.com via the Referer header. The /-route HTTP
+       response also sets Referrer-Policy: no-referrer as the authoritative
+       belt-and-suspenders. -->
+  <meta name="referrer" content="no-referrer" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ClaudeClaw+</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />

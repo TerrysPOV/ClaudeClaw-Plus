@@ -217,7 +217,18 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
 
       if (url.pathname === "/" || url.pathname === "/index.html") {
         return new Response(htmlPage(), {
-          headers: { "Content-Type": "text/html; charset=utf-8" },
+          headers: {
+            "Content-Type": "text/html; charset=utf-8",
+            // Issue #164 PR B (Codex P1): the dashboard is opened with the
+            // web token in ?token=. no-referrer guarantees the token is
+            // never sent in a Referer header to the Google Fonts (or any
+            // cross-origin) subresource requests fired during head parse,
+            // regardless of the browser's default Referrer-Policy. Safe
+            // here — nothing in the dashboard relies on Referer (CSRF uses
+            // X-CSRF-Token; the Origin gate uses the Origin header, which
+            // this policy does not affect).
+            "Referrer-Policy": "no-referrer",
+          },
         });
       }
 
