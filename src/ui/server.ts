@@ -167,6 +167,7 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
     fetch: async (req) => {
       const url = new URL(req.url);
 
+<<<<<<< HEAD
       // Issue #164 item 2: DNS-rebinding defense via Host header
       // validation. A wildcard bind (0.0.0.0 / ::) means the operator
       // opted into remote access and the browser Host won't match the
@@ -193,6 +194,28 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
       // present (browsers set it on POST/DELETE; the local MCP bridge
       // and CLI clients don't, so they pass). This layers under the
       // existing per-session CSRF-token check (PR #75).
+=======
+      // Task 1.2: Reject DNS rebinding attacks via Host header validation.
+      // Wildcard bind addresses (0.0.0.0, ::) mean the user opted into remote access —
+      // the browser Host header won't match the bind address, so we skip the check.
+      // For specific bind addresses (loopback or LAN IP) we enforce the allowlist.
+      const host = req.headers.get("host") ?? "";
+      const isWildcardBind = opts.host === "0.0.0.0" || opts.host === "::";
+      if (!isWildcardBind) {
+        const expectedHosts = new Set([
+          `127.0.0.1:${opts.port}`,
+          `localhost:${opts.port}`,
+          `[::1]:${opts.port}`,
+          `${opts.host}:${opts.port}`,
+        ]);
+        if (!expectedHosts.has(host)) {
+          return new Response("Bad Host", { status: 421 });
+        }
+      }
+
+      // Task 1.3: CSRF defense — reject cross-origin requests for state-changing methods.
+      // Accept both http and https origins for validated hosts.
+>>>>>>> upstream/master
       if (req.method === "POST" || req.method === "DELETE") {
         const origin = req.headers.get("origin");
         if (origin) {
@@ -203,6 +226,7 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
         }
       }
 
+<<<<<<< HEAD
       // Plugin HTTP gateway — handles /api/plugin/* routes and
       // /mcp/<server>/* multiplexer routes (registered by the
       // McpMultiplexerPlugin at daemon startup).
@@ -215,6 +239,8 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
         }
       }
 
+=======
+>>>>>>> upstream/master
       if (url.pathname === "/" || url.pathname === "/index.html") {
         return new Response(htmlPage(), {
           headers: {
@@ -232,12 +258,17 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
         });
       }
 
+<<<<<<< HEAD
       // Health check is intentionally pre-auth so monitors / load balancers
       // work unauthenticated.
+=======
+      // Health check is intentionally pre-auth so monitors and load balancers work unauthenticated.
+>>>>>>> upstream/master
       if (url.pathname === "/api/health") {
         return json({ ok: true, now: Date.now() });
       }
 
+<<<<<<< HEAD
       // Issue #164 PR B: require the web token for every /api/* route.
       // The HTML shell ("/" above) and /api/health (above) stay pre-auth;
       // the dashboard JS reads the token from `?token=` on first load and
@@ -266,6 +297,23 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
         return new Response(JSON.stringify({ token }), { headers });
       }
 
+=======
+      // Task 1.1: Require bearer token for all /api/* routes.
+      // /api/inject also accepts the legacy settings.apiToken so existing automation isn't broken.
+      if (url.pathname.startsWith("/api/")) {
+        const apiToken = opts.getSnapshot().settings.apiToken;
+        const validWebToken = checkToken(req, opts.token);
+        const validApiToken =
+          url.pathname === "/api/inject" && !!apiToken && checkToken(req, apiToken);
+        if (!validWebToken && !validApiToken) {
+          return new Response(JSON.stringify({ ok: false, error: "unauthorized" }), {
+            status: 401,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
+
+>>>>>>> upstream/master
       if (url.pathname === "/api/state") {
         return json(await buildState(opts.getSnapshot()));
       }
@@ -504,9 +552,12 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
       }
 
       if (url.pathname === "/api/inject" && req.method === "POST") {
+<<<<<<< HEAD
         // Auth already enforced by the /api/* block above (web token OR
         // the legacy settings.apiToken). No extra checkBearer here — it
         // would wrongly reject a valid web-token-only request.
+=======
+>>>>>>> upstream/master
         try {
           const body = await req.json();
           const message = typeof body.message === "string" ? body.message.trim() : "";
