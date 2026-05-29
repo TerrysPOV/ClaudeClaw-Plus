@@ -289,6 +289,42 @@ describe("parseSettings — bus routing (Sprint 5.2b)", () => {
   });
 });
 
+describe("parseSettings — llmRouter (#70)", () => {
+  it("defaults to empty tiers + the OpenRouter base when absent", async () => {
+    await writeRawSettings({});
+    await reloadSettings();
+    expect(getSettings().llmRouter).toEqual({
+      tiers: { fast: [], balanced: [], reasoning: [] },
+      openRouterBaseUrl: "https://openrouter.ai/api/v1",
+    });
+  });
+
+  it("parses configured tier model lists + custom base + ollama", async () => {
+    await writeRawSettings({
+      llmRouter: {
+        tiers: { fast: ["groq/llama"], balanced: ["a/b", "c/d"], reasoning: ["anthropic/opus"] },
+        openRouterBaseUrl: "https://proxy.example/api/v1",
+        ollamaBaseUrl: "http://127.0.0.1:11434/v1",
+      },
+    });
+    await reloadSettings();
+    expect(getSettings().llmRouter).toEqual({
+      tiers: { fast: ["groq/llama"], balanced: ["a/b", "c/d"], reasoning: ["anthropic/opus"] },
+      openRouterBaseUrl: "https://proxy.example/api/v1",
+      ollamaBaseUrl: "http://127.0.0.1:11434/v1",
+    });
+  });
+
+  it("drops non-string / empty tier entries and trims", async () => {
+    await writeRawSettings({
+      llmRouter: { tiers: { fast: ["  groq/llama  ", "", 42, null], balanced: "nope" } },
+    });
+    await reloadSettings();
+    expect(getSettings().llmRouter.tiers.fast).toEqual(["groq/llama"]);
+    expect(getSettings().llmRouter.tiers.balanced).toEqual([]);
+  });
+});
+
 describe("parseSettings — sessionTimeoutMs default (#179)", () => {
   it("defaults DEFAULT_SESSION_TIMEOUT_MS to 120 minutes", () => {
     // 120 * 60 * 1000 = 7,200,000 ms

@@ -230,6 +230,15 @@ const DEFAULT_SETTINGS: Settings = {
   agents: [{ id: "default" }],
   plugins: {},
   memorySearch: {},
+  // LLM router (#70). Tiers ship EMPTY — no opinionated model defaults; the
+  // operator searches the OpenRouter catalogue (llm_models tool) and assigns
+  // ids, or passes a per-call model. Only consulted by the llm-router MCP
+  // plugin when registered as a shared server. The secret OPENROUTER_API_KEY
+  // is env-only and never stored here.
+  llmRouter: {
+    tiers: { fast: [], balanced: [], reasoning: [] },
+    openRouterBaseUrl: "https://openrouter.ai/api/v1",
+  },
 };
 
 export interface HeartbeatExcludeWindow {
@@ -659,7 +668,23 @@ export interface Settings {
   plugins: Record<string, PluginEntry>;
   session: SessionConfig;
   memorySearch: MemorySearchSettings;
+  llmRouter: LlmRouterConfig;
   jobsDir?: string;
+}
+
+/**
+ * LLM router config (#70). Non-secret only — `OPENROUTER_API_KEY` is read from
+ * the environment by the llm-router plugin, never stored here. `tiers` maps each
+ * cost tier to an ordered list of OpenRouter model ids (fallback order). Empty
+ * by default: the operator chooses models via the `llm_models` search tool or a
+ * per-call `model`.
+ */
+export interface LlmRouterConfig {
+  tiers: { fast: string[]; balanced: string[]; reasoning: string[] };
+  /** OpenRouter API base. Default https://openrouter.ai/api/v1. */
+  openRouterBaseUrl: string;
+  /** Optional local Ollama OpenAI-compatible base (e.g. http://127.0.0.1:11434/v1). */
+  ollamaBaseUrl?: string;
 }
 
 export interface AgenticMode {
@@ -982,6 +1007,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
     watchdog: parseWatchdogConfig(raw.watchdog),
     plugins: parsePlugins(raw.plugins),
     memorySearch: parseMemorySearchSettings(raw.memorySearch),
+    llmRouter: parseLlmRouterConfig(raw.llmRouter),
     session: {
       autoRotate: raw.session?.autoRotate ?? false,
       maxMessages: Number.isFinite(raw.session?.maxMessages) ? Number(raw.session.maxMessages) : 50,
@@ -1131,6 +1157,44 @@ function parseBusAgents(raw: unknown): BusAgentSettings[] {
     out.push(parsed);
   }
   return out;
+}
+
+/**
+ * Parse `settings.llmRouter` (#70). Non-secret config only. Tier model lists
+ * default to empty (operator chooses via the llm_models tool); invalid entries
+ * are dropped with a warning rather than throwing. `OPENROUTER_API_KEY` is never
+ * read here — it's an env-only secret consumed by the llm-router plugin.
+ */
+function parseLlmRouterConfig(raw: unknown): LlmRouterConfig {
+  const defaults = DEFAULT_SETTINGS.llmRouter;
+  if (!raw || typeof raw !== "object") return defaults;
+  const r = raw as Record<string, unknown>;
+
+  const parseTier = (key: "fast" | "balanced" | "reasoning"): string[] => {
+    const tiers = r.tiers as Record<string, unknown> | undefined;
+    const list = tiers?.[key];
+    if (!Array.isArray(list)) return [];
+    return list
+      .filter((m): m is string => typeof m === "string" && m.trim().length > 0)
+      .map((m) => m.trim());
+  };
+
+  const baseUrl =
+    typeof r.openRouterBaseUrl === "string" && r.openRouterBaseUrl.trim().length > 0
+      ? r.openRouterBaseUrl.trim()
+      : defaults.openRouterBaseUrl;
+
+  return {
+    tiers: {
+      fast: parseTier("fast"),
+      balanced: parseTier("balanced"),
+      reasoning: parseTier("reasoning"),
+    },
+    openRouterBaseUrl: baseUrl,
+    ...(typeof r.ollamaBaseUrl === "string" && r.ollamaBaseUrl.trim().length > 0
+      ? { ollamaBaseUrl: r.ollamaBaseUrl.trim() }
+      : {}),
+  };
 }
 
 /**
