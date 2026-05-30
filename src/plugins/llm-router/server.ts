@@ -112,23 +112,37 @@ export function createLlmRouterHandlers(deps: LlmRouterHandlerDeps) {
     throw new Error("createLlmRouterHandlers requires `config` or `getConfig`.");
   }
   const getConfig = deps.getConfig ?? (async () => deps.config as LlmRouterRuntimeConfig);
-  // The catalogue + dispatch only need the API key + base URL — both stable
-  // for the process lifetime — so they're built once. Tier changes go through
-  // `getConfig()` per call, which is the only part dashboard edits affect.
-  const initial = deps.config ?? null;
-  const orDeps: OpenRouterDeps = {
-    apiKey: deps.apiKey,
-    baseUrl: initial?.openRouterBaseUrl ?? "https://openrouter.ai/api/v1",
-    ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
-  };
-  const catalogue = deps.catalogue ?? new ModelCatalogue(orDeps);
   const audit = deps.audit ?? (() => {});
-  const dispatch: Dispatch = (model, opts) => chatCompletion(model, opts, orDeps);
+
+  // `orDeps` (apiKey + baseUrl) is built from the live config per call so a
+  // dashboard edit of `openRouterBaseUrl` (Codex P2 on #204) — or any future
+  // proxy/gateway override — takes effect without a daemon restart. apiKey is
+  // process-env at boot and stable; baseUrl can change. The catalogue holds a
+  // fetched models snapshot, so it's cached by baseUrl and rebuilt only when
+  // baseUrl changes (avoids dropping the cache on every call).
+  let cachedBaseUrl: string | null = null;
+  let cachedCatalogue: ModelCatalogue | null = null;
+  function buildOrDeps(baseUrl: string): OpenRouterDeps {
+    return {
+      apiKey: deps.apiKey,
+      baseUrl,
+      ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+    };
+  }
+  function getCatalogue(baseUrl: string): ModelCatalogue {
+    if (deps.catalogue) return deps.catalogue;
+    if (cachedCatalogue && cachedBaseUrl === baseUrl) return cachedCatalogue;
+    cachedCatalogue = new ModelCatalogue(buildOrDeps(baseUrl));
+    cachedBaseUrl = baseUrl;
+    return cachedCatalogue;
+  }
 
   async function llmCall(rawArgs: Record<string, unknown>) {
     if (!deps.apiKey) throw new Error("OPENROUTER_API_KEY is not set in the daemon environment.");
     const params = parseLlmCallArgs(rawArgs);
     const config = await getConfig();
+    const orDeps = buildOrDeps(config.openRouterBaseUrl);
+    const dispatch: Dispatch = (model, opts) => chatCompletion(model, opts, orDeps);
     const startedAt = Date.now();
     try {
       const result = await callLlm(params, config, dispatch);
@@ -156,6 +170,8 @@ export function createLlmRouterHandlers(deps: LlmRouterHandlerDeps) {
   async function llmModels(rawArgs: Record<string, unknown>) {
     if (!deps.apiKey) throw new Error("OPENROUTER_API_KEY is not set in the daemon environment.");
     const params = parseLlmModelsArgs(rawArgs);
+    const config = await getConfig();
+    const catalogue = getCatalogue(config.openRouterBaseUrl);
     const { models, cachedAt } = await catalogue.search(params);
     audit("llm_models_listed", { query: params.query ?? null, returned: models.length });
     return { models, cachedAt };

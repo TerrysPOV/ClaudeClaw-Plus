@@ -140,6 +140,44 @@ describe("createLlmRouterHandlers.llmCall", () => {
 });
 
 describe("createLlmRouterHandlers — live-reload via getConfig (#70 Phase C)", () => {
+  it("uses the live openRouterBaseUrl from getConfig (Codex P2 on PR #204)", async () => {
+    // Regression: when only getConfig was passed, baseUrl fell back to the
+    // hardcoded OpenRouter default, so an operator-set proxy URL was ignored.
+    let chatUrl = "";
+    let modelsUrl = "";
+    const fetchImpl = (async (url: string, init?: RequestInit) => {
+      if (url.includes("/chat/completions")) {
+        chatUrl = url;
+        return new Response(
+          JSON.stringify({
+            model: "x/y",
+            choices: [{ message: { content: "ok" } }],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          }),
+          { status: 200 },
+        );
+      }
+      if (url.includes("/models")) {
+        modelsUrl = url;
+        return new Response(JSON.stringify({ data: [] }), { status: 200 });
+      }
+      return new Response("nf", { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const h = createLlmRouterHandlers({
+      getConfig: async () => ({
+        tiers: { fast: ["x/y"], balanced: [], reasoning: [] },
+        openRouterBaseUrl: "https://proxy.example.test/v1",
+      }),
+      apiKey: "k",
+      fetchImpl,
+    });
+    await h.llmCall({ tier: "fast", messages: [{ role: "user", content: "hi" }] });
+    await h.llmModels({});
+    expect(chatUrl).toBe("https://proxy.example.test/v1/chat/completions");
+    expect(modelsUrl).toBe("https://proxy.example.test/v1/models");
+  });
+
   it("invokes getConfig per llm_call so dashboard tier edits take effect without restart", async () => {
     let configCalls = 0;
     const tierLists: Array<string[]> = [["x/first"], ["x/second"]];
