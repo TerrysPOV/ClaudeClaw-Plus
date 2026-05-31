@@ -38,6 +38,7 @@ import { wireSlashCommands } from "./wiring";
 import type { MountedAdapter } from "./adapter-wiring";
 import { stopBusAdapters } from "./adapter-wiring";
 import { detectOrphanAgents, formatOrphanWarnings } from "./orphan-agent-detect";
+import { createPromptStreamHandler } from "./receipt-wiring";
 
 export interface BusRuntimeHandle {
   /** The mounted BusCore. Adapters / tests subscribe via this. */
@@ -249,13 +250,14 @@ export async function mountBusRuntime(
     wireSlashCommands(bus, sessionManager);
     // Wire PTY-stdin prompt delivery: route inbound prompts to the agent's
     // REPL so headless claudes (which ignore the MCP channel notification)
-    // start a turn. No-op for agents whose process doesn't support streaming.
-    bus.setStreamPromptHandler(async (agentId, text) => {
-      const proc = sessionManager.getAgent(agentId);
-      if (proc && typeof proc.send_prompt_stream === "function") {
-        await proc.send_prompt_stream(text);
-      }
-    });
+    // start a turn. Receipt chain (issue #207): the helper looks up the open
+    // receipt by `prompt_hash`, back-fills pid + generation + stamps
+    // `stdin_written_at` on success, and closes as `stale_session` if the
+    // PTY write fails or no process is registered. The caller (e.g. the
+    // webui bridge) still owns the terminal close on observed/timeout.
+    bus.setStreamPromptHandler(
+      createPromptStreamHandler((agentId) => sessionManager.getAgent(agentId)),
+    );
 
     const declaredAgents = opts.agents ?? [];
 

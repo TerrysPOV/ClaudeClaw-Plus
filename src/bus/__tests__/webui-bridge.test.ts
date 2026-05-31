@@ -9,10 +9,37 @@
  * reply path by calling `bus.ingestReply` directly — that's how the
  * plus-bus MCP server normally publishes claude's responses.
  */
-import { describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createBusCore, type BusCore } from "../core";
 import type { EventEntryInput, EventRecord } from "../../event-log";
+import {
+  _setDefaultReceiptStoreForTests,
+  createReceiptStore,
+  hashPrompt,
+  type ReceiptRecord,
+  type ReceiptStore,
+} from "../receipt";
 import { streamBusPrompt } from "../webui-bridge";
+
+// Redirect the process-wide default receipt store to a throwaway path for the
+// duration of this file so the existing 11 streamBusPrompt tests (which
+// do not pass receiptStore) do not append to the user real
+// ~/.claude/claudeclaw/receipts.jsonl. The receipt-chain describe below
+// passes an explicit per-test store so it is not affected by this redirection.
+let _singletonTmpDir: string;
+let _restoreSingleton: (() => void) | null = null;
+beforeAll(() => {
+  _singletonTmpDir = mkdtempSync(join(tmpdir(), "ccplus-bridge-singleton-"));
+  const sink = createReceiptStore({ path: join(_singletonTmpDir, "receipts.jsonl") });
+  _restoreSingleton = _setDefaultReceiptStoreForTests(sink);
+});
+afterAll(() => {
+  _restoreSingleton?.();
+  if (existsSync(_singletonTmpDir)) rmSync(_singletonTmpDir, { recursive: true, force: true });
+});
 
 function mockEventLog() {
   let seq = 0;
@@ -224,5 +251,102 @@ describe("streamBusPrompt", () => {
     const [a, b] = await Promise.all([aPending, bPending]);
     expect(a.output).toBe("alpha-reply");
     expect(b.output).toBe("beta-reply");
+  });
+});
+
+/**
+ * Receipt-chain wiring: the bridge must open a receipt at entry, stamp
+ * `agent_id` + `prompt_hash` + selected route, and close on the terminal
+ * state observed (`turn_observed` / `timeout` / `wedged_prompt`). Issue #207.
+ */
+describe("streamBusPrompt — receipt chain", () => {
+  let tmpDir: string;
+  let logPath: string;
+  let store: ReceiptStore;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "ccplus-bridge-receipt-"));
+    logPath = join(tmpDir, "receipts.jsonl");
+    store = createReceiptStore({ path: logPath });
+  });
+
+  afterEach(() => {
+    if (existsSync(tmpDir)) rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function readReceipts(): ReceiptRecord[] {
+    if (!existsSync(logPath)) return [];
+    return readFileSync(logPath, "utf-8")
+      .split("\n")
+      .filter((l) => l.trim().length > 0)
+      .map((l) => JSON.parse(l) as ReceiptRecord);
+  }
+
+  it("closes a receipt as turn_observed on intent:final", async () => {
+    const bus = makeBus();
+    const pending = streamBusPrompt(bus, "alpha", "hello world", {
+      timeoutMs: 2000,
+      receiptStore: store,
+      originId: "test-msg-1",
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    bus.ingestReply({ agent_id: "alpha", text: "reply", intent: "final" });
+    await pending;
+    // Wait for the receipt close fire-and-forget to flush to disk.
+    for (let i = 0; i < 20 && readReceipts().length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const recs = readReceipts();
+    expect(recs).toHaveLength(1);
+    expect(recs[0].final_state).toBe("turn_observed");
+    expect(recs[0].agent_id).toBe("alpha");
+    expect(recs[0].selected_route).toBe("agent=alpha");
+    expect(recs[0].prompt_hash).toBe(hashPrompt("hello world"));
+    expect(recs[0].message_id).toMatch(/^webui:test-msg-1:[0-9a-f]{8}$/);
+    expect(typeof recs[0].duration_ms).toBe("number");
+    expect(recs[0].notes).toMatchObject({ output_chars: 5, bus_send_ok: true });
+  });
+
+  it("closes a receipt as timeout when no final lands", async () => {
+    const bus = makeBus();
+    const pending = streamBusPrompt(bus, "alpha", "stuck", {
+      timeoutMs: 100,
+      receiptStore: store,
+    });
+    await pending;
+    for (let i = 0; i < 20 && readReceipts().length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const recs = readReceipts();
+    expect(recs).toHaveLength(1);
+    expect(recs[0].final_state).toBe("timeout");
+    expect(recs[0].notes?.timeout_ms).toBe(100);
+  });
+
+  it("indexes the open receipt by prompt_hash so the bus → PTY seam can patch", async () => {
+    const bus = makeBus();
+    const pending = streamBusPrompt(bus, "alpha", "lookup me", {
+      timeoutMs: 1000,
+      receiptStore: store,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    // The receipt is open and indexed by hash — runtime-mount would find it here.
+    const r = store.findByPromptHash(hashPrompt("lookup me"));
+    expect(r).toBeDefined();
+    expect(r?.record.agent_id).toBe("alpha");
+    // Simulate the bus → PTY seam back-filling PID + generation.
+    r?.patch({ process_pid: 12345, process_generation: 1 });
+    bus.ingestReply({ agent_id: "alpha", text: "ok", intent: "final" });
+    await pending;
+    for (let i = 0; i < 20 && readReceipts().length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const recs = readReceipts();
+    expect(recs[0].process_pid).toBe(12345);
+    expect(recs[0].process_generation).toBe(1);
+    // After close, the hash index is cleared.
+    expect(store.findByPromptHash(hashPrompt("lookup me"))).toBeUndefined();
   });
 });

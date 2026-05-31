@@ -9,6 +9,8 @@ import {
   createReceiptStore,
   hashPrompt,
   defaultReceiptLogPath,
+  getDefaultReceiptStore,
+  _setDefaultReceiptStoreForTests,
   type ReceiptRecord,
 } from "../receipt";
 
@@ -175,5 +177,63 @@ describe("ReceiptStore", () => {
     await r.close("turn_observed", { stage2: "done" });
     const [rec] = readReceipts();
     expect(rec.notes).toEqual({ stage1: "ok", stage2: "done" });
+  });
+});
+
+describe("findByPromptHash", () => {
+  test("indexes a receipt opened with a prompt_hash", () => {
+    const store = createReceiptStore({ path: logPath });
+    const h = hashPrompt("the prompt");
+    const r = store.open("tg-h1", { prompt_hash: h });
+    expect(store.findByPromptHash(h)).toBe(r);
+  });
+
+  test("returns undefined for an unknown hash", () => {
+    const store = createReceiptStore({ path: logPath });
+    expect(store.findByPromptHash("sha256:0000000000000000")).toBeUndefined();
+  });
+
+  test("indexes a receipt that gets its prompt_hash via patch()", () => {
+    const store = createReceiptStore({ path: logPath });
+    const r = store.open("tg-h2");
+    const h = hashPrompt("late hash");
+    r.patch({ prompt_hash: h });
+    expect(store.findByPromptHash(h)).toBe(r);
+  });
+
+  test("close() removes the receipt from the hash index", async () => {
+    const store = createReceiptStore({ path: logPath });
+    const h = hashPrompt("zap");
+    const r = store.open("tg-h3", { prompt_hash: h });
+    expect(store.findByPromptHash(h)).toBe(r);
+    await r.close("turn_observed");
+    expect(store.findByPromptHash(h)).toBeUndefined();
+  });
+
+  test("patching prompt_hash to a new value re-indexes", () => {
+    const store = createReceiptStore({ path: logPath });
+    const h1 = hashPrompt("one");
+    const h2 = hashPrompt("two");
+    const r = store.open("tg-h4", { prompt_hash: h1 });
+    r.patch({ prompt_hash: h2 });
+    expect(store.findByPromptHash(h1)).toBeUndefined();
+    expect(store.findByPromptHash(h2)).toBe(r);
+  });
+});
+
+describe("getDefaultReceiptStore", () => {
+  test("returns the same instance across calls (singleton)", () => {
+    const a = getDefaultReceiptStore();
+    const b = getDefaultReceiptStore();
+    expect(a).toBe(b);
+  });
+
+  test("_setDefaultReceiptStoreForTests swaps the singleton + restores", () => {
+    const original = getDefaultReceiptStore();
+    const fake = createReceiptStore({ path: logPath });
+    const restore = _setDefaultReceiptStoreForTests(fake);
+    expect(getDefaultReceiptStore()).toBe(fake);
+    restore();
+    expect(getDefaultReceiptStore()).toBe(original);
   });
 });

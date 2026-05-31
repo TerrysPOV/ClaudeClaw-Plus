@@ -14,9 +14,19 @@
  *   - `/api/chat` — passes `onChunk` so each `response.text` event is
  *     streamed back to the dashboard SSE as it arrives. Resolves
  *     when `intent: "final"` lands or the timeout fires.
+ *
+ * Receipt chain (issue #207): every call opens a receipt at entry, stamps
+ * `route_resolved` + `prompt_hash` immediately, and closes on the terminal
+ * state (`turn_observed` on final, `timeout` on timer, `wedged_prompt` on
+ * `bus.sendPrompt` rejection). The bus → PTY seam in `runtime-mount.ts`
+ * back-fills `process_pid`/`process_generation`/`agent_cwd` + stamps
+ * `stdin_written` via `findByPromptHash`. Receipts land at
+ * `~/.claude/claudeclaw/receipts.jsonl` (0600).
  */
 
+import { randomBytes } from "node:crypto";
 import type { BusCore } from "./core";
+import { getDefaultReceiptStore, hashPrompt, type ReceiptStore } from "./receipt";
 import type { BusOrigin } from "./types";
 
 /**
@@ -51,6 +61,11 @@ export interface StreamBusPromptOptions {
    * with `ok: false` and whatever was accumulated when the timeout fires.
    */
   timeoutMs?: number;
+  /**
+   * Receipt store to record per-prompt observability into. Defaults to the
+   * process-wide singleton (`getDefaultReceiptStore`). Override is for tests.
+   */
+  receiptStore?: ReceiptStore;
 }
 
 export interface BusPromptResult {
@@ -123,10 +138,31 @@ function runPrompt(
   opts: StreamBusPromptOptions,
 ): Promise<BusPromptResult> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS;
+  const origin = opts.origin ?? "webui";
+  const originId = opts.originId ?? "webui";
+  // Receipt: open at entry so the prompt is *visible* from the first byte
+  // of bridge work. `message_id` includes a short nonce so concurrent calls
+  // sharing the same `origin_id` (e.g. two webui chats) don't collide on
+  // the receipt store's `message_id` index. The `prompt_hash` index, by
+  // contrast, is keyed on the prompt text and is what the bus → PTY seam
+  // uses to back-fill PID/generation/cwd.
+  const store = opts.receiptStore ?? getDefaultReceiptStore();
+  const messageId = `${origin}:${originId}:${randomBytes(4).toString("hex")}`;
+  const prompt_hash = hashPrompt(message);
+  const receipt = store.open(messageId, {
+    selected_route: `agent=${agentId}`,
+    agent_id: agentId,
+    prompt_hash,
+    notes: { origin, origin_id: originId },
+  });
   let accumulated = "";
   return new Promise<BusPromptResult>((resolve) => {
     let resolved = false;
-    const finish = (r: BusPromptResult) => {
+    const finish = (
+      r: BusPromptResult,
+      finalState: "turn_observed" | "timeout" | "wedged_prompt",
+      notes?: Record<string, unknown>,
+    ) => {
       if (resolved) return;
       resolved = true;
       try {
@@ -135,6 +171,11 @@ function runPrompt(
         /* idempotent close — fine */
       }
       clearTimeout(timer);
+      // Close the receipt before resolving — best-effort, never throws.
+      // We don't await here because the caller (e.g. dashboard SSE)
+      // shouldn't block on a disk write, but the store appends serially
+      // so observers see the line within a tick.
+      void receipt.close(finalState, notes);
       resolve(r);
     };
     const sub = bus.subscribe({ agent_id: agentId, topics: ["response.text"] }, (event) => {
@@ -150,36 +191,55 @@ function runPrompt(
         }
       }
       if (payload.intent === "final") {
-        finish({
-          ok: true,
-          output: accumulated || (payload.text ?? ""),
-          exitCode: 0,
-        });
+        finish(
+          {
+            ok: true,
+            output: accumulated || (payload.text ?? ""),
+            exitCode: 0,
+          },
+          "turn_observed",
+          { output_chars: accumulated.length },
+        );
       }
     });
     const timer = setTimeout(() => {
-      finish({
-        ok: false,
-        output: accumulated,
-        exitCode: 1,
-        error: `timed out after ${timeoutMs}ms waiting for agent ${agentId} reply`,
-      });
+      finish(
+        {
+          ok: false,
+          output: accumulated,
+          exitCode: 1,
+          error: `timed out after ${timeoutMs}ms waiting for agent ${agentId} reply`,
+        },
+        "timeout",
+        { timeout_ms: timeoutMs, accumulated_chars: accumulated.length },
+      );
     }, timeoutMs);
     bus
       .sendPrompt({
         agent_id: agentId,
-        origin: opts.origin ?? "webui",
-        origin_id: opts.originId ?? "webui",
+        origin,
+        origin_id: originId,
         user_id: "webui",
         text: message,
       })
+      .then(() => {
+        // The bus accepted the prompt — the route was resolvable. We
+        // don't yet know whether the PTY actually accepted it (that's
+        // stamped by `runtime-mount.ts` via prompt_hash lookup), but
+        // we can confirm the bus seam is unblocked.
+        receipt.patch({ notes: { ...receipt.record.notes, bus_send_ok: true } });
+      })
       .catch((err) => {
-        finish({
-          ok: false,
-          output: accumulated,
-          exitCode: 1,
-          error: err instanceof Error ? err.message : String(err),
-        });
+        finish(
+          {
+            ok: false,
+            output: accumulated,
+            exitCode: 1,
+            error: err instanceof Error ? err.message : String(err),
+          },
+          "wedged_prompt",
+          { error: err instanceof Error ? err.message : String(err), stage: "bus_send_prompt" },
+        );
       });
   });
 }

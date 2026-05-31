@@ -79,6 +79,10 @@ export interface ReceiptStore {
   open(message_id: string, fields?: Partial<ReceiptRecord>): OpenReceipt;
   /** Find an open receipt without creating one. */
   find(message_id: string): OpenReceipt | undefined;
+  /** Look up an open receipt by its `prompt_hash`. Used at the bus → PTY
+   *  seam, where only the prompt text is available (no message_id). Returns
+   *  undefined if no receipt is currently open for that hash. */
+  findByPromptHash(prompt_hash: string): OpenReceipt | undefined;
   /** Close every still-open receipt with the given terminal state (e.g. on
    *  daemon shutdown, mark them as `timeout`). */
   drain(state: ReceiptFinalState): Promise<void>;
@@ -112,6 +116,13 @@ export function createReceiptStore(opts: ReceiptStoreOptions = {}): ReceiptStore
   const now = opts.now ?? (() => new Date());
   const onError = opts.onError ?? (() => {});
   const openReceipts = new Map<string, OpenReceipt>();
+  // Secondary index for the bus → PTY seam, which only sees `text` (no
+  // message_id). Populated when a receipt is patched with `prompt_hash` and
+  // cleared on close. A hash collision would shadow an earlier still-open
+  // receipt; we accept that for the short window between stdin_written and
+  // turn_observed since the alternative (collision-free uuid plumbing
+  // through every adapter) is invasive.
+  const byPromptHash = new Map<string, OpenReceipt>();
 
   // Best-effort ensure parent directory exists. Synchronous (one-shot) so we
   // don't race the first append.
@@ -145,6 +156,16 @@ export function createReceiptStore(opts: ReceiptStoreOptions = {}): ReceiptStore
     }
   }
 
+  function indexHash(receipt: OpenReceipt, hash: string | undefined): void {
+    if (!hash) return;
+    byPromptHash.set(hash, receipt);
+  }
+
+  function deindexHash(hash: string | undefined): void {
+    if (!hash) return;
+    byPromptHash.delete(hash);
+  }
+
   function makeReceipt(message_id: string, fields: Partial<ReceiptRecord>): OpenReceipt {
     const startedAt = now();
     // Drop any caller-supplied identity / terminal fields up-front so a typo
@@ -173,7 +194,14 @@ export function createReceiptStore(opts: ReceiptStoreOptions = {}): ReceiptStore
         if (closed) return;
         // Don't allow patch() to override identity or terminal state.
         const { message_id: _m, received_at: _r, final_state: _f, ...rest } = more;
+        // Track hash transitions so the prompt-hash index stays in sync if a
+        // caller back-fills the hash after open.
+        const before = rec.prompt_hash;
         Object.assign(rec, rest);
+        if (rec.prompt_hash !== before) {
+          deindexHash(before);
+          indexHash(this, rec.prompt_hash);
+        }
       },
       async close(state: ReceiptFinalState, notes?: Record<string, unknown>): Promise<void> {
         if (closed) return;
@@ -182,9 +210,11 @@ export function createReceiptStore(opts: ReceiptStoreOptions = {}): ReceiptStore
         rec.duration_ms = now().getTime() - startedAt.getTime();
         if (notes) rec.notes = { ...(rec.notes ?? {}), ...notes };
         openReceipts.delete(message_id);
+        deindexHash(rec.prompt_hash);
         await appendRecord(rec);
       },
     };
+    indexHash(receipt, rec.prompt_hash);
     return receipt;
   }
 
@@ -205,9 +235,42 @@ export function createReceiptStore(opts: ReceiptStoreOptions = {}): ReceiptStore
     find(message_id: string): OpenReceipt | undefined {
       return openReceipts.get(message_id);
     },
+    findByPromptHash(prompt_hash: string): OpenReceipt | undefined {
+      return byPromptHash.get(prompt_hash);
+    },
     async drain(state: ReceiptFinalState): Promise<void> {
       const pending = [...openReceipts.values()];
       await Promise.all(pending.map((r) => r.close(state, { drained: true })));
     },
+  };
+}
+
+/**
+ * Process-wide singleton store. Lazily created on first access so importing
+ * this module does not touch the filesystem. The store writes to
+ * `~/.claude/claudeclaw/receipts.jsonl` and forwards non-fatal failures to
+ * stderr — instrumentation must never break the bus, but we still want to
+ * know if the disk is wedged.
+ */
+let _defaultStore: ReceiptStore | null = null;
+export function getDefaultReceiptStore(): ReceiptStore {
+  if (_defaultStore) return _defaultStore;
+  _defaultStore = createReceiptStore({
+    onError: (err, ctx) => {
+      // One-line, prefixed, on stderr — easy to grep, won't drown daemon logs.
+      console.error(`[receipt:${ctx}] ${err.message}`);
+    },
+  });
+  return _defaultStore;
+}
+
+/** Test-only: swap the singleton. Returns a disposer that restores the
+ *  previous one. Not exported via the module's main entry — the bus runtime
+ *  always calls `getDefaultReceiptStore()`. */
+export function _setDefaultReceiptStoreForTests(store: ReceiptStore | null): () => void {
+  const prev = _defaultStore;
+  _defaultStore = store;
+  return () => {
+    _defaultStore = prev;
   };
 }
