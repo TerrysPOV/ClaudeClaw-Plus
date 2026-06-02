@@ -1,28 +1,37 @@
 export const pageScript = String.raw`    const $ = (id) => document.getElementById(id);
 
     // --- Web token auth (issue #164 PR B) ---
-    // All /api/* routes now require the 256-bit web token. On first load
-    // we read it from the ?token= query param (how the operator opens the
-    // dashboard), persist it to sessionStorage, then strip it from the URL
+    // All /api/* routes require the 256-bit web token. On first load we
+    // read it from the ?token= query param (how the operator opens the
+    // dashboard), persist it to localStorage, then strip it from the URL
     // so it doesn't linger in history / Referer headers. Every same-origin
     // /api/ fetch then carries it as an Authorization: Bearer header via
     // the wrapper below — covering both raw fetch() and mutatingFetch.
+    //
+    // localStorage (not sessionStorage) because the server-side token at
+    // .claude/claudeclaw/web.token is permanent, so making the operator
+    // re-paste on every tab close was UX-only friction with no security
+    // benefit on a single-user dashboard. XSS exfiltration risk is the
+    // same for both storages; persistence is the only difference.
+    // Issue #220 tracks the stronger fix (httpOnly cookie + Set-Cookie
+    // bootstrap) for when the dashboard becomes multi-user or starts
+    // including third-party JS.
     (function initWebToken() {
       try {
         const u = new URL(window.location.href);
         const t = u.searchParams.get("token");
         if (t) {
-          sessionStorage.setItem("ccaw_web_token", t);
+          localStorage.setItem("ccaw_web_token", t);
           u.searchParams.delete("token");
           window.history.replaceState({}, document.title, u.pathname + u.search + u.hash);
         }
       } catch (e) {
-        /* sessionStorage / URL unavailable — fall through unauthenticated */
+        /* localStorage / URL unavailable — fall through unauthenticated */
       }
     })();
     function getWebToken() {
       try {
-        return sessionStorage.getItem("ccaw_web_token") || "";
+        return localStorage.getItem("ccaw_web_token") || "";
       } catch (e) {
         return "";
       }
@@ -1057,7 +1066,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
         const v = input.value.trim();
         if (!v) return;
         try {
-          sessionStorage.setItem("ccaw_web_token", v);
+          localStorage.setItem("ccaw_web_token", v);
         } catch (e) {}
         bar.remove();
         loadSettings();
