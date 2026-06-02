@@ -1,5 +1,11 @@
 {
+<<<<<<< HEAD
   "name": "claudeclaw-plus",
   "version": "2.2.132",
   "description": "ClaudeClaw+ — governance, orchestration, persistent memory, and hardened web UI for Claude Code daemons. Sister project to moazbuilds/claudeclaw."
+=======
+  "name": "claudeclaw",
+  "version": "1.0.38",
+  "description": "Cron-like daemon that runs Claude prompts on a schedule"
+>>>>>>> upstream/master
 }
