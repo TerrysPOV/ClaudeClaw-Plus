@@ -403,6 +403,29 @@ export class JsonlTailer {
     if (line.message?.usage) {
       this.publish("usage", line.message.usage, line);
     }
+    // Turn-boundary surfacing — when the API stops with `end_turn`, the
+    // agent has signalled "I'm done with this turn". Emit a single event
+    // carrying the concatenated text blocks of this turn so downstream
+    // subscribers (silent-drop safety net in bus core) can detect the
+    // pattern where the agent ended the turn with text but never called
+    // the `reply` tool to deliver it to the user. `tool_use` stop_reason
+    // means the agent intends to continue after a tool result, so we
+    // don't emit on those.
+    if (line.message?.stop_reason === "end_turn") {
+      const turnText = blocks
+        .filter((b) => b.type === "text")
+        .map((b) => (b as { text?: string }).text ?? "")
+        .join("\n")
+        .trim();
+      this.publish(
+        "response.turn_end",
+        {
+          stop_reason: "end_turn",
+          text: turnText,
+        },
+        line,
+      );
+    }
     // Degraded-turn surfacing — §5.2 mentions `error` / `isApiErrorMessage` /
     // `apiErrorStatus` on assistant lines. Forward as `system.api_error`.
     if (line.error || line.isApiErrorMessage) {

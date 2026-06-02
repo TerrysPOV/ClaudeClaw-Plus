@@ -299,6 +299,63 @@ describe("JsonlTailer — assistant lines", () => {
     expect((usage?.payload as { input_tokens: number }).input_tokens).toBe(100);
   });
 
+  it("emits response.turn_end with concatenated text blocks when stop_reason is end_turn (issue #215)", async () => {
+    writeFileSync(
+      sessionPath,
+      jsonl({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          id: "msg_TE",
+          content: [
+            { type: "text", text: "First line." },
+            { type: "thinking", thinking: "internal" },
+            { type: "text", text: "Second line." },
+          ],
+          stop_reason: "end_turn",
+        },
+        timestamp: "2026-06-02T10:00:00.000Z",
+        sessionId: SESSION_ID,
+      }),
+    );
+    const { bus, events } = createMockBus();
+    tailer = makeTailer(bus);
+    await tailer.start();
+
+    const turnEnd = events.find((e) => e.topic === "response.turn_end");
+    expect(turnEnd).toBeDefined();
+    const payload = turnEnd!.payload as { stop_reason: string; text: string };
+    expect(payload.stop_reason).toBe("end_turn");
+    // Text blocks concatenated with newline, thinking excluded, trimmed.
+    expect(payload.text).toBe("First line.\nSecond line.");
+  });
+
+  it("does NOT emit response.turn_end when stop_reason is tool_use (turn continues)", async () => {
+    writeFileSync(
+      sessionPath,
+      jsonl({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          id: "msg_TU",
+          content: [
+            { type: "text", text: "Let me check that." },
+            { type: "tool_use", id: "toolu_Y", name: "Read", input: { path: "/tmp/y" } },
+          ],
+          stop_reason: "tool_use",
+        },
+        timestamp: "2026-06-02T10:00:01.000Z",
+        sessionId: SESSION_ID,
+      }),
+    );
+    const { bus, events } = createMockBus();
+    tailer = makeTailer(bus);
+    await tailer.start();
+
+    const turnEnd = events.find((e) => e.topic === "response.turn_end");
+    expect(turnEnd).toBeUndefined();
+  });
+
   it("surfaces api_error fields as system.api_error", async () => {
     writeFileSync(
       sessionPath,

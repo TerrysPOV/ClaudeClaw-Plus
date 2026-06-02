@@ -72,6 +72,7 @@ export type BusEventTopic =
   | "response.tool_use"
   | "response.edit_text"
   | "response.thinking"
+  | "response.turn_end"
   | "tool_result"
   | "usage"
   | "session.init"

@@ -887,4 +887,210 @@ describe("BusCore IPC", () => {
     expect((m as { response: { behavior: string } }).response.behavior).toBe("allow");
     client.close();
   });
+
+  describe("silent-drop safety net (issue #215)", () => {
+    function makeBus(): BusCore {
+      return createBusCore({
+        eventLogAppend: createMockEventLog().append,
+      });
+    }
+
+    function captureReplies(b: BusCore, agentId: string) {
+      const replies: { text: string; origin?: string }[] = [];
+      b.subscribe({ agent_id: agentId, topics: ["response.text"] }, (event) => {
+        const payload = event.payload as { text?: string; intent?: string; origin?: string };
+        if (payload?.intent === "final") {
+          replies.push({ text: payload.text ?? "", origin: payload.origin });
+        }
+      });
+      return replies;
+    }
+
+    it("synthesizes a final reply when turn_end fires without prior reply call", async () => {
+      const b = makeBus();
+      const replies = captureReplies(b, "alpha");
+
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "webui",
+        origin_id: "test-1",
+        user_id: "u1",
+        text: "say hi",
+      });
+
+      // Tailer publishes response.turn_end without any prior reply tool call
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: "alpha",
+        session_id: "",
+        topic: "response.turn_end",
+        payload: { stop_reason: "end_turn", text: "hi there, this is the silent-dropped text" },
+      });
+
+      expect(replies.length).toBe(1);
+      expect(replies[0].text).toBe("hi there, this is the silent-dropped text");
+      expect(replies[0].origin).toBe("webui");
+    });
+
+    it("does NOT synthesize when the agent already called reply with intent: final", async () => {
+      const b = makeBus();
+      const replies = captureReplies(b, "alpha");
+
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "webui",
+        origin_id: "test-2",
+        user_id: "u1",
+        text: "say hi",
+      });
+
+      // Agent called reply correctly.
+      b.ingestReply({
+        agent_id: "alpha",
+        text: "hello — delivered properly via reply tool",
+        intent: "final",
+      });
+
+      // Tailer also publishes turn_end (legitimate end of turn after reply).
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: "alpha",
+        session_id: "",
+        topic: "response.turn_end",
+        payload: { stop_reason: "end_turn", text: "hello — delivered properly via reply tool" },
+      });
+
+      // Only the real reply, no duplicate from the safety net.
+      expect(replies.length).toBe(1);
+      expect(replies[0].text).toBe("hello — delivered properly via reply tool");
+    });
+
+    it("does NOT synthesize when turn_end text is empty", async () => {
+      const b = makeBus();
+      const replies = captureReplies(b, "alpha");
+
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "webui",
+        origin_id: "test-3",
+        user_id: "u1",
+        text: "say hi",
+      });
+
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: "alpha",
+        session_id: "",
+        topic: "response.turn_end",
+        payload: { stop_reason: "end_turn", text: "" },
+      });
+
+      expect(replies.length).toBe(0);
+    });
+
+    it("does NOT synthesize when there is no lastPromptOrigin (cron/ambient turn)", async () => {
+      const b = makeBus();
+      const replies = captureReplies(b, "alpha");
+
+      // No sendPrompt — simulates a cron/scheduler tick that ends with text.
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: "alpha",
+        session_id: "",
+        topic: "response.turn_end",
+        payload: { stop_reason: "end_turn", text: "some ambient output" },
+      });
+
+      expect(replies.length).toBe(0);
+    });
+
+    it("resets the per-turn flag on each new prompt (single-flight per prompt)", async () => {
+      const b = makeBus();
+      const replies = captureReplies(b, "alpha");
+
+      // Prompt 1: agent calls reply → no synthesis.
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "webui",
+        origin_id: "p1",
+        user_id: "u1",
+        text: "first",
+      });
+      b.ingestReply({ agent_id: "alpha", text: "reply 1", intent: "final" });
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: "alpha",
+        session_id: "",
+        topic: "response.turn_end",
+        payload: { stop_reason: "end_turn", text: "reply 1" },
+      });
+
+      // Prompt 2: agent forgets reply → synthesis fires.
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "webui",
+        origin_id: "p2",
+        user_id: "u1",
+        text: "second",
+      });
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: "alpha",
+        session_id: "",
+        topic: "response.turn_end",
+        payload: { stop_reason: "end_turn", text: "silent-dropped reply 2" },
+      });
+
+      // Prompt 3: agent calls reply again → no extra synthesis.
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "webui",
+        origin_id: "p3",
+        user_id: "u1",
+        text: "third",
+      });
+      b.ingestReply({ agent_id: "alpha", text: "reply 3", intent: "final" });
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: "alpha",
+        session_id: "",
+        topic: "response.turn_end",
+        payload: { stop_reason: "end_turn", text: "reply 3" },
+      });
+
+      // Exactly 3 deliveries: real, synthetic, real.
+      expect(replies.length).toBe(3);
+      expect(replies[0].text).toBe("reply 1");
+      expect(replies[1].text).toBe("silent-dropped reply 2");
+      expect(replies[2].text).toBe("reply 3");
+    });
+
+    it("only synthesizes once per turn even if multiple turn_end events arrive", async () => {
+      const b = makeBus();
+      const replies = captureReplies(b, "alpha");
+
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "webui",
+        origin_id: "test-dedup",
+        user_id: "u1",
+        text: "say hi",
+      });
+
+      const turnEnd: BusEvent = {
+        ts: Date.now(),
+        agent_id: "alpha",
+        session_id: "",
+        topic: "response.turn_end",
+        payload: { stop_reason: "end_turn", text: "the recovered text" },
+      };
+
+      b.ingestSessionEvent(turnEnd);
+      b.ingestSessionEvent(turnEnd); // duplicate (e.g. tailer replay).
+
+      // Only one synthetic delivery, not two.
+      expect(replies.length).toBe(1);
+      expect(replies[0].text).toBe("the recovered text");
+    });
+  });
 });

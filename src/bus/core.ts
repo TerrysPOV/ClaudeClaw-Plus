@@ -178,6 +178,18 @@ export class BusCoreImpl implements BusCore {
    */
   private readonly lastPromptOrigin = new Map<string, { origin: BusOrigin; origin_id: string }>();
 
+  /**
+   * Silent-drop safety net (issue #215): tracks per-agent whether the
+   * current turn has called the `reply` MCP tool with `intent: "final"`.
+   * Reset on every new inbound prompt (`sendPrompt`), set to `true` when
+   * an `intent: "final"` `ingestReply` lands. On `response.turn_end`
+   * (emitted by the JSONL tailer when `stop_reason === "end_turn"`), if
+   * this is still `false` and the turn produced non-empty text, the
+   * agent ended the turn without delivering — we synthesize an
+   * `ingestReply` so the user actually receives the response.
+   */
+  private readonly currentTurnReplied = new Map<string, boolean>();
+
   constructor(opts: BusCoreOptions = {}) {
     this.socketPath = opts.socketPath ?? null;
     this.ringbufferCapacity = opts.ringbufferCapacity ?? DEFAULT_RINGBUFFER_CAPACITY;
@@ -206,6 +218,7 @@ export class BusCoreImpl implements BusCore {
           // agent (after a reconnect) would inherit the dead session's
           // origin and misroute (5-agent review on PR #138, A1 finding).
           this.lastPromptOrigin.delete(agentId);
+          this.currentTurnReplied.delete(agentId);
         }
       },
       onError: (err, agentId) => this.onError(err, { ctx: "ipc", agentId }),
@@ -263,6 +276,10 @@ export class BusCoreImpl implements BusCore {
       origin: req.origin,
       origin_id: req.origin_id,
     });
+    // Silent-drop safety net (#215): new prompt → reset the "did this
+    // turn call reply?" flag. If the agent ends the turn (response.turn_end)
+    // without ever setting this to true, we'll synthesize delivery.
+    this.currentTurnReplied.set(req.agent_id, false);
 
     const ipcMsg: IpcPrompt = {
       type: "prompt",
@@ -402,9 +419,64 @@ export class BusCoreImpl implements BusCore {
     if (req.intent === "final") {
       this.lastPromptOrigin.delete(req.agent_id);
     }
+    // Silent-drop safety net (#215): the agent called `reply` with a
+    // final intent → mark this turn as delivered. The
+    // `response.turn_end` handler will skip the synthetic-delivery
+    // fallback for this turn.
+    if (req.intent === "final") {
+      this.currentTurnReplied.set(req.agent_id, true);
+    }
+  }
+
+  /**
+   * Silent-drop safety net handler (issue #215). Wired by
+   * `ingestSessionEvent`/JSONL tailer when it observes a `response.turn_end`
+   * with `stop_reason: "end_turn"`. If the agent ended the turn with
+   * non-empty text but never called the `reply` tool for this prompt,
+   * synthesize an `ingestReply` so the user actually receives the
+   * response. Without this, the text sits in the session `.jsonl` and
+   * the user-facing surface gets nothing — confirmed live 2x in 12h
+   * on a real bus-mode deployment after issue #215 was filed.
+   */
+  private handleTurnEnd(agentId: string, text: string): void {
+    if (this.currentTurnReplied.get(agentId) === true) return;
+    if (!text || text.trim().length === 0) return;
+    const origin = this.lastPromptOrigin.get(agentId);
+    if (!origin) {
+      // No origin to route to (cron tick / unprompted ambient turn).
+      // Log so operators can correlate; don't fabricate delivery.
+      console.warn(
+        `[bus] silent-drop detected for agent=${agentId} (turn ended with text but no reply); ` +
+          `no lastPromptOrigin to route to — dropping silently as before.`,
+      );
+      return;
+    }
+    console.warn(
+      `[bus] silent-drop recovered for agent=${agentId} (origin=${origin.origin}, ` +
+        `chars=${text.length}): the turn ended with text but the agent did not call the ` +
+        `reply tool — synthesizing ingestReply to deliver. See issue #215.`,
+    );
+    // Mark BEFORE the recursive ingestReply so the synthetic call itself
+    // doesn't trigger another safety-net pass (it would no-op anyway
+    // because we set the flag here, but the explicit ordering makes the
+    // single-fire intent clearer).
+    this.currentTurnReplied.set(agentId, true);
+    this.ingestReply({
+      agent_id: agentId,
+      text,
+      intent: "final",
+    });
   }
 
   ingestSessionEvent(e: BusEvent): void {
+    // Silent-drop safety net (#215): the JSONL tailer publishes a
+    // `response.turn_end` event when claude stops with `end_turn`. Hook
+    // into it before the generic publish so we can synthesize a
+    // delivery for turns that produced text but never called reply.
+    if (e.topic === "response.turn_end" && e.agent_id) {
+      const payload = e.payload as { text?: string };
+      this.handleTurnEnd(e.agent_id, payload?.text ?? "");
+    }
     this.publish(e);
   }
 
@@ -549,6 +621,10 @@ export class BusCoreImpl implements BusCore {
         // this agent doesn't inherit it and misroute (5-agent review
         // on PR #138, A1 finding).
         this.lastPromptOrigin.delete(agentId);
+        // Silent-drop safety net (#215): cancelled turn won't produce
+        // a real reply OR a `response.turn_end` event — drop the
+        // tracking flag to keep the map bounded.
+        this.currentTurnReplied.delete(agentId);
         break;
       case "request_human": {
         // Forward the correlation id along with the question. Without
@@ -603,6 +679,9 @@ export class BusCoreImpl implements BusCore {
         // scheduler events for this agent don't inherit the stale
         // origin (5-agent review on PR #138, A1 finding).
         this.lastPromptOrigin.delete(agentId);
+        // Silent-drop safety net (#215): error path won't produce a
+        // turn_end either — clear tracking too.
+        this.currentTurnReplied.delete(agentId);
         break;
       // hello already handled in the IPC layer; outbound types (prompt,
       // permission_response, ask_answer) shouldn't arrive from MCP.
