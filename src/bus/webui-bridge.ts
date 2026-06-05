@@ -28,6 +28,9 @@ import { randomBytes } from "node:crypto";
 import type { BusCore } from "./core";
 import { getDefaultReceiptStore, hashPrompt, type ReceiptStore } from "./receipt";
 import type { BusOrigin } from "./types";
+import { incrementMessageCount, peekSession } from "../sessions";
+import { needsRotation } from "../rotation";
+import { getSettings } from "../config";
 
 /**
  * Per-agent mutex tail used to serialize `streamBusPrompt` calls. Codex
@@ -122,7 +125,41 @@ export async function streamBusPrompt(
     }
   }
   try {
-    return await runPrompt(bus, agentId, message, opts);
+    const result = await runPrompt(bus, agentId, message, opts);
+    if (result.ok) {
+      // Per-agent turn accounting for #213, scoped to the named agent's
+      // own `session.json` (the long-lived PTY session) rather than the
+      // global bootstrap tracker. Best-effort: a tracking failure must
+      // never break the prompt the caller is awaiting.
+      //
+      // The rotation MECHANISM is intentionally NOT wired here. Filesystem
+      // rotation can't rotate a live bus PTY — it keeps the same session
+      // id and process alive — so when the gate trips we only surface a
+      // WARN. The restart-based rotation that actually delivers #213 is
+      // tracked in #227 (built on the restart() primitive, #226).
+      try {
+        await incrementMessageCount(agentId);
+        let sessionConfig: ReturnType<typeof getSettings>["session"] | null = null;
+        try {
+          sessionConfig = getSettings().session;
+        } catch {
+          /* settings not loaded yet (early boot / tests) — skip the gate */
+        }
+        if (sessionConfig?.autoRotate) {
+          const peeked = await peekSession(agentId);
+          if (peeked && needsRotation(peeked, sessionConfig)) {
+            console.warn(
+              `[${new Date().toLocaleTimeString()}] [bus] agent=${agentId} session needs rotation ` +
+                `(${peeked.messageCount ?? 0} msgs >= ${sessionConfig.maxMessages}) — ` +
+                `restart-based rotation not yet wired; deferred to #227.`,
+            );
+          }
+        }
+      } catch (e) {
+        console.error(`[${new Date().toLocaleTimeString()}] bus rotation tracking failed:`, e);
+      }
+    }
+    return result;
   } finally {
     // Only clear the tail slot if no other call has chained onto us;
     // chained callers will overwrite the map entry themselves.

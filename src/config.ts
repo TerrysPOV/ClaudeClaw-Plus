@@ -10,7 +10,10 @@ import { parseMemorySearchSettings, type MemorySearchSettings } from "./memory";
 export type WatchdogSettings = WatchdogConfig;
 
 const HEARTBEAT_DIR = join(process.cwd(), ".claude", "claudeclaw");
-const SETTINGS_FILE = join(HEARTBEAT_DIR, "settings.json");
+const DEFAULT_SETTINGS_FILE = join(HEARTBEAT_DIR, "settings.json");
+// Mutable only so tests can redirect it via _setSettingsFileForTests(); the
+// daemon never reassigns it. Frozen at module load to the start-up cwd.
+let SETTINGS_FILE = DEFAULT_SETTINGS_FILE;
 const DEFAULT_JOBS_DIR = join(HEARTBEAT_DIR, "jobs");
 const LOGS_DIR = join(HEARTBEAT_DIR, "logs");
 
@@ -1543,6 +1546,20 @@ export async function reloadSettings(): Promise<Settings> {
 export function getSettings(): Settings {
   if (!cached) throw new Error("Settings not loaded. Call loadSettings() first.");
   return cached;
+}
+
+/**
+ * TEST-ONLY: redirect the settings file path so tests never read or write the
+ * developer's real `<cwd>/.claude/claudeclaw/settings.json` (which is frozen at
+ * module load to the start-up cwd). Pass a temp path to point there; call with
+ * no argument to restore the default. Clears the settings cache so the next
+ * `loadSettings()` / `reloadSettings()` reads from the (new) path. Pair with a
+ * call in the test's `afterEach` to avoid leaking the override or cached
+ * settings across tests.
+ */
+export function _setSettingsFileForTests(path?: string): void {
+  SETTINGS_FILE = path ?? DEFAULT_SETTINGS_FILE;
+  cached = null;
 }
 
 const PROMPT_EXTENSIONS = [".md", ".txt", ".prompt"];

@@ -9,8 +9,8 @@
  * reply path by calling `bus.ingestReply` directly — that's how the
  * plus-bus MCP server normally publishes claude's responses.
  */
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createBusCore, type BusCore } from "../core";
@@ -23,6 +23,8 @@ import {
   type ReceiptStore,
 } from "../receipt";
 import { streamBusPrompt } from "../webui-bridge";
+import { createSession, peekSession, incrementMessageCount } from "../../sessions";
+import { reloadSettings, _setSettingsFileForTests } from "../../config";
 
 // Redirect the process-wide default receipt store to a throwaway path for the
 // duration of this file so the existing 11 streamBusPrompt tests (which
@@ -348,5 +350,80 @@ describe("streamBusPrompt — receipt chain", () => {
     expect(recs[0].process_generation).toBe(1);
     // After close, the hash index is cleared.
     expect(store.findByPromptHash(hashPrompt("lookup me"))).toBeUndefined();
+  });
+});
+
+describe("streamBusPrompt — per-agent bookkeeping (#213, split per #218)", () => {
+  // getAgentsDir() resolves from the live process.cwd(), so chdir'ing into a
+  // temp dir isolates each test's agent session files (removed with the temp
+  // dir). config's SETTINGS_FILE is frozen at import-time cwd, so the
+  // rotation-gate test redirects it into the temp dir via
+  // _setSettingsFileForTests() instead of touching the real settings.json.
+  let frozenCwd: string;
+  let tmp: string;
+
+  async function driveOneTurn(agentId: string): Promise<void> {
+    const bus = makeBus();
+    const pending = streamBusPrompt(bus, agentId, "hi", { timeoutMs: 2000 });
+    await Promise.resolve();
+    await Promise.resolve();
+    bus.ingestReply({ agent_id: agentId, text: "ok", intent: "final" });
+    // Bookkeeping is awaited inside streamBusPrompt before it resolves.
+    expect((await pending).ok).toBe(true);
+  }
+
+  beforeEach(() => {
+    frozenCwd = process.cwd();
+    tmp = mkdtempSync(join(tmpdir(), "ccaw-218-"));
+    process.chdir(tmp);
+  });
+
+  afterEach(() => {
+    // Restore the default settings path and clear the cache so neither the
+    // override nor cached settings leak into later tests in this file.
+    _setSettingsFileForTests();
+    process.chdir(frozenCwd);
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("increments the named agent's message count on a successful prompt", async () => {
+    await createSession("11111111-1111-1111-1111-111111111111", "alpha");
+    expect((await peekSession("alpha"))?.messageCount ?? 0).toBe(0);
+    await driveOneTurn("alpha");
+    expect((await peekSession("alpha"))?.messageCount).toBe(1);
+  });
+
+  it("WARNs and defers to #227 when the agent crosses the threshold — without rotating", async () => {
+    // Point config at a settings file inside this test's temp dir (removed in
+    // afterEach) so we never read or write the developer's real settings.json.
+    const settingsFile = join(tmp, ".claude", "claudeclaw", "settings.json");
+    mkdirSync(join(tmp, ".claude", "claudeclaw"), { recursive: true });
+    writeFileSync(settingsFile, JSON.stringify({ session: { autoRotate: true, maxMessages: 2 } }));
+    _setSettingsFileForTests(settingsFile);
+
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await reloadSettings();
+      await createSession("22222222-2222-2222-2222-222222222222", "beta");
+      await incrementMessageCount("beta"); // 0 -> 1; the next turn trips the gate
+
+      await driveOneTurn("beta"); // 1 -> 2, needsRotation(2 >= 2) === true
+
+      const warned = warnSpy.mock.calls.some((c) => String(c[0]).includes("deferred to #227"));
+      expect(warned).toBe(true);
+
+      // The rotation MECHANISM is not wired: the session is counted, not reset.
+      const after = await peekSession("beta");
+      expect(after?.messageCount).toBe(2);
+      expect(after?.sessionId).toBe("22222222-2222-2222-2222-222222222222");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("does not break the prompt when there is no session to count (best-effort)", async () => {
+    // No createSession — incrementMessageCount no-ops; the prompt still resolves.
+    await driveOneTurn("gamma");
+    expect(await peekSession("gamma")).toBeNull();
   });
 });

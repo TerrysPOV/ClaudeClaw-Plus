@@ -2149,7 +2149,12 @@ async function execClaude(
     ].join("\n");
 
     await Bun.write(logFile, output);
-    // Count this invocation for rotation tracking (global session only; agent sessions don't rotate).
+    // Count this invocation for rotation tracking on the legacy (global)
+    // session path. Bus-mode agent sessions are counted separately via
+    // `streamBusPrompt` in `src/bus/webui-bridge.ts`, which threads the
+    // `agentId` through to `incrementMessageCount` so per-agent accounting
+    // lands on the agent's own `session.json` (#213). The restart-based
+    // rotation mechanism for those agent sessions is tracked in #227.
     if (!agentName && !threadId) await incrementMessageCount();
     console.log(`[${new Date().toLocaleTimeString()}] Done: ${name} → ${logFile}`);
 
