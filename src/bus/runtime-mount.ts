@@ -35,6 +35,7 @@ import type { AgentConfig, BusOrigin } from "./types";
 import { BusCoreImpl, type BusCore } from "./core";
 import { SessionManager } from "./session-manager";
 import { wireSlashCommands } from "./wiring";
+import { createMcpReconciler } from "./mcp-reconciler";
 import type { MountedAdapter } from "./adapter-wiring";
 import { stopBusAdapters } from "./adapter-wiring";
 import { detectOrphanAgents, formatOrphanWarnings } from "./orphan-agent-detect";
@@ -257,6 +258,20 @@ export async function mountBusRuntime(
     // webui bridge) still owns the terminal close on observed/timeout.
     bus.setStreamPromptHandler(
       createPromptStreamHandler((agentId) => sessionManager.getAgent(agentId)),
+    );
+
+    // #222 reconciliation: when an IPC send fails because the agent's MCP
+    // registration is gone but its process is still alive (the recurring
+    // deaf-agent wedge), respawn it via the Session Manager. Confirm-delay +
+    // cooldown + attempt cap live in the reconciler so this never storms or
+    // kills an agent that's merely mid-spawn.
+    bus.setMcpSendFailedHandler(
+      createMcpReconciler({
+        isConnected: (agentId) => bus.isAgentConnected(agentId),
+        isProcessAlive: (agentId) => sessionManager.health()[agentId]?.alive ?? false,
+        restart: (agentId) => sessionManager.restart(agentId),
+        log: (msg, fields) => logger.error("[mcp-reconcile]", msg, fields),
+      }),
     );
 
     const declaredAgents = opts.agents ?? [];

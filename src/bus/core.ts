@@ -127,6 +127,15 @@ export interface BusCoreOptions {
   streamPromptHandler?: StreamPromptHandler;
   /** Logger; defaults to console.error. */
   onError?: (err: unknown, ctx?: Record<string, unknown>) => void;
+  /**
+   * Reconciliation signal (issue #222). Fired when an IPC `send` to an agent
+   * fails because Bus core has no live MCP connection for it. The daemon
+   * wires this to a debounced reconciler that checks process liveness via
+   * the Session Manager and respawns the agent if it's alive-but-deaf
+   * (process up, MCP/IPC registration gone). Default no-op so the bus is
+   * usable without the wiring (and in tests).
+   */
+  onMcpSendFailed?: (agentId: string, ctx: { reason: string }) => void;
 }
 
 /* ───────────────────────────────────────────────────────────────────── */
@@ -145,6 +154,16 @@ export interface BusCore {
    */
   setSlashCommandHandler(handler: SlashCommandHandler | null): void;
   setStreamPromptHandler(handler: StreamPromptHandler | null): void;
+  /**
+   * Install or replace the #222 reconciliation signal handler. Wired by the
+   * bus runtime once the Session Manager is available. Pass `null` to detach
+   * (resets to a no-op).
+   */
+  setMcpSendFailedHandler(
+    handler: ((agentId: string, ctx: { reason: string }) => void) | null,
+  ): void;
+  /** True if Bus core currently holds a live MCP/IPC connection for the agent (#222). */
+  isAgentConnected(agentId: string): boolean;
   ingestReply(req: IngestReplyRequest): void;
   ingestSessionEvent(e: BusEvent): void;
   ingestPermissionDecision(req: IngestPermissionDecisionRequest): void;
@@ -167,6 +186,9 @@ export class BusCoreImpl implements BusCore {
   private slashCommandHandler: SlashCommandHandler | null;
   private streamPromptHandler: StreamPromptHandler | null;
   private readonly onError: (err: unknown, ctx?: Record<string, unknown>) => void;
+  // Settable post-hoc (like streamPromptHandler): the bus is constructed
+  // before the SessionManager exists, so the reconciler is wired afterwards.
+  private onMcpSendFailed: (agentId: string, ctx: { reason: string }) => void = () => {};
   /**
    * Tracks the origin (surface + channel id) of the most recent prompt
    * per agent. Adapters use this on outbound `response.text` events to
@@ -185,6 +207,18 @@ export class BusCoreImpl implements BusCore {
     this.slashCommandHandler = opts.slashCommandHandler ?? null;
     this.streamPromptHandler = opts.streamPromptHandler ?? null;
     this.onError = opts.onError ?? ((err, ctx) => console.error("[bus]", err, ctx));
+    if (opts.onMcpSendFailed) this.onMcpSendFailed = opts.onMcpSendFailed;
+  }
+
+  /**
+   * Structured observability for the MCP registration seam (#222). Lands on
+   * stderr → captured in the daemon log, grep-able as `[bus-ipc]`. Until this
+   * existed, the bus logged the *symptom* ("No MCP connection") loudly but
+   * nothing about *why* there was no connection — no hello/close/restart
+   * trace — so a recurring deaf-agent wedge was undiagnosable from logs.
+   */
+  private logIpc(msg: string, fields: Record<string, unknown>): void {
+    console.error(`[bus-ipc] ${msg}`, { ts: new Date().toISOString(), ...fields });
   }
 
   /* ─────────────────────────────── lifecycle ─────────────────────────────── */
@@ -194,6 +228,12 @@ export class BusCoreImpl implements BusCore {
     this.ipcServer = await bindUdsServer(this.socketPath, {
       onHello: (agentId, _caps) => {
         this.connectedAgents.add(agentId);
+        this.logIpc("hello", {
+          agent: agentId,
+          caps: _caps.length,
+          connections: this.ipcServer?.connectionCount() ?? 0,
+          registered: this.connectedAgents.size,
+        });
       },
       onMessage: (agentId, msg) => this.handleIpcMessage(agentId, msg),
       onClose: (agentId) => {
@@ -206,6 +246,13 @@ export class BusCoreImpl implements BusCore {
           // agent (after a reconnect) would inherit the dead session's
           // origin and misroute (5-agent review on PR #138, A1 finding).
           this.lastPromptOrigin.delete(agentId);
+          this.logIpc("close", {
+            agent: agentId,
+            connections: this.ipcServer?.connectionCount() ?? 0,
+            registered: this.connectedAgents.size,
+          });
+        } else {
+          this.logIpc("close", { agent: null, note: "pre-handshake socket closed" });
         }
       },
       onError: (err, agentId) => this.onError(err, { ctx: "ipc", agentId }),
@@ -279,6 +326,23 @@ export class BusCoreImpl implements BusCore {
         this.onError(new Error(`No MCP connection for agent_id=${req.agent_id}`), {
           ctx: "sendPrompt",
         });
+        // #222 observability: was the agent ever registered, or did it just
+        // drop? `registeredKnown=false` means we never saw a hello (a fresh
+        // mcp-server never reached the bus); `=true` + no connection means the
+        // socket dropped after handshake. Distinguishes "never connected"
+        // from "connected then lost" at a glance.
+        this.logIpc("send-failed", {
+          agent: req.agent_id,
+          ctx: "sendPrompt",
+          registeredKnown: this.connectedAgents.has(req.agent_id),
+          connections: this.ipcServer.connectionCount(),
+        });
+        // The inbound prompt still falls through to PTY-stdin below, but the
+        // agent's outbound `reply` path rides this same dead IPC with no
+        // fallback → it goes deaf. Signal the daemon to reconcile (respawn if
+        // the process is alive-but-deaf). Debounce/cooldown live in the wired
+        // reconciler, not here.
+        this.onMcpSendFailed(req.agent_id, { reason: "sendPrompt:no-mcp-connection" });
       }
     }
 
@@ -322,6 +386,16 @@ export class BusCoreImpl implements BusCore {
 
   setStreamPromptHandler(handler: StreamPromptHandler | null): void {
     this.streamPromptHandler = handler;
+  }
+
+  setMcpSendFailedHandler(
+    handler: ((agentId: string, ctx: { reason: string }) => void) | null,
+  ): void {
+    this.onMcpSendFailed = handler ?? (() => {});
+  }
+
+  isAgentConnected(agentId: string): boolean {
+    return this.connectedAgents.has(agentId);
   }
 
   /* ─────────────────────────────── subscriptions ─────────────────────────────── */
