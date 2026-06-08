@@ -19,6 +19,7 @@ export interface WebServerHandle {
 export interface StartWebUiOptions {
   host: string;
   port: number;
+<<<<<<< HEAD
   /**
    * The persisted 256-bit web token (issue #164). All `/api/*` routes
    * require it via `Authorization: Bearer <token>` or `?token=<token>`,
@@ -26,6 +27,8 @@ export interface StartWebUiOptions {
    * the legacy `settings.apiToken`). Minted by `getOrCreateWebToken()` in
    * `start.ts` before the server boots.
    */
+=======
+>>>>>>> upstream/master
   token: string;
   getSnapshot: () => WebSnapshot;
   onHeartbeatEnabledChanged?: (enabled: boolean) => void | Promise<void>;

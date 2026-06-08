@@ -62,6 +62,7 @@ export async function buildState(snapshot: WebSnapshot) {
   };
 }
 
+<<<<<<< HEAD
 /**
  * Field names whose values are secrets and must never leave the daemon
  * unredacted. Matched case-insensitively against every key at every
@@ -97,13 +98,34 @@ function redactSettings(raw: unknown): unknown {
       out[key] = `<redacted:${len} chars>`;
     } else {
       out[key] = redactSettings(value);
+=======
+const SECRET_KEYS = new Set(["token", "api", "apiKey", "apiToken", "botToken", "appToken", "password", "secret"]);
+
+function redact(obj: unknown): unknown {
+  if (!obj || typeof obj !== "object") return obj;
+  if (Array.isArray(obj)) return obj.map(redact);
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+    if (SECRET_KEYS.has(k) && typeof v === "string" && v.length > 0) {
+      out[k] = `<redacted:${v.length} chars>`;
+    } else {
+      out[k] = redact(v);
+>>>>>>> upstream/master
     }
   }
   return out;
 }
 
+async function redactJsonFile(path: string): Promise<unknown | null> {
+  try {
+    const raw = await readFile(path, "utf-8");
+    return redact(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
 export async function buildTechnicalInfo(snapshot: WebSnapshot) {
-  const rawSettings = await readJsonFile(SETTINGS_FILE);
   return {
     daemon: {
       pid: snapshot.pid,
@@ -111,13 +133,16 @@ export async function buildTechnicalInfo(snapshot: WebSnapshot) {
       uptimeMs: Math.max(0, Date.now() - snapshot.startedAt),
     },
     files: {
-      settingsJson: redactSettings(rawSettings),
-      sessionJson: await readJsonFile(SESSION_FILE),
+      settingsJson: await redactJsonFile(SETTINGS_FILE),
+      sessionJson: await redactJsonFile(SESSION_FILE),
       stateJson: await readJsonFile(STATE_FILE),
     },
     snapshot: {
-      ...snapshot,
-      settings: redactSettings(snapshot.settings) as WebSnapshot["settings"],
+      pid: snapshot.pid,
+      startedAt: snapshot.startedAt,
+      heartbeatNextAt: snapshot.heartbeatNextAt,
+      settings: sanitizeSettings(snapshot.settings),
+      jobs: snapshot.jobs,
     },
   };
 }
