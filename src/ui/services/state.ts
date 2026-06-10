@@ -112,7 +112,7 @@ export async function buildTechnicalInfo(snapshot: WebSnapshot) {
     },
     files: {
       settingsJson: redactSettings(rawSettings),
-      sessionJson: await readJsonFile(SESSION_FILE),
+      sessionJson: redactSettings(await readJsonFile(SESSION_FILE)) as WebSnapshot["settings"],
       stateJson: await readJsonFile(STATE_FILE),
     },
     snapshot: {
