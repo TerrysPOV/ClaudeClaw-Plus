@@ -21,7 +21,7 @@ import type {
   SubscriptionFilter,
   SubscriptionHandler,
 } from "../../../bus/core-subscription";
-import type { BusEvent } from "../../../bus/types";
+import { type BusEvent, TAILER_EVENT_SOURCE } from "../../../bus/types";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -535,6 +535,38 @@ describe("TelegramAdapter — response.text outbound", () => {
     expect(sent).toBeDefined();
     expect(sent?.text).toBe("hi there");
     expect(sent?.chat_id).toBe(100);
+  });
+
+  it("IGNORES the JSONL tailer observability echo so replies are not double-posted (#217)", async () => {
+    // The tailer re-emits a raw per-block response.text stamped with
+    // _meta.source = "jsonl-tailer"; the real delivery comes from ingestReply
+    // (no marker). Delivering both double-posts — assert the echo sends nothing.
+    adapter = await startAdapter();
+    await feedInbound();
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "echo", _meta: { source: TAILER_EVENT_SOURCE } },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(api.sendMessages).toHaveLength(0);
+  });
+
+  it("STILL delivers a non-tailer response.text exactly once (#217)", async () => {
+    adapter = await startAdapter();
+    await feedInbound();
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "recovered" },
+    });
+    await waitFor(() => api.sendMessages.length > 0);
+    expect(api.sendMessages).toHaveLength(1);
+    expect(api.sendMessages[0]?.text).toBe("recovered");
   });
 
   it("strips [react:<emoji>] tags and applies them via setMessageReaction", async () => {
@@ -1175,6 +1207,61 @@ describe("TelegramAdapter — inbound receipts (#211)", () => {
     );
     expect(closedReceipts().find((r) => r.message_id === "tg-1")?.notes?.reason).toBe(
       "no_final_reply_within_timeout",
+    );
+  });
+
+  it("rearms the inactivity timeout on every turn activity — a long working turn is not falsely timed out", async () => {
+    adapter = await startAdapter({ receiptTimeoutMs: 100 });
+    await feed("long agentic task");
+    // Emit progress activity every 25ms (well under the 100ms inactivity budget)
+    // for ~150ms total — longer than the budget, so a fixed wall-clock timer
+    // armed at prompt arrival would already have fired. Each progress rearms it.
+    for (let i = 0; i < 6; i++) {
+      bus.emit({
+        ts: Date.now(),
+        agent_id: "triage",
+        session_id: "s1",
+        topic: "response.text",
+        payload: { text: `working ${i}...`, intent: "progress" },
+      });
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    // Activity kept rearming: still open though elapsed (~150ms) > budget (100ms).
+    expect(closedReceipts().some((r) => r.message_id === "tg-1")).toBe(false);
+    // Once silent, it closes as a genuine inactivity timeout.
+    await waitFor(() =>
+      closedReceipts().some((r) => r.message_id === "tg-1" && r.final_state === "timeout"),
+    );
+    expect(closedReceipts().find((r) => r.message_id === "tg-1")?.notes?.reason).toBe(
+      "no_final_reply_within_timeout",
+    );
+  });
+
+  it("closes as timeout(max_turn_budget_exceeded) when activity never stops past the absolute ceiling", async () => {
+    // Ceiling = receiptMaxBudgetMultiplier * receiptTimeoutMs. Pin both small
+    // (4 * 30ms = ~120ms from received_at) so the test is deterministic under
+    // the generous production default. Emit progress every 20ms (always under
+    // the inactivity budget) for longer than the ceiling: the inactivity rearm
+    // alone would keep the receipt open forever, but the ceiling forces a close
+    // with a DISTINCT reason so a chatty-but-wedged agent stays visible.
+    adapter = await startAdapter({ receiptTimeoutMs: 30, receiptMaxBudgetMultiplier: 4 });
+    await feed("forever-chatty wedge");
+    const stop = Date.now() + 220;
+    while (Date.now() < stop && !closedReceipts().some((r) => r.message_id === "tg-1")) {
+      bus.emit({
+        ts: Date.now(),
+        agent_id: "triage",
+        session_id: "s1",
+        topic: "response.text",
+        payload: { text: "still working...", intent: "progress" },
+      });
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    await waitFor(() =>
+      closedReceipts().some((r) => r.message_id === "tg-1" && r.final_state === "timeout"),
+    );
+    expect(closedReceipts().find((r) => r.message_id === "tg-1")?.notes?.reason).toBe(
+      "max_turn_budget_exceeded",
     );
   });
 

@@ -80,3 +80,124 @@ describe("PtyAgentProcess.send_prompt_stream", () => {
     expect(writes).toEqual([]);
   });
 });
+
+function bootPty(): { handle: PtyHandle; writes: string[]; emit: (d: string) => void } {
+  const writes: string[] = [];
+  let dataCb: ((d: string) => void) | null = null;
+  const handle: PtyHandle = {
+    pid: 4321,
+    onData: (cb) => {
+      dataCb = cb;
+      return { dispose() {} };
+    },
+    onExit: () => ({ dispose() {} }),
+    write: (data: string) => {
+      writes.push(data);
+    },
+    kill: () => {},
+  };
+  return { handle, writes, emit: (d) => dataCb?.(d) };
+}
+
+describe("PtyAgentProcess boot-dialog watcher (structural / ANSI-resilient)", () => {
+  it("answers a confirm dialog whose title is split by a cursor-move escape (the 2.1.x regression)", () => {
+    const { handle, writes, emit } = bootPty();
+    new PtyAgentProcess("alpha", handle);
+    // Raw PTY: ESC[32G is interleaved INSIDE the title, so a literal
+    // "development channels" match on the raw buffer fails — exactly the bug
+    // that wedged boots after a CLI auto-update. The structural match (selected
+    // option + "Enter to confirm") must still confirm the proceed default.
+    emit(
+      "WARNING: Loading development\x1b[32Gchannels\r\n" +
+        " ❯ 1. I am using this for local development\r\n" +
+        "   2. Exit\r\n Enter to confirm · Esc to cancel",
+    );
+    expect(writes).toEqual(["\r"]);
+  });
+
+  it("answers the new trust-folder dialog with Enter (default = trust)", () => {
+    const { handle, writes, emit } = bootPty();
+    new PtyAgentProcess("beta", handle);
+    emit(
+      "Quick safety check: Is this a project you trust?\r\n" +
+        " ❯ 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm · Esc to cancel",
+    );
+    expect(writes).toEqual(["\r"]);
+  });
+
+  it("sends one Enter per distinct dialog, not per render chunk", () => {
+    const { handle, writes, emit } = bootPty();
+    new PtyAgentProcess("gamma", handle);
+    const trust = " ❯ 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm";
+    emit(trust);
+    emit(trust); // same dialog re-rendered across chunks -> no second Enter
+    expect(writes).toEqual(["\r"]);
+    emit(" ❯ 1. I am using this for local development\r\n   2. Exit\r\n Enter to confirm"); // distinct dialog
+    expect(writes).toEqual(["\r", "\r"]);
+  });
+
+  it("does NOT auto-answer an unknown dialog whose default is destructive; warns once", () => {
+    const { handle, writes, emit } = bootPty();
+    new PtyAgentProcess("delta", handle);
+    const origErr = console.error;
+    let warned = "";
+    console.error = (...a: unknown[]) => {
+      warned = a.map(String).join(" ");
+    };
+    try {
+      emit(" ❯ 2. No, exit\r\n   1. Delete everything\r\n Enter to confirm");
+    } finally {
+      console.error = origErr;
+    }
+    expect(writes).toEqual([]); // no blind keypress on a non-proceed default
+    expect(warned).toContain("non-proceed default");
+  });
+
+  it("fails safe on a destructive default phrased without an exit/cancel keyword (allowlist invert)", () => {
+    // A selected default phrased "Delete everything" matched no proceed verb,
+    // so the watcher must warn-and-wait rather than blind-Enter it — the case
+    // the old destructive-blocklist (exit|cancel|abort|…) would have missed.
+    const { handle, writes, emit } = bootPty();
+    new PtyAgentProcess("zeta", handle);
+    const origErr = console.error;
+    let warned = "";
+    console.error = (...a: unknown[]) => {
+      warned = a.map(String).join(" ");
+    };
+    try {
+      emit(" ❯ 1. Delete everything\r\n   2. Keep files\r\n Enter to confirm");
+    } finally {
+      console.error = origErr;
+    }
+    expect(writes).toEqual([]); // not a recognised proceed action -> no Enter
+    expect(warned).toContain("non-proceed default");
+  });
+
+  it("does NOT fire a second Enter when the bypass dialog re-renders after Down+Enter (Codex F3)", async () => {
+    // The bypass-permissions dialog is answered by the gated Down+Enter branch.
+    // On the redraw chunk the SAME dialog text is still on screen with "❯" now
+    // on the accept row — it must NOT fall through to the generic confirm
+    // branch and fire a second, blind Enter racing the deferred one.
+    const { handle, writes, emit } = bootPty();
+    new PtyAgentProcess("eta", handle);
+    emit(
+      "WARNING: Bypass Permissions mode\r\n ❯ 1. No, exit\r\n   2. Yes, I accept\r\n Enter to confirm",
+    );
+    // redraw after Down: selection moved to the accept row, dialog still up.
+    emit(
+      "WARNING: Bypass Permissions mode\r\n   1. No, exit\r\n ❯ 2. Yes, I accept\r\n Enter to confirm",
+    );
+    await new Promise((r) => setTimeout(r, 250)); // let the deferred Enter land
+    expect(writes).toEqual(["\x1b[B", "\r"]); // exactly Down then one Enter
+  });
+
+  it("disengages on the REPL footer and ignores later dialog-looking text", async () => {
+    const { handle, writes, emit } = bootPty();
+    new PtyAgentProcess("epsilon", handle);
+    emit("⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents");
+    writes.length = 0;
+    emit(" ❯ 1. I am using this for local development\r\n Enter to confirm");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(writes).toEqual([]); // disengaged -> no key into a live REPL
+  });
+});

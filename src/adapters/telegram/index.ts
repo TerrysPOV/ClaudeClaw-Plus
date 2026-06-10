@@ -14,6 +14,7 @@ import {
   type BusEvent,
   type BusOrigin,
   type PermissionRequest,
+  isTailerOriginEvent,
 } from "../../bus/types";
 import { createTelegramApi } from "./api";
 import { extractReactionDirectives } from "./directives";
@@ -45,6 +46,8 @@ export interface TelegramAdapterOptions {
   /** Milliseconds before an unanswered turn's receipt (#211) auto-closes as
    *  `timeout`. Defaults to 5 min (RECEIPT_TIMEOUT_MS). Lowered in tests. */
   receiptTimeoutMs?: number;
+  /** Override the absolute-ceiling multiple of receiptTimeoutMs (default 12). */
+  receiptMaxBudgetMultiplier?: number;
   /** Receipt store (#211). Defaults to the process-wide singleton; tests
    *  inject an isolated store so they never touch the real receipts.jsonl. */
   receiptStore?: ReceiptStore;
@@ -101,6 +104,7 @@ export class TelegramAdapter {
   private readonly defaultAgentId: string | undefined;
   private readonly pollIntervalMs: number;
   private readonly receiptTimeoutMs: number;
+  private readonly receiptMaxBudgetMultiplier: number;
   private readonly receiptStore: ReceiptStore;
   private readonly logger: Pick<Console, "warn" | "info" | "error">;
 
@@ -159,6 +163,17 @@ export class TelegramAdapter {
   /** Mirror of webui-bridge's DEFAULT_PROMPT_TIMEOUT_MS — a turn that never
    *  produces a final reply closes its receipt as `timeout` after this. */
   private static readonly RECEIPT_TIMEOUT_MS = 5 * 60 * 1000;
+  /** Default multiple of `receiptTimeoutMs` (from a receipt's `received_at`) at
+   *  which the inactivity rearm hits an ABSOLUTE ceiling and closes with the
+   *  DISTINCT reason `max_turn_budget_exceeded` (kept apart from a genuine
+   *  no-reply timeout). This is a COARSE safety-valve for deployments WITHOUT
+   *  external monitoring: it bounds an otherwise never-closing receipt without
+   *  dropping the turn (a still-running turn still delivers via the reply tool,
+   *  and the distinct reason means a wedge watchdog does not treat it as a
+   *  no-reply wedge). Precise stuck-vs-slow detection belongs to an operator
+   *  liveness probe gated on real API-token flow, not a wall-clock cap — so the
+   *  default is deliberately generous. Override via `receiptMaxBudgetMultiplier`. */
+  private static readonly DEFAULT_MAX_TURN_BUDGET_MULTIPLIER = 12;
   /** request_id → context; callback_query routes back to `ingestPermissionDecision`. */
   private readonly pendingPermissions = new Map<string, { agent_id: string; chat_id: number }>();
   /** chat_id → pending ask. The next plain-text reply resolves it. */
@@ -187,6 +202,8 @@ export class TelegramAdapter {
     this.defaultAgentId = opts.routing.defaultAgentId;
     this.pollIntervalMs = opts.pollIntervalMs ?? 1000;
     this.receiptTimeoutMs = opts.receiptTimeoutMs ?? TelegramAdapter.RECEIPT_TIMEOUT_MS;
+    this.receiptMaxBudgetMultiplier =
+      opts.receiptMaxBudgetMultiplier ?? TelegramAdapter.DEFAULT_MAX_TURN_BUDGET_MULTIPLIER;
     this.receiptStore = opts.receiptStore ?? getDefaultReceiptStore();
     this.logger = opts.logger ?? console;
   }
@@ -454,6 +471,10 @@ export class TelegramAdapter {
 
   private async handleResponseText(agentId: string, event: BusEvent): Promise<void> {
     if (!eventBelongsToTelegram(event)) return;
+    // Skip the JSONL tailer's per-block observability echo (#217): the
+    // real delivery comes from the agent's `reply` tool (ingestReply),
+    // which carries no tailer source marker. Delivering both double-posts.
+    if (isTailerOriginEvent(event)) return;
     const payload = event.payload as { text?: string };
     const rawText = typeof payload?.text === "string" ? payload.text : "";
     if (rawText.length === 0) return;
@@ -472,6 +493,12 @@ export class TelegramAdapter {
     const isProgress = intent === "progress";
     const FRAMES = TelegramAdapter.SPINNER_FRAMES;
     const key = this.convKey(agentId, target.chat_id);
+    // Receipt timeout is INACTIVITY-based, not a wall-clock budget: any assistant
+    // output for this turn — progress OR final — proves the turn is alive, so
+    // rearm the timeout. A long, actively-working turn (subagents, tool calls)
+    // is never closed as a false no-reply timeout; only a genuinely silent turn
+    // (deaf agent / model hang) lets it fire.
+    this.armReceiptTimeout(key);
     // Every new reply replaces the active animated message — stop any prior spinner.
     this.stopSpinner(key);
     // Receipt (#211): a non-progress response.text is the turn-final
@@ -561,6 +588,9 @@ export class TelegramAdapter {
       return;
     }
     const key = this.convKey(agentId, target.chat_id);
+    // Streamed edit output is also turn activity — rearm the inactivity timeout
+    // (mirrors handleResponseText) so an edit-only turn still proves liveness.
+    this.armReceiptTimeout(key);
     const FRAMES = TelegramAdapter.SPINNER_FRAMES;
     const last = this.lastBotMessage.get(key);
     if (!last) {
@@ -696,6 +726,50 @@ export class TelegramAdapter {
     // Never keep the event loop alive solely for this watchdog timer.
     if (typeof timer.unref === "function") timer.unref();
     this.openReceipts.set(key, { receipt, timer });
+  }
+
+  /** (Re)arm the inactivity timeout for an open receipt. Called on every
+   *  observed turn output so the receipt closes as `timeout` only after
+   *  `receiptTimeoutMs` of NO activity — not a fixed wall-clock budget from
+   *  prompt arrival, which would falsely time out a long but actively-working
+   *  turn. No-op when no receipt is open.
+   *
+   *  The inactivity rearm still has an ABSOLUTE ceiling at
+   *  `received_at + MAX_TURN_BUDGET_MULTIPLIER × receiptTimeoutMs`: a turn that
+   *  keeps emitting progress forever would otherwise never close as `timeout`,
+   *  blinding the Layer-2 wedge watchdog (which detects a wedge solely via a
+   *  closed `timeout` receipt). When the ceiling is hit the receipt closes with
+   *  the DISTINCT reason `max_turn_budget_exceeded`, so the watchdog still sees
+   *  the wedge while it stays distinguishable from a silent no-reply. */
+  private armReceiptTimeout(key: string): void {
+    const entry = this.openReceipts.get(key);
+    if (!entry) return;
+    clearTimeout(entry.timer);
+    const now = Date.now();
+    const receivedAt = Date.parse(entry.receipt.record.received_at);
+    // Absolute ceiling anchored at received_at. NaN (unparseable timestamp)
+    // degrades gracefully to a plain inactivity rearm.
+    const ceiling = Number.isNaN(receivedAt)
+      ? Number.POSITIVE_INFINITY
+      : receivedAt + this.receiptMaxBudgetMultiplier * this.receiptTimeoutMs;
+    if (now >= ceiling) {
+      // Already over budget — close now rather than rearm.
+      this.closeTelegramReceipt(key, "timeout", {
+        reason: "max_turn_budget_exceeded",
+      });
+      return;
+    }
+    // Inactivity deadline, capped so it never overshoots the absolute ceiling.
+    const inactivityDeadline = now + this.receiptTimeoutMs;
+    const deadline = Math.min(inactivityDeadline, ceiling);
+    const hitsCeiling = deadline === ceiling && deadline < inactivityDeadline;
+    const timer = setTimeout(() => {
+      this.closeTelegramReceipt(key, "timeout", {
+        reason: hitsCeiling ? "max_turn_budget_exceeded" : "no_final_reply_within_timeout",
+      });
+    }, deadline - now);
+    if (typeof timer.unref === "function") timer.unref();
+    entry.timer = timer;
   }
 
   /** Close (idempotently) the open receipt for a conversation, if any. */

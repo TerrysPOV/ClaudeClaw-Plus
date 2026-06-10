@@ -36,7 +36,7 @@ import type {
   SubscriptionFilter,
   SubscriptionHandler,
 } from "../../../bus/core-subscription";
-import type { BusEvent } from "../../../bus/types";
+import { type BusEvent, TAILER_EVENT_SOURCE } from "../../../bus/types";
 import type {
   SlackApi,
   SlackBlock,
@@ -1693,5 +1693,34 @@ describe("sanitiseBotText", () => {
     );
     await waitFor(() => bus.prompts.length > 0);
     expect(bus.prompts[0]?.text).toContain("[react:🔥]");
+  });
+});
+
+describe("SlackAdapter — tailer echo suppression (#217)", () => {
+  it("IGNORES the JSONL tailer observability echo so replies are not double-posted", async () => {
+    adapter = await startAdapter({ routing: { channels: { C100: "triage" } } });
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s",
+      topic: "response.text",
+      payload: { text: "echo", _meta: { source: TAILER_EVENT_SOURCE } },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(api.sent).toHaveLength(0);
+  });
+
+  it("STILL delivers a non-tailer response.text exactly once", async () => {
+    adapter = await startAdapter({ routing: { channels: { C100: "triage" } } });
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s",
+      topic: "response.text",
+      payload: { text: "recovered" },
+    });
+    await waitFor(() => api.sent.length > 0);
+    expect(api.sent).toHaveLength(1);
+    expect(api.sent[0]?.text).toBe("recovered");
   });
 });

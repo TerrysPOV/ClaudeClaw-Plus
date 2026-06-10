@@ -40,6 +40,10 @@ import {
   writeConfigForPty,
 } from "../runner/pty-mcp-config-writer";
 import { createSession } from "../sessions";
+import type { BusCore } from "./core";
+import { JsonlTailer } from "./jsonl-tailer";
+import { capturePostMortem, type PostMortemOptions } from "./post-mortem";
+import type { ReceiptRecord } from "./receipt";
 import {
   type AgentProcess,
   ChildAgentProcess,
@@ -106,6 +110,61 @@ export interface SessionManagerOptions {
    * Optional logger override. Defaults to `console`.
    */
   logger?: Pick<Console, "warn" | "info" | "error">;
+  /**
+   * Bus core to feed session JSONL events into (issue #215). When set,
+   * every spawned agent gets a `JsonlTailer` bound to its live session
+   * that forwards `response.turn_end` (etc.) via `bus.ingestSessionEvent`,
+   * which powers the silent-drop safety net. Absent in unit tests that
+   * don't exercise the tailer. The daemon (`runtime-mount`) wires it.
+   */
+  bus?: BusCore;
+  /**
+   * Override the `~/.claude/projects` root the per-agent `JsonlTailer`
+   * reads (issue #215). Defaults to the tailer's own default. Tests point
+   * it at a temp dir so they never touch the real projects directory.
+   */
+  projectsDir?: string;
+  /**
+   * Clock seam for the `restart()` rate-limiter (tests). Returns epoch ms.
+   * Defaults to `Date.now`.
+   */
+  now?: () => number;
+  /**
+   * Override the directory restart post-mortems are written to. Defaults to
+   * `~/.claude/claudeclaw/post-mortems` (see `post-mortem.ts`). Tests point
+   * this at a temp dir.
+   */
+  postMortemDir?: string;
+  /**
+   * Override the `~/.claude/projects` root the post-mortem reads session
+   * JSONL from. Tests point this at a temp dir.
+   */
+  postMortemProjectsDir?: string;
+}
+
+/**
+ * Options for `SessionManager.restart()` — the shared respawn primitive.
+ */
+export interface RestartOptions {
+  /**
+   * Why the respawn fired. Stamped on the post-mortem so the three triggers
+   * (control-plane wedge, data-plane model-hang, rotation) are
+   * distinguishable offline. Defaults to `"manual"`.
+   */
+  reason?: string;
+  /**
+   * Snapshot of the receipt that triggered the respawn, when available.
+   * Captured verbatim into the post-mortem (already redacted — the receipt
+   * stores a prompt hash, never plaintext).
+   */
+  receipt?: Readonly<ReceiptRecord> | null;
+  /**
+   * Mint a fresh session id (rotate the conversation) vs. resume the existing
+   * transcript. Defaults to `true` — the rotation + model-hang triggers both
+   * want a clean session. Pass `false` to recycle a wedged process while
+   * keeping context.
+   */
+  freshSession?: boolean;
 }
 
 /**
@@ -324,6 +383,16 @@ export function resolveClaudeclawPluginRoot(): string {
 const DEFAULT_COLLISION_DETECT_MS = 2000;
 
 /**
+ * Restart rate-limit (Terry's required add on the respawn primitive). More
+ * than `MAX_RESTARTS_PER_WINDOW` restarts of one agent inside
+ * `RESTART_WINDOW_MS` flips the agent into operator-intervention mode rather
+ * than looping — a crash-on-boot / bad-config cause is NOT the upstream
+ * model-hang and must not be papered over with an infinite respawn loop.
+ */
+const MAX_RESTARTS_PER_WINDOW = 3;
+const RESTART_WINDOW_MS = 60 * 60 * 1000;
+
+/**
  * Regex matching claude's "Session ID is already in use" startup error.
  * Permissive on the uuid shape to survive any future formatting tweaks
  * (claude has used both classic 36-char dashed UUIDs and variants).
@@ -454,12 +523,36 @@ interface AgentRecord {
    * `agent.mcp_config`, or dormant multiplexer).
    */
   mcpConfigCwd?: string;
+  /**
+   * Live session JSONL tailer (issue #215). Present when `options.bus`
+   * is set; feeds `response.turn_end` events so the bus can synthesize a
+   * reply the agent forgot to send. Stopped on agent exit / stop().
+   */
+  tailer?: JsonlTailer;
 }
 
 export class SessionManager {
   private readonly options: SessionManagerOptions;
   private readonly agents = new Map<string, AgentRecord>();
   private mcpSynth: BusMcpConfigSynthesizer | null = null;
+  /**
+   * Per-agent restart timestamps (epoch ms) inside the rate-limit window.
+   * Guards a non-upstream failure cause (bad config, crash-on-boot) from
+   * looping respawns forever — see `restart()` + `MAX_RESTARTS_PER_WINDOW`.
+   * Only failure-driven restarts are recorded; healthy `reason==='rotation'`
+   * respawns have their own backpressure and bypass this budget entirely.
+   */
+  private readonly restartHistory = new Map<string, number[]>();
+  /**
+   * Per-agent in-flight `restart()` promises. The three triggers
+   * (control-plane wedge, data-plane model-hang, rotation) are independent
+   * event sources that can fire for the SAME agent concurrently. Serializing
+   * per agent makes the rate-limit gate meaningful, prevents double-mint /
+   * double-post-mortem, and closes the `already spawned` race where the
+   * loser tears down the freshly-spawned process. Cleared in `restart()`'s
+   * finally.
+   */
+  private readonly restartInFlight = new Map<string, Promise<AgentProcess>>();
 
   constructor(options: SessionManagerOptions = {}) {
     this.options = options;
@@ -563,6 +656,8 @@ export class SessionManager {
     proc.onExit(() => {
       const current = this.agents.get(agent.id);
       if (current && current.proc === proc) {
+        // Issue #215: tear down the session tailer on natural exit too.
+        void current.tailer?.stop();
         // Issue #165 (PR #184 re-review): a natural exit (crash, OOM,
         // claude-side auth failure, operator kill) never routes through
         // stop(), so release the multiplexer identity + delete the 0600
@@ -570,6 +665,10 @@ export class SessionManager {
         // ran (e.g. stop() racing the process's own exit).
         this.cleanupAgentMcpConfig(current.mcpConfigCwd, agent.id);
         this.agents.delete(agent.id);
+        // A natural exit that bypasses stop() (crash, OOM, operator kill)
+        // must also drop the restart-budget entry so a churn of distinct
+        // agent ids can't leak number[] entries for the life of the manager.
+        this.restartHistory.delete(agent.id);
       }
     });
 
@@ -627,6 +726,34 @@ export class SessionManager {
       throw new Error(
         `agent ${agent.id}: session-id collision persisted after rotation (id=${agent.session_id}) — manual intervention required`,
       );
+    }
+
+    // Issue #215: wire a JSONL tailer to this agent's live session so the
+    // bus observes `response.turn_end` and can synthesize a reply when a
+    // turn ends with text but the agent never called the `reply` tool.
+    // Without this the safety net in BusCore.handleTurnEnd is inert (no
+    // events are ever produced in the runtime). Created here — after any
+    // session-id rotation — so it binds the FINAL session_id. start() is
+    // fire-and-forget: it must not block returning the proc, and a tail
+    // failure must never fail the spawn.
+    if (this.options.bus) {
+      const tailer = new JsonlTailer({
+        bus: this.options.bus,
+        agent_id: agent.id,
+        session_id: agent.session_id,
+        cwd: realCwd,
+        startAt: "end",
+        projectsDir: this.options.projectsDir,
+      });
+      record.tailer = tailer;
+      void tailer
+        .start()
+        .catch((err) =>
+          (this.options.logger ?? console).warn(
+            `[bus-session] agent=${agent.id} jsonl tailer start failed`,
+            err,
+          ),
+        );
     }
 
     return proc;
@@ -783,12 +910,18 @@ export class SessionManager {
     if (!record) return Promise.resolve();
     return new Promise<void>((resolve) => {
       const finalise = (): void => {
+        // Issue #215: tear down the session tailer.
+        void record.tailer?.stop();
         // Issue #165: release the multiplexer identity + delete the
         // synthesized per-agent --mcp-config when this spawn had one.
         this.cleanupAgentMcpConfig(record.mcpConfigCwd, agent_id);
         // Drop from registry (the onExit handler installed in spawnAgent()
         // will also do this; harmless to do twice).
         this.agents.delete(agent_id);
+        // Drop the restart-budget entry too — otherwise a stopped-and-never-
+        // restarted agent leaves a stranded number[] for the life of the
+        // manager (slow leak in a primitive whose purpose is to bound growth).
+        this.restartHistory.delete(agent_id);
         resolve();
       };
       if (record.proc._isExited()) {
@@ -819,15 +952,157 @@ export class SessionManager {
   }
 
   /**
-   * Restart an agent. Same `session_id` (claude resumes via `--session-id`).
+   * Respawn an agent's live PTY. This is the SHARED primitive behind three
+   * triggers — control-plane wedge (prompt never reached the agent), the
+   * data-plane model-hang (prompt reached the agent but no turn followed),
+   * and session rotation (message/age threshold tripped). One mechanism,
+   * built once.
+   *
+   * Unlike the old same-`session_id` restart, this actually rotates the
+   * conversation: it stops the current process, mints + persists a FRESH
+   * session id, and spawns a new PTY against it. That's what makes it a real
+   * fix for bus-mode session rotation (#213) — the live `claude` was writing
+   * one ever-growing JSONL keyed to the boot session id; only respawning it
+   * against a new id stops the growth. Minting fresh also sidesteps claude's
+   * locked-`--resume` refusal: the old id is no longer live, and the summary
+   * (rotation caller's concern) is generated against the backed-up id, not
+   * the live one.
+   *
+   * `freshSession: false` keeps the existing id (resume the same transcript) —
+   * for callers that only need to recycle a wedged process without discarding
+   * context. Default is `true`.
+   *
+   * Before stopping, a best-effort post-mortem is written (cwd, last ~50
+   * JSONL lines, triggering receipt) so the *why* survives the respawn.
+   *
+   * Rate-limited: more than `MAX_RESTARTS_PER_WINDOW` restarts for one agent
+   * inside `RESTART_WINDOW_MS` logs a CRITICAL and throws WITHOUT respawning.
+   * A crash-on-boot or bad-config agent must not loop forever — that's an
+   * operator-intervention signal, not something to paper over.
+   *
+   * Best-effort instrumentation posture: the post-mortem capture never
+   * rejects the restart, mirroring the receipt-chain "must not break the bus"
+   * rule. The rate-limit throw is the one intentional refusal.
    */
-  async restart(agent_id: string): Promise<AgentProcess> {
+  async restart(agent_id: string, opts: RestartOptions = {}): Promise<AgentProcess> {
+    // Non-re-entrant per agent: the three triggers can fire for the SAME
+    // agent concurrently. Coalesce — a concurrent caller awaits the same
+    // in-flight restart instead of racing it (double-mint, double-post-mortem,
+    // rate-limit undercount, and the `already spawned` teardown-the-fresh-proc
+    // race all stem from overlapping restarts). The entry is cleared in the
+    // finally below before the promise settles, so a follow-on restart can run.
+    const inflight = this.restartInFlight.get(agent_id);
+    if (inflight) return inflight;
+
+    const p = this.restartInternal(agent_id, opts).finally(() => {
+      this.restartInFlight.delete(agent_id);
+    });
+    this.restartInFlight.set(agent_id, p);
+    return p;
+  }
+
+  private async restartInternal(agent_id: string, opts: RestartOptions): Promise<AgentProcess> {
     const record = this.agents.get(agent_id);
     if (!record) {
       throw new Error(`cannot restart unknown agent ${agent_id}`);
     }
+    const reason = opts.reason ?? "manual";
+    const log = this.options.logger ?? console;
+    const nowMs = (this.options.now ?? Date.now)();
+
+    // Healthy rotation (#213) has its own backpressure (message/age threshold)
+    // and is a normal event on a high-traffic agent — it must NOT share the
+    // crash-loop budget, or a busy agent gets denied a needed rotation and a
+    // few benign rotations can starve a genuine wedge respawn. The gate exists
+    // for failure-driven triggers (crash-on-boot / bad-config loops) only.
+    const countsAgainstBudget = reason !== "rotation";
+
+    // Rate-limit gate — prune the window, refuse if we're already at the cap.
+    // Mutate the STORED array in place (no filtered-copy + overwrite) so the
+    // accounting can't be clobbered. `history` is null for rotation (skipped).
+    let history: number[] | null = null;
+    if (countsAgainstBudget) {
+      history = this.restartHistory.get(agent_id) ?? [];
+      // Prune expired timestamps in place on the stored reference.
+      for (let i = history.length - 1; i >= 0; i--) {
+        if (nowMs - (history[i] as number) >= RESTART_WINDOW_MS) history.splice(i, 1);
+      }
+      this.restartHistory.set(agent_id, history);
+      if (history.length >= MAX_RESTARTS_PER_WINDOW) {
+        log.error(
+          `[bus-session] CRITICAL agent=${agent_id} hit ${history.length} restarts in ` +
+            `${RESTART_WINDOW_MS / 60000}min (reason=${reason}) — auto-restart SUSPENDED, ` +
+            `operator intervention required (likely a crash-on-boot or bad-config cause, ` +
+            `not the upstream model-hang)`,
+        );
+        throw new Error(
+          `agent ${agent_id}: restart rate limit exceeded ` +
+            `(${history.length}/${MAX_RESTARTS_PER_WINDOW} in ${RESTART_WINDOW_MS / 60000}min) — ` +
+            `auto-restart suspended`,
+        );
+      }
+    }
+
     const { agent, origin } = record;
+
+    // Mint + persist the FRESH session id BEFORE stop() so a persist failure
+    // (EACCES/ENOSPC/EROFS, or a throwing persistRotatedSessionId) aborts the
+    // restart with the agent STILL LIVE and registered — never torn down with
+    // no recovery path through restart(). The live record's session_id is only
+    // mutated after the persist resolves; the post-mortem (below) still tails
+    // the dying session because it captures from the same pre-stop snapshot.
+    let freshId: string | null = null;
+    if (opts.freshSession !== false) {
+      freshId = randomUUID();
+      // Public option takes `(agentId, sessionId)`; the legacy `createSession`
+      // storage layer takes them reversed — same convention as the
+      // collision-rotation path above.
+      const persist =
+        this.options.persistRotatedSessionId ??
+        ((id: string, sid: string) => createSession(sid, id));
+      await persist(agent_id, freshId);
+    }
+
+    // Post-mortem BEFORE the stop so the JSONL we tail is the dying session's.
+    // Captured against the still-current `agent.session_id` (not yet rotated).
+    // Best-effort — instrumentation must never break the respawn.
+    const pmOpts: PostMortemOptions = {};
+    if (this.options.postMortemDir !== undefined) pmOpts.dir = this.options.postMortemDir;
+    if (this.options.postMortemProjectsDir !== undefined)
+      pmOpts.projectsDir = this.options.postMortemProjectsDir;
+    try {
+      const path = await capturePostMortem(
+        {
+          agentId: agent_id,
+          cwd: resolveAgentCwd(agent.cwd),
+          sessionId: agent.session_id,
+          reason,
+          receipt: opts.receipt ?? null,
+          generation: history?.length ?? 0,
+        },
+        pmOpts,
+      );
+      if (path) log.info(`[bus-session] agent=${agent_id} post-mortem written (reason=${reason})`);
+    } catch (err) {
+      log.warn(`[bus-session] agent=${agent_id} post-mortem capture failed`, err);
+    }
+
     await this.stop(agent_id);
+
+    // Persist succeeded — adopt the fresh id on the live record now that the
+    // old process is gone (so the respawn boots against the new session).
+    if (freshId !== null) agent.session_id = freshId;
+
+    // Count this restart against the window only once we've committed to it
+    // (past the rate-limit gate + persist + post-mortem). Push to the SAME
+    // stored array reference + re-set so concurrent accounting can't be lost
+    // — though `restart()`'s in-flight guard already serializes us per agent.
+    // Rotation (history === null) is intentionally not recorded.
+    if (history !== null) {
+      history.push(nowMs);
+      this.restartHistory.set(agent_id, history);
+    }
+
     return this.spawnAgent(agent, origin);
   }
 
