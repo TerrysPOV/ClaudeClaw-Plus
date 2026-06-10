@@ -39,7 +39,7 @@ import {
   type ToolResultBlock,
   type UserLine,
 } from "./jsonl-line-types";
-import type { BusEvent, BusEventTopic } from "./types";
+import { type BusEvent, type BusEventTopic, TAILER_EVENT_SOURCE } from "./types";
 
 /**
  * Parser schema version. Bump whenever line-type handling changes in a
@@ -105,6 +105,15 @@ export interface JsonlTailerOptions {
   projectsDir?: string;
   /** Surfaced via schema-probe cache (Sprint 2 Agent B). */
   schemaVersion?: string;
+  /**
+   * Where to begin tailing when the session file already exists.
+   * `"begin"` (default) replays from byte 0 — used by tests and any
+   * consumer that wants historical events. `"end"` seeks to EOF and
+   * live-tails new lines only — used by the runtime wiring (issue #215)
+   * so a resumed session never re-emits historical `response.turn_end`
+   * events (which could synthesize a stale reply).
+   */
+  startAt?: "begin" | "end";
   /** Error sink. Defaults to console.error. */
   onError?: (err: unknown, ctx?: Record<string, unknown>) => void;
 }
@@ -118,12 +127,24 @@ export class JsonlTailer {
   private readonly schemaVersion: string;
   private readonly onError: (err: unknown, ctx?: Record<string, unknown>) => void;
   private readonly filePath: string;
+  private readonly startAt: "begin" | "end";
 
   private offset = 0;
+  /**
+   * Set when the startup seek-to-EOF (`startAt: "end"`) could not `statSync`
+   * the file (transient perm flip / NFS hiccup / rotation). While true, the
+   * next `drainFromOffset` re-seeks to current EOF instead of reading from
+   * offset 0 — otherwise it would replay the entire history and synthesize a
+   * stale reply, the exact failure `startAt: "end"` exists to prevent
+   * (#217 review).
+   */
+  private seekToEndPending = false;
   private buffer = "";
   /** Set true once the first non-empty line emits `session.init`. */
   private initEmitted = false;
   private watcher: FSWatcher | null = null;
+  /** Set while polling for a not-yet-created session file. Cleared by stop(). */
+  private createPollTimer: ReturnType<typeof setTimeout> | null = null;
   private started = false;
   private stopped = false;
   /**
@@ -140,6 +161,7 @@ export class JsonlTailer {
     this.projectsDir = opts.projectsDir ?? join(homedir(), ".claude", "projects");
     this.schemaVersion = opts.schemaVersion ?? SCHEMA_VERSION;
     this.onError = opts.onError ?? ((err, ctx) => console.error("[jsonl-tailer]", err, ctx));
+    this.startAt = opts.startAt ?? "begin";
     this.filePath = join(
       this.projectsDir,
       encodeCwdForProjectsDir(this.cwd),
@@ -164,31 +186,94 @@ export class JsonlTailer {
     // emit the replay-done marker (with offset=0) and the live-tail
     // path picks up the first byte when it appears.
     if (existsSync(this.filePath)) {
-      await this.drainFromOffset();
+      if (this.startAt === "end") {
+        // Issue #215 runtime wiring: live-tail NEW turns only. Replaying
+        // from byte 0 on a resumed session would re-emit historical
+        // `response.turn_end` events and, with a prompt in flight, could
+        // synthesize a stale reply. Seek to EOF and watch forward.
+        try {
+          this.offset = statSync(this.filePath).size;
+        } catch (err) {
+          this.onError(err, { ctx: "start-eof-stat" });
+          // Couldn't establish EOF. Do NOT let the follow-up drain read from
+          // offset 0 — that replays the whole history and synthesizes a stale
+          // reply. Defer the seek: the next drainFromOffset re-seeks to the
+          // then-current EOF and tails forward (#217 review).
+          this.seekToEndPending = true;
+        }
+      } else {
+        await this.drainFromOffset();
+      }
+      this.emitReplayDone();
+      this.attachFileWatcher();
+      // Close the startup TOCTOU on the existing-file path (review #217).
+      // `fs.watch` only fires on changes AFTER it attaches, so bytes written
+      // in the window between the `statSync` seek-to-EOF above and
+      // `attachFileWatcher()` are not delivered by the watcher and stay unread
+      // until the NEXT write triggers `scheduleDrain`. If those missed bytes
+      // contain an `end_turn` line and the agent then goes idle — the exact
+      // pattern this safety net exists to recover — synthesis is delayed
+      // indefinitely. Schedule a follow-up drain to sweep the gap immediately,
+      // mirroring what `awaitFileCreation` already does after its attach.
+      this.scheduleDrain();
+      return;
     }
-    this.emitReplayDone();
 
-    // Live tail. fs.watch on macOS is generally reliable for append-only
-    // files in our scenarios; if we ever see drops on Linux network FS
-    // we'll fall back to fs.watchFile polling. Spec §5.2 explicitly
-    // allows either.
+    // File not created yet. A fresh agent session has claude write the
+    // JSONL lazily (on the first turn), so at spawn time the path — and
+    // even its parent dir — may not exist. Emit replay-done at offset 0,
+    // then poll for the file's appearance and attach. Without this the
+    // tailer is inert for every fresh session (issue #215 runtime wiring:
+    // the common case — the original code only logged the ENOENT from
+    // `watch()` and gave up, so no events ever flowed in production).
+    this.emitReplayDone();
+    this.awaitFileCreation();
+  }
+
+  /** Attach the live fs.watch to an already-existing session file. */
+  private attachFileWatcher(): void {
+    if (this.stopped || this.watcher) return;
     try {
       this.watcher = watch(this.filePath, { persistent: false }, () => {
         this.scheduleDrain();
       });
       this.watcher.on("error", (err) => this.onError(err, { ctx: "fs-watch" }));
     } catch (err) {
-      // ENOENT — file not yet created. Poll the parent dir minimally:
-      // schedule a one-shot retry. In practice Session Manager has
-      // already spawned `claude` and the file appears within ms.
       this.onError(err, { ctx: "watch-setup", path: this.filePath });
     }
+  }
+
+  /**
+   * Poll (unref'd) until the session file appears, then attach the watcher
+   * and drain whatever has been written. A brand-new file has offset 0 ==
+   * EOF, so `startAt: "end"` and `"begin"` coincide for it. Cleared by stop().
+   */
+  private awaitFileCreation(): void {
+    const poll = (): void => {
+      if (this.stopped) return;
+      if (existsSync(this.filePath)) {
+        // File appeared — the await-creation poll is done; clear its handle so
+        // the tailer's state isn't misleading and stop() doesn't clear a stale
+        // timer (Copilot review #217).
+        this.createPollTimer = null;
+        this.attachFileWatcher();
+        this.scheduleDrain();
+        return;
+      }
+      this.createPollTimer = setTimeout(poll, 150);
+      this.createPollTimer.unref?.();
+    };
+    poll();
   }
 
   /** Stop and release watchers. Idempotent. */
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
+    if (this.createPollTimer) {
+      clearTimeout(this.createPollTimer);
+      this.createPollTimer = null;
+    }
     if (this.watcher) {
       this.watcher.close();
       this.watcher = null;
@@ -222,6 +307,14 @@ export class JsonlTailer {
       // re-fire when bytes appear (or won't, if the file truly never
       // gets created — that's a higher-layer concern).
       this.onError(err, { ctx: "drain-stat" });
+      return;
+    }
+    if (this.seekToEndPending) {
+      // Startup seek-to-EOF was deferred because the initial statSync failed.
+      // Establish EOF now and tail forward — a startAt:"end" tailer must never
+      // replay history (#217 review).
+      this.offset = size;
+      this.seekToEndPending = false;
       return;
     }
     if (size <= this.offset) return;
@@ -403,6 +496,29 @@ export class JsonlTailer {
     if (line.message?.usage) {
       this.publish("usage", line.message.usage, line);
     }
+    // Turn-boundary surfacing — when the API stops with `end_turn`, the
+    // agent has signalled "I'm done with this turn". Emit a single event
+    // carrying the concatenated text blocks of this turn so downstream
+    // subscribers (silent-drop safety net in bus core) can detect the
+    // pattern where the agent ended the turn with text but never called
+    // the `reply` tool to deliver it to the user. `tool_use` stop_reason
+    // means the agent intends to continue after a tool result, so we
+    // don't emit on those.
+    if (line.message?.stop_reason === "end_turn") {
+      const turnText = blocks
+        .filter((b) => b.type === "text")
+        .map((b) => (b as { text?: string }).text ?? "")
+        .join("\n")
+        .trim();
+      this.publish(
+        "response.turn_end",
+        {
+          stop_reason: "end_turn",
+          text: turnText,
+        },
+        line,
+      );
+    }
     // Degraded-turn surfacing — §5.2 mentions `error` / `isApiErrorMessage` /
     // `apiErrorStatus` on assistant lines. Forward as `system.api_error`.
     if (line.error || line.isApiErrorMessage) {
@@ -469,7 +585,13 @@ export class JsonlTailer {
       agent_id: this.agent_id,
       session_id: sessionFromLine ?? this.session_id,
       topic,
-      payload: metadata ? { ...(payload as object), _meta: metadata } : payload,
+      // Stamp the tailer source marker (#217) into `_meta` so delivery
+      // adapters can tell this observability echo apart from a real
+      // `ingestReply` delivery (otherwise every reply double-posts).
+      // Merge with any caller-supplied metadata. Only object (non-array)
+      // payloads carry `_meta`; primitive/array payloads are never
+      // adapter-deliverable, so leave them untouched.
+      payload: this.withTailerMeta(payload, metadata),
       raw: rawLine,
     };
     try {
@@ -477,6 +599,22 @@ export class JsonlTailer {
     } catch (err) {
       this.onError(err, { ctx: "publish", topic });
     }
+  }
+
+  /**
+   * Merge the tailer source marker (#217) — and any caller metadata —
+   * into an object payload's `_meta`. Primitive/array payloads are
+   * returned unchanged (they are never adapter-deliverable, so they
+   * don't need the marker, and spreading them would be lossy).
+   */
+  private withTailerMeta(payload: unknown, metadata?: Record<string, unknown>): unknown {
+    if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+      return payload;
+    }
+    return {
+      ...(payload as object),
+      _meta: { ...metadata, source: TAILER_EVENT_SOURCE },
+    };
   }
 
   private emitReplayDone(): void {

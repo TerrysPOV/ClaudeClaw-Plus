@@ -24,6 +24,24 @@ import type { ChildProcess } from "node:child_process";
 import { sanitizePtyPromptText } from "../runner/pty-prompt-sanitizer";
 import type { SupervisionMode } from "./types";
 
+/** Strip ANSI OSC/CSI escape sequences so dialog matching survives the
+ *  cursor-positioning escapes the CLI interleaves into rendered text. Without
+ *  this, a raw substring like "development channels" silently stops matching
+ *  after a CLI build renders it as "development\x1b[32Gchannels". Mirrors the
+ *  stripper in `runner/pty-process.ts` (kept local to avoid importing the PTY
+ *  runner into the bus module). */
+function stripAnsiEscapes(text: string): string {
+  return (
+    text
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: OSC escape sequences require control bytes.
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI CSI escape stripper.
+      .replace(/\x1b\[[?0-9;]*[ -/]*[@-~]/g, "")
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: catch-all ESC byte stripper.
+      .replace(/\x1b/g, "")
+  );
+}
+
 export type ExitHandler = (code: number) => void;
 export type DataHandler = (chunk: string) => void;
 
@@ -88,7 +106,10 @@ export class PtyAgentProcess implements AgentProcess {
   private bootDialogActive = true;
   private bootDialogBuffer = "";
   private answeredBypassPrompt = false;
-  private answeredDevChannelsPrompt = false;
+  /** Signature of the last generic confirm-dialog we answered, so we send one
+   *  Enter per distinct dialog instead of on every render chunk. */
+  private lastConfirmSig: string | null = null;
+  private warnedUnhandledDialog = false;
   /** Hard cap on the boot-dialog watch window (issue #193 / Codex P2). If no
    *  REPL-ready marker is observed within this window (e.g. a future CLI
    *  changes the footer text), the watcher disengages anyway so it never
@@ -191,52 +212,115 @@ export class PtyAgentProcess implements AgentProcess {
   }
 
   /** Answer claude's interactive startup confirmation dialogs by inspecting
-   *  early PTY output (issue #193). Sends the *correct* key per dialog: Enter
-   *  for the dev-channels confirmation (whose default IS the accept option),
-   *  and Down+Enter for the "Bypass Permissions mode" dialog (whose default is
-   *  "No, exit" — a blind Enter would select exit and kill the agent). Matches
-   *  on text unique to each dialog so the REPL footer (which contains the
-   *  "shift+tab to cycle" hint) cannot false-trigger. */
+   *  early PTY output (issue #193), then disengage once the REPL is up.
+   *
+   *  Resilient to CLI rendering changes (the reason this used to wedge after a
+   *  CLI auto-update): the raw PTY stream interleaves cursor-positioning
+   *  escapes *inside* dialog text — e.g. a build renders the title
+   *  "development<ESC>[32Gchannels" — so a literal substring match on the raw
+   *  buffer silently stops matching, leaving the dialog unanswered and the
+   *  agent stuck before the REPL. We therefore (1) strip ANSI before matching,
+   *  and (2) drive the dialog by its *structure* — the selected ("❯") option +
+   *  the "Enter to confirm" affordance — rather than per-title strings.
+   *
+   *  Default-key safety: a dialog whose selected option is a proceed action
+   *  (trust-folder, dev-channels) is confirmed with Enter. The only known
+   *  dialog whose default is destructive is the bypass-permissions prompt
+   *  ("No, exit" preselected) — handled specifically with Down+Enter. An
+   *  unrecognised dialog whose default looks destructive is NOT auto-answered
+   *  (we log once instead), so a future CLI change degrades to "stuck + a
+   *  warning" rather than "blindly pressed the wrong button". */
   private handleBootDialog(chunk: string): void {
     this.bootDialogBuffer = (this.bootDialogBuffer + chunk).slice(-4000);
-    const buf = this.bootDialogBuffer;
-    if (!this.answeredBypassPrompt && buf.includes("Yes, I accept")) {
-      this.answeredBypassPrompt = true;
-      try {
-        this.pty.write("\x1b[B"); // move selection to "2. Yes, I accept"
+    const buf = stripAnsiEscapes(this.bootDialogBuffer);
+
+    // REPL is up — disengage FIRST so we never inject a key into a live REPL.
+    // Every REPL mode footer carries the mode-cycler hint ("shift+tab to
+    // cycle" / a future "tab to cycle permission modes"); "tab to cycle" is its
+    // version-stable core and — unlike the bare "to cycle" — cannot trip on
+    // arbitrary boot prose, which would disengage early and re-expose #195.
+    if (buf.includes("tab to cycle")) {
+      this.endBootDialogPhase();
+      return;
+    }
+
+    // Bypass-permissions dialog — DEFAULT is "No, exit"; a blind Enter selects
+    // exit and kills the agent, so move the selection to the accept row first.
+    if (buf.includes("Yes, I accept")) {
+      if (!this.answeredBypassPrompt) {
+        this.answeredBypassPrompt = true;
+        this.sendBootKeys("\x1b[B", "\r"); // Down, then Enter
+      }
+      // The bypass dialog is still on screen (re-rendered after the Down): do
+      // NOT fall through to the generic confirm branch, which would fire a
+      // second, blind Enter racing the deferred one above (Codex F3 / #195).
+      return;
+    }
+
+    // Generic confirm dialog. Identify the selected option (the "❯" row) just
+    // above the "Enter to confirm" affordance and only press Enter when that
+    // default is a proceed action. Dedup on the option region so we send one
+    // Enter per distinct dialog (trust-folder → dev-channels → REPL), not one
+    // per render chunk.
+    // Use the LAST affordance: the buffer accumulates across dialogs, so an
+    // earlier (already-answered) dialog's text may still be present above the
+    // current one.
+    const ec = buf.lastIndexOf("Enter to confirm");
+    if (ec === -1) return;
+    const region = buf.slice(0, ec);
+    const arrow = region.lastIndexOf("❯");
+    if (arrow === -1) return;
+    const eol = region.indexOf("\n", arrow);
+    // The selected ("❯") option line identifies the dialog stably regardless of
+    // how much earlier output has accumulated in the buffer — use it both as
+    // the proceed/destructive discriminator AND the per-dialog dedup key (one
+    // Enter per distinct dialog, not per render chunk).
+    const selected = region
+      .slice(arrow, eol === -1 ? region.length : eol)
+      .trim()
+      .toLowerCase();
+    if (selected === this.lastConfirmSig) return; // same dialog still rendering
+    // Fail-safe ALLOWLIST: only auto-press Enter when the selected ("❯") option
+    // affirmatively reads as a proceed/accept action. This subsumes the old
+    // destructive-blocklist (which both blind-Entered destructive defaults
+    // phrased delete/discard/… and false-wedged on benign labels that merely
+    // mentioned "exit"): an unrecognised default now degrades to "stuck + a
+    // one-time warning" rather than "blindly pressed the wrong button".
+    const label = selected.replace(/^❯\s*\d*[.):]?\s*/, ""); // strip "❯ N." prefix
+    const proceedDefault =
+      /\b(yes|accept|trust|continue|proceed|allow|enable|confirm|ok|i am using this)\b/.test(label);
+    if (proceedDefault) {
+      this.lastConfirmSig = selected;
+      this.sendBootKeys("\r"); // default is a recognised proceed option
+    } else if (!this.warnedUnhandledDialog) {
+      // Default does not read as a proceed action — don't guess which key is
+      // safe. Surface it so the drift is visible (the watchdog / a follow-up
+      // can react) instead of silently pressing the wrong button.
+      this.warnedUnhandledDialog = true;
+      console.error(
+        `[boot-dialog] agent=${this.agent_id}: confirm dialog with non-proceed default ` +
+          `not auto-answered (selected="${selected.trim().slice(0, 60)}"). REPL may stall.`,
+      );
+    }
+  }
+
+  /** Write one or two keystrokes to the PTY, the second after a short settle so
+   *  a bracketed-paste terminal treats them as distinct keys. Swallows write
+   *  errors (the PTY can exit mid-boot). */
+  private sendBootKeys(first: string, second?: string): void {
+    try {
+      this.pty.write(first);
+      if (second !== undefined) {
         setTimeout(() => {
           try {
-            this.pty.write("\r");
+            this.pty.write(second);
           } catch {
             /* pty may have exited — non-fatal */
           }
         }, 200);
-      } catch {
-        /* pty may have exited — non-fatal */
       }
-      return;
-    }
-    if (!this.answeredDevChannelsPrompt && buf.includes("development channels")) {
-      this.answeredDevChannelsPrompt = true;
-      try {
-        this.pty.write("\r");
-      } catch {
-        /* pty may have exited — non-fatal */
-      }
-      return;
-    }
-    // REPL-ready marker (issue #193 / Codex P2 ×2). Every REPL mode footer
-    // ends with the "shift+tab to cycle" mode-cycler hint, regardless of the
-    // agent's permission_mode ("bypass permissions on", "plan mode on",
-    // "accept edits on", etc.). Matching the generic hint — rather than the
-    // bypass-specific footer — means the watcher disengages promptly in ALL
-    // modes, not only bypass. (The bypass-only marker left non-bypass agents
-    // watching until the 15s timeout, during which a stray "Yes, I accept"
-    // model echo could inject Down/Enter into a live REPL.) No dialog contains
-    // this hint, so it cannot false-trigger. Disengaging stops buffering +
-    // cancels the timeout; writes nothing.
-    if (buf.includes("shift+tab to cycle")) {
-      this.endBootDialogPhase();
+    } catch {
+      /* pty may have exited — non-fatal */
     }
   }
 

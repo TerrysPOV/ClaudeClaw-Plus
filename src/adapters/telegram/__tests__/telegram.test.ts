@@ -21,7 +21,7 @@ import type {
   SubscriptionFilter,
   SubscriptionHandler,
 } from "../../../bus/core-subscription";
-import type { BusEvent } from "../../../bus/types";
+import { type BusEvent, TAILER_EVENT_SOURCE } from "../../../bus/types";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -535,6 +535,38 @@ describe("TelegramAdapter — response.text outbound", () => {
     expect(sent).toBeDefined();
     expect(sent?.text).toBe("hi there");
     expect(sent?.chat_id).toBe(100);
+  });
+
+  it("IGNORES the JSONL tailer observability echo so replies are not double-posted (#217)", async () => {
+    // The tailer re-emits a raw per-block response.text stamped with
+    // _meta.source = "jsonl-tailer"; the real delivery comes from ingestReply
+    // (no marker). Delivering both double-posts — assert the echo sends nothing.
+    adapter = await startAdapter();
+    await feedInbound();
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "echo", _meta: { source: TAILER_EVENT_SOURCE } },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(api.sendMessages).toHaveLength(0);
+  });
+
+  it("STILL delivers a non-tailer response.text exactly once (#217)", async () => {
+    adapter = await startAdapter();
+    await feedInbound();
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "recovered" },
+    });
+    await waitFor(() => api.sendMessages.length > 0);
+    expect(api.sendMessages).toHaveLength(1);
+    expect(api.sendMessages[0]?.text).toBe("recovered");
   });
 
   it("strips [react:<emoji>] tags and applies them via setMessageReaction", async () => {

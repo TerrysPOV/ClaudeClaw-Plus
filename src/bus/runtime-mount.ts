@@ -235,7 +235,7 @@ export async function mountBusRuntime(
 
   const bus: BusCore = opts.bus ?? new BusCoreImpl({ socketPath });
   const sessionManager: SessionManager =
-    opts.sessionManager ?? new SessionManager({ busSocketPath: socketPath });
+    opts.sessionManager ?? new SessionManager({ busSocketPath: socketPath, bus });
 
   let busStarted = false;
   const spawned: string[] = [];
