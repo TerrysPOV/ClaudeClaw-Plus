@@ -21,6 +21,7 @@ import {
   type BusEvent,
   type BusOrigin,
   type PermissionRequest,
+  isTailerOriginEvent,
 } from "../../bus/types";
 import { createSlackApi } from "./api";
 import { buildPermissionBlocks } from "./blocks";
@@ -606,6 +607,10 @@ export class SlackAdapter {
 
   private async handleResponseText(agentId: string, event: BusEvent): Promise<void> {
     if (!eventBelongsToSlack(event)) return;
+    // Skip the JSONL tailer's per-block observability echo (#217): the
+    // real delivery comes from the agent's `reply` tool (ingestReply),
+    // which carries no tailer source marker. Delivering both double-posts.
+    if (isTailerOriginEvent(event)) return;
     const payload = event.payload as { text?: string; origin?: string; origin_id?: string };
     const text = typeof payload?.text === "string" ? payload.text : "";
     if (text.length === 0) return;

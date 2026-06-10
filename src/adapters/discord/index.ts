@@ -41,6 +41,7 @@ import {
   type BusEvent,
   type BusOrigin,
   type PermissionRequest,
+  isTailerOriginEvent,
 } from "../../bus/types";
 import { createDiscordGateway } from "./gateway";
 import {
@@ -429,6 +430,10 @@ export class DiscordAdapter {
     if (targetChannels.length === 0) return;
 
     if (event.topic === "response.text") {
+      // Skip the JSONL tailer's per-block observability echo (#217): the
+      // real delivery comes from the agent's `reply` tool (ingestReply),
+      // which carries no tailer source marker. Delivering both double-posts.
+      if (isTailerOriginEvent(event)) return;
       const payload = event.payload as { text?: string };
       const text = typeof payload.text === "string" ? payload.text : "";
       if (!text) return;

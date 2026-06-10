@@ -10,7 +10,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { DiscordAdapter } from "../index";
-import type { PermissionRequest } from "../../../bus/types";
+import { type PermissionRequest, TAILER_EVENT_SOURCE } from "../../../bus/types";
 import {
   type AdapterHarness,
   flushMicrotasks,
@@ -46,6 +46,40 @@ describe("DiscordAdapter — outbound response.text", () => {
     });
     expect(h.rest.sent.map((m) => m.channelId).sort()).toEqual(["ch-2", "th-1"]);
     expect(h.rest.sent[0]?.text).toBe("done");
+  });
+
+  it("IGNORES the JSONL tailer's observability echo so replies aren't double-posted (#217)", async () => {
+    // The silent-drop net (#217) wires the JSONL tailer into the live bus.
+    // The tailer re-emits a raw per-block `response.text` for every assistant
+    // text block, stamped with `_meta.source = "jsonl-tailer"`. The real
+    // delivery comes from the agent's `reply` tool (ingestReply), which has
+    // NO source marker. If the adapter delivered both, every reply would
+    // double-post. Assert the tailer echo produces ZERO sends.
+    adapter = await startAdapter(h);
+    h.bus.emit({
+      ts: Date.now(),
+      agent_id: "ops",
+      session_id: "s",
+      topic: "response.text",
+      payload: { text: "done", _meta: { source: TAILER_EVENT_SOURCE } },
+    });
+    expect(h.rest.sent).toHaveLength(0);
+  });
+
+  it("STILL delivers a real ingestReply (no tailer marker) exactly once (#217)", async () => {
+    // Companion to the echo-suppression test: a genuine reply — or the
+    // safety net's SYNTHESIZED final, both produced via ingestReply and
+    // therefore carrying no tailer source marker — must still deliver.
+    adapter = await startAdapter(h);
+    h.bus.emit({
+      ts: Date.now(),
+      agent_id: "ops",
+      session_id: "s",
+      topic: "response.text",
+      payload: { text: "recovered", intent: "final", origin: "discord", origin_id: "dm-9" },
+    });
+    expect(h.rest.sent.map((m) => m.channelId)).toEqual(["dm-9"]);
+    expect(h.rest.sent[0]?.text).toBe("recovered");
   });
 
   it("skips empty response.text payloads", async () => {

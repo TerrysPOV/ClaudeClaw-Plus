@@ -195,9 +195,27 @@ export class BusCoreImpl implements BusCore {
    * in-flight prompts on one agent would let the second `sendPrompt` reset
    * the flag mid-turn for the first; the webui-bridge mutex serialising
    * prompt→reply per agent is the workaround for the path that would
-   * otherwise violate the one-turn-at-a-time assumption.
+   * otherwise violate the one-turn-at-a-time assumption. The residual
+   * cross-channel stale/misroute race this leaves open (a lagged turn_end
+   * synthesizing the wrong prompt's text to the wrong surface) is tracked
+   * as deferred follow-up #239 — see the note in `handleTurnEnd`.
    */
   private readonly currentTurnReplied = new Map<string, boolean>();
+
+  /**
+   * Cross-transport dedup for the silent-drop net (#217, finding 2).
+   * `currentTurnReplied` is reset to `false` on every `sendPrompt` and set
+   * to `true` once a final lands — but a real `reply` (IPC) and the
+   * synthesized recovery (`response.turn_end` via the fs.watch tailer)
+   * travel on two independent, unordered async channels. If the tailer
+   * wins the race, `handleTurnEnd` synthesizes+delivers a final, then the
+   * real `ingestReply(final)` IPC arrives and would deliver the SAME text
+   * a second time. This per-turn flag records that a final `response.text`
+   * was already PUBLISHED for the in-flight turn so the loser of the race
+   * is suppressed. Set in both `ingestReply(final)` and the synthesizer;
+   * cleared alongside `currentTurnReplied` on prompt / disconnect / cancel.
+   */
+  private readonly currentTurnFinalPublished = new Map<string, boolean>();
 
   constructor(opts: BusCoreOptions = {}) {
     this.socketPath = opts.socketPath ?? null;
@@ -228,6 +246,7 @@ export class BusCoreImpl implements BusCore {
           // origin and misroute (5-agent review on PR #138, A1 finding).
           this.lastPromptOrigin.delete(agentId);
           this.currentTurnReplied.delete(agentId);
+          this.currentTurnFinalPublished.delete(agentId);
         }
       },
       onError: (err, agentId) => this.onError(err, { ctx: "ipc", agentId }),
@@ -289,6 +308,9 @@ export class BusCoreImpl implements BusCore {
     // turn call reply?" flag. If the agent ends the turn (response.turn_end)
     // without ever setting this to true, we'll synthesize delivery.
     this.currentTurnReplied.set(req.agent_id, false);
+    // #217 finding 2: a new turn starts undelivered — clear the
+    // cross-transport "final already published" dedup flag.
+    this.currentTurnFinalPublished.set(req.agent_id, false);
 
     const ipcMsg: IpcPrompt = {
       type: "prompt",
@@ -382,7 +404,22 @@ export class BusCoreImpl implements BusCore {
 
   /* ─────────────────────────────── ingest ─────────────────────────────── */
 
-  ingestReply(req: IngestReplyRequest): void {
+  ingestReply(req: IngestReplyRequest, opts?: { synthetic?: boolean }): void {
+    // Cross-transport dedup (#217 finding 2): a final reply can arrive both
+    // as the agent's real `reply` IPC AND as the synthesized recovery from
+    // `response.turn_end` (the JSONL tailer). They race on two unordered
+    // channels; whichever lands first publishes and sets
+    // `currentTurnFinalPublished`. The loser is suppressed here so the same
+    // turn never delivers two finals. `synthetic` calls (from
+    // `handleTurnEnd`) bypass the check — they only run AFTER confirming no
+    // final has published yet, and must be allowed to publish the first.
+    if (
+      req.intent === "final" &&
+      !opts?.synthetic &&
+      this.currentTurnFinalPublished.get(req.agent_id) === true
+    ) {
+      return;
+    }
     const topic: BusEventTopic =
       req.intent === "tool_status" ? "response.tool_use" : "response.text";
     // Attach the originating surface so adapters can route the reply
@@ -431,6 +468,10 @@ export class BusCoreImpl implements BusCore {
       // intent → mark this turn as delivered, so the `response.turn_end`
       // handler skips the synthetic-delivery fallback for this turn.
       this.currentTurnReplied.set(req.agent_id, true);
+      // #217 finding 2: record that a final was published for this turn so
+      // the cross-transport race loser (real reply vs synthesized) is
+      // suppressed above.
+      this.currentTurnFinalPublished.set(req.agent_id, true);
     }
   }
 
@@ -446,7 +487,23 @@ export class BusCoreImpl implements BusCore {
    */
   private handleTurnEnd(agentId: string, text: string): void {
     if (this.currentTurnReplied.get(agentId) === true) return;
+    // #217 finding 2: if a final already published for this turn (e.g. the
+    // real reply IPC landed first), don't synthesize a duplicate.
+    if (this.currentTurnFinalPublished.get(agentId) === true) return;
     if (!text || text.trim().length === 0) return;
+    // RESIDUAL RACE (#217 finding 3 → deferred #239): `lastPromptOrigin` and
+    // the per-turn flags are single-slot, keyed by agent_id only, with no
+    // prompt/turn identity. The JSONL tailer's `response.turn_end` is
+    // delivered asynchronously (fs.watch + drain), so on a cross-channel
+    // interleave — P1(telegram) ends → reply → P2(webui) arrives (resets the
+    // flag, rewrites origin=webui) → P1's lagged turn_end lands here — this
+    // can route P1's text to P2's origin (webui). The flag-reset path is
+    // largely covered by the webui-bridge mutex serialising prompt→reply per
+    // agent, but cross-surface interleave is NOT fully closed. A complete fix
+    // threads the originating prompt_id onto the turn_end event and matches
+    // it to the in-flight prompt before synthesizing; that requires the
+    // tailer to carry prompt identity and is tracked as deferred follow-up
+    // #239 to avoid destabilizing this safety-net PR.
     const origin = this.lastPromptOrigin.get(agentId);
     if (!origin) {
       // No origin to route to (cron tick / unprompted ambient turn).
@@ -477,11 +534,17 @@ export class BusCoreImpl implements BusCore {
     // because we set the flag here, but the explicit ordering makes the
     // single-fire intent clearer).
     this.currentTurnReplied.set(agentId, true);
-    this.ingestReply({
-      agent_id: agentId,
-      text,
-      intent: "final",
-    });
+    // `synthetic: true` lets this first delivery through the cross-transport
+    // dedup (#217 finding 2); it sets `currentTurnFinalPublished`, so a
+    // later real `reply` IPC for the same turn is suppressed.
+    this.ingestReply(
+      {
+        agent_id: agentId,
+        text,
+        intent: "final",
+      },
+      { synthetic: true },
+    );
   }
 
   ingestSessionEvent(e: BusEvent): void {
@@ -641,6 +704,7 @@ export class BusCoreImpl implements BusCore {
         // a real reply OR a `response.turn_end` event — drop the
         // tracking flag to keep the map bounded.
         this.currentTurnReplied.delete(agentId);
+        this.currentTurnFinalPublished.delete(agentId);
         break;
       case "request_human": {
         // Forward the correlation id along with the question. Without
@@ -698,6 +762,7 @@ export class BusCoreImpl implements BusCore {
         // Silent-drop safety net (#215): error path won't produce a
         // turn_end either — clear tracking too.
         this.currentTurnReplied.delete(agentId);
+        this.currentTurnFinalPublished.delete(agentId);
         break;
       // hello already handled in the IPC layer; outbound types (prompt,
       // permission_response, ask_answer) shouldn't arrive from MCP.

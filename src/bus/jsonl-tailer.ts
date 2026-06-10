@@ -39,7 +39,7 @@ import {
   type ToolResultBlock,
   type UserLine,
 } from "./jsonl-line-types";
-import type { BusEvent, BusEventTopic } from "./types";
+import { type BusEvent, type BusEventTopic, TAILER_EVENT_SOURCE } from "./types";
 
 /**
  * Parser schema version. Bump whenever line-type handling changes in a
@@ -581,7 +581,13 @@ export class JsonlTailer {
       agent_id: this.agent_id,
       session_id: sessionFromLine ?? this.session_id,
       topic,
-      payload: metadata ? { ...(payload as object), _meta: metadata } : payload,
+      // Stamp the tailer source marker (#217) into `_meta` so delivery
+      // adapters can tell this observability echo apart from a real
+      // `ingestReply` delivery (otherwise every reply double-posts).
+      // Merge with any caller-supplied metadata. Only object (non-array)
+      // payloads carry `_meta`; primitive/array payloads are never
+      // adapter-deliverable, so leave them untouched.
+      payload: this.withTailerMeta(payload, metadata),
       raw: rawLine,
     };
     try {
@@ -589,6 +595,22 @@ export class JsonlTailer {
     } catch (err) {
       this.onError(err, { ctx: "publish", topic });
     }
+  }
+
+  /**
+   * Merge the tailer source marker (#217) — and any caller metadata —
+   * into an object payload's `_meta`. Primitive/array payloads are
+   * returned unchanged (they are never adapter-deliverable, so they
+   * don't need the marker, and spreading them would be lossy).
+   */
+  private withTailerMeta(payload: unknown, metadata?: Record<string, unknown>): unknown {
+    if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+      return payload;
+    }
+    return {
+      ...(payload as object),
+      _meta: { ...metadata, source: TAILER_EVENT_SOURCE },
+    };
   }
 
   private emitReplayDone(): void {

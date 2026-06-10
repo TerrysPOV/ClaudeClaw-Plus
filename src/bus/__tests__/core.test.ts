@@ -1119,5 +1119,40 @@ describe("BusCore IPC", () => {
       expect(replies.length).toBe(1);
       expect(replies[0].text).toBe("the recovered text");
     });
+
+    it("delivers exactly once when turn_end LOSES the race (synthesis fires, then real reply lands) (#217 finding 2)", async () => {
+      // Cross-transport race: the real `reply` IPC and the synthesized
+      // recovery (from the tailer's response.turn_end) travel on two
+      // unordered channels. Here the tailer wins — turn_end is processed
+      // BEFORE the real reply IPC lands. handleTurnEnd synthesizes a final,
+      // then the late real reply arrives. Without per-turn dedup the user
+      // would receive the same answer twice.
+      const b = makeBus();
+      const replies = captureReplies(b, "alpha");
+
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "webui",
+        origin_id: "race-1",
+        user_id: "u1",
+        text: "say hi",
+      });
+
+      // Tailer wins: turn_end processed first → synthesizes + delivers.
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: "alpha",
+        session_id: "",
+        topic: "response.turn_end",
+        payload: { stop_reason: "end_turn", text: "the answer" },
+      });
+
+      // The real reply IPC lands late for the SAME turn.
+      b.ingestReply({ agent_id: "alpha", text: "the answer", intent: "final" });
+
+      // Exactly one final delivered, not two.
+      expect(replies.length).toBe(1);
+      expect(replies[0].text).toBe("the answer");
+    });
   });
 });

@@ -14,6 +14,7 @@ import {
   type BusEvent,
   type BusOrigin,
   type PermissionRequest,
+  isTailerOriginEvent,
 } from "../../bus/types";
 import { createTelegramApi } from "./api";
 import { extractReactionDirectives } from "./directives";
@@ -454,6 +455,10 @@ export class TelegramAdapter {
 
   private async handleResponseText(agentId: string, event: BusEvent): Promise<void> {
     if (!eventBelongsToTelegram(event)) return;
+    // Skip the JSONL tailer's per-block observability echo (#217): the
+    // real delivery comes from the agent's `reply` tool (ingestReply),
+    // which carries no tailer source marker. Delivering both double-posts.
+    if (isTailerOriginEvent(event)) return;
     const payload = event.payload as { text?: string };
     const rawText = typeof payload?.text === "string" ? payload.text : "";
     if (rawText.length === 0) return;
