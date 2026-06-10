@@ -517,8 +517,20 @@ export class SessionManager {
    * Per-agent restart timestamps (epoch ms) inside the rate-limit window.
    * Guards a non-upstream failure cause (bad config, crash-on-boot) from
    * looping respawns forever — see `restart()` + `MAX_RESTARTS_PER_WINDOW`.
+   * Only failure-driven restarts are recorded; healthy `reason==='rotation'`
+   * respawns have their own backpressure and bypass this budget entirely.
    */
   private readonly restartHistory = new Map<string, number[]>();
+  /**
+   * Per-agent in-flight `restart()` promises. The three triggers
+   * (control-plane wedge, data-plane model-hang, rotation) are independent
+   * event sources that can fire for the SAME agent concurrently. Serializing
+   * per agent makes the rate-limit gate meaningful, prevents double-mint /
+   * double-post-mortem, and closes the `already spawned` race where the
+   * loser tears down the freshly-spawned process. Cleared in `restart()`'s
+   * finally.
+   */
+  private readonly restartInFlight = new Map<string, Promise<AgentProcess>>();
 
   constructor(options: SessionManagerOptions = {}) {
     this.options = options;
@@ -629,6 +641,10 @@ export class SessionManager {
         // ran (e.g. stop() racing the process's own exit).
         this.cleanupAgentMcpConfig(current.mcpConfigCwd, agent.id);
         this.agents.delete(agent.id);
+        // A natural exit that bypasses stop() (crash, OOM, operator kill)
+        // must also drop the restart-budget entry so a churn of distinct
+        // agent ids can't leak number[] entries for the life of the manager.
+        this.restartHistory.delete(agent.id);
       }
     });
 
@@ -848,6 +864,10 @@ export class SessionManager {
         // Drop from registry (the onExit handler installed in spawnAgent()
         // will also do this; harmless to do twice).
         this.agents.delete(agent_id);
+        // Drop the restart-budget entry too — otherwise a stopped-and-never-
+        // restarted agent leaves a stranded number[] for the life of the
+        // manager (slow leak in a primitive whose purpose is to bound growth).
+        this.restartHistory.delete(agent_id);
         resolve();
       };
       if (record.proc._isExited()) {
@@ -911,6 +931,23 @@ export class SessionManager {
    * rule. The rate-limit throw is the one intentional refusal.
    */
   async restart(agent_id: string, opts: RestartOptions = {}): Promise<AgentProcess> {
+    // Non-re-entrant per agent: the three triggers can fire for the SAME
+    // agent concurrently. Coalesce — a concurrent caller awaits the same
+    // in-flight restart instead of racing it (double-mint, double-post-mortem,
+    // rate-limit undercount, and the `already spawned` teardown-the-fresh-proc
+    // race all stem from overlapping restarts). The entry is cleared in the
+    // finally below before the promise settles, so a follow-on restart can run.
+    const inflight = this.restartInFlight.get(agent_id);
+    if (inflight) return inflight;
+
+    const p = this.restartInternal(agent_id, opts).finally(() => {
+      this.restartInFlight.delete(agent_id);
+    });
+    this.restartInFlight.set(agent_id, p);
+    return p;
+  }
+
+  private async restartInternal(agent_id: string, opts: RestartOptions): Promise<AgentProcess> {
     const record = this.agents.get(agent_id);
     if (!record) {
       throw new Error(`cannot restart unknown agent ${agent_id}`);
@@ -919,28 +956,61 @@ export class SessionManager {
     const log = this.options.logger ?? console;
     const nowMs = (this.options.now ?? Date.now)();
 
+    // Healthy rotation (#213) has its own backpressure (message/age threshold)
+    // and is a normal event on a high-traffic agent — it must NOT share the
+    // crash-loop budget, or a busy agent gets denied a needed rotation and a
+    // few benign rotations can starve a genuine wedge respawn. The gate exists
+    // for failure-driven triggers (crash-on-boot / bad-config loops) only.
+    const countsAgainstBudget = reason !== "rotation";
+
     // Rate-limit gate — prune the window, refuse if we're already at the cap.
-    const history = (this.restartHistory.get(agent_id) ?? []).filter(
-      (t) => nowMs - t < RESTART_WINDOW_MS,
-    );
-    if (history.length >= MAX_RESTARTS_PER_WINDOW) {
+    // Mutate the STORED array in place (no filtered-copy + overwrite) so the
+    // accounting can't be clobbered. `history` is null for rotation (skipped).
+    let history: number[] | null = null;
+    if (countsAgainstBudget) {
+      history = this.restartHistory.get(agent_id) ?? [];
+      // Prune expired timestamps in place on the stored reference.
+      for (let i = history.length - 1; i >= 0; i--) {
+        if (nowMs - (history[i] as number) >= RESTART_WINDOW_MS) history.splice(i, 1);
+      }
       this.restartHistory.set(agent_id, history);
-      log.error(
-        `[bus-session] CRITICAL agent=${agent_id} hit ${history.length} restarts in ` +
-          `${RESTART_WINDOW_MS / 60000}min (reason=${reason}) — auto-restart SUSPENDED, ` +
-          `operator intervention required (likely a crash-on-boot or bad-config cause, ` +
-          `not the upstream model-hang)`,
-      );
-      throw new Error(
-        `agent ${agent_id}: restart rate limit exceeded ` +
-          `(${history.length}/${MAX_RESTARTS_PER_WINDOW} in ${RESTART_WINDOW_MS / 60000}min) — ` +
-          `auto-restart suspended`,
-      );
+      if (history.length >= MAX_RESTARTS_PER_WINDOW) {
+        log.error(
+          `[bus-session] CRITICAL agent=${agent_id} hit ${history.length} restarts in ` +
+            `${RESTART_WINDOW_MS / 60000}min (reason=${reason}) — auto-restart SUSPENDED, ` +
+            `operator intervention required (likely a crash-on-boot or bad-config cause, ` +
+            `not the upstream model-hang)`,
+        );
+        throw new Error(
+          `agent ${agent_id}: restart rate limit exceeded ` +
+            `(${history.length}/${MAX_RESTARTS_PER_WINDOW} in ${RESTART_WINDOW_MS / 60000}min) — ` +
+            `auto-restart suspended`,
+        );
+      }
     }
 
     const { agent, origin } = record;
 
+    // Mint + persist the FRESH session id BEFORE stop() so a persist failure
+    // (EACCES/ENOSPC/EROFS, or a throwing persistRotatedSessionId) aborts the
+    // restart with the agent STILL LIVE and registered — never torn down with
+    // no recovery path through restart(). The live record's session_id is only
+    // mutated after the persist resolves; the post-mortem (below) still tails
+    // the dying session because it captures from the same pre-stop snapshot.
+    let freshId: string | null = null;
+    if (opts.freshSession !== false) {
+      freshId = randomUUID();
+      // Public option takes `(agentId, sessionId)`; the legacy `createSession`
+      // storage layer takes them reversed — same convention as the
+      // collision-rotation path above.
+      const persist =
+        this.options.persistRotatedSessionId ??
+        ((id: string, sid: string) => createSession(sid, id));
+      await persist(agent_id, freshId);
+    }
+
     // Post-mortem BEFORE the stop so the JSONL we tail is the dying session's.
+    // Captured against the still-current `agent.session_id` (not yet rotated).
     // Best-effort — instrumentation must never break the respawn.
     const pmOpts: PostMortemOptions = {};
     if (this.options.postMortemDir !== undefined) pmOpts.dir = this.options.postMortemDir;
@@ -954,7 +1024,7 @@ export class SessionManager {
           sessionId: agent.session_id,
           reason,
           receipt: opts.receipt ?? null,
-          generation: history.length,
+          generation: history?.length ?? 0,
         },
         pmOpts,
       );
@@ -965,23 +1035,19 @@ export class SessionManager {
 
     await this.stop(agent_id);
 
-    if (opts.freshSession !== false) {
-      const fresh = randomUUID();
-      // Public option takes `(agentId, sessionId)`; the legacy `createSession`
-      // storage layer takes them reversed — same convention as the
-      // collision-rotation path above.
-      const persist =
-        this.options.persistRotatedSessionId ??
-        ((id: string, sid: string) => createSession(sid, id));
-      await persist(agent_id, fresh);
-      agent.session_id = fresh;
-    }
+    // Persist succeeded — adopt the fresh id on the live record now that the
+    // old process is gone (so the respawn boots against the new session).
+    if (freshId !== null) agent.session_id = freshId;
 
     // Count this restart against the window only once we've committed to it
-    // (past the rate-limit gate + post-mortem). Stored before the spawn so a
-    // spawn that throws still counts as an attempt.
-    history.push(nowMs);
-    this.restartHistory.set(agent_id, history);
+    // (past the rate-limit gate + persist + post-mortem). Push to the SAME
+    // stored array reference + re-set so concurrent accounting can't be lost
+    // — though `restart()`'s in-flight guard already serializes us per agent.
+    // Rotation (history === null) is intentionally not recorded.
+    if (history !== null) {
+      history.push(nowMs);
+      this.restartHistory.set(agent_id, history);
+    }
 
     return this.spawnAgent(agent, origin);
   }

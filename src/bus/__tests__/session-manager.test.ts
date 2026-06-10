@@ -557,6 +557,106 @@ describe("restart() respawn primitive", () => {
     const recovered = await mgr.restart("rl-1");
     expect(recovered.agent_id).toBe("rl-1");
   }, 30000);
+
+  it("reason='rotation' bypasses the crash-loop budget", async () => {
+    const clock = 2_000_000;
+    const mgr = new SessionManager({
+      commandOverride: "/bin/cat",
+      argsOverride: [],
+      busSocketPath: "/tmp/test-bus.sock",
+      postMortemDir: mkTmp("ccaw-pm-"),
+      persistRotatedSessionId: async () => {},
+      now: () => clock, // frozen — every restart shares one window
+    });
+    cleanups.push(() => mgr.stop("rot-budget"));
+
+    const agent = mkAgent({ id: "rot-budget" });
+    await mgr.spawnAgent(agent, "cron");
+
+    // Far more than MAX_RESTARTS_PER_WINDOW rotations in one frozen window:
+    // rotation has its own backpressure, so it never trips the gate.
+    for (let i = 0; i < 6; i++) {
+      const r = await mgr.restart("rot-budget", { reason: "rotation" });
+      expect(r.agent_id).toBe("rot-budget");
+    }
+    expect(mgr._list()).toContain("rot-budget");
+
+    // ...and the bypass didn't consume budget: a failure-driven restart still
+    // gets its full allowance right after the rotation burst.
+    for (let i = 0; i < 3; i++) {
+      await mgr.restart("rot-budget", { reason: "wedge" });
+    }
+    await expect(mgr.restart("rot-budget", { reason: "wedge" })).rejects.toThrow(/rate limit/);
+  }, 30000);
+
+  it("serializes concurrent restart() of the same agent (coalesces, counts once)", async () => {
+    let clock = 3_000_000;
+    let persistCount = 0;
+    const mgr = new SessionManager({
+      commandOverride: "/bin/cat",
+      argsOverride: [],
+      busSocketPath: "/tmp/test-bus.sock",
+      postMortemDir: mkTmp("ccaw-pm-"),
+      persistRotatedSessionId: async () => {
+        persistCount++;
+      },
+      now: () => clock,
+    });
+    cleanups.push(() => mgr.stop("concur-1"));
+
+    const agent = mkAgent({ id: "concur-1" });
+    await mgr.spawnAgent(agent, "cron");
+
+    // Two overlapping restarts fired in the same tick: the second must
+    // coalesce onto the first's in-flight promise — same process back, a
+    // single mint, and a single budget entry (no undercount, no
+    // `already spawned` throw from the loser).
+    const [a, b] = await Promise.all([
+      mgr.restart("concur-1", { reason: "wedge" }),
+      mgr.restart("concur-1", { reason: "wedge" }),
+    ]);
+    expect(a.pid).toBe(b.pid); // coalesced — one respawn, not two
+    expect(persistCount).toBe(1); // single fresh-session mint
+    expect(mgr._list()).toContain("concur-1");
+
+    // Exactly one slot of budget was consumed: two more wedge restarts are
+    // allowed, the third (4th overall) trips the gate.
+    clock += 1000;
+    await mgr.restart("concur-1", { reason: "wedge" });
+    clock += 1000;
+    await mgr.restart("concur-1", { reason: "wedge" });
+    clock += 1000;
+    await expect(mgr.restart("concur-1", { reason: "wedge" })).rejects.toThrow(/rate limit/);
+  }, 30000);
+
+  it("persist failure before stop() leaves the agent live and restartable", async () => {
+    let failNext = true;
+    const mgr = new SessionManager({
+      commandOverride: "/bin/cat",
+      argsOverride: [],
+      busSocketPath: "/tmp/test-bus.sock",
+      postMortemDir: mkTmp("ccaw-pm-"),
+      persistRotatedSessionId: async () => {
+        if (failNext) throw new Error("EROFS: read-only file system");
+      },
+    });
+    cleanups.push(() => mgr.stop("persist-fail"));
+
+    const agent = mkAgent({ id: "persist-fail" });
+    const a = await mgr.spawnAgent(agent, "cron");
+
+    // Persist throws BEFORE stop() — the restart rejects but the live process
+    // is untouched and the agent is still registered (no strand-down).
+    await expect(mgr.restart("persist-fail", { reason: "wedge" })).rejects.toThrow(/EROFS/);
+    // Still registered → not stranded down; recovery through restart() is possible.
+    expect(mgr._list()).toContain("persist-fail");
+
+    // Recovery path through restart() works once persistence is healthy again.
+    failNext = false;
+    const b = await mgr.restart("persist-fail", { reason: "wedge" });
+    expect(b.agent_id).toBe("persist-fail");
+    expect(b.pid).not.toBe(a.pid);
+  }, 15000);
 });
 
 /* ───────────────────────────────────────────────────────────────────── */
