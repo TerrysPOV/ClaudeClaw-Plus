@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 import {
   ensureProjectClaudeMd,
   run,
@@ -13,6 +14,11 @@ import {
   setPermissionMode,
   type PermissionMode,
 } from "../runner";
+=======
+import { ensureProjectClaudeMd, run, runUserMessage, runFork, killActive, isMainBusy, compactCurrentSession, compactCurrentThreadSession, isRateLimited, getRateLimitResetAt, getPermissionMode, setPermissionMode, type PermissionMode } from "../runner";
+import { wrapUntrusted } from "../prompt-safety";
+import { isAllowed } from "../allowlist";
+>>>>>>> upstream/master
 import { extractErrorDetail } from "../messaging";
 import { loadPendingResume } from "../pending-resume";
 import { getSettings, loadSettings } from "../config";
@@ -171,6 +177,10 @@ interface TelegramMessage {
   document?: TelegramDocument;
   voice?: TelegramVoice;
   audio?: TelegramAudio;
+  video?: TelegramVideo;
+  animation?: TelegramAnimation;
+  sticker?: TelegramSticker;
+  video_note?: TelegramVideoNote;
   entities?: Array<{
     type: "mention" | "bot_command" | string;
     offset: number;
@@ -194,6 +204,44 @@ interface TelegramDocument {
   file_id: string;
   file_name?: string;
   mime_type?: string;
+  file_size?: number;
+}
+
+interface TelegramVideo {
+  file_id: string;
+  file_name?: string;
+  mime_type?: string;
+  duration?: number;
+  width?: number;
+  height?: number;
+  file_size?: number;
+}
+
+// GIFs and silent looping videos. Telegram delivers these as mp4.
+interface TelegramAnimation {
+  file_id: string;
+  file_name?: string;
+  mime_type?: string;
+  duration?: number;
+  width?: number;
+  height?: number;
+  file_size?: number;
+}
+
+// Static stickers are .webp, animated are .tgs (lottie), video are .webm.
+interface TelegramSticker {
+  file_id: string;
+  emoji?: string;
+  is_animated?: boolean;
+  is_video?: boolean;
+  file_size?: number;
+}
+
+// Round video messages — always mp4, no filename/mime from Telegram.
+interface TelegramVideoNote {
+  file_id: string;
+  duration?: number;
+  length?: number;
   file_size?: number;
 }
 
@@ -336,31 +384,77 @@ function getMessageTextAndEntities(message: TelegramMessage): {
   return { text: "", entities: [] };
 }
 
-function isImageDocument(document?: TelegramDocument): boolean {
+export function isImageDocument(document?: TelegramDocument): boolean {
   return Boolean(document?.mime_type?.startsWith("image/"));
 }
 
-function isAudioDocument(document?: TelegramDocument): boolean {
+export function isAudioDocument(document?: TelegramDocument): boolean {
   return Boolean(document?.mime_type?.startsWith("audio/"));
 }
 
-const DOCUMENT_MIME_TYPES = new Set([
-  "application/pdf",
-  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-  "application/msword",
-  "application/vnd.ms-excel",
-  "application/vnd.ms-powerpoint",
-  "text/plain",
-  "text/csv",
-  "text/markdown",
-]);
-
-function isDocumentAttachment(document?: TelegramDocument): boolean {
-  if (!document?.mime_type) return false;
+// Accept any file sent as a document. Images and audio are routed to their
+// dedicated paths (image inspection / voice transcription); everything else —
+// regardless of mime type, including a missing one — is handed to Claude as a
+// file on disk to read and process.
+export function isDocumentAttachment(document?: TelegramDocument): boolean {
+  if (!document) return false;
   if (isImageDocument(document) || isAudioDocument(document)) return false;
-  return DOCUMENT_MIME_TYPES.has(document.mime_type);
+  return true;
+}
+
+export type MediaKind = "video" | "animation" | "sticker" | "video_note";
+
+export interface MediaAttachment {
+  file_id: string;
+  fileName: string;
+  mimeType?: string;
+  kind: MediaKind;
+}
+
+// Normalizes the first present gallery-media field (video/animation/sticker/
+// video_note) into a common shape with a sensible fallback filename+extension.
+// These arrive in dedicated Telegram fields, not `document`.
+export function pickMediaAttachment(message: TelegramMessage): MediaAttachment | null {
+  if (message.video) {
+    const v = message.video;
+    return {
+      file_id: v.file_id,
+      fileName: v.file_name ?? `video${extFromMime(v.mime_type, ".mp4")}`,
+      mimeType: v.mime_type,
+      kind: "video",
+    };
+  }
+  if (message.animation) {
+    const a = message.animation;
+    return {
+      file_id: a.file_id,
+      fileName: a.file_name ?? `animation${extFromMime(a.mime_type, ".mp4")}`,
+      mimeType: a.mime_type,
+      kind: "animation",
+    };
+  }
+  if (message.sticker) {
+    const s = message.sticker;
+    const ext = s.is_video ? ".webm" : s.is_animated ? ".tgs" : ".webp";
+    return { file_id: s.file_id, fileName: `sticker${ext}`, kind: "sticker" };
+  }
+  if (message.video_note) {
+    return { file_id: message.video_note.file_id, fileName: "video_note.mp4", kind: "video_note" };
+  }
+  return null;
+}
+
+function extFromMime(mimeType: string | undefined, fallback: string): string {
+  switch (mimeType) {
+    case "video/mp4":
+      return ".mp4";
+    case "video/webm":
+      return ".webm";
+    case "video/quicktime":
+      return ".mov";
+    default:
+      return fallback;
+  }
 }
 
 function pickLargestPhoto(photo: TelegramPhotoSize[]): TelegramPhotoSize {
@@ -1028,6 +1122,38 @@ async function downloadDocumentFromMessage(
   return { localPath, originalName };
 }
 
+async function downloadMediaFromMessage(
+  token: string,
+  message: TelegramMessage
+): Promise<{ localPath: string; originalName: string; kind: MediaKind } | null> {
+  const media = pickMediaAttachment(message);
+  if (!media) return null;
+
+  const fileMeta = await callApi<{ ok: boolean; result: TelegramFile }>(
+    token,
+    "getFile",
+    { file_id: media.file_id }
+  );
+  if (!fileMeta.ok || !fileMeta.result.file_path) return null;
+
+  const remotePath = fileMeta.result.file_path;
+  const downloadUrl = `${FILE_API_BASE}${token}/${remotePath}`;
+  const response = await fetch(downloadUrl);
+  if (!response.ok) {
+    throw new Error(`Telegram file download failed: ${response.status} ${response.statusText}`);
+  }
+
+  const dir = join(process.cwd(), ".claude", "claudeclaw", "inbox", "telegram");
+  await mkdir(dir, { recursive: true });
+
+  const ext = extname(media.fileName) || extname(remotePath) || "";
+  const filename = `${message.chat.id}-${message.message_id}-${Date.now()}${ext}`;
+  const localPath = join(dir, filename);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  await Bun.write(localPath, bytes);
+  return { localPath, originalName: media.fileName, kind: media.kind };
+}
+
 async function handleMyChatMember(update: TelegramMyChatMemberUpdate): Promise<void> {
   const config = getSettings().telegram;
   const chat = update.chat;
@@ -1042,15 +1168,22 @@ async function handleMyChatMember(update: TelegramMyChatMemberUpdate): Promise<v
 
   if (!isGroup || !wasOut || !isIn) return;
 
+  const adderId = update.from.id;
+  if (!isAllowed(adderId, config.allowedUserIds)) {
+    console.log(`[Telegram] Unauthorized add to ${chat.id} by ${adderId}; leaving.`);
+    await callApi(config.token, "leaveChat", { chat_id: chat.id }).catch(() => {});
+    return;
+  }
+
   const chatName = chat.title ?? String(chat.id);
   console.log(`[Telegram] Added to ${chat.type}: ${chatName} (${chat.id}) by ${update.from.id}`);
 
   const addedBy = update.from.username ?? `${update.from.first_name} (${update.from.id})`;
   const eventPrompt =
     `[Telegram system event] I was added to a ${chat.type}.\n` +
-    `Group title: ${chatName}\n` +
+    `Group title: ${wrapUntrusted("group-title", chatName)}\n` +
     `Group id: ${chat.id}\n` +
-    `Added by: ${addedBy}\n` +
+    `Added by: ${wrapUntrusted("adder-username", addedBy)}\n` +
     "Write a short first message for the group. It should confirm I was added and explain how to trigger me.";
 
   try {
@@ -1107,6 +1240,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
   );
   const hasVoice = Boolean(message.voice || message.audio || isAudioDocument(message.document));
   const hasDocument = Boolean(message.document && isDocumentAttachment(message.document));
+  const hasMedia = Boolean(message.video || message.animation || message.sticker || message.video_note);
   const sessionKey = getTelegramSessionKey(chatId, threadId, userId, isPrivate, config.dmIsolation);
 
   if (!isPrivate && !isGroup) return;
@@ -1122,6 +1256,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     `Handle message chat=${chatId} type=${chatType} from=${userId ?? "unknown"} reason=${triggerReason} text="${(text ?? "").slice(0, 80)}"`,
   );
 
+<<<<<<< HEAD
   // Security: Rate limit check
   if (userId && !checkRateLimit(userId)) {
     debugLog(`Rate limited: userId=${userId}`);
@@ -1136,11 +1271,19 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
         `[Telegram] Ignored group message from unauthorized user ${userId} in chat ${chatId}`,
       );
       debugLog(`Skip group message chat=${chatId} from=${userId} reason=unauthorized_user`);
+=======
+  if (!isAllowed(userId, config.allowedUserIds)) {
+    if (isPrivate) {
+      await sendMessage(config.token, chatId, "Unauthorized.");
+    } else {
+      console.log(`[Telegram] Ignored group message from unauthorized user ${userId ?? "unknown"} in chat ${chatId}`);
+      debugLog(`Skip group message chat=${chatId} from=${userId ?? "unknown"} reason=unauthorized_user`);
+>>>>>>> upstream/master
     }
     return;
   }
 
-  if (!text.trim() && !hasImage && !hasVoice && !hasDocument) {
+  if (!text.trim() && !hasImage && !hasVoice && !hasDocument && !hasMedia) {
     debugLog(`Skip message chat=${chatId} from=${userId ?? "unknown"} reason=empty_text`);
     return;
   }
@@ -1660,6 +1803,17 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       }
     }
 
+    let mediaInfo: { localPath: string; originalName: string; kind: MediaKind } | null = null;
+    if (hasMedia) {
+      try {
+        mediaInfo = await downloadMediaFromMessage(config.token, message);
+      } catch (err) {
+        console.error(
+          `[Telegram] Failed to download media for ${label}: ${err instanceof Error ? err.message : err}`
+        );
+      }
+    }
+
     const promptParts = [`[Telegram from ${label}]`];
     if (threadId) promptParts.push(`[thread:${threadId}]`);
     if (skillContext) {
@@ -1667,9 +1821,9 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       const args = text.trim().slice(command!.length).trim();
       promptParts.push(`<command-name>${command}</command-name>`);
       promptParts.push(skillContext);
-      if (args) promptParts.push(`User arguments: ${args}`);
+      if (args) promptParts.push(`User arguments: ${wrapUntrusted("skill-arguments", args)}`);
     } else if (text.trim()) {
-      promptParts.push(`Message: ${text}`);
+      promptParts.push(`Message: ${wrapUntrusted("user-message", text)}`);
     }
     if (imagePath) {
       promptParts.push(`Image path: ${imagePath}`);
@@ -1682,7 +1836,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       );
     }
     if (voiceTranscript) {
-      promptParts.push(`Voice transcript: ${voiceTranscript}`);
+      promptParts.push(`Voice transcript: ${wrapUntrusted("voice-transcript", voiceTranscript, 2000)}`);
     } else if (voicePath) {
       const { delegateTool } = getSettings().stt;
       if (delegateTool) {
@@ -1702,11 +1856,31 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     }
     if (documentInfo) {
       promptParts.push(`Document path: ${documentInfo.localPath}`);
+<<<<<<< HEAD
       promptParts.push(`Original filename: ${documentInfo.originalName}`);
       promptParts.push("The user attached a document. Read and process this file directly.");
+=======
+      promptParts.push(`Original filename: ${wrapUntrusted("attachment-filename", documentInfo.originalName)}`);
+      promptParts.push(
+        "The user attached a document. Read and process this file directly."
+      );
+>>>>>>> upstream/master
     } else if (hasDocument) {
       promptParts.push(
         "The user attached a document, but downloading it failed. Respond and ask them to resend.",
+      );
+    }
+    if (mediaInfo) {
+      promptParts.push(`Media path: ${mediaInfo.localPath}`);
+      promptParts.push(`Original filename: ${wrapUntrusted("attachment-filename", mediaInfo.originalName)}`);
+      const mediaInstruction =
+        mediaInfo.kind === "sticker"
+          ? "The user sent a sticker (saved at the path above — may be .webp, .tgs, or .webm). Use available tools to inspect it if relevant."
+          : "The user sent a video. It's saved at the path above; use available tools (ffmpeg, frame extraction, etc.) to inspect, transcode, or pull frames as needed before responding.";
+      promptParts.push(mediaInstruction);
+    } else if (hasMedia) {
+      promptParts.push(
+        "The user attached video/sticker media, but downloading it failed (Telegram bots cannot fetch files over 20 MB). Respond and ask them to resend a smaller file or send it as a document."
       );
     }
     const prefixedPrompt = promptParts.join("\n");
@@ -1888,7 +2062,7 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
 
   // Enforce allowlist on callback queries (same policy as regular messages)
   const callbackUserId = query.from.id;
-  if (config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(callbackUserId)) {
+  if (!isAllowed(callbackUserId, config.allowedUserIds)) {
     await callApi(config.token, "answerCallbackQuery", {
       callback_query_id: query.id,
       text: "Unauthorized.",
@@ -2180,9 +2354,13 @@ async function poll(generation: number): Promise<void> {
   }
 
   console.log("Telegram bot started (long polling)");
+<<<<<<< HEAD
   console.log(
     `  Allowed users: ${config.allowedUserIds.length === 0 ? "all" : config.allowedUserIds.join(", ")}`,
   );
+=======
+  console.log(`  Allowed users: ${config.allowedUserIds.length === 0 ? "none (deny all)" : config.allowedUserIds.join(", ")}`);
+>>>>>>> upstream/master
   if (telegramDebug) console.log("  Debug: enabled");
 
   // Register available skills as bot command menu (non-blocking)
