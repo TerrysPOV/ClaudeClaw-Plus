@@ -26,7 +26,7 @@ function fakePty(): { handle: PtyHandle; writes: string[] } {
 describe("PtyAgentProcess.send_prompt_stream", () => {
   it("serialises concurrent prompts so their bytes don't interleave", async () => {
     const { handle, writes } = fakePty();
-    const proc = new PtyAgentProcess("alpha", handle);
+    const proc = new PtyAgentProcess("alpha", handle, { submitConfirmMs: 5 });
 
     // Fire two prompts without awaiting the first — without serialisation the
     // second `write(line)` would land inside the first's 200ms settle window,
@@ -54,7 +54,7 @@ describe("PtyAgentProcess.send_prompt_stream", () => {
       },
       kill: () => {},
     };
-    const proc = new PtyAgentProcess("alpha", handle);
+    const proc = new PtyAgentProcess("alpha", handle, { submitConfirmMs: 5 });
 
     // An early prompt is dispatched BEFORE the boot dialog renders (slow
     // fresh-install boot). The old code disengaged the watcher here, leaving
@@ -98,6 +98,32 @@ function bootPty(): { handle: PtyHandle; writes: string[]; emit: (d: string) => 
   };
   return { handle, writes, emit: (d) => dataCb?.(d) };
 }
+
+describe("PtyAgentProcess.send_prompt_stream delivery-confirm (#wedge)", () => {
+  it("re-sends the submit keystroke when the idle REPL footer is still rendering (turn never started)", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("z", handle, { submitConfirmMs: 60, maxSubmitNudges: 2 });
+    const p = proc.send_prompt_stream("hello");
+    // Simulate a prompt that was typed but NOT submitted: the idle prompt keeps
+    // re-rendering its footer ("to cycle") instead of a streaming turn.
+    const iv = setInterval(() => emit("\n⏵ accept edits on (shift+tab to cycle)"), 8);
+    await p;
+    clearInterval(iv);
+    // 1 initial submit + 2 re-nudges (footer present at every confirm window).
+    expect(writes.filter((w) => w === "\r").length).toBe(3);
+  });
+
+  it("does NOT re-nudge when a turn started (streaming output, footer gone)", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("z", handle, { submitConfirmMs: 60, maxSubmitNudges: 2 });
+    const p = proc.send_prompt_stream("hello");
+    // Simulate a real turn: streaming output with NO idle footer.
+    const iv = setInterval(() => emit("assistant is streaming a response chunk here"), 8);
+    await p;
+    clearInterval(iv);
+    expect(writes.filter((w) => w === "\r").length).toBe(1); // only the submit
+  });
+});
 
 describe("PtyAgentProcess boot-dialog watcher (structural / ANSI-resilient)", () => {
   it("answers a confirm dialog whose title is split by a cursor-move escape (the 2.1.x regression)", () => {

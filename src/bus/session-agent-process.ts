@@ -94,6 +94,11 @@ export class PtyAgentProcess implements AgentProcess {
   /** Serializes the write/settle/CR sequence so concurrent prompts can't
    *  interleave in the PTY input buffer (review #141 P1). */
   private writeChain: Promise<void> = Promise.resolve();
+  /** ANSI-stripped tail of PTY output, reset after each submit so the
+   *  delivery-confirm check only inspects post-submit frames (#wedge). */
+  private recentOut = "";
+  private readonly submitConfirmMs: number;
+  private readonly maxSubmitNudges: number;
   /** Boot-dialog watcher state (issue #193). Claude shows interactive
    *  confirmation dialogs at startup (the dev-channels prompt, and the newer
    *  "Bypass Permissions mode" prompt). We answer them by inspecting early PTY
@@ -117,16 +122,31 @@ export class PtyAgentProcess implements AgentProcess {
   private static readonly BOOT_DIALOG_MAX_MS = 15_000;
   private bootDialogTimer: ReturnType<typeof setTimeout> | undefined;
 
-  constructor(agent_id: string, pty: PtyHandle) {
+  constructor(
+    agent_id: string,
+    pty: PtyHandle,
+    opts: {
+      /** Grace window to confirm a submit started a turn before re-nudging. */
+      submitConfirmMs?: number;
+      /** Max times to re-send the submit keystroke when no turn is observed. */
+      maxSubmitNudges?: number;
+    } = {},
+  ) {
     this.agent_id = agent_id;
     this.pty = pty;
     this.pid = pty.pid;
+    this.submitConfirmMs = opts.submitConfirmMs ?? 1500;
+    this.maxSubmitNudges = opts.maxSubmitNudges ?? 2;
     this.bootDialogTimer = setTimeout(
       () => this.endBootDialogPhase(),
       PtyAgentProcess.BOOT_DIALOG_MAX_MS,
     );
     pty.onData((chunk) => {
       if (this.bootDialogActive) this.handleBootDialog(chunk);
+      // Keep a small ANSI-stripped tail so send_prompt_stream can tell whether a
+      // submit actually started a turn (the idle REPL footer disappears on turn
+      // start) -- see the delivery-confirm loop. Observation only.
+      this.recentOut = (this.recentOut + stripAnsiEscapes(chunk)).slice(-2000);
       // Crash-signal observation ONLY (spec §5.3). Never parsed as model output.
       for (const h of this.dataHandlers) {
         try {
@@ -192,7 +212,24 @@ export class PtyAgentProcess implements AgentProcess {
       if (this._exited) throw new Error(`agent ${this.agent_id} has exited`);
       this.pty.write(text);
       await new Promise((r) => setTimeout(r, 200));
+      if (this._exited) throw new Error(`agent ${this.agent_id} has exited`);
       this.pty.write("\r");
+      // #wedge fix (prompt-delivery-confirm): the typed text + CR can fail to
+      // start a turn when the CR lands during a transient REPL render (paste /
+      // redraw race) -- the prompt sits un-submitted, no turn, no API socket,
+      // and the receipt only times out 5 min later. Confirm a turn started: the
+      // idle REPL footer ("to cycle", the version-stable mode-cycler hint) is
+      // replaced by the streaming view the instant a turn begins; if it is still
+      // being rendered after a grace window, re-send the submit keystroke (the
+      // text is already in the input box). Bounded; a stray CR at an idle REPL
+      // is a no-op, and a genuinely stuck REPL still degrades to the watchdog.
+      for (let nudge = 0; nudge < this.maxSubmitNudges; nudge++) {
+        this.recentOut = "";
+        await new Promise((r) => setTimeout(r, this.submitConfirmMs));
+        if (this._exited) return;
+        if (!this.recentOut.includes("to cycle")) break; // turn started
+        this.pty.write("\r"); // footer still idle -> CR did not submit -> nudge
+      }
     });
     // Keep the chain alive past a rejected write so later prompts still run.
     this.writeChain = run.catch(() => {});
