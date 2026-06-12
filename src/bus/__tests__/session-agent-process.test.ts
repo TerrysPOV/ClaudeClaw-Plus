@@ -169,6 +169,69 @@ describe("PtyAgentProcess.send_prompt_stream delivery-confirm (#wedge)", () => {
     // Only the initial submit CR -- no idle footer was ever seen, so no nudge.
     expect(writes.filter((w) => w === "\r").length).toBe(1);
   });
+
+  it("does NOT mistake the bare word 'Compacting' in streamed output for a compaction (no stall)", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("z", handle, {
+      submitConfirmMs: 30,
+      maxSubmitNudges: 2,
+      maxCompactionWaitMs: 5000,
+    });
+    const p = proc.send_prompt_stream("hello");
+    // A real turn is streaming and its text contains the bare word "Compacting"
+    // (e.g. the agent discussing log/db compaction). No status line, no footer.
+    // The anchored probe must read this as turn-started, not wait out a phantom
+    // compaction (which would also block the serialised writeChain).
+    const iv = setInterval(() => emit("the daemon was Compacting the old logs when it ran"), 8);
+    const t0 = Date.now();
+    await p;
+    clearInterval(iv);
+    expect(writes.filter((w) => w === "\r").length).toBe(1); // only the submit
+    expect(Date.now() - t0).toBeLessThan(2500); // resolved fast, not the 5s deadline
+  });
+
+  it("clears the stranded input line and warns once when a submit is never confirmed", async () => {
+    const { handle, writes, emit } = bootPty();
+    const realWarn = console.warn;
+    const warnings: string[] = [];
+    console.warn = (...a: unknown[]) => {
+      warnings.push(a.map(String).join(" "));
+    };
+    try {
+      const proc = new PtyAgentProcess("z", handle, { submitConfirmMs: 20, maxSubmitNudges: 2 });
+      const p = proc.send_prompt_stream("hello");
+      const iv = setInterval(() => emit("\n⏵ accept edits on (shift+tab to cycle)"), 6); // idle forever
+      await p;
+      clearInterval(iv);
+      expect(writes).toContain("\x15"); // Ctrl-U cleared the un-submitted prompt
+      expect(warnings.some((w) => w.includes("not confirmed"))).toBe(true);
+    } finally {
+      console.warn = realWarn;
+    }
+  });
+
+  it("rejects (not resolves) if the agent exits during the confirm wait", async () => {
+    const writes: string[] = [];
+    let exitCb: ((e: { exitCode: number }) => void) | null = null;
+    const handle: PtyHandle = {
+      pid: 99,
+      onData: () => ({ dispose() {} }),
+      onExit: (cb) => {
+        exitCb = cb as typeof exitCb;
+        return { dispose() {} };
+      },
+      write: (d: string) => {
+        writes.push(d);
+      },
+      kill: () => {},
+    };
+    const proc = new PtyAgentProcess("z", handle, { submitConfirmMs: 50, maxSubmitNudges: 2 });
+    const p = proc.send_prompt_stream("hello");
+    setTimeout(() => exitCb?.({ exitCode: 1 }), 230); // die after the CR, mid-confirm
+    // The other _exited checks in send_prompt_stream throw; the in-loop check
+    // must too, so the caller/receipt layer learns delivery failed.
+    await expect(p).rejects.toThrow("has exited");
+  });
 });
 
 describe("PtyAgentProcess boot-dialog watcher (structural / ANSI-resilient)", () => {

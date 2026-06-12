@@ -116,6 +116,9 @@ export class PtyAgentProcess implements AgentProcess {
    *  Enter per distinct dialog instead of on every render chunk. */
   private lastConfirmSig: string | null = null;
   private warnedUnhandledDialog = false;
+  /** One-shot guard so an unconfirmed delivery is surfaced once per process
+   *  (see the delivery-confirm loop) instead of spamming the log. */
+  private warnedUnconfirmedDelivery = false;
   /** Hard cap on the boot-dialog watch window (issue #193 / Codex P2). If no
    *  REPL-ready marker is observed within this window (e.g. a future CLI
    *  changes the footer text), the watcher disengages anyway so it never
@@ -241,18 +244,56 @@ export class PtyAgentProcess implements AgentProcess {
       // it finishes the footer returns to "to cycle" and the idle-footer branch
       // re-submits the still-typed prompt. Bounded by maxCompactionWaitMs so a
       // stuck compaction degrades to the watchdog instead of looping forever.
+      // Outcomes: "turn-started" (delivered) | "stuck-compaction" |
+      // "unconfirmed-idle" (gave up). A give-up degrades to the watchdog, but
+      // NEVER silently -- the stranded input line is cleared and a diagnostic is
+      // surfaced, since a silently-dropped prompt is the failure this loop fixes.
       const compactionDeadline = Date.now() + this.maxCompactionWaitMs;
+      let outcome: "turn-started" | "stuck-compaction" | "unconfirmed-idle" = "unconfirmed-idle";
       for (let nudge = 0; nudge < this.maxSubmitNudges; ) {
         this.recentOut = "";
         await new Promise((r) => setTimeout(r, this.submitConfirmMs));
-        if (this._exited) return;
-        if (this.recentOut.includes("Compacting")) {
-          if (Date.now() > compactionDeadline) break;
+        // Exit mid-confirm must REJECT, in parity with the two pre-CR checks
+        // above: the CR is not proof of delivery (the whole point of this loop),
+        // so resolving here would report a phantom success for a prompt whose
+        // target just died -- suppressing re-queue and masking the wedge.
+        if (this._exited) throw new Error(`agent ${this.agent_id} has exited`);
+        // Anchor the compaction probe to the CLI status line ("Compacting
+        // conversation" / "Compacting at auto window") rather than the bare word
+        // "Compacting", which also occurs in ordinary model output: a live turn
+        // streaming that word would otherwise be mistaken for a compaction and
+        // stall this loop -- and the serialised writeChain behind it -- up to the
+        // deadline.
+        if (
+          this.recentOut.includes("Compacting conversation") ||
+          this.recentOut.includes("Compacting at auto")
+        ) {
+          if (Date.now() > compactionDeadline) {
+            outcome = "stuck-compaction";
+            break;
+          }
           continue; // compaction in progress -> wait, do not spend a nudge
         }
-        if (!this.recentOut.includes("to cycle")) break; // turn started
+        if (!this.recentOut.includes("to cycle")) {
+          outcome = "turn-started";
+          break;
+        }
         this.pty.write("\r"); // footer still idle -> CR did not submit -> nudge
         nudge++;
+      }
+      if (outcome === "unconfirmed-idle") {
+        // The prompt is still sitting un-submitted in the REPL input box; left
+        // there it would concatenate onto the next prompt. The REPL is idle here
+        // (footer present every window), so clearing the line is safe.
+        this.pty.write("\x15"); // Ctrl-U: kill the input line
+      }
+      if (outcome !== "turn-started" && !this.warnedUnconfirmedDelivery) {
+        this.warnedUnconfirmedDelivery = true;
+        console.warn(
+          `[delivery-confirm] agent=${this.agent_id}: submit not confirmed ` +
+            `(${outcome}); degraded to the watchdog. Recurring occurrences may mean ` +
+            `the REPL footer marker changed in the CLI.`,
+        );
       }
     });
     // Keep the chain alive past a rejected write so later prompts still run.
