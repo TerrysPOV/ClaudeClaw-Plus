@@ -99,6 +99,7 @@ export class PtyAgentProcess implements AgentProcess {
   private recentOut = "";
   private readonly submitConfirmMs: number;
   private readonly maxSubmitNudges: number;
+  private readonly maxCompactionWaitMs: number;
   /** Boot-dialog watcher state (issue #193). Claude shows interactive
    *  confirmation dialogs at startup (the dev-channels prompt, and the newer
    *  "Bypass Permissions mode" prompt). We answer them by inspecting early PTY
@@ -130,6 +131,9 @@ export class PtyAgentProcess implements AgentProcess {
       submitConfirmMs?: number;
       /** Max times to re-send the submit keystroke when no turn is observed. */
       maxSubmitNudges?: number;
+      /** Upper bound to wait out an in-progress auto-compaction before the
+       *  submit is abandoned to the watchdog (compaction can run ~100s). */
+      maxCompactionWaitMs?: number;
     } = {},
   ) {
     this.agent_id = agent_id;
@@ -137,6 +141,7 @@ export class PtyAgentProcess implements AgentProcess {
     this.pid = pty.pid;
     this.submitConfirmMs = opts.submitConfirmMs ?? 1500;
     this.maxSubmitNudges = opts.maxSubmitNudges ?? 2;
+    this.maxCompactionWaitMs = opts.maxCompactionWaitMs ?? 240_000;
     this.bootDialogTimer = setTimeout(
       () => this.endBootDialogPhase(),
       PtyAgentProcess.BOOT_DIALOG_MAX_MS,
@@ -218,17 +223,36 @@ export class PtyAgentProcess implements AgentProcess {
       // start a turn when the CR lands during a transient REPL render (paste /
       // redraw race) -- the prompt sits un-submitted, no turn, no API socket,
       // and the receipt only times out 5 min later. Confirm a turn started: the
-      // idle REPL footer ("to cycle", the version-stable mode-cycler hint) is
+      // idle REPL footer ("to cycle", the version-stable core of the mode-cycler
+      // hint -- "shift+tab to cycle" in older CLIs, "to cycle permission modes"
+      // in 2.1.168+, so the bare "to cycle" is what survives the rename) is
       // replaced by the streaming view the instant a turn begins; if it is still
       // being rendered after a grace window, re-send the submit keystroke (the
       // text is already in the input box). Bounded; a stray CR at an idle REPL
       // is a no-op, and a genuinely stuck REPL still degrades to the watchdog.
-      for (let nudge = 0; nudge < this.maxSubmitNudges; nudge++) {
+      // NB: handleBootDialog uses the stricter "tab to cycle" to avoid
+      // disengaging on boot prose (#195); here the REPL is already up, so boot
+      // prose is not a concern and the bare core is the safer live-footer match.
+      // A second wedge class (socket=yes): an auto-compaction can seize the
+      // REPL the instant the prompt arrives and swallow the submit CR -- the
+      // turn never starts and the receipt only times out 5 min later. While
+      // "Compacting" is on screen, wait it out; this does NOT spend a submit
+      // nudge (compaction runs ~100s, far longer than the nudge cadence). When
+      // it finishes the footer returns to "to cycle" and the idle-footer branch
+      // re-submits the still-typed prompt. Bounded by maxCompactionWaitMs so a
+      // stuck compaction degrades to the watchdog instead of looping forever.
+      const compactionDeadline = Date.now() + this.maxCompactionWaitMs;
+      for (let nudge = 0; nudge < this.maxSubmitNudges; ) {
         this.recentOut = "";
         await new Promise((r) => setTimeout(r, this.submitConfirmMs));
         if (this._exited) return;
+        if (this.recentOut.includes("Compacting")) {
+          if (Date.now() > compactionDeadline) break;
+          continue; // compaction in progress -> wait, do not spend a nudge
+        }
         if (!this.recentOut.includes("to cycle")) break; // turn started
         this.pty.write("\r"); // footer still idle -> CR did not submit -> nudge
+        nudge++;
       }
     });
     // Keep the chain alive past a rejected write so later prompts still run.

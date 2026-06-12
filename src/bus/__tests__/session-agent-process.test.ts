@@ -123,6 +123,52 @@ describe("PtyAgentProcess.send_prompt_stream delivery-confirm (#wedge)", () => {
     clearInterval(iv);
     expect(writes.filter((w) => w === "\r").length).toBe(1); // only the submit
   });
+
+  it("waits out an auto-compaction and re-submits when the REPL returns (socket=yes wedge)", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("z", handle, {
+      submitConfirmMs: 30,
+      maxSubmitNudges: 2,
+      maxCompactionWaitMs: 5000,
+    });
+    const p = proc.send_prompt_stream("hello");
+    // An auto-compaction seizes the REPL for ~150ms and swallows the submit CR
+    // (no turn). The footer then returns to its idle "to cycle" hint.
+    let compacting = true;
+    const iv = setInterval(
+      () =>
+        emit(
+          compacting
+            ? "\nCompacting conversation… (esc to interrupt)"
+            : "\n⏵ accept edits on (shift+tab to cycle)",
+        ),
+      8,
+    );
+    const stop = setTimeout(() => {
+      compacting = false;
+    }, 150);
+    await p;
+    clearInterval(iv);
+    clearTimeout(stop);
+    // The submit was re-sent AFTER compaction finished: initial CR + >=1 nudge.
+    // (Compaction-wait iterations must not have burned the nudge budget.)
+    expect(writes.filter((w) => w === "\r").length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("gives up on a stuck compaction at maxCompactionWaitMs without hanging or spurious submits", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("z", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      maxCompactionWaitMs: 80,
+    });
+    const p = proc.send_prompt_stream("hello");
+    const iv = setInterval(() => emit("\nCompacting conversation…"), 8); // never ends
+    await p; // must resolve (bounded), not hang
+    clearInterval(iv);
+    // Only the initial submit CR -- no idle footer was ever seen, so no nudge.
+    expect(writes.filter((w) => w === "\r").length).toBe(1);
+  });
 });
 
 describe("PtyAgentProcess boot-dialog watcher (structural / ANSI-resilient)", () => {
