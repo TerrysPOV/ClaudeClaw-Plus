@@ -154,6 +154,7 @@ const DEFAULT_SETTINGS: Settings = {
     allowedUserIds: [],
     listenChannels: [],
     listenGuilds: [],
+    allowedGuilds: [],
     imageOutputRoots: [],
     streaming: false,
   },
@@ -346,6 +347,7 @@ export interface DiscordConfig {
   allowedUserIds: string[]; // Discord snowflake IDs exceed Number.MAX_SAFE_INTEGER
   listenChannels: string[]; // Channel IDs where bot responds to all messages (no mention needed)
   listenGuilds: string[]; // Guild IDs where bot responds to all messages in any channel/thread
+  allowedGuilds: string[]; // Guild IDs where the bot will post a welcome message on join (empty = silent)
   channelNames?: Record<string, string>; // channelId -> friendly name for system prompt context
   imageOutputRoots: string[]; // Absolute path prefixes from which image uploads are permitted
   streaming?: boolean; // When true, POST a live preview while Claude is working. Default: false.
@@ -868,6 +870,9 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
         : [],
       listenGuilds: Array.isArray(raw.discord?.listenGuilds)
         ? raw.discord.listenGuilds.map(String)
+        : [],
+      allowedGuilds: Array.isArray(raw.discord?.allowedGuilds)
+        ? raw.discord.allowedGuilds.map(String)
         : [],
       channelNames:
         raw.discord?.channelNames && typeof raw.discord.channelNames === "object"
