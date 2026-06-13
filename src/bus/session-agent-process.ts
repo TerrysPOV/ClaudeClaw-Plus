@@ -274,17 +274,28 @@ export class PtyAgentProcess implements AgentProcess {
           }
           continue; // compaction in progress -> wait, do not spend a nudge
         }
-        if (!this.recentOut.includes("to cycle")) {
+        // A turn-start is POSITIVE evidence -- the streaming view replaced the
+        // footer. An EMPTY confirm window is NOT that: a long-idle, quiet REPL
+        // emits nothing, so `!includes("to cycle")` on an empty buffer falsely
+        // reads as turn-started, stops the nudging, and leaves the prompt
+        // un-submitted until the 5-min receipt timeout. This is the residual
+        // idle-REPL wedge (dossier 20260612T080557: idle 7h, stdin written,
+        // turn_started_at absent, socket=no -- with the full delivery+compaction
+        // fix stack already active). Require real output before trusting the
+        // footer's absence; an empty/whitespace window stays inconclusive and
+        // spends a nudge instead of claiming a phantom success.
+        if (this.recentOut.trim().length > 0 && !this.recentOut.includes("to cycle")) {
           outcome = "turn-started";
           break;
         }
-        this.pty.write("\r"); // footer still idle -> CR did not submit -> nudge
+        this.pty.write("\r"); // footer still idle (or silent) -> CR did not submit -> nudge
         nudge++;
       }
       if (outcome === "unconfirmed-idle") {
         // The prompt is still sitting un-submitted in the REPL input box; left
-        // there it would concatenate onto the next prompt. The REPL is idle here
-        // (footer present every window), so clearing the line is safe.
+        // there it would concatenate onto the next prompt. The REPL never began
+        // streaming (footer present, or silent the whole time), so clearing the
+        // line is safe.
         this.pty.write("\x15"); // Ctrl-U: kill the input line
       }
       if (outcome !== "turn-started" && !this.warnedUnconfirmedDelivery) {
