@@ -1378,12 +1378,18 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
   // A backstop flush fires on a TIMER because replay_done never arrived. During
   // an IPC-reconnect storm the session is still re-initialising, so the flushed
   // keystroke is swallowed and never starts a turn (dossier 20260613T033017).
-  const turnEvt = (agent: string): BusEvent => ({
+  //
+  // Turn-start proof is ATTRIBUTED (#252): the tailer `prompt` event carries the
+  // ingested user line, which is the exact wrapped string the bus delivered. The
+  // verify is cancelled only when the event's `text` matches a pending prompt —
+  // so `turnEvt` must echo the delivered text, and an unrelated prompt's turn
+  // (different text) must NOT cancel.
+  const turnEvt = (agent: string, ingestedText: string): BusEvent => ({
     ts: 1,
     agent_id: agent,
     session_id: "s",
     topic: "prompt", // tailer: claude wrote the ingested user line = turn started
-    payload: { text: "x" },
+    payload: { text: ingestedText },
   });
 
   it("re-delivers ONCE when a backstop-flushed prompt never starts a turn (idle-REPL wedge)", async () => {
@@ -1424,8 +1430,67 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     await prompt("alpha", "held");
     await new Promise((r) => setTimeout(r, 45)); // > backstop → flush
     expect(delivered).toHaveLength(1);
-    bus.ingestSessionEvent(turnEvt("alpha")); // turn started → cancel pending re-delivery
+    // tailer `prompt` echoing the delivered (wrapped) line proves THIS prompt
+    // started its turn → cancel its pending re-delivery.
+    bus.ingestSessionEvent(turnEvt("alpha", delivered[0]));
     await new Promise((r) => setTimeout(r, 45)); // > flushVerify
     expect(delivered).toHaveLength(1); // not re-delivered
+  });
+
+  it("re-delivers when only an UNRELATED prompt starts a turn (attribution, #252)", async () => {
+    // The bug: a later unrelated prompt's turn activity cancelled the swallowed
+    // prompt's pending re-delivery, dropping it silently. Attribution by ingested
+    // text fixes it — a non-matching `prompt` event must NOT cancel.
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      deliveryBackstopMs: 20,
+      flushVerifyMs: 30,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "held");
+    await new Promise((r) => setTimeout(r, 45)); // > backstop → first (swallowed) flush
+    expect(delivered).toHaveLength(1);
+    // A DIFFERENT prompt's turn-start lands — must not satisfy the swallowed one.
+    bus.ingestSessionEvent(turnEvt("alpha", "<channel>some other prompt</channel>"));
+    await new Promise((r) => setTimeout(r, 45)); // > flushVerify → swallowed prompt re-delivered
+    expect(delivered).toHaveLength(2);
+    expect(delivered[1]).toContain("held");
+  });
+
+  it("does NOT re-deliver while a delivery handler is still in-flight (compaction, #252)", async () => {
+    // The regression: flushVerify fired at flushVerifyMs (8s) while the delivery
+    // handler legitimately held through auto-compaction (up to 240s), so the
+    // prompt got submitted twice once compaction finished. The in-flight guard
+    // defers re-delivery until the handler settles.
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      deliveryBackstopMs: 20,
+      flushVerifyMs: 30,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    let release!: () => void;
+    const handlerDone = new Promise<void>((r) => {
+      release = r;
+    });
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+      await handlerDone; // simulate a handler blocked on compaction
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "held");
+    await new Promise((r) => setTimeout(r, 45)); // > backstop → flush (handler now in-flight)
+    expect(delivered).toHaveLength(1);
+    await new Promise((r) => setTimeout(r, 80)); // well past flushVerify — must NOT double-submit
+    expect(delivered).toHaveLength(1); // deferred while in-flight
+    release(); // compaction finishes, handler settles, turn never started
+    await new Promise((r) => setTimeout(r, 45)); // next verify tick → re-deliver once
+    expect(delivered).toHaveLength(2);
+    expect(delivered[1]).toContain("held");
   });
 });
