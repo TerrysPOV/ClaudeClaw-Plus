@@ -939,6 +939,87 @@ describe("BusCore IPC", () => {
     client.close();
   });
 
+  it("re-delivers an immediately-delivered prompt when the IPC send failed (MCP-blip wedge, #252)", async () => {
+    // dossier 20260614T034258: the MCP/IPC socket blipped right at the prompt
+    // boundary (`send-failed: no-mcp-connection`), the prompt fell through to an
+    // IMMEDIATE PTY delivery (session not initialising, so no backstop), the
+    // keystroke coincided with the reconnect and never started a turn — and the
+    // #222 reconciler disarmed on "reconnected during confirm window" without
+    // verifying a turn. Verify turn-start on this path too and re-deliver once.
+    const sockPath = join(tempDir, "bus.sock");
+    const delivered: string[] = [];
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      flushVerifyMs: 30,
+      streamPromptHandler: async (_a, text) => {
+        delivered.push(text);
+      },
+      onError: () => {},
+    });
+    await bus.start();
+    // No agent ever connected → ipcServer.send returns false (ipcSendFailed),
+    // and the agent is NOT initialising → the prompt is delivered immediately.
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "ping",
+    });
+    expect(delivered).toHaveLength(1); // delivered immediately to PTY
+    await new Promise((r) => setTimeout(r, 45)); // > flushVerify, no turn → re-deliver once
+    expect(delivered).toHaveLength(2);
+    expect(delivered[1]).toContain("ping");
+  });
+
+  it("clears a pending flush-verify when the agent's socket closes (no stale re-delivery, #252)", async () => {
+    // A reconciler restart (#222) kills the claude process → its IPC socket
+    // closes → onClose must tear down any armed verify, so a verify timer can
+    // never re-deliver a keystroke into a restarted session that reused the
+    // agent_id (and the reconciler/verify don't both act on the same prompt).
+    const sockPath = join(tempDir, "bus.sock");
+    const delivered: string[] = [];
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      deliveryBackstopMs: 20,
+      flushVerifyMs: 80,
+      streamPromptHandler: async (_a, text) => {
+        delivered.push(text);
+      },
+      onError: () => {},
+    });
+    await bus.start();
+    const client = await connectIpcClient(sockPath);
+    const hello: IpcHello = {
+      type: "hello",
+      agent_id: "alpha",
+      capabilities: ["claude/channel", "claude/channel/permission"],
+    };
+    client.send(hello);
+    await new Promise((r) => setTimeout(r, 20)); // let the hello register the connection
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "session.init",
+      payload: {},
+    });
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "held",
+    });
+    await new Promise((r) => setTimeout(r, 50)); // > backstop → flush + arm verify
+    expect(delivered).toHaveLength(1);
+    client.close(); // socket close → onClose(alpha) → clearFlushVerify(alpha)
+    await new Promise((r) => setTimeout(r, 120)); // > flushVerify + grace
+    expect(delivered).toHaveLength(1); // verify torn down → NOT re-delivered
+  });
+
   describe("silent-drop safety net (issue #215)", () => {
     function makeBus(): BusCore {
       return createBusCore({
@@ -1373,5 +1454,180 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     });
     expect(delivered).toHaveLength(1);
     expect(delivered[0]).toContain("held");
+  });
+
+  // A backstop flush fires on a TIMER because replay_done never arrived. During
+  // an IPC-reconnect storm the session is still re-initialising, so the flushed
+  // keystroke is swallowed and never starts a turn (dossier 20260613T033017).
+  //
+  // Turn-start proof is ATTRIBUTED (#252): the tailer `prompt` event carries the
+  // ingested user line, which is the exact wrapped string the bus delivered. The
+  // verify is cancelled only when the event's `text` matches a pending prompt —
+  // so `turnEvt` must echo the delivered text, and an unrelated prompt's turn
+  // (different text) must NOT cancel.
+  const turnEvt = (agent: string, ingestedText: string): BusEvent => ({
+    ts: 1,
+    agent_id: agent,
+    session_id: "s",
+    topic: "prompt", // tailer: claude wrote the ingested user line = turn started
+    payload: { text: ingestedText },
+  });
+
+  it("re-delivers ONCE when a backstop-flushed prompt never starts a turn (idle-REPL wedge)", async () => {
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      deliveryBackstopMs: 20,
+      flushVerifyMs: 30,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "held");
+    expect(delivered).toHaveLength(0);
+    await new Promise((r) => setTimeout(r, 45)); // > backstop → first (swallowed) flush
+    expect(delivered).toHaveLength(1);
+    await new Promise((r) => setTimeout(r, 45)); // > flushVerify, no turn activity → re-deliver
+    expect(delivered).toHaveLength(2);
+    expect(delivered[1]).toContain("held");
+    await new Promise((r) => setTimeout(r, 45)); // never more than once
+    expect(delivered).toHaveLength(2);
+  });
+
+  it("does NOT re-deliver a backstop-flushed prompt that starts a turn", async () => {
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      deliveryBackstopMs: 20,
+      flushVerifyMs: 30,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "held");
+    await new Promise((r) => setTimeout(r, 45)); // > backstop → flush
+    expect(delivered).toHaveLength(1);
+    // tailer `prompt` echoing the delivered (wrapped) line proves THIS prompt
+    // started its turn → cancel its pending re-delivery.
+    bus.ingestSessionEvent(turnEvt("alpha", delivered[0]));
+    await new Promise((r) => setTimeout(r, 45)); // > flushVerify
+    expect(delivered).toHaveLength(1); // not re-delivered
+  });
+
+  it("re-delivers when only an UNRELATED prompt starts a turn (attribution, #252)", async () => {
+    // The bug: a later unrelated prompt's turn activity cancelled the swallowed
+    // prompt's pending re-delivery, dropping it silently. Attribution by ingested
+    // text fixes it — a non-matching `prompt` event must NOT cancel.
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      deliveryBackstopMs: 20,
+      flushVerifyMs: 30,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "held");
+    await new Promise((r) => setTimeout(r, 45)); // > backstop → first (swallowed) flush
+    expect(delivered).toHaveLength(1);
+    // A DIFFERENT prompt's turn-start lands — must not satisfy the swallowed one.
+    bus.ingestSessionEvent(turnEvt("alpha", "<channel>some other prompt</channel>"));
+    await new Promise((r) => setTimeout(r, 45)); // > flushVerify → swallowed prompt re-delivered
+    expect(delivered).toHaveLength(2);
+    expect(delivered[1]).toContain("held");
+  });
+
+  it("attributes a MULTI-LINE prompt's turn-start despite PTY newline sanitization (#252 ultra HIGH)", async () => {
+    // The PTY layer runs sanitizePtyPromptText before typing — newlines collapse
+    // to spaces — and the tailer's `prompt` event carries that sanitized form.
+    // The verify must key on the sanitized text, else a multi-line prompt's
+    // healthy turn never matches and the prompt is spuriously re-delivered
+    // (double-submit). This test fails on the raw-key implementation.
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      deliveryBackstopMs: 20,
+      flushVerifyMs: 30,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "line one\nline two"); // multi-line user text
+    await new Promise((r) => setTimeout(r, 45)); // > backstop → flush
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toContain("\n"); // raw wrapped still carries the newline
+    // The tailer records what claude received = the PTY-sanitized line (newlines
+    // collapsed to spaces). Emitting THAT must still cancel the verify.
+    const sanitized = delivered[0].replace(/\r\n?|\n/g, " ");
+    bus.ingestSessionEvent(turnEvt("alpha", sanitized));
+    await new Promise((r) => setTimeout(r, 45)); // > flushVerify
+    expect(delivered).toHaveLength(1); // attributed → NOT re-delivered
+  });
+
+  it("does NOT re-deliver while a delivery handler is still in-flight (compaction, #252)", async () => {
+    // The regression: flushVerify fired at flushVerifyMs (8s) while the delivery
+    // handler legitimately held through auto-compaction (up to 240s), so the
+    // prompt got submitted twice once compaction finished. The in-flight guard
+    // defers re-delivery until the handler settles.
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      deliveryBackstopMs: 20,
+      flushVerifyMs: 30,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    let release!: () => void;
+    const handlerDone = new Promise<void>((r) => {
+      release = r;
+    });
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+      await handlerDone; // simulate a handler blocked on compaction
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "held");
+    await new Promise((r) => setTimeout(r, 45)); // > backstop → flush (handler now in-flight)
+    expect(delivered).toHaveLength(1);
+    await new Promise((r) => setTimeout(r, 80)); // well past flushVerify — must NOT double-submit
+    expect(delivered).toHaveLength(1); // deferred while in-flight
+    release(); // compaction finishes, handler settles, turn never started
+    await new Promise((r) => setTimeout(r, 45)); // next verify tick → re-deliver once
+    expect(delivered).toHaveLength(2);
+    expect(delivered[1]).toContain("held");
+  });
+
+  it("re-delivers a swallowed prompt AT MOST ONCE across repeated backstop cycles (#252)", async () => {
+    // A re-delivery that is itself held (agent re-initialising) and flushed by a
+    // SECOND backstop must NOT arm a second verify: a prompt gets one
+    // re-delivery for its whole lifetime, the watchdog is the net beyond that.
+    // The verify entry is left in the pending map after re-delivery precisely so
+    // a later armFlushVerify for the same key is a no-op.
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      deliveryBackstopMs: 50,
+      flushVerifyMs: 60,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "held");
+    await new Promise((r) => setTimeout(r, 90)); // > backstop → flush#1 (d=1), verify armed
+    expect(delivered).toHaveLength(1);
+    bus.ingestSessionEvent(initEvt("alpha")); // re-init: the imminent re-delivery is held
+    // verify fires (~110) → grace → re-deliver (~125), queued (initialising);
+    // backstop#2 (~140) flushes it → d=2 and must NOT re-arm a third verify.
+    await new Promise((r) => setTimeout(r, 200)); // past backstop#2 + any spurious 3rd verify
+    expect(delivered).toHaveLength(2); // exactly one re-delivery, never a second
   });
 });
