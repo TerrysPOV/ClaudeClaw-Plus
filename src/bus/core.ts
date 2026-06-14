@@ -134,6 +134,9 @@ export interface BusCoreOptions {
    *  the backstop path is verified — the real `replay_done` path is known-ready.
    *  Defaults to 8000. Lowered in tests. */
   flushVerifyMs?: number;
+  /** Grace (ms) after a delivery handler settles before a verify re-delivers,
+   *  to let the asynchronous turn-start tailer event land first. Default 1500. */
+  flushVerifyGraceMs?: number;
   /** Slash-command delegate (Agent C wires this). */
   slashCommandHandler?: SlashCommandHandler;
   /** REPL prompt delegate for PTY-stdin agents. Wired by the Session Manager. */
@@ -263,9 +266,18 @@ export class BusCoreImpl implements BusCore {
    */
   private readonly flushVerify = new Map<
     string,
-    Map<string, { wrapped: string; timer: ReturnType<typeof setTimeout> }>
+    Map<string, { wrapped: string; graced: boolean; timer: ReturnType<typeof setTimeout> }>
   >();
   private readonly flushVerifyMs: number;
+  /**
+   * Grace (ms) between a delivery handler settling and declaring the prompt
+   * swallowed. The turn-start `prompt` event reaches the bus asynchronously via
+   * the JSONL tailer and can lag a little behind the handler return; without a
+   * grace the verify could fire in that window and re-deliver a prompt whose
+   * turn actually started (post-settle/pre-ingest double-submit). Defaults to
+   * min(1500, flushVerifyMs/4) so it scales down with the lowered test timings.
+   */
+  private readonly flushVerifyGraceMs: number;
   /**
    * In-flight `streamPromptHandler` count per agent. A delivery handler that
    * hasn't settled is legitimately working — notably it holds through
@@ -318,6 +330,8 @@ export class BusCoreImpl implements BusCore {
     this.ringbufferCapacity = opts.ringbufferCapacity ?? DEFAULT_RINGBUFFER_CAPACITY;
     this.deliveryBackstopMs = opts.deliveryBackstopMs ?? 4000;
     this.flushVerifyMs = opts.flushVerifyMs ?? 8000;
+    this.flushVerifyGraceMs =
+      opts.flushVerifyGraceMs ?? Math.min(1500, Math.ceil(this.flushVerifyMs / 4));
     this.eventLogAppend = opts.eventLogAppend ?? eventLogAppend;
     this.slashCommandHandler = opts.slashCommandHandler ?? null;
     this.streamPromptHandler = opts.streamPromptHandler ?? null;
@@ -628,12 +642,23 @@ export class BusCoreImpl implements BusCore {
       // fail and a healthy turn get re-delivered / double-submitted (#252
       // ultra-review HIGH). Keep the original wrapped to re-deliver verbatim.
       const key = sanitizePtyPromptText(wrapped);
-      if (pending.has(key)) continue; // already awaiting — don't stack a 2nd timer
-      pending.set(key, { wrapped, timer: this.scheduleFlushVerify(agent_id, key) });
+      // pending.has(key) covers BOTH an active verify AND a re-delivered entry
+      // left in place to enforce at-most-once (see scheduleFlushVerify): a later
+      // backstop flush therefore never arms a 2nd verify for the same prompt.
+      if (pending.has(key)) continue;
+      pending.set(key, {
+        wrapped,
+        graced: false,
+        timer: this.scheduleFlushVerify(agent_id, key, this.flushVerifyMs),
+      });
     }
   }
 
-  private scheduleFlushVerify(agent_id: string, key: string): ReturnType<typeof setTimeout> {
+  private scheduleFlushVerify(
+    agent_id: string,
+    key: string,
+    delayMs: number,
+  ): ReturnType<typeof setTimeout> {
     return setTimeout(() => {
       const pending = this.flushVerify.get(agent_id);
       const entry = pending?.get(key);
@@ -641,18 +666,30 @@ export class BusCoreImpl implements BusCore {
       // Compaction-aware: a delivery handler still in-flight is legitimately
       // working (it holds through auto-compaction, up to maxCompactionWaitMs ≫
       // flushVerifyMs). Re-delivering now would double-submit once compaction
-      // finishes (#252 regression). Defer: re-arm and re-check after the handler
-      // settles — it will either start a turn (cancels this verify via the
-      // matching `prompt` event) or return turn-less (re-deliver next tick).
+      // finishes (#252 regression). Defer: re-arm and re-check after it settles.
       if ((this.inFlightDeliveries.get(agent_id) ?? 0) > 0) {
-        entry.timer = this.scheduleFlushVerify(agent_id, key);
+        entry.graced = false;
+        entry.timer = this.scheduleFlushVerify(agent_id, key, this.flushVerifyMs);
         return;
       }
-      // No turn started and the handler is idle → the keystroke was swallowed by
-      // a still-(re)initialising TUI. Re-deliver ONCE, through the gate so an
-      // in-progress re-init re-holds it instead of swallowing it again (#252).
-      pending.delete(key);
-      if (pending.size === 0) this.flushVerify.delete(agent_id);
+      // Post-settle grace: the handler has returned but the turn-start `prompt`
+      // event reaches the bus asynchronously (JSONL tailer) and can lag behind.
+      // Wait one short grace for it before declaring the prompt swallowed, else a
+      // turn that started right as the handler returned would be re-delivered
+      // (the post-settle/pre-ingest double-submit window).
+      if (!entry.graced) {
+        entry.graced = true;
+        entry.timer = this.scheduleFlushVerify(agent_id, key, this.flushVerifyGraceMs);
+        return;
+      }
+      // No turn after settle + grace → genuinely swallowed by a still-(re)init
+      // TUI. Re-deliver through the gate so an in-progress re-init re-holds it
+      // instead of swallowing it again. KEEP the entry in `pending` (don't
+      // delete) and do NOT re-arm: a later backstop flush sees pending.has(key)
+      // and skips it, so a prompt gets AT MOST ONE re-delivery for its whole
+      // lifetime (the watchdog is the net beyond that). The entry is cleared
+      // when the re-delivery's turn-start lands (noteFlushTurnStart) or on
+      // socket close / shutdown (clearFlushVerify).
       this.onError(
         new Error(
           `backstop-flushed prompt produced no turn within ${this.flushVerifyMs}ms; re-delivering once for agent_id=${agent_id}`,
@@ -660,7 +697,7 @@ export class BusCoreImpl implements BusCore {
         { ctx: "flushVerify", agent_id },
       );
       this.deliverOrQueuePrompt(agent_id, entry.wrapped);
-    }, this.flushVerifyMs);
+    }, delayMs);
   }
 
   /** A tailer `prompt` event proves THAT specific prompt started its turn: its

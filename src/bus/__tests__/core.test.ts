@@ -973,6 +973,53 @@ describe("BusCore IPC", () => {
     expect(delivered[1]).toContain("ping");
   });
 
+  it("clears a pending flush-verify when the agent's socket closes (no stale re-delivery, #252)", async () => {
+    // A reconciler restart (#222) kills the claude process → its IPC socket
+    // closes → onClose must tear down any armed verify, so a verify timer can
+    // never re-deliver a keystroke into a restarted session that reused the
+    // agent_id (and the reconciler/verify don't both act on the same prompt).
+    const sockPath = join(tempDir, "bus.sock");
+    const delivered: string[] = [];
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      deliveryBackstopMs: 20,
+      flushVerifyMs: 80,
+      streamPromptHandler: async (_a, text) => {
+        delivered.push(text);
+      },
+      onError: () => {},
+    });
+    await bus.start();
+    const client = await connectIpcClient(sockPath);
+    const hello: IpcHello = {
+      type: "hello",
+      agent_id: "alpha",
+      capabilities: ["claude/channel", "claude/channel/permission"],
+    };
+    client.send(hello);
+    await new Promise((r) => setTimeout(r, 20)); // let the hello register the connection
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "session.init",
+      payload: {},
+    });
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "held",
+    });
+    await new Promise((r) => setTimeout(r, 50)); // > backstop → flush + arm verify
+    expect(delivered).toHaveLength(1);
+    client.close(); // socket close → onClose(alpha) → clearFlushVerify(alpha)
+    await new Promise((r) => setTimeout(r, 120)); // > flushVerify + grace
+    expect(delivered).toHaveLength(1); // verify torn down → NOT re-delivered
+  });
+
   describe("silent-drop safety net (issue #215)", () => {
     function makeBus(): BusCore {
       return createBusCore({
@@ -1555,5 +1602,32 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     await new Promise((r) => setTimeout(r, 45)); // next verify tick → re-deliver once
     expect(delivered).toHaveLength(2);
     expect(delivered[1]).toContain("held");
+  });
+
+  it("re-delivers a swallowed prompt AT MOST ONCE across repeated backstop cycles (#252)", async () => {
+    // A re-delivery that is itself held (agent re-initialising) and flushed by a
+    // SECOND backstop must NOT arm a second verify: a prompt gets one
+    // re-delivery for its whole lifetime, the watchdog is the net beyond that.
+    // The verify entry is left in the pending map after re-delivery precisely so
+    // a later armFlushVerify for the same key is a no-op.
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      deliveryBackstopMs: 50,
+      flushVerifyMs: 60,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "held");
+    await new Promise((r) => setTimeout(r, 90)); // > backstop → flush#1 (d=1), verify armed
+    expect(delivered).toHaveLength(1);
+    bus.ingestSessionEvent(initEvt("alpha")); // re-init: the imminent re-delivery is held
+    // verify fires (~110) → grace → re-deliver (~125), queued (initialising);
+    // backstop#2 (~140) flushes it → d=2 and must NOT re-arm a third verify.
+    await new Promise((r) => setTimeout(r, 200)); // past backstop#2 + any spurious 3rd verify
+    expect(delivered).toHaveLength(2); // exactly one re-delivery, never a second
   });
 });
