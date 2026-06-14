@@ -145,7 +145,48 @@ At least one agent is **required** under bus runtime — without it the daemon m
 
 Each agent has its own working directory, system prompt file, and memory file. See `BusAgentSettings` in [`src/config.ts`](src/config.ts) for the full per-agent shape.
 
+<<<<<<< HEAD
 > ⚠ **Important if you have an `agents/` directory on disk.** Every directory under `agents/<name>/` with jobs in it MUST have a matching entry in `settings.agents[]`. If not, the bus runtime publishes prompts targeting `agent_id: <name>` but no process is subscribed, and your jobs silently fail. The daemon now logs `[bus-runtime] WARN: agent dir "<name>" has N scheduled job(s) ... but is not declared in settings.agents` at startup when a mismatch is detected — fix the warning either by adding `{ "id": "<name>" }` to `settings.agents` or by removing the orphan `agents/<name>/jobs/` directory.
+=======
+## Upgrading
+
+### v1.0.26 — Allowlist behavior change (Telegram & Discord)
+
+Prior to this release, an empty `allowedUserIds` list meant **allow everyone**. That was a potential security vulnerability; any Telegram or Discord user could drive the daemon.
+
+**New behavior:** an empty list means **block everyone**. The daemon will refuse to start if a bot token is configured without at least one allowed user ID.
+
+**Migration:** add your user ID(s) to `settings.json` before upgrading:
+
+```json
+"telegram": { "allowedUserIds": [123456789] },
+"discord":  { "allowedUserIds": ["987654321012345678"] }
+```
+
+Run `claudeclaw config` for guided setup if you're unsure of your user ID.
+
+### v1.1.0 — Web UI bearer token gate
+
+All `/api/*` routes (except `/api/health`) now require an `Authorization: Bearer <token>` header. The token is auto-generated on first start and written to `.claude/claudeclaw/web.token`. The daemon also prints the full URL with the token embedded when the web UI starts.
+
+**Migration:** update any scripts that call `/api/state` or other API routes to pass the token:
+
+```
+Authorization: Bearer <contents of .claude/claudeclaw/web.token>
+```
+
+Existing `/api/inject` users who configured `settings.apiToken` are unaffected; that fallback still works.
+
+### v1.1.0 — Discord text-attachment truncation limit reduced
+
+Text attachments sent to the Discord bot are now truncated at **2,048 bytes** (previously 51,200). Payloads over that limit have `…[truncated]` appended silently; there is no config knob to restore the old limit.
+
+**Migration:** if you rely on passing large text files through Discord attachments, switch to gists or another file-sharing mechanism and paste the URL instead.
+
+---
+
+## What Would Be Built Next?
+>>>>>>> upstream/master
 
 ### 5. Primary channel per agent (Discord + Slack)
 
