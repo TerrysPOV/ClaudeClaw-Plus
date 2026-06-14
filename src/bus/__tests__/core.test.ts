@@ -1496,6 +1496,35 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     expect(delivered[1]).toContain("held");
   });
 
+  it("attributes a MULTI-LINE prompt's turn-start despite PTY newline sanitization (#252 ultra HIGH)", async () => {
+    // The PTY layer runs sanitizePtyPromptText before typing — newlines collapse
+    // to spaces — and the tailer's `prompt` event carries that sanitized form.
+    // The verify must key on the sanitized text, else a multi-line prompt's
+    // healthy turn never matches and the prompt is spuriously re-delivered
+    // (double-submit). This test fails on the raw-key implementation.
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      deliveryBackstopMs: 20,
+      flushVerifyMs: 30,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(initEvt("alpha"));
+    await prompt("alpha", "line one\nline two"); // multi-line user text
+    await new Promise((r) => setTimeout(r, 45)); // > backstop → flush
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toContain("\n"); // raw wrapped still carries the newline
+    // The tailer records what claude received = the PTY-sanitized line (newlines
+    // collapsed to spaces). Emitting THAT must still cancel the verify.
+    const sanitized = delivered[0].replace(/\r\n?|\n/g, " ");
+    bus.ingestSessionEvent(turnEvt("alpha", sanitized));
+    await new Promise((r) => setTimeout(r, 45)); // > flushVerify
+    expect(delivered).toHaveLength(1); // attributed → NOT re-delivered
+  });
+
   it("does NOT re-deliver while a delivery handler is still in-flight (compaction, #252)", async () => {
     // The regression: flushVerify fired at flushVerifyMs (8s) while the delivery
     // handler legitimately held through auto-compaction (up to 240s), so the

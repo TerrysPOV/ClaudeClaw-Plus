@@ -30,6 +30,7 @@ import { randomUUID } from "node:crypto";
 import type { EventRecord, EventEntryInput } from "../event-log";
 import { append as eventLogAppend } from "../event-log";
 import { bindUdsServer, encodeFrame, resolveDefaultUdsPath, type IpcServer } from "./core-ipc";
+import { sanitizePtyPromptText } from "../runner/pty-prompt-sanitizer";
 import {
   DEFAULT_RINGBUFFER_CAPACITY,
   drainSubscriber,
@@ -260,7 +261,10 @@ export class BusCoreImpl implements BusCore {
    * ones, and each prompt is verified/re-delivered independently. The watchdog
    * stays the ultimate net. Maps agent → (wrapped prompt → verify timer).
    */
-  private readonly flushVerify = new Map<string, Map<string, ReturnType<typeof setTimeout>>>();
+  private readonly flushVerify = new Map<
+    string,
+    Map<string, { wrapped: string; timer: ReturnType<typeof setTimeout> }>
+  >();
   private readonly flushVerifyMs: number;
   /**
    * In-flight `streamPromptHandler` count per agent. A delivery handler that
@@ -403,7 +407,7 @@ export class BusCoreImpl implements BusCore {
     this.deliveryQueue.clear();
     this.agentLiveSession.clear();
     for (const pending of this.flushVerify.values())
-      for (const timer of pending.values()) clearTimeout(timer);
+      for (const entry of pending.values()) clearTimeout(entry.timer);
     this.flushVerify.clear();
     this.inFlightDeliveries.clear();
   }
@@ -615,15 +619,25 @@ export class BusCoreImpl implements BusCore {
       this.flushVerify.set(agent_id, pending);
     }
     for (const wrapped of prompts) {
-      if (pending.has(wrapped)) continue; // already awaiting — don't stack a 2nd timer
-      pending.set(wrapped, this.scheduleFlushVerify(agent_id, wrapped));
+      // Key by the text the tailer will actually observe, NOT the raw wrapped
+      // string: the PTY layer runs sanitizePtyPromptText (collapses newlines to
+      // spaces, strips control chars) before typing, and claude records — and
+      // the tailer re-emits as the `prompt` event — that sanitized form. Keying
+      // by the raw wrapped (with literal newlines) would never match a
+      // multi-line prompt's turn-start event, so attribution would silently
+      // fail and a healthy turn get re-delivered / double-submitted (#252
+      // ultra-review HIGH). Keep the original wrapped to re-deliver verbatim.
+      const key = sanitizePtyPromptText(wrapped);
+      if (pending.has(key)) continue; // already awaiting — don't stack a 2nd timer
+      pending.set(key, { wrapped, timer: this.scheduleFlushVerify(agent_id, key) });
     }
   }
 
-  private scheduleFlushVerify(agent_id: string, wrapped: string): ReturnType<typeof setTimeout> {
+  private scheduleFlushVerify(agent_id: string, key: string): ReturnType<typeof setTimeout> {
     return setTimeout(() => {
       const pending = this.flushVerify.get(agent_id);
-      if (!pending?.has(wrapped)) return;
+      const entry = pending?.get(key);
+      if (!pending || !entry) return;
       // Compaction-aware: a delivery handler still in-flight is legitimately
       // working (it holds through auto-compaction, up to maxCompactionWaitMs ≫
       // flushVerifyMs). Re-delivering now would double-submit once compaction
@@ -631,13 +645,13 @@ export class BusCoreImpl implements BusCore {
       // settles — it will either start a turn (cancels this verify via the
       // matching `prompt` event) or return turn-less (re-deliver next tick).
       if ((this.inFlightDeliveries.get(agent_id) ?? 0) > 0) {
-        pending.set(wrapped, this.scheduleFlushVerify(agent_id, wrapped));
+        entry.timer = this.scheduleFlushVerify(agent_id, key);
         return;
       }
       // No turn started and the handler is idle → the keystroke was swallowed by
       // a still-(re)initialising TUI. Re-deliver ONCE, through the gate so an
       // in-progress re-init re-holds it instead of swallowing it again (#252).
-      pending.delete(wrapped);
+      pending.delete(key);
       if (pending.size === 0) this.flushVerify.delete(agent_id);
       this.onError(
         new Error(
@@ -645,7 +659,7 @@ export class BusCoreImpl implements BusCore {
         ),
         { ctx: "flushVerify", agent_id },
       );
-      this.deliverOrQueuePrompt(agent_id, wrapped);
+      this.deliverOrQueuePrompt(agent_id, entry.wrapped);
     }, this.flushVerifyMs);
   }
 
@@ -657,10 +671,14 @@ export class BusCoreImpl implements BusCore {
   private noteFlushTurnStart(agent_id: string, ingestedText: string): void {
     const pending = this.flushVerify.get(agent_id);
     if (!pending) return;
-    const timer = pending.get(ingestedText);
-    if (!timer) return;
-    clearTimeout(timer);
-    pending.delete(ingestedText);
+    // ingestedText is the line claude recorded (already PTY-sanitized) and the
+    // map keys are sanitized too; sanitize again — it is idempotent — to be
+    // robust against any residual normalization before the exact-match lookup.
+    const key = sanitizePtyPromptText(ingestedText);
+    const entry = pending.get(key);
+    if (!entry) return;
+    clearTimeout(entry.timer);
+    pending.delete(key);
     if (pending.size === 0) this.flushVerify.delete(agent_id);
   }
 
@@ -669,7 +687,7 @@ export class BusCoreImpl implements BusCore {
   private clearFlushVerify(agent_id: string): void {
     const pending = this.flushVerify.get(agent_id);
     if (!pending) return;
-    for (const timer of pending.values()) clearTimeout(timer);
+    for (const entry of pending.values()) clearTimeout(entry.timer);
     this.flushVerify.delete(agent_id);
   }
 
