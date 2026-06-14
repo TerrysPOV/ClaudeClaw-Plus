@@ -939,6 +939,40 @@ describe("BusCore IPC", () => {
     client.close();
   });
 
+  it("re-delivers an immediately-delivered prompt when the IPC send failed (MCP-blip wedge, #252)", async () => {
+    // dossier 20260614T034258: the MCP/IPC socket blipped right at the prompt
+    // boundary (`send-failed: no-mcp-connection`), the prompt fell through to an
+    // IMMEDIATE PTY delivery (session not initialising, so no backstop), the
+    // keystroke coincided with the reconnect and never started a turn — and the
+    // #222 reconciler disarmed on "reconnected during confirm window" without
+    // verifying a turn. Verify turn-start on this path too and re-deliver once.
+    const sockPath = join(tempDir, "bus.sock");
+    const delivered: string[] = [];
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      flushVerifyMs: 30,
+      streamPromptHandler: async (_a, text) => {
+        delivered.push(text);
+      },
+      onError: () => {},
+    });
+    await bus.start();
+    // No agent ever connected → ipcServer.send returns false (ipcSendFailed),
+    // and the agent is NOT initialising → the prompt is delivered immediately.
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "ping",
+    });
+    expect(delivered).toHaveLength(1); // delivered immediately to PTY
+    await new Promise((r) => setTimeout(r, 45)); // > flushVerify, no turn → re-deliver once
+    expect(delivered).toHaveLength(2);
+    expect(delivered[1]).toContain("ping");
+  });
+
   describe("silent-drop safety net (issue #215)", () => {
     function makeBus(): BusCore {
       return createBusCore({

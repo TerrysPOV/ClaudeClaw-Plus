@@ -464,9 +464,11 @@ export class BusCoreImpl implements BusCore {
       text: req.text,
       metadata: req.metadata,
     };
+    let ipcSendFailed = false;
     if (this.ipcServer) {
       const sent = this.ipcServer.send(req.agent_id, ipcMsg);
       if (!sent) {
+        ipcSendFailed = true;
         this.onError(new Error(`No MCP connection for agent_id=${req.agent_id}`), {
           ctx: "sendPrompt",
         });
@@ -508,7 +510,17 @@ export class BusCoreImpl implements BusCore {
         }
       }
       const wrapped = `<channel ${attrs.join(" ")}>${escapeXmlText(req.text)}</channel>`;
+      // If the agent's session is (re)initialising the prompt is HELD and the
+      // backstop flush-verify path already covers it. The uncovered case is an
+      // IMMEDIATE delivery whose IPC send just failed: the MCP/IPC socket
+      // blipped at the prompt boundary, so the PTY keystroke can coincide with a
+      // reconnect and be swallowed without starting a turn — and the #222
+      // reconciler disarms on "reconnected during confirm window" WITHOUT
+      // checking a turn started (dossier 20260614T034258). Verify turn-start for
+      // that prompt and re-deliver once if none lands.
+      const deliveredImmediately = !this.agentInitializing.has(req.agent_id);
       this.deliverOrQueuePrompt(req.agent_id, wrapped);
+      if (ipcSendFailed && deliveredImmediately) this.armFlushVerify(req.agent_id, [wrapped]);
     }
     return { promise_id };
   }
