@@ -1536,9 +1536,18 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     await prompt("alpha", "held");
     await new Promise((r) => setTimeout(r, 45)); // > backstop → first (swallowed) flush
     expect(delivered).toHaveLength(1);
-    // A DIFFERENT prompt's turn-start lands — must not satisfy the swallowed one.
+    // A DIFFERENT prompt's turn-start lands — must not satisfy the swallowed one
+    // (attribution), though it does mark the agent's turn active so the verify
+    // defers until that turn ends.
     bus.ingestSessionEvent(turnEvt("alpha", "<channel>some other prompt</channel>"));
-    await new Promise((r) => setTimeout(r, 45)); // > flushVerify → swallowed prompt re-delivered
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "response.turn_end",
+      payload: { text: "" },
+    }); // the unrelated turn ends → REPL free → "held"'s verify can now fire
+    await new Promise((r) => setTimeout(r, 60)); // > flushVerify + grace → swallowed prompt re-delivered
     expect(delivered).toHaveLength(2);
     expect(delivered[1]).toContain("held");
   });
@@ -1629,5 +1638,60 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     // backstop#2 (~140) flushes it → d=2 and must NOT re-arm a third verify.
     await new Promise((r) => setTimeout(r, 200)); // past backstop#2 + any spurious 3rd verify
     expect(delivered).toHaveLength(2); // exactly one re-delivery, never a second
+  });
+
+  // Turn-end event helper for the back-to-back (neighbor-turn) tests.
+  const turnEndEvt = (agent: string): BusEvent => ({
+    ts: 1,
+    agent_id: agent,
+    session_id: "s",
+    topic: "response.turn_end",
+    payload: { text: "" }, // empty → the #215 synthesizer is a no-op
+  });
+
+  it("re-delivers a prompt queued behind a neighbor turn if it never starts its own (bus-level #250 HIGH)", async () => {
+    // A prompt delivered while a neighbor turn is STREAMING is only a queued
+    // keystroke in the REPL box; the PTY confirm-loop can misread the neighbor's
+    // stream as this prompt's turn-start. The bus arms a verify (reliable
+    // tailer attribution), DEFERS it while the neighbor turn is active (the
+    // prompt legitimately waits behind it — re-delivering sooner double-submits),
+    // and re-delivers only if no turn ever starts for it.
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      flushVerifyMs: 40,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(turnEvt("alpha", "<channel>neighbor</channel>")); // neighbor turn active
+    await prompt("alpha", "queued");
+    expect(delivered).toHaveLength(1); // delivered immediately (queued in the box)
+    await new Promise((r) => setTimeout(r, 100)); // > flushVerify, but neighbor still active
+    expect(delivered).toHaveLength(1); // DEFERRED — not re-delivered behind the live turn
+    bus.ingestSessionEvent(turnEndEvt("alpha")); // neighbor turn ends → REPL free
+    await new Promise((r) => setTimeout(r, 100)); // > flushVerify + grace, no turn for "queued"
+    expect(delivered).toHaveLength(2); // now re-delivered exactly once
+    expect(delivered[1]).toContain("queued");
+  });
+
+  it("does NOT re-deliver a queued prompt that starts its own turn after the neighbor ends (#252)", async () => {
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      flushVerifyMs: 40,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(turnEvt("alpha", "<channel>neighbor</channel>")); // neighbor turn active
+    await prompt("alpha", "queued");
+    expect(delivered).toHaveLength(1);
+    bus.ingestSessionEvent(turnEndEvt("alpha")); // neighbor ends
+    bus.ingestSessionEvent(turnEvt("alpha", delivered[0])); // "queued" starts its OWN turn → cancel
+    await new Promise((r) => setTimeout(r, 100)); // > flushVerify + grace
+    expect(delivered).toHaveLength(1); // attributed → not re-delivered
   });
 });

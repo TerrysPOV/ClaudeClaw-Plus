@@ -288,6 +288,18 @@ export class BusCoreImpl implements BusCore {
    */
   private readonly inFlightDeliveries = new Map<string, number>();
   /**
+   * Agents with a turn currently streaming (tailer `prompt` seen, no
+   * `response.turn_end` yet). A prompt delivered while a neighbor turn is in
+   * progress can only be a queued keystroke in the REPL input box — the PTY
+   * confirm-loop cannot attribute the neighbor's stream to it and may falsely
+   * report it as turn-started (#250 ultra HIGH). The bus has reliable
+   * attribution (the per-prompt `prompt` tailer event), so deliveries made
+   * during an active turn arm a flush-verify; that verify is DEFERRED while a
+   * turn is still active (the prompt legitimately waits behind it — re-delivering
+   * sooner would double-submit), then re-delivers only if no turn ever starts.
+   */
+  private readonly agentTurnActive = new Set<string>();
+  /**
    * Silent-drop safety net (issue #215): tracks per-agent whether the
    * current turn has called the `reply` MCP tool with `intent: "final"`.
    * Reset on every new inbound prompt (`sendPrompt`), set to `true` when
@@ -393,6 +405,7 @@ export class BusCoreImpl implements BusCore {
           // into the fresh session (#252 HIGH).
           this.clearFlushVerify(agentId);
           this.inFlightDeliveries.delete(agentId);
+          this.agentTurnActive.delete(agentId);
           this.logIpc("close", {
             agent: agentId,
             connections: this.ipcServer?.connectionCount() ?? 0,
@@ -424,6 +437,7 @@ export class BusCoreImpl implements BusCore {
       for (const entry of pending.values()) clearTimeout(entry.timer);
     this.flushVerify.clear();
     this.inFlightDeliveries.clear();
+    this.agentTurnActive.clear();
   }
 
   /* ─────────────────────────────── prompts ─────────────────────────────── */
@@ -536,9 +550,18 @@ export class BusCoreImpl implements BusCore {
       // reconciler disarms on "reconnected during confirm window" WITHOUT
       // checking a turn started (dossier 20260614T034258). Verify turn-start for
       // that prompt and re-deliver once if none lands.
+      // Arm a turn-start verify when the PTY confirm-loop can't be trusted to
+      // attribute the turn to THIS prompt: (a) the IPC send just failed (socket
+      // blip), or (b) a neighbor turn is already streaming, so this keystroke is
+      // queued in the REPL box and the confirm-loop may read the neighbor's
+      // stream as this prompt's turn-start (#250 HIGH). The verify defers while a
+      // turn stays active and re-delivers only if no turn ever starts.
       const deliveredImmediately = !this.agentInitializing.has(req.agent_id);
+      const neighborTurnActive = this.agentTurnActive.has(req.agent_id);
       this.deliverOrQueuePrompt(req.agent_id, wrapped);
-      if (ipcSendFailed && deliveredImmediately) this.armFlushVerify(req.agent_id, [wrapped]);
+      if ((ipcSendFailed || neighborTurnActive) && deliveredImmediately) {
+        this.armFlushVerify(req.agent_id, [wrapped]);
+      }
     }
     return { promise_id };
   }
@@ -663,11 +686,13 @@ export class BusCoreImpl implements BusCore {
       const pending = this.flushVerify.get(agent_id);
       const entry = pending?.get(key);
       if (!pending || !entry) return;
-      // Compaction-aware: a delivery handler still in-flight is legitimately
-      // working (it holds through auto-compaction, up to maxCompactionWaitMs ≫
-      // flushVerifyMs). Re-delivering now would double-submit once compaction
-      // finishes (#252 regression). Defer: re-arm and re-check after it settles.
-      if ((this.inFlightDeliveries.get(agent_id) ?? 0) > 0) {
+      // Defer while the prompt legitimately can't have started its turn yet:
+      //  - a delivery handler is still in-flight (compaction-aware: it holds
+      //    through auto-compaction, up to maxCompactionWaitMs ≫ flushVerifyMs); or
+      //  - a neighbor turn is still streaming, so this prompt is queued behind it
+      //    in the REPL box and can only start once that turn ends (#250 HIGH).
+      // Re-delivering in either case would double-submit. Re-arm and re-check.
+      if ((this.inFlightDeliveries.get(agent_id) ?? 0) > 0 || this.agentTurnActive.has(agent_id)) {
         entry.graced = false;
         entry.timer = this.scheduleFlushVerify(agent_id, key, this.flushVerifyMs);
         return;
@@ -947,7 +972,11 @@ export class BusCoreImpl implements BusCore {
       // activity must not silence a still-swallowed prompt's re-delivery.
       else if (e.topic === "prompt") {
         const text = (e.payload as { text?: string } | undefined)?.text;
+        // Cancel the matching prompt's verify FIRST (attribution), then mark the
+        // agent as having an active turn so a LATER prompt delivered during it
+        // arms — and defers — its own verify.
         if (typeof text === "string") this.noteFlushTurnStart(e.agent_id, text);
+        this.agentTurnActive.add(e.agent_id);
       }
     }
     // Silent-drop safety net (#215): the JSONL tailer publishes a
@@ -957,6 +986,9 @@ export class BusCoreImpl implements BusCore {
     if (e.topic === "response.turn_end" && e.agent_id) {
       const payload = e.payload as { text?: string };
       this.handleTurnEnd(e.agent_id, payload?.text ?? "");
+      // The turn ended → the REPL is free, so a prompt queued behind it can now
+      // start; stop deferring its flush-verify (see agentTurnActive).
+      this.agentTurnActive.delete(e.agent_id);
     }
     this.publish(e);
   }
