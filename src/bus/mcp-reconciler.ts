@@ -30,6 +30,11 @@ export interface McpReconcilerDeps {
   isConnected(agentId: string): boolean;
   /** True iff the agent's process is alive (not exited) per the Session Manager. */
   isProcessAlive(agentId: string): boolean;
+  /** True iff a turn is currently streaming for the agent (bus tracks this via
+   *  the JSONL tailer). Optional; when present, `attempt()` defers a restart of
+   *  a deaf-but-mid-turn agent so a live turn is not interrupted (#252 stack
+   *  ultra) — the turn still delivers via the tailer-based silent-drop net. */
+  isTurnActive?(agentId: string): boolean;
   /** Respawn the agent (Session Manager `restart()` — same session_id, resumes). */
   restart(agentId: string): Promise<unknown>;
   /** Structured logger. Lands in the daemon log, grep-able. */
@@ -106,6 +111,21 @@ export function createMcpReconciler(
     // supervisor owns respawn. The reconciler only handles alive-but-deaf.
     if (!deps.isProcessAlive(agentId)) {
       deps.log("reconcile-skip", { agent: agentId, reason: "process-not-alive" });
+      return;
+    }
+    // Deaf-but-mid-turn: the MCP socket is down but a turn is actively streaming
+    // (PTY-confirmed). A restart would interrupt a live turn whose output the
+    // silent-drop net (#215, tailer-based, does NOT need the MCP socket) can
+    // still deliver. Defer: re-arm a confirm so we restart only once the turn
+    // ends (bounded — agentTurnActive clears on turn_end / replay_done).
+    if (deps.isTurnActive?.(agentId)) {
+      deps.log("reconcile-skip", {
+        agent: agentId,
+        reason: "turn-active",
+        note: "deferring restart until the turn ends",
+      });
+      s.pendingConfirm = true; // keep coalescing further signals; re-check after the turn
+      setTimer(() => attempt(agentId, reason), confirmMs);
       return;
     }
     if (s.inFlight) return;

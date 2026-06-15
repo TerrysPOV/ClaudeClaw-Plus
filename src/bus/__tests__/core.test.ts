@@ -1020,6 +1020,63 @@ describe("BusCore IPC", () => {
     expect(delivered).toHaveLength(1); // verify torn down → NOT re-delivered
   });
 
+  it("re-delivers a prompt held at socket close once the fresh session is ready (#252 stack ultra B1)", async () => {
+    // A reconciler restart of an alive-but-deaf agent closes the socket while a
+    // prompt is still held (or awaiting verify). onClose snapshots it; the fresh
+    // generation's replay_done re-delivers it through the gate instead of the
+    // prompt being silently dropped (no recovery layer owned it before).
+    const sockPath = join(tempDir, "bus.sock");
+    const delivered: string[] = [];
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      deliveryBackstopMs: 5000, // large: the prompt stays HELD (not backstop-flushed) until close
+      onError: () => {},
+      streamPromptHandler: async (_a, text) => {
+        delivered.push(text);
+      },
+    });
+    await bus.start();
+    const client = await connectIpcClient(sockPath);
+    const hello: IpcHello = {
+      type: "hello",
+      agent_id: "alpha",
+      capabilities: ["claude/channel", "claude/channel/permission"],
+    };
+    client.send(hello);
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "session.init",
+      payload: {},
+    });
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "carryme",
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(delivered).toHaveLength(0); // held while (re)initialising
+    client.close(); // onClose → snapshot the held prompt into pendingRedelivery
+    await new Promise((r) => setTimeout(r, 40));
+    expect(delivered).toHaveLength(0); // still nothing — no ready session yet
+    // The fresh generation reaches replay_done → carried prompt re-delivered.
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s2",
+      topic: "bus.events.replay_done",
+      payload: {},
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(delivered).toHaveLength(1);
+    expect(delivered[0]).toContain("carryme");
+  });
+
   describe("silent-drop safety net (issue #215)", () => {
     function makeBus(): BusCore {
       return createBusCore({
@@ -1693,5 +1750,30 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
     bus.ingestSessionEvent(turnEvt("alpha", delivered[0])); // "queued" starts its OWN turn → cancel
     await new Promise((r) => setTimeout(r, 100)); // > flushVerify + grace
     expect(delivered).toHaveLength(1); // attributed → not re-delivered
+  });
+
+  it("recovers a stuck neighbor-turn flag on replay_done so flush-verify is not disabled forever (#252 stack ultra HIGH)", async () => {
+    // A turn whose `response.turn_end` is never seen (interrupted by a reconciler
+    // restart whose new tailer seeks past it) would leave agentTurnActive stuck
+    // true, permanently DEFERRING every flush-verify for the agent. A new session
+    // generation (replay_done) must clear it so the safety net comes back.
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      flushVerifyMs: 40,
+      onError: () => {},
+    });
+    const delivered: string[] = [];
+    bus.setStreamPromptHandler(async (_a, text) => {
+      delivered.push(text);
+    });
+    bus.ingestSessionEvent(turnEvt("alpha", "<channel>orphan</channel>")); // turn starts, NO turn_end ever
+    await prompt("alpha", "p1"); // immediate delivery during the (stuck) active turn → arms a verify
+    expect(delivered).toHaveLength(1);
+    await new Promise((r) => setTimeout(r, 70)); // > flushVerify: deferred while agentTurnActive stuck true
+    expect(delivered).toHaveLength(1); // not re-delivered — verify is (correctly) deferred...
+    bus.ingestSessionEvent(replayEvt("alpha")); // ...until a new generation clears the stuck flag
+    await new Promise((r) => setTimeout(r, 70)); // verify now fires → re-deliver "p1"
+    expect(delivered).toHaveLength(2);
+    expect(delivered[1]).toContain("p1");
   });
 });
