@@ -40,7 +40,11 @@ import {
   recordInvocationStart,
   recordInvocationCompletion,
   recordInvocationFailure,
+  extractTranscriptUsage,
+  type EstimatedCost,
+  type UsageMetrics,
 } from "./governance/usage-tracker";
+import { calculateEstimatedCost } from "./governance/budget-engine";
 import {
   recordExecutionMetric,
   checkLimits,
@@ -1783,6 +1787,7 @@ async function execClaude(
       model: primaryConfig.model,
       metadata: { taskType, routingReasoning },
     };
+    const invocationStartedAt = new Date().toISOString();
     await recordInvocationStart(invocationContext, invocationId);
 
     // Capture memory file mtime before invocation (for fallback write detection)
@@ -2098,8 +2103,39 @@ async function execClaude(
       exitCode,
     };
 
-    // Record successful completion
-    await recordInvocationCompletion(invocationId, undefined, undefined);
+    // Record successful completion WITH the real token usage + cost so the
+    // budget layer can actually enforce. Previously this passed undefined →
+    // every record had estimatedCost undefined → totalEstimatedCost stayed 0 →
+    // budgetState never left "healthy" → the block branch was unreachable
+    // (governance audit CRITICAL). Usage is read from claude's own session
+    // transcript (works for BOTH the legacy stream-json and the PTY paths);
+    // cost is computed from the configured pricing tier. Best-effort: a failure
+    // here never breaks the invocation.
+    let invocationUsage: UsageMetrics | undefined;
+    let invocationCost: EstimatedCost | undefined;
+    try {
+      const u = await extractTranscriptUsage(
+        spawnCwd ?? PROJECT_DIR,
+        sessionId,
+        invocationStartedAt,
+      );
+      if (u) {
+        invocationUsage = u;
+        const c = calculateEstimatedCost(u, invocationContext.provider, invocationContext.model);
+        if (c) {
+          invocationCost = {
+            currency: "USD",
+            inputCost: c.breakdown.inputCost,
+            outputCost: c.breakdown.outputCost,
+            cacheCost: c.breakdown.cacheCost,
+            totalCost: c.totalCost,
+          };
+        }
+      }
+    } catch {
+      // best-effort — usage accounting must never break the invocation
+    }
+    await recordInvocationCompletion(invocationId, invocationUsage, invocationCost);
 
     // Check watchdog limits
     const watchdogDecision = await checkLimits({ invocationId, sessionId: invocationSessionId });
