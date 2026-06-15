@@ -312,8 +312,7 @@ export class SessionPersistenceStore {
     // FRESHLY-read `current` by these keys (inside the mutex) instead of writing
     // back this pre-computed snapshot — otherwise a record()/touch() that landed
     // between this read and the rewrite is silently clobbered (lost update).
-    const dropped = new Set<string>();
-    const entryKey = (e: PersistedSessionRecord) => `${e.ptyId} ${e.sessionId}`;
+    // (the prune-rewrite below re-validates fresh entries directly — no key set)
 
     for (const entry of parsed.entries) {
       if (!_isPersistedRecord(entry)) {
@@ -333,7 +332,6 @@ export class SessionPersistenceStore {
           sessionId: entry.sessionId,
           reason: "integrity_failed",
         });
-        dropped.add(entryKey(entry));
         mutated = true;
         continue;
       }
@@ -351,7 +349,6 @@ export class SessionPersistenceStore {
           reason: "ttl_expired",
           ageMs,
         });
-        dropped.add(entryKey(entry));
         mutated = true;
         continue;
       }
@@ -365,16 +362,25 @@ export class SessionPersistenceStore {
       });
     }
 
-    // If we dropped anything, rewrite — but re-filter the FRESHLY-read `current`
-    // inside the mutex (dropping the entries we flagged + any corrupt ones),
-    // rather than writing back the stale `kept` snapshot. This preserves
-    // record()/touch() writes that landed concurrently with this loadAll.
+    // If we dropped anything, rewrite — re-validating each FRESHLY-read entry
+    // inside the mutex rather than trusting the stale flags. A touch()/record()
+    // that refreshed an entry between this loadAll's read and the rewrite must
+    // RESCUE it (touch leaves ptyId/sessionId — the key — unchanged, so a stale
+    // key set would wrongly evict it and defeat the idle-TTL fix). Drop only
+    // entries that STILL fail integrity/TTL against their current on-disk state.
     if (mutated) {
+      const freshNow = Date.now();
       await this._mutate(serverName, (current) => ({
         ...current,
         version: CURRENT_VERSION,
         serverName,
-        entries: current.entries.filter((e) => _isPersistedRecord(e) && !dropped.has(entryKey(e))),
+        entries: current.entries.filter(
+          (e) =>
+            _isPersistedRecord(e) &&
+            e.serverName === serverName &&
+            e.hash === _hashFor(e.serverName, e.ptyId, e.sessionId) &&
+            freshNow - e.lastUsedAt <= this.maxAgeMs,
+        ),
       }));
     }
 
@@ -420,8 +426,13 @@ export class SessionPersistenceStore {
     // _atomicWrite. Only sweep clearly-stale ones (mtime well in the past) so we
     // never race a concurrent in-flight write.
     const tmpCutoff = Date.now() - 60_000;
+    // Match ONLY the actual atomic-write tmpfile shape `<server>.json.tmp.<hex>`
+    // (the suffix is randomBytes(4).toString("hex")). A bare `.includes(".json.tmp.")`
+    // would also match a legitimate persistence file for a server whose NAME
+    // contains ".json.tmp." and delete real data (#255 self-review).
+    const TMP_RE = /\.json\.tmp\.[0-9a-f]+$/;
     for (const filename of files) {
-      if (!filename.includes(".json.tmp.")) continue;
+      if (!TMP_RE.test(filename)) continue;
       const p = join(this.storageRoot, filename);
       try {
         if ((await stat(p)).mtimeMs < tmpCutoff) await this._unlinkSafe(p);

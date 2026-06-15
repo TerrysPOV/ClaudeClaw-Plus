@@ -51,10 +51,12 @@ If file doesn't exist (first run), Plus auto-creates it at `~/.config/plus/plugi
 ### Step 3 — Verify Plus is running
 
 ```bash
-curl -s http://localhost:4632/api/plugin/list
+curl -s -H "Authorization: Bearer $(bun run src/plugins/cli.ts print-bootstrap-token)" http://localhost:4632/api/plugin/list
 ```
 
-If 404 / connection refused → Plus daemon not running with `--web` flag. Suggest restart:
+A `200` (JSON plugin list) means Plus is up. A `401` also means it's UP — just a
+bootstrap-token mismatch (re-print the token). Only `404` / connection refused
+means the daemon isn't running with the `--web` flag. Suggest restart:
 ```bash
 systemctl --user restart claudeclaw.service
 ```
@@ -99,7 +101,7 @@ Goal: show all registered plugins with their health status.
 ### Step 1 — Fetch list
 
 ```bash
-curl -s http://localhost:4632/api/plugin/list
+curl -s -H "Authorization: Bearer $(bun run src/plugins/cli.ts print-bootstrap-token)" http://localhost:4632/api/plugin/list
 ```
 
 ### Step 2 — Render table
@@ -157,7 +159,7 @@ Goal: deep dive on one plugin.
 ### Step 1 — Fetch plugin info
 
 ```bash
-curl -s http://localhost:4632/api/plugin/list | jq '.plugins[] | select(.name == "<plugin>")'
+curl -s -H "Authorization: Bearer $(bun run src/plugins/cli.ts print-bootstrap-token)" http://localhost:4632/api/plugin/list | jq '.plugins[] | select(.name == "<plugin>")'
 ```
 
 ### Step 2 — Force health check
@@ -232,7 +234,11 @@ Goal: full health sweep + config validation.
 ### Step 1 — Check Plus is running
 
 ```bash
-curl -fsS http://localhost:4632/api/plugin/list > /dev/null || echo "Plus daemon down"
+# Liveness probe: /api/plugin/list now requires the bootstrap token, so a 401
+# still proves the daemon is UP (it responded). Treat 200 OR 401 as alive;
+# only a connection failure (code 000) means the daemon is down.
+code=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:4632/api/plugin/list)
+case "$code" in 200 | 401) ;; *) echo "Plus daemon down" ;; esac
 ```
 
 ### Step 2 — Check bootstrap token exists
@@ -524,7 +530,7 @@ Goal: overview of the mcp-proxy warm pool — server states, crash counts, laten
 ### Step 1 — Verify mcp-proxy registered
 
 ```bash
-curl -s http://localhost:4632/api/plugin/list | jq '.plugins[] | select(.name == "mcp-proxy")'
+curl -s -H "Authorization: Bearer $(bun run src/plugins/cli.ts print-bootstrap-token)" http://localhost:4632/api/plugin/list | jq '.plugins[] | select(.name == "mcp-proxy")'
 ```
 
 If not found: "mcp-proxy plugin not registered — daemon may be starting or mcp-proxy.json missing."
@@ -572,7 +578,7 @@ If no: End.
 
 Check if the daemon exposes an admin restart tool via the bridge:
 ```bash
-curl -s http://localhost:4632/api/plugin/list | jq '.plugins[] | select(.name == "mcp-proxy") | .tools'
+curl -s -H "Authorization: Bearer $(bun run src/plugins/cli.ts print-bootstrap-token)" http://localhost:4632/api/plugin/list | jq '.plugins[] | select(.name == "mcp-proxy") | .tools'
 ```
 
 If a `mcp-proxy__restart_server` tool is listed: invoke it with `{"arguments": {"server": "<server>"}}`.

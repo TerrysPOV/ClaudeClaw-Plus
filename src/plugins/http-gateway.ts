@@ -48,6 +48,11 @@ export class PluginHttpGateway {
   private plugins = new Map<string, RegisteredPlugin>();
   private bootstrapToken: Buffer;
   private allowedCallbackHosts: Set<string>;
+  /** Invoke HMAC signatures seen within the replay window → reject a captured
+   *  request resent before its ts ages out (the HMAC + ts-window alone accept
+   *  it repeatedly). Maps signature → expiry epoch ms; pruned opportunistically
+   *  so it stays bounded by the window, not by total request volume. */
+  private seenInvokeSigs = new Map<string, number>();
   /** Per-server-name MCP route handlers registered by the multiplexer.
    *  Key is the lowercase kebab server name (matches `mcp-proxy.json`). */
   private mcpHandlers = new Map<string, McpRouteHandler>();
@@ -185,7 +190,9 @@ export class PluginHttpGateway {
       return json(this.errorBody("invalid_manifest", String(e), requestId), 400);
     }
 
-    const callbackHost = new URL(manifest.callback_url).hostname;
+    // Strip the brackets URL.hostname puts around IPv6 literals ("[::1]") so the
+    // comparison matches the bare-form allowlist entries ("::1") (#255 self-review).
+    const callbackHost = new URL(manifest.callback_url).hostname.replace(/^\[|\]$/g, "");
     if (!this.allowedCallbackHosts.has(callbackHost)) {
       return json(
         this.errorBody(
@@ -202,7 +209,7 @@ export class PluginHttpGateway {
     // registered plugin could point it at an internal host/metadata endpoint and
     // turn the health check into an SSRF probe (MCP-bridge security audit).
     if (manifest.health_url) {
-      const healthHost = new URL(manifest.health_url).hostname;
+      const healthHost = new URL(manifest.health_url).hostname.replace(/^\[|\]$/g, "");
       if (!this.allowedCallbackHosts.has(healthHost)) {
         return json(
           this.errorBody(
@@ -334,6 +341,21 @@ export class PluginHttpGateway {
         401,
       );
     }
+
+    // Replay guard: the HMAC + ts-window above accept a captured request as many
+    // times as it is resent within the window. Reject a signature already used,
+    // and prune entries past the window so the map stays bounded (#255 follow-up).
+    const nowMs = Date.now();
+    for (const [s, exp] of this.seenInvokeSigs) {
+      if (exp <= nowMs) this.seenInvokeSigs.delete(s);
+    }
+    if (this.seenInvokeSigs.has(sig)) {
+      return json(
+        this.errorBody("replayed_signature", "request signature already used", requestId, name),
+        401,
+      );
+    }
+    this.seenInvokeSigs.set(sig, tsMs + REPLAY_WINDOW_MS);
 
     const fqn = `${name}__${tool}`;
     const bridge = getMcpBridge();
@@ -526,7 +548,11 @@ export class PluginHttpGateway {
         signal: ctrl.signal,
         redirect: "manual",
       });
-      const healthy = r.ok;
+      // A 3xx (redirect:"manual" surfaces it as an opaque/normal response, not a
+      // throw) means the host RESPONDED, so the service is up — don't equate a
+      // redirect-fronted health_url with "down" (#255 self-review). We still
+      // never follow the redirect (SSRF safety).
+      const healthy = r.ok || (r.status >= 300 && r.status < 400);
       plugin.lastHealthCheck = { ts: new Date(), healthy, status: r.status };
       return json({ name, healthy, status: r.status, request_id: requestId });
     } catch (e) {

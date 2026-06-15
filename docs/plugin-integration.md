@@ -21,7 +21,7 @@ Daemon-style plugins register themselves over HTTP and serve tool calls via a ca
 | `POST` | `/api/plugin/register` | Bearer bootstrap | Register plugin + tools |
 | `POST` | `/api/plugin/<n>/tools/<t>/invoke` | HMAC + timestamp | Invoke tool via callback |
 | `DELETE` | `/api/plugin/<n>` | Bootstrap or plugin token | Unregister |
-| `GET` | `/api/plugin/list` | None | List registered plugins + health |
+| `GET` | `/api/plugin/list` | Bearer bootstrap | List registered plugins + health |
 | `GET` | `/api/plugin/<n>/health` | None | Proxy to plugin health_url |
 
 ### Security model
