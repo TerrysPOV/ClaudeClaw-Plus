@@ -9,24 +9,16 @@
 import { describe, expect, it } from "bun:test";
 import { PtyAgentProcess, type PtyHandle } from "../session-agent-process";
 
-function fakePty(): { handle: PtyHandle; writes: string[] } {
-  const writes: string[] = [];
-  const handle: PtyHandle = {
-    pid: 1234,
-    onData: () => ({ dispose() {} }),
-    onExit: () => ({ dispose() {} }),
-    write: (data: string) => {
-      writes.push(data);
-    },
-    kill: () => {},
-  };
-  return { handle, writes };
-}
-
 describe("PtyAgentProcess.send_prompt_stream", () => {
   it("serialises concurrent prompts so their bytes don't interleave", async () => {
-    const { handle, writes } = fakePty();
+    const { handle, writes, emit } = bootPty();
     const proc = new PtyAgentProcess("alpha", handle, { submitConfirmMs: 5 });
+
+    // A real REPL redraws after each CR: streaming output replaces the footer,
+    // so each turn confirms started after the first window -> exactly one CR per
+    // prompt. (A silent fake never confirms and now nudges to budget — covered
+    // by the idle-REPL test below — which would mask the interleave check here.)
+    const iv = setInterval(() => emit("assistant is streaming a response chunk"), 2);
 
     // Fire two prompts without awaiting the first — without serialisation the
     // second `write(line)` would land inside the first's 200ms settle window,
@@ -34,6 +26,7 @@ describe("PtyAgentProcess.send_prompt_stream", () => {
     const a = proc.send_prompt_stream("first");
     const b = proc.send_prompt_stream("second");
     await Promise.all([a, b]);
+    clearInterval(iv);
 
     // Each prompt's text is immediately followed by its own CR.
     expect(writes).toEqual(["first", "\r", "second", "\r"]);
@@ -168,6 +161,10 @@ describe("PtyAgentProcess.send_prompt_stream delivery-confirm (#wedge)", () => {
     clearInterval(iv);
     // Only the initial submit CR -- no idle footer was ever seen, so no nudge.
     expect(writes.filter((w) => w === "\r").length).toBe(1);
+    // The turn never started, so the typed line is still stranded in the input
+    // box; a stuck compaction must clear it too (else it concatenates onto the
+    // next prompt) -- not only the unconfirmed-idle outcome.
+    expect(writes).toContain("\x15"); // Ctrl-U cleared the stranded line
   });
 
   it("does NOT mistake the bare word 'Compacting' in streamed output for a compaction (no stall)", async () => {
@@ -204,6 +201,60 @@ describe("PtyAgentProcess.send_prompt_stream delivery-confirm (#wedge)", () => {
       await p;
       clearInterval(iv);
       expect(writes).toContain("\x15"); // Ctrl-U cleared the un-submitted prompt
+      expect(warnings.some((w) => w.includes("not confirmed"))).toBe(true);
+    } finally {
+      console.warn = realWarn;
+    }
+  });
+
+  it("treats a WHITESPACE-only confirm window as inconclusive (not a started turn) — the .trim() guard", async () => {
+    // A confirm window that contains only whitespace/newlines must NOT be read
+    // as a started turn: `recentOut.trim().length > 0` is false on "   \n", so
+    // the window stays inconclusive, spends a nudge, and (budget gone) gives up
+    // honestly with a line-clear + warn — same as a truly-empty window. Guards
+    // the `.trim()` half of the gate that a non-whitespace test would miss.
+    const { handle, writes, emit } = bootPty();
+    const realWarn = console.warn;
+    const warnings: string[] = [];
+    console.warn = (...a: unknown[]) => {
+      warnings.push(a.map(String).join(" "));
+    };
+    try {
+      const proc = new PtyAgentProcess("z", handle, { submitConfirmMs: 20, maxSubmitNudges: 2 });
+      const p = proc.send_prompt_stream("hello");
+      // Only whitespace flows during the confirm windows — never a footer,
+      // never streaming text.
+      const iv = setInterval(() => emit("   \n  \n"), 6);
+      await p;
+      clearInterval(iv);
+      expect(writes.filter((w) => w === "\r").length).toBe(3); // submit + 2 nudges
+      expect(writes).toContain("\x15"); // Ctrl-U cleared the un-submitted line
+      expect(warnings.some((w) => w.includes("not confirmed"))).toBe(true);
+    } finally {
+      console.warn = realWarn;
+    }
+  });
+
+  it("does NOT mistake a silent idle REPL (zero output) for a started turn — keeps nudging then gives up honestly (idle-REPL wedge, dossier 20260612T080557)", async () => {
+    const { handle, writes } = bootPty();
+    const realWarn = console.warn;
+    const warnings: string[] = [];
+    console.warn = (...a: unknown[]) => {
+      warnings.push(a.map(String).join(" "));
+    };
+    try {
+      const proc = new PtyAgentProcess("z", handle, { submitConfirmMs: 20, maxSubmitNudges: 2 });
+      // A long-idle REPL whose swallowed CR triggers no redraw emits NOTHING
+      // during the confirm windows (never call emit). The empty buffer must not
+      // be read as a started turn: `!includes("to cycle")` is true on "" too.
+      // The loop must spend its full nudge budget and then give up honestly,
+      // not claim a phantom turn-started and let the prompt rot to the 5-min
+      // receipt timeout (the residual wedge this guards).
+      await proc.send_prompt_stream("hello");
+      // initial submit CR + 2 nudges = 3 (an empty window is inconclusive, not
+      // a turn-start, so every window spends a nudge until the budget is gone).
+      expect(writes.filter((w) => w === "\r").length).toBe(3);
+      expect(writes).toContain("\x15"); // Ctrl-U cleared the un-submitted line
       expect(warnings.some((w) => w.includes("not confirmed"))).toBe(true);
     } finally {
       console.warn = realWarn;
