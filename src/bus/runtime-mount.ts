@@ -269,6 +269,7 @@ export async function mountBusRuntime(
       createMcpReconciler({
         isConnected: (agentId) => bus.isAgentConnected(agentId),
         isProcessAlive: (agentId) => sessionManager.health()[agentId]?.alive ?? false,
+        isTurnActive: (agentId) => bus.isAgentTurnActive(agentId),
         restart: (agentId) => sessionManager.restart(agentId),
         log: (msg, fields) => logger.error("[mcp-reconcile]", msg, fields),
       }),

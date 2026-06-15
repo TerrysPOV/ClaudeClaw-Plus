@@ -180,6 +180,9 @@ export interface BusCore {
   ): void;
   /** True if Bus core currently holds a live MCP/IPC connection for the agent (#222). */
   isAgentConnected(agentId: string): boolean;
+  /** True if the agent has a turn currently streaming (#222 reconciler reads
+   *  this to skip restarting a deaf-but-mid-turn agent). */
+  isAgentTurnActive(agentId: string): boolean;
   ingestReply(req: IngestReplyRequest): void;
   ingestSessionEvent(e: BusEvent): void;
   ingestPermissionDecision(req: IngestPermissionDecisionRequest): void;
@@ -300,6 +303,17 @@ export class BusCoreImpl implements BusCore {
    */
   private readonly agentTurnActive = new Set<string>();
   /**
+   * Prompts that were outstanding (held in the delivery queue, or flushed and
+   * awaiting turn-start verification) when an agent's socket closed — typically
+   * a #222 reconciler restart of an alive-but-deaf agent. Without this they are
+   * silently dropped: onClose tears down the queue and the verify, and the
+   * restart resumes the session WITHOUT re-typing the keystroke, so no recovery
+   * layer owns the prompt (#252 stack ultra). Snapshotted on close, re-delivered
+   * through the gate when the fresh generation reaches `replay_done`. Cleared on
+   * shutdown; superseded if the agent never comes back (no further replay_done).
+   */
+  private readonly pendingRedelivery = new Map<string, string[]>();
+  /**
    * Silent-drop safety net (issue #215): tracks per-agent whether the
    * current turn has called the `reply` MCP tool with `intent: "final"`.
    * Reset on every new inbound prompt (`sendPrompt`), set to `true` when
@@ -399,6 +413,17 @@ export class BusCoreImpl implements BusCore {
           const heldInitTimer = this.agentInitializing.get(agentId);
           if (heldInitTimer) clearTimeout(heldInitTimer);
           this.agentInitializing.delete(agentId);
+          // Snapshot any outstanding prompts (still-held queue + flushed-and-
+          // awaiting-verify) BEFORE tearing them down, so a reconciler restart
+          // of an alive-but-deaf agent re-delivers them once the fresh session
+          // is ready instead of silently dropping them (#252 stack ultra). The
+          // timers themselves still die here (no stale keystroke into a reused
+          // agent_id — the #252 HIGH); only the prompt text is carried over.
+          const carryOver = new Set<string>(this.deliveryQueue.get(agentId) ?? []);
+          const pendingVerify = this.flushVerify.get(agentId);
+          if (pendingVerify)
+            for (const entry of pendingVerify.values()) carryOver.add(entry.wrapped);
+          if (carryOver.size > 0) this.pendingRedelivery.set(agentId, [...carryOver]);
           this.deliveryQueue.delete(agentId);
           // Same hazard for a pending flush-verify timer: if it fired after a
           // restart that reused this agent_id it would type a stale keystroke
@@ -438,6 +463,7 @@ export class BusCoreImpl implements BusCore {
     this.flushVerify.clear();
     this.inFlightDeliveries.clear();
     this.agentTurnActive.clear();
+    this.pendingRedelivery.clear();
   }
 
   /* ─────────────────────────────── prompts ─────────────────────────────── */
@@ -633,6 +659,23 @@ export class BusCoreImpl implements BusCore {
     const timer = this.agentInitializing.get(agent_id);
     if (timer) clearTimeout(timer);
     this.agentInitializing.delete(agent_id);
+    // A (re)ready session generation cannot have the previous turn still
+    // streaming, so clear the neighbor-turn flag here too. This is the
+    // generation boundary that recovers a stuck agentTurnActive after a
+    // reconciler restart whose new tailer (startAt:"end") never replays the
+    // interrupted turn's end_turn — without it, flush-verify would defer
+    // forever for this agent and leak a lingering entry per prompt (#252 stack
+    // ultra HIGH).
+    this.agentTurnActive.delete(agent_id);
+    // Re-deliver prompts carried over from a prior socket close (e.g. a #222
+    // reconciler restart of a deaf agent): the fresh session is now ready, so
+    // push them through the gate. Independent of the held-queue below, and done
+    // first so they keep their original order ahead of anything newly held.
+    const carried = this.pendingRedelivery.get(agent_id);
+    if (carried) {
+      this.pendingRedelivery.delete(agent_id);
+      for (const wrapped of carried) this.deliverOrQueuePrompt(agent_id, wrapped);
+    }
     const q = this.deliveryQueue.get(agent_id);
     if (!q || q.length === 0) return;
     this.deliveryQueue.delete(agent_id);
@@ -778,6 +821,15 @@ export class BusCoreImpl implements BusCore {
 
   isAgentConnected(agentId: string): boolean {
     return this.connectedAgents.has(agentId);
+  }
+
+  /** True if the agent has a turn currently streaming (tailer `prompt` seen, no
+   *  `response.turn_end` yet). The #222 reconciler reads this to avoid a
+   *  destructive restart of an agent that is merely deaf-but-mid-turn — the turn
+   *  still completes and is delivered by the silent-drop net (#215), which rides
+   *  the tailer, not the dead MCP socket. */
+  isAgentTurnActive(agentId: string): boolean {
+    return this.agentTurnActive.has(agentId);
   }
 
   /* ─────────────────────────────── subscriptions ─────────────────────────────── */
@@ -1139,6 +1191,10 @@ export class BusCoreImpl implements BusCore {
         // tracking flag to keep the map bounded.
         this.currentTurnReplied.delete(agentId);
         this.currentTurnFinalPublished.delete(agentId);
+        // A cancelled/errored turn emits no response.turn_end, so the
+        // neighbor-turn flag would never clear via the tailer — drop it here
+        // too, else flush-verify defers forever for this agent (#252 stack ultra).
+        this.agentTurnActive.delete(agentId);
         break;
       case "request_human": {
         // Forward the correlation id along with the question. Without
@@ -1197,6 +1253,10 @@ export class BusCoreImpl implements BusCore {
         // turn_end either — clear tracking too.
         this.currentTurnReplied.delete(agentId);
         this.currentTurnFinalPublished.delete(agentId);
+        // A cancelled/errored turn emits no response.turn_end, so the
+        // neighbor-turn flag would never clear via the tailer — drop it here
+        // too, else flush-verify defers forever for this agent (#252 stack ultra).
+        this.agentTurnActive.delete(agentId);
         break;
       // hello already handled in the IPC layer; outbound types (prompt,
       // permission_response, ask_answer) shouldn't arrive from MCP.

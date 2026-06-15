@@ -83,6 +83,22 @@ describe("createMcpReconciler (#222)", () => {
     expect(h.logs.some((l) => l.msg === "reconcile-skip")).toBe(true);
   });
 
+  it("does NOT restart while a turn is actively streaming — defers until the turn ends (#252 stack ultra)", async () => {
+    let turnActive = true;
+    const h = harness({ isTurnActive: () => turnActive });
+    const onFail = createMcpReconciler(h.deps);
+    onFail("default", { reason: "test" });
+    await h.flush(); // confirm window fires: turn active → skip + re-arm, no restart
+    expect(h.restartCalls).toEqual([]);
+    expect(
+      h.logs.some((l) => l.msg === "reconcile-skip" && l.fields.reason === "turn-active"),
+    ).toBe(true);
+    // The turn ends; the deferred re-check now restarts the still-deaf agent.
+    turnActive = false;
+    await h.flush();
+    expect(h.restartCalls).toEqual(["default"]);
+  });
+
   it("coalesces a burst of signals into a single restart", async () => {
     const h = harness();
     const onFail = createMcpReconciler(h.deps);

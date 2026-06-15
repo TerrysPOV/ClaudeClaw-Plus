@@ -217,10 +217,21 @@ export async function bindUdsServer(path: string, handlers: IpcServerHandlers): 
       close(socket) {
         allSockets.delete(socket);
         const aid = socket.data?.agentId;
-        if (aid && connectionsByAgent.get(aid) === socket) {
-          connectionsByAgent.delete(aid);
+        if (aid) {
+          if (connectionsByAgent.get(aid) === socket) {
+            // This socket is the agent's CURRENT connection — a real disconnect.
+            connectionsByAgent.delete(aid);
+            handlers.onClose(aid);
+          }
+          // else: a newer hello for the same agent_id already superseded this
+          // socket (reconnect / reconciler restart reusing agent_id, see the
+          // `prev.end()` takeover in handleMessage). This is the OLD socket
+          // closing late; firing onClose would tear down the FRESH generation's
+          // delivery-gate / flush-verify / silent-drop state (#252 stack ultra).
+          // The new socket owns the agent now — skip the stale teardown.
+        } else {
+          handlers.onClose(null); // pre-handshake socket closed
         }
-        handlers.onClose(aid ?? null);
       },
       error(socket, err) {
         handlers.onError(err, socket.data?.agentId ?? null);
