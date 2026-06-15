@@ -41,6 +41,11 @@ export class McpServerProcess {
   private restartHook?: (name: string, reason: string) => void;
   private stopping = false;
   private restartTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Fires after the server has been stably "up" for CRASH_WINDOW_MS, resetting
+   *  the crash counters so the restart backoff reflects the CURRENT crash burst
+   *  rather than the process lifetime. Cancelled by the next crash, so a tight
+   *  crash-loop never resets and its backoff still escalates. */
+  private stabilityTimer: ReturnType<typeof setTimeout> | null = null;
   // Generation counter: stale onclose/onerror handlers from old transports are discarded
   private generation = 0;
   /**
@@ -152,6 +157,18 @@ export class McpServerProcess {
 
     this.status = "up";
     this.startedAt = new Date();
+    // Arm the stability reset: if the server stays up for a full crash window,
+    // clear the crash counters so a later isolated crash gets a SHORT backoff
+    // again instead of being pinned at max by the lifetime crash count. A crash
+    // before then cancels this (see _handleCrash), keeping backoff escalating
+    // through a genuine crash-loop.
+    if (this.stabilityTimer !== null) clearTimeout(this.stabilityTimer);
+    this.stabilityTimer = setTimeout(() => {
+      this.stabilityTimer = null;
+      this.crashCount = 0;
+      this.crashTimestamps = [];
+    }, CRASH_WINDOW_MS);
+    (this.stabilityTimer as { unref?: () => void }).unref?.();
   }
 
   async call(tool: string, args: unknown, timeoutMs = DEFAULT_CALL_TIMEOUT_MS): Promise<unknown> {
@@ -206,6 +223,10 @@ export class McpServerProcess {
       clearTimeout(this.restartTimer);
       this.restartTimer = null;
     }
+    if (this.stabilityTimer !== null) {
+      clearTimeout(this.stabilityTimer);
+      this.stabilityTimer = null;
+    }
     this.status = "stopped";
     try {
       await this.client?.close();
@@ -219,6 +240,12 @@ export class McpServerProcess {
 
   private _handleCrash(reason: string): void {
     if (this.stopping || this.status === "failed" || this.status === "stopped") return;
+    // A crash cancels the pending stability reset, so crashCount keeps climbing
+    // (and backoff keeps escalating) through a genuine crash-loop.
+    if (this.stabilityTimer !== null) {
+      clearTimeout(this.stabilityTimer);
+      this.stabilityTimer = null;
+    }
     this.status = "crashed";
     this.crashCount++;
     const now = Date.now();

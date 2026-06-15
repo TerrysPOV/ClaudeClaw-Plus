@@ -19,7 +19,17 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import { chmod, mkdir, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  stat,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { getMcpBridge } from "../mcp-bridge.js";
 
@@ -298,6 +308,12 @@ export class SessionPersistenceStore {
     const now = Date.now();
     const kept: PersistedSessionRecord[] = [];
     let mutated = false;
+    // Keys of entries we decide to drop. The prune-rewrite below filters the
+    // FRESHLY-read `current` by these keys (inside the mutex) instead of writing
+    // back this pre-computed snapshot — otherwise a record()/touch() that landed
+    // between this read and the rewrite is silently clobbered (lost update).
+    const dropped = new Set<string>();
+    const entryKey = (e: PersistedSessionRecord) => `${e.ptyId} ${e.sessionId}`;
 
     for (const entry of parsed.entries) {
       if (!_isPersistedRecord(entry)) {
@@ -317,11 +333,16 @@ export class SessionPersistenceStore {
           sessionId: entry.sessionId,
           reason: "integrity_failed",
         });
+        dropped.add(entryKey(entry));
         mutated = true;
         continue;
       }
 
-      const ageMs = now - entry.issuedAt;
+      // Age from lastUsedAt (bumped by touch()), not issuedAt: the TTL is an
+      // IDLE timeout, so an actively-used session must not be force-expired a
+      // fixed hour after it was first minted (MCP-bridge audit). lastUsedAt is
+      // set to issuedAt at mint, so a never-touched session still ages normally.
+      const ageMs = now - entry.lastUsedAt;
       if (ageMs > this.maxAgeMs) {
         _audit("mcp_session_lost_on_restart", {
           server: serverName,
@@ -330,6 +351,7 @@ export class SessionPersistenceStore {
           reason: "ttl_expired",
           ageMs,
         });
+        dropped.add(entryKey(entry));
         mutated = true;
         continue;
       }
@@ -343,12 +365,16 @@ export class SessionPersistenceStore {
       });
     }
 
-    // If we dropped anything, rewrite the file with only the kept entries.
+    // If we dropped anything, rewrite — but re-filter the FRESHLY-read `current`
+    // inside the mutex (dropping the entries we flagged + any corrupt ones),
+    // rather than writing back the stale `kept` snapshot. This preserves
+    // record()/touch() writes that landed concurrently with this loadAll.
     if (mutated) {
-      await this._mutate(serverName, () => ({
+      await this._mutate(serverName, (current) => ({
+        ...current,
         version: CURRENT_VERSION,
         serverName,
-        entries: kept,
+        entries: current.entries.filter((e) => _isPersistedRecord(e) && !dropped.has(entryKey(e))),
       }));
     }
 
@@ -387,6 +413,21 @@ export class SessionPersistenceStore {
       scanned += before;
       kept += records.length;
       dropped += Math.max(0, before - records.length);
+    }
+
+    // Reclaim orphaned atomic-write tmpfiles (`<server>.json.tmp.<hex>`) left by
+    // a hard crash between writeFile and rename — the error path is handled in
+    // _atomicWrite. Only sweep clearly-stale ones (mtime well in the past) so we
+    // never race a concurrent in-flight write.
+    const tmpCutoff = Date.now() - 60_000;
+    for (const filename of files) {
+      if (!filename.includes(".json.tmp.")) continue;
+      const p = join(this.storageRoot, filename);
+      try {
+        if ((await stat(p)).mtimeMs < tmpCutoff) await this._unlinkSafe(p);
+      } catch {
+        // best-effort — gone already or unreadable
+      }
     }
 
     _audit("mcp_session_gc", { scanned, kept, dropped });
@@ -451,14 +492,22 @@ export class SessionPersistenceStore {
     await this._ensureDir();
     const tmpSuffix = randomBytes(4).toString("hex");
     const tmpPath = `${filePath}.tmp.${tmpSuffix}`;
-    await writeFile(tmpPath, payload, { mode: FILE_MODE, encoding: "utf8" });
-    // Some FS / umask combinations strip the mode bits from writeFile; force.
     try {
-      await chmod(tmpPath, FILE_MODE);
-    } catch {
-      // best-effort
+      await writeFile(tmpPath, payload, { mode: FILE_MODE, encoding: "utf8" });
+      // Some FS / umask combinations strip the mode bits from writeFile; force.
+      try {
+        await chmod(tmpPath, FILE_MODE);
+      } catch {
+        // best-effort
+      }
+      await rename(tmpPath, filePath);
+    } catch (err) {
+      // writeFile succeeded but chmod/rename threw → the tmpfile would leak in
+      // storageRoot forever. Reclaim it before rethrowing. (A hard crash between
+      // write and rename is swept by garbageCollect's stale-tmp pass.)
+      await this._unlinkSafe(tmpPath);
+      throw err;
     }
-    await rename(tmpPath, filePath);
   }
 
   /** Safe unlink — swallows ENOENT, silently ignores other errors. */

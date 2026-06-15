@@ -282,10 +282,14 @@ describe("SessionPersistenceStore", () => {
       serverName: string;
       entries: PersistedSessionRecord[];
     };
-    // Back-date "tim" to well over the default 1h TTL.
+    // Back-date "tim" to well over the default 1h TTL. The TTL is now an IDLE
+    // timeout (measured from lastUsedAt, which touch() bumps), so back-date
+    // lastUsedAt — issuedAt alone no longer expires an actively-tracked session.
     const stale = parsed.entries.find((e) => e.ptyId === "tim");
     if (!stale) throw new Error("expected tim entry");
-    stale.issuedAt = Date.now() - 10 * 60 * 60 * 1000; // 10 hours ago
+    const tenHoursAgo = Date.now() - 10 * 60 * 60 * 1000;
+    stale.issuedAt = tenHoursAgo;
+    stale.lastUsedAt = tenHoursAgo;
     writeFileSync(filePath, JSON.stringify(parsed));
 
     const result = await store.garbageCollect();

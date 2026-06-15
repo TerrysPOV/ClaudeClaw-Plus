@@ -197,6 +197,24 @@ export class PluginHttpGateway {
         400,
       );
     }
+    // health_url is fetched on demand by the (unauthenticated) health endpoint,
+    // so it MUST be host-allowlisted exactly like callback_url — otherwise a
+    // registered plugin could point it at an internal host/metadata endpoint and
+    // turn the health check into an SSRF probe (MCP-bridge security audit).
+    if (manifest.health_url) {
+      const healthHost = new URL(manifest.health_url).hostname;
+      if (!this.allowedCallbackHosts.has(healthHost)) {
+        return json(
+          this.errorBody(
+            "health_host_not_allowed",
+            `Host ${healthHost} not in allowlist`,
+            requestId,
+            manifest.name,
+          ),
+          400,
+        );
+      }
+    }
 
     if (this.plugins.has(manifest.name)) {
       // Clean up stale tools from bridge before re-registering
@@ -427,6 +445,16 @@ export class PluginHttpGateway {
 
   private async handleList(req: Request): Promise<Response> {
     const requestId = this.requestId(req);
+    // The plugin/tool inventory is sensitive (it maps the agent's capability
+    // surface); gate it behind the bootstrap token like /register and
+    // /multiplexer/metrics, rather than leaving it world-readable on the bind.
+    const authToken = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/, "");
+    if (!this.verifyBootstrap(authToken)) {
+      return json(
+        this.errorBody("invalid_bootstrap", "Invalid or missing Bearer token", requestId),
+        401,
+      );
+    }
     const list = [...this.plugins.values()].map((p) => ({
       name: p.manifest.name,
       version: p.manifest.version,
@@ -490,13 +518,20 @@ export class PluginHttpGateway {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 5_000);
     try {
-      const r = await fetch(plugin.manifest.health_url, { signal: ctrl.signal });
+      // redirect:"manual" so an allowlisted health_url cannot 3xx-redirect the
+      // request to an internal host (SSRF via redirect). Raw error strings are
+      // NOT reflected to the caller — they can leak internal network topology;
+      // a generic "unreachable" is returned instead (MCP-bridge security audit).
+      const r = await fetch(plugin.manifest.health_url, {
+        signal: ctrl.signal,
+        redirect: "manual",
+      });
       const healthy = r.ok;
       plugin.lastHealthCheck = { ts: new Date(), healthy, status: r.status };
       return json({ name, healthy, status: r.status, request_id: requestId });
     } catch (e) {
       plugin.lastHealthCheck = { ts: new Date(), healthy: false, error: String(e) };
-      return json({ name, healthy: false, error: String(e), request_id: requestId });
+      return json({ name, healthy: false, error: "unreachable", request_id: requestId });
     } finally {
       clearTimeout(timer);
     }
