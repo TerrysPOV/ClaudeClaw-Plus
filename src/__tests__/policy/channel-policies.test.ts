@@ -17,7 +17,7 @@ import {
   reloadScopedPolicy,
   type ScopedPolicyConfig,
 } from "../../policy/channel-policies";
-import { loadRules, type ToolRequestContext, type PolicyRule } from "../../policy/engine";
+import { loadRules, evaluate, type ToolRequestContext, type PolicyRule } from "../../policy/engine";
 
 const POLICY_DIR = join(process.cwd(), ".claude", "claudeclaw");
 const SCOPED_POLICY_FILE = join(POLICY_DIR, "scoped-policies.json");
@@ -107,6 +107,70 @@ describe("Channel Policies - Scoped Rules", () => {
     const denyRule = rules.find((r) => r.id === "channel-deny-bash");
     expect(denyRule).toBeDefined();
     expect(denyRule?.action).toBe("deny");
+  });
+
+  it("evaluate() ENFORCES a scoped channel deny over a global allow (the wiring, governance audit HIGH)", async () => {
+    const POLICY_FILE = join(POLICY_DIR, "policies.json");
+    try {
+      // Global rule ALLOWS Bash everywhere (low priority).
+      await writeFile(
+        POLICY_FILE,
+        JSON.stringify({
+          rules: [
+            {
+              id: "global-allow-bash",
+              priority: 1,
+              tool: "Bash",
+              action: "allow",
+              reason: "global allow",
+            },
+          ],
+        }),
+        "utf8",
+      );
+      await loadRules();
+      // Scoped policy DENIES Bash in one specific channel (higher priority).
+      await writeFile(
+        SCOPED_POLICY_FILE,
+        JSON.stringify({
+          version: 1,
+          sources: {
+            telegram: {
+              source: "telegram",
+              channels: {
+                "telegram:123": {
+                  channelId: "telegram:123",
+                  denyRules: [
+                    {
+                      id: "channel-deny-bash",
+                      priority: 200,
+                      tool: "Bash",
+                      action: "deny",
+                      reason: "channel deny",
+                    },
+                  ],
+                },
+              },
+            },
+          },
+          globalRules: [],
+          updatedAt: new Date().toISOString(),
+        }),
+        "utf8",
+      );
+      reloadScopedPolicy();
+
+      // In the denied channel → scoped deny now participates and wins.
+      const denied = evaluate(createRequest({ toolName: "Bash", channelId: "telegram:123" }));
+      expect(denied.action).toBe("deny");
+      expect(denied.matchedRuleId).toBe("channel-deny-bash");
+
+      // In a different channel → the scoped rule does not apply, global allow stands.
+      const allowed = evaluate(createRequest({ toolName: "Bash", channelId: "telegram:999" }));
+      expect(allowed.action).toBe("allow");
+    } finally {
+      await rm(POLICY_FILE, { force: true });
+    }
   });
 
   it("should resolve user-specific overrides", async () => {
