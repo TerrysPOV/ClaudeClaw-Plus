@@ -30,6 +30,7 @@ import { randomUUID } from "node:crypto";
 import type { EventRecord, EventEntryInput } from "../event-log";
 import { append as eventLogAppend } from "../event-log";
 import { bindUdsServer, encodeFrame, resolveDefaultUdsPath, type IpcServer } from "./core-ipc";
+import { sanitizePtyPromptText } from "../runner/pty-prompt-sanitizer";
 import {
   DEFAULT_RINGBUFFER_CAPACITY,
   drainSubscriber,
@@ -126,6 +127,16 @@ export interface BusCoreOptions {
    *  agent's session (re)initialises before it's flushed even without a
    *  `replay_done`. Defaults to 4000. Lowered in tests. */
   deliveryBackstopMs?: number;
+  /** After a BACKSTOP flush (timer-driven, not a real `replay_done`), the
+   *  session may still be mid-(re)init and swallow the keystroke, so the prompt
+   *  never starts a turn (the socket=no wedge, dossier 20260613T033017). Verify
+   *  a turn actually starts within this window; if not, re-deliver ONCE. Only
+   *  the backstop path is verified — the real `replay_done` path is known-ready.
+   *  Defaults to 8000. Lowered in tests. */
+  flushVerifyMs?: number;
+  /** Grace (ms) after a delivery handler settles before a verify re-delivers,
+   *  to let the asynchronous turn-start tailer event land first. Default 1500. */
+  flushVerifyGraceMs?: number;
   /** Slash-command delegate (Agent C wires this). */
   slashCommandHandler?: SlashCommandHandler;
   /** REPL prompt delegate for PTY-stdin agents. Wired by the Session Manager. */
@@ -240,6 +251,55 @@ export class BusCoreImpl implements BusCore {
   private readonly agentLiveSession = new Map<string, string>();
   private readonly deliveryBackstopMs: number;
   /**
+   * Pending turn-start verification for a BACKSTOP-flushed prompt. The backstop
+   * fires on a TIMER because `replay_done` never arrived — but during an
+   * IPC-reconnect storm the session is still re-initialising, so the flushed
+   * keystroke can be swallowed and never start a turn (dossier 20260613T033017).
+   * After such a flush we watch for proof THAT prompt started a turn — a tailer
+   * `prompt` event whose ingested text matches the wrapped string we delivered
+   * (exact attribution; an unrelated later prompt's turn must not satisfy an
+   * earlier swallowed one) — and, if none lands within `flushVerifyMs`,
+   * re-deliver THAT prompt ONCE through the gate. Per-prompt timers, not one
+   * per agent: a second flush adds to the set instead of discarding pending
+   * ones, and each prompt is verified/re-delivered independently. The watchdog
+   * stays the ultimate net. Maps agent → (wrapped prompt → verify timer).
+   */
+  private readonly flushVerify = new Map<
+    string,
+    Map<string, { wrapped: string; graced: boolean; timer: ReturnType<typeof setTimeout> }>
+  >();
+  private readonly flushVerifyMs: number;
+  /**
+   * Grace (ms) between a delivery handler settling and declaring the prompt
+   * swallowed. The turn-start `prompt` event reaches the bus asynchronously via
+   * the JSONL tailer and can lag a little behind the handler return; without a
+   * grace the verify could fire in that window and re-deliver a prompt whose
+   * turn actually started (post-settle/pre-ingest double-submit). Defaults to
+   * min(1500, flushVerifyMs/4) so it scales down with the lowered test timings.
+   */
+  private readonly flushVerifyGraceMs: number;
+  /**
+   * In-flight `streamPromptHandler` count per agent. A delivery handler that
+   * hasn't settled is legitimately working — notably it holds through
+   * auto-compaction (maxCompactionWaitMs, up to 240s ≫ flushVerifyMs). The
+   * flush-verify timer must NOT re-deliver while a handler is in-flight or it
+   * double-submits the prompt once compaction finishes (#252 regression). It
+   * defers until the handler settles instead.
+   */
+  private readonly inFlightDeliveries = new Map<string, number>();
+  /**
+   * Agents with a turn currently streaming (tailer `prompt` seen, no
+   * `response.turn_end` yet). A prompt delivered while a neighbor turn is in
+   * progress can only be a queued keystroke in the REPL input box — the PTY
+   * confirm-loop cannot attribute the neighbor's stream to it and may falsely
+   * report it as turn-started (#250 ultra HIGH). The bus has reliable
+   * attribution (the per-prompt `prompt` tailer event), so deliveries made
+   * during an active turn arm a flush-verify; that verify is DEFERRED while a
+   * turn is still active (the prompt legitimately waits behind it — re-delivering
+   * sooner would double-submit), then re-delivers only if no turn ever starts.
+   */
+  private readonly agentTurnActive = new Set<string>();
+  /**
    * Silent-drop safety net (issue #215): tracks per-agent whether the
    * current turn has called the `reply` MCP tool with `intent: "final"`.
    * Reset on every new inbound prompt (`sendPrompt`), set to `true` when
@@ -281,6 +341,9 @@ export class BusCoreImpl implements BusCore {
     this.socketPath = opts.socketPath ?? null;
     this.ringbufferCapacity = opts.ringbufferCapacity ?? DEFAULT_RINGBUFFER_CAPACITY;
     this.deliveryBackstopMs = opts.deliveryBackstopMs ?? 4000;
+    this.flushVerifyMs = opts.flushVerifyMs ?? 8000;
+    this.flushVerifyGraceMs =
+      opts.flushVerifyGraceMs ?? Math.min(1500, Math.ceil(this.flushVerifyMs / 4));
     this.eventLogAppend = opts.eventLogAppend ?? eventLogAppend;
     this.slashCommandHandler = opts.slashCommandHandler ?? null;
     this.streamPromptHandler = opts.streamPromptHandler ?? null;
@@ -337,6 +400,12 @@ export class BusCoreImpl implements BusCore {
           if (heldInitTimer) clearTimeout(heldInitTimer);
           this.agentInitializing.delete(agentId);
           this.deliveryQueue.delete(agentId);
+          // Same hazard for a pending flush-verify timer: if it fired after a
+          // restart that reused this agent_id it would type a stale keystroke
+          // into the fresh session (#252 HIGH).
+          this.clearFlushVerify(agentId);
+          this.inFlightDeliveries.delete(agentId);
+          this.agentTurnActive.delete(agentId);
           this.logIpc("close", {
             agent: agentId,
             connections: this.ipcServer?.connectionCount() ?? 0,
@@ -364,6 +433,11 @@ export class BusCoreImpl implements BusCore {
     this.agentInitializing.clear();
     this.deliveryQueue.clear();
     this.agentLiveSession.clear();
+    for (const pending of this.flushVerify.values())
+      for (const entry of pending.values()) clearTimeout(entry.timer);
+    this.flushVerify.clear();
+    this.inFlightDeliveries.clear();
+    this.agentTurnActive.clear();
   }
 
   /* ─────────────────────────────── prompts ─────────────────────────────── */
@@ -422,9 +496,11 @@ export class BusCoreImpl implements BusCore {
       text: req.text,
       metadata: req.metadata,
     };
+    let ipcSendFailed = false;
     if (this.ipcServer) {
       const sent = this.ipcServer.send(req.agent_id, ipcMsg);
       if (!sent) {
+        ipcSendFailed = true;
         this.onError(new Error(`No MCP connection for agent_id=${req.agent_id}`), {
           ctx: "sendPrompt",
         });
@@ -466,7 +542,26 @@ export class BusCoreImpl implements BusCore {
         }
       }
       const wrapped = `<channel ${attrs.join(" ")}>${escapeXmlText(req.text)}</channel>`;
+      // If the agent's session is (re)initialising the prompt is HELD and the
+      // backstop flush-verify path already covers it. The uncovered case is an
+      // IMMEDIATE delivery whose IPC send just failed: the MCP/IPC socket
+      // blipped at the prompt boundary, so the PTY keystroke can coincide with a
+      // reconnect and be swallowed without starting a turn — and the #222
+      // reconciler disarms on "reconnected during confirm window" WITHOUT
+      // checking a turn started (dossier 20260614T034258). Verify turn-start for
+      // that prompt and re-deliver once if none lands.
+      // Arm a turn-start verify when the PTY confirm-loop can't be trusted to
+      // attribute the turn to THIS prompt: (a) the IPC send just failed (socket
+      // blip), or (b) a neighbor turn is already streaming, so this keystroke is
+      // queued in the REPL box and the confirm-loop may read the neighbor's
+      // stream as this prompt's turn-start (#250 HIGH). The verify defers while a
+      // turn stays active and re-delivers only if no turn ever starts.
+      const deliveredImmediately = !this.agentInitializing.has(req.agent_id);
+      const neighborTurnActive = this.agentTurnActive.has(req.agent_id);
       this.deliverOrQueuePrompt(req.agent_id, wrapped);
+      if ((ipcSendFailed || neighborTurnActive) && deliveredImmediately) {
+        this.armFlushVerify(req.agent_id, [wrapped]);
+      }
     }
     return { promise_id };
   }
@@ -487,9 +582,17 @@ export class BusCoreImpl implements BusCore {
 
   private streamDeliver(agent_id: string, wrapped: string): void {
     if (!this.streamPromptHandler) return;
-    void this.streamPromptHandler(agent_id, wrapped).catch((err) =>
-      this.onError(err, { ctx: "streamPromptHandler", agent_id }),
-    );
+    // Track the handler as in-flight so a flush-verify timer can tell a prompt
+    // that is legitimately being processed (e.g. holding through compaction)
+    // from one that was silently swallowed (#252).
+    this.inFlightDeliveries.set(agent_id, (this.inFlightDeliveries.get(agent_id) ?? 0) + 1);
+    void this.streamPromptHandler(agent_id, wrapped)
+      .catch((err) => this.onError(err, { ctx: "streamPromptHandler", agent_id }))
+      .finally(() => {
+        const n = (this.inFlightDeliveries.get(agent_id) ?? 1) - 1;
+        if (n <= 0) this.inFlightDeliveries.delete(agent_id);
+        else this.inFlightDeliveries.set(agent_id, n);
+      });
   }
 
   /** `session.init` → start holding PTY-stdin prompts for this agent, UNLESS
@@ -516,7 +619,7 @@ export class BusCoreImpl implements BusCore {
         ),
         { ctx: "deliveryBackstop", agent_id },
       );
-      this.markAgentReady(agent_id);
+      this.markAgentReady(agent_id, undefined, true);
     }, this.deliveryBackstopMs);
     this.agentInitializing.set(agent_id, timer);
   }
@@ -525,7 +628,7 @@ export class BusCoreImpl implements BusCore {
    *  (so a late `session.init` for it can't re-arm a hold), clear any pending
    *  hold, and flush held prompts in order. Called unconditionally on
    *  `replay_done`, which the tailer emits for every session generation. */
-  private markAgentReady(agent_id: string, session_id?: string): void {
+  private markAgentReady(agent_id: string, session_id?: string, viaBackstop = false): void {
     if (session_id) this.agentLiveSession.set(agent_id, session_id);
     const timer = this.agentInitializing.get(agent_id);
     if (timer) clearTimeout(timer);
@@ -534,6 +637,120 @@ export class BusCoreImpl implements BusCore {
     if (!q || q.length === 0) return;
     this.deliveryQueue.delete(agent_id);
     for (const wrapped of q) this.streamDeliver(agent_id, wrapped);
+    // A backstop flush is timer-driven (no `replay_done`), so the session may
+    // still be mid-(re)init and swallow the keystroke; verify a turn actually
+    // starts and re-deliver once if not. The real `replay_done` path is
+    // known-ready and needs no verification.
+    if (viaBackstop) this.armFlushVerify(agent_id, q);
+  }
+
+  /** Arm per-prompt turn-start verification after a backstop flush. Each flushed
+   *  prompt gets its own one-shot timer; a prompt already awaiting verification
+   *  is left untouched (a second flush ADDS to the set, never discards pending
+   *  ones — #252). The timer is cancelled by `noteFlushTurnStart` when the
+   *  matching `prompt` lands, and re-delivers exactly that prompt otherwise. */
+  private armFlushVerify(agent_id: string, prompts: string[]): void {
+    let pending = this.flushVerify.get(agent_id);
+    if (!pending) {
+      pending = new Map();
+      this.flushVerify.set(agent_id, pending);
+    }
+    for (const wrapped of prompts) {
+      // Key by the text the tailer will actually observe, NOT the raw wrapped
+      // string: the PTY layer runs sanitizePtyPromptText (collapses newlines to
+      // spaces, strips control chars) before typing, and claude records — and
+      // the tailer re-emits as the `prompt` event — that sanitized form. Keying
+      // by the raw wrapped (with literal newlines) would never match a
+      // multi-line prompt's turn-start event, so attribution would silently
+      // fail and a healthy turn get re-delivered / double-submitted (#252
+      // ultra-review HIGH). Keep the original wrapped to re-deliver verbatim.
+      const key = sanitizePtyPromptText(wrapped);
+      // pending.has(key) covers BOTH an active verify AND a re-delivered entry
+      // left in place to enforce at-most-once (see scheduleFlushVerify): a later
+      // backstop flush therefore never arms a 2nd verify for the same prompt.
+      if (pending.has(key)) continue;
+      pending.set(key, {
+        wrapped,
+        graced: false,
+        timer: this.scheduleFlushVerify(agent_id, key, this.flushVerifyMs),
+      });
+    }
+  }
+
+  private scheduleFlushVerify(
+    agent_id: string,
+    key: string,
+    delayMs: number,
+  ): ReturnType<typeof setTimeout> {
+    return setTimeout(() => {
+      const pending = this.flushVerify.get(agent_id);
+      const entry = pending?.get(key);
+      if (!pending || !entry) return;
+      // Defer while the prompt legitimately can't have started its turn yet:
+      //  - a delivery handler is still in-flight (compaction-aware: it holds
+      //    through auto-compaction, up to maxCompactionWaitMs ≫ flushVerifyMs); or
+      //  - a neighbor turn is still streaming, so this prompt is queued behind it
+      //    in the REPL box and can only start once that turn ends (#250 HIGH).
+      // Re-delivering in either case would double-submit. Re-arm and re-check.
+      if ((this.inFlightDeliveries.get(agent_id) ?? 0) > 0 || this.agentTurnActive.has(agent_id)) {
+        entry.graced = false;
+        entry.timer = this.scheduleFlushVerify(agent_id, key, this.flushVerifyMs);
+        return;
+      }
+      // Post-settle grace: the handler has returned but the turn-start `prompt`
+      // event reaches the bus asynchronously (JSONL tailer) and can lag behind.
+      // Wait one short grace for it before declaring the prompt swallowed, else a
+      // turn that started right as the handler returned would be re-delivered
+      // (the post-settle/pre-ingest double-submit window).
+      if (!entry.graced) {
+        entry.graced = true;
+        entry.timer = this.scheduleFlushVerify(agent_id, key, this.flushVerifyGraceMs);
+        return;
+      }
+      // No turn after settle + grace → genuinely swallowed by a still-(re)init
+      // TUI. Re-deliver through the gate so an in-progress re-init re-holds it
+      // instead of swallowing it again. KEEP the entry in `pending` (don't
+      // delete) and do NOT re-arm: a later backstop flush sees pending.has(key)
+      // and skips it, so a prompt gets AT MOST ONE re-delivery for its whole
+      // lifetime (the watchdog is the net beyond that). The entry is cleared
+      // when the re-delivery's turn-start lands (noteFlushTurnStart) or on
+      // socket close / shutdown (clearFlushVerify).
+      this.onError(
+        new Error(
+          `backstop-flushed prompt produced no turn within ${this.flushVerifyMs}ms; re-delivering once for agent_id=${agent_id}`,
+        ),
+        { ctx: "flushVerify", agent_id },
+      );
+      this.deliverOrQueuePrompt(agent_id, entry.wrapped);
+    }, delayMs);
+  }
+
+  /** A tailer `prompt` event proves THAT specific prompt started its turn: its
+   *  ingested text is the user line claude recorded = the wrapped string we
+   *  delivered. Cancel only the matching pending verify, so an unrelated later
+   *  prompt's turn never silences a still-swallowed earlier prompt's
+   *  re-delivery (#252). */
+  private noteFlushTurnStart(agent_id: string, ingestedText: string): void {
+    const pending = this.flushVerify.get(agent_id);
+    if (!pending) return;
+    // ingestedText is the line claude recorded (already PTY-sanitized) and the
+    // map keys are sanitized too; sanitize again — it is idempotent — to be
+    // robust against any residual normalization before the exact-match lookup.
+    const key = sanitizePtyPromptText(ingestedText);
+    const entry = pending.get(key);
+    if (!entry) return;
+    clearTimeout(entry.timer);
+    pending.delete(key);
+    if (pending.size === 0) this.flushVerify.delete(agent_id);
+  }
+
+  /** Cancel and drop every pending flush-verify for an agent (socket close, or
+   *  shutdown) so no stale timer fires into a restarted/reused session. */
+  private clearFlushVerify(agent_id: string): void {
+    const pending = this.flushVerify.get(agent_id);
+    if (!pending) return;
+    for (const entry of pending.values()) clearTimeout(entry.timer);
+    this.flushVerify.delete(agent_id);
   }
 
   async invokeSlashCommand(agent_id: string, cmd: string): Promise<void> {
@@ -745,6 +962,22 @@ export class BusCoreImpl implements BusCore {
     if (e.agent_id) {
       if (e.topic === "session.init") this.markAgentInitializing(e.agent_id, e.session_id);
       else if (e.topic === "bus.events.replay_done") this.markAgentReady(e.agent_id, e.session_id);
+      // Turn-start proof for a pending backstop-flush verification. ONLY the
+      // tailer `prompt` topic qualifies — it carries the ingested user line
+      // (= the wrapped string we delivered), so we can attribute the turn to the
+      // exact flushed prompt and cancel only its verify. Fires within ms of
+      // ingest (before any thinking), so a slow-but-healthy turn never trips a
+      // spurious re-delivery. In-turn topics (tool_result/usage/turn_end) carry
+      // no prompt identity and are deliberately NOT used: an unrelated prompt's
+      // activity must not silence a still-swallowed prompt's re-delivery.
+      else if (e.topic === "prompt") {
+        const text = (e.payload as { text?: string } | undefined)?.text;
+        // Cancel the matching prompt's verify FIRST (attribution), then mark the
+        // agent as having an active turn so a LATER prompt delivered during it
+        // arms — and defers — its own verify.
+        if (typeof text === "string") this.noteFlushTurnStart(e.agent_id, text);
+        this.agentTurnActive.add(e.agent_id);
+      }
     }
     // Silent-drop safety net (#215): the JSONL tailer publishes a
     // `response.turn_end` event when claude stops with `end_turn`. Hook
@@ -753,6 +986,9 @@ export class BusCoreImpl implements BusCore {
     if (e.topic === "response.turn_end" && e.agent_id) {
       const payload = e.payload as { text?: string };
       this.handleTurnEnd(e.agent_id, payload?.text ?? "");
+      // The turn ended → the REPL is free, so a prompt queued behind it can now
+      // start; stop deferring its flush-verify (see agentTurnActive).
+      this.agentTurnActive.delete(e.agent_id);
     }
     this.publish(e);
   }
