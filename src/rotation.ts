@@ -66,8 +66,19 @@ export async function rotateSession(config: SessionConfig): Promise<string | nul
   return freshSummary;
 }
 
-/** Write a summary for the given session. Returns the summary content on success, null on timeout or failure. */
-async function generateSummary(sessionId: string, summaryPath: string): Promise<string | null> {
+/**
+ * Write a summary for the given session. Returns the summary content on
+ * success, null on timeout or failure.
+ *
+ * Exported for the bus restart-based rotation path (#227): after
+ * `sessionManager.restart(reason:"rotation")` drops the live PTY, the rotation
+ * caller summarizes the BACKED-UP (old) session id here — never the live one,
+ * which would hit claude's locked-`--resume` refusal (the #227 critical 3).
+ */
+export async function generateSummary(
+  sessionId: string,
+  summaryPath: string,
+): Promise<string | null> {
   await mkdir(summaryPath, { recursive: true });
 
   let summaryPrompt: string;

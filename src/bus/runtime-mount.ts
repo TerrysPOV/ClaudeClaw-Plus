@@ -40,6 +40,9 @@ import type { MountedAdapter } from "./adapter-wiring";
 import { stopBusAdapters } from "./adapter-wiring";
 import { detectOrphanAgents, formatOrphanWarnings } from "./orphan-agent-detect";
 import { createPromptStreamHandler } from "./receipt-wiring";
+import { peekSession } from "../sessions";
+import { generateSummary } from "../rotation";
+import { getSettings } from "../config";
 
 export interface BusRuntimeHandle {
   /** The mounted BusCore. Adapters / tests subscribe via this. */
@@ -76,6 +79,14 @@ export interface BusRuntimeHandle {
    * to legacy surfaces). Throws if the handle has already been stopped.
    */
   spawnAgents(batch?: readonly AgentConfig[], spawnOriginOverride?: BusOrigin): Promise<void>;
+  /**
+   * Restart-based session rotation for one agent (#227). Drops the live PTY,
+   * mints a fresh session id, respawns, and best-effort summarizes the old
+   * session in the background. Wired into the bridge's post-turn rotation gate
+   * (`streamBusPrompt`'s `rotateAgent` option) so a threshold trip actually
+   * rotates the live conversation instead of only logging a warning.
+   */
+  rotateAgent(agentId: string): Promise<void>;
   /**
    * Register adapters with the handle's stop lifecycle. Sprint 5.2b
    * (PR #123) Codex P1/P2 fold-in: callers wire adapters AFTER the
@@ -216,6 +227,55 @@ export function resolveDaemonSocketPath(override?: string): string {
 }
 
 /**
+ * Injectable dependencies for {@link createRotateAgent}. Kept narrow so the
+ * rotation orchestration is unit-testable without spawning a real PTY, reading
+ * settings, or shelling out to the summarizer.
+ */
+export interface RotateAgentDeps {
+  /** Drop the live PTY + mint a fresh session id + respawn (the #226 primitive, with reason "rotation"). */
+  restart: (agentId: string) => Promise<unknown>;
+  /** The agent's CURRENT (about-to-be-rotated) session id, read BEFORE restart. */
+  peekSessionId: (agentId: string) => Promise<string | undefined>;
+  /** Summarize a (no-longer-live) session id into the summary dir. */
+  summarize: (sessionId: string, summaryPath: string) => Promise<unknown>;
+  /** Resolve the configured summary dir, or "" to skip summarization. Must not throw. */
+  getSummaryPath: () => string;
+  logger: Pick<Console, "warn">;
+}
+
+/**
+ * Build the restart-based session-rotation orchestrator (#227).
+ *
+ * Order matters: capture the OLD session id, then `restart()` (which drops the
+ * live PTY, mints+persists a fresh session id, respawns — re-arming the message
+ * counter via the new session.json), THEN summarize the OLD id. Summarizing
+ * after the restart is what sidesteps claude's locked-`--resume` refusal (the
+ * old id is no longer live — #227 critical 3), and it runs in the background so
+ * the turn that tripped the threshold isn't blocked on the ~60s summarizer.
+ */
+export function createRotateAgent(deps: RotateAgentDeps): (agentId: string) => Promise<void> {
+  return async (agentId: string): Promise<void> => {
+    let oldSessionId: string | undefined;
+    try {
+      oldSessionId = await deps.peekSessionId(agentId);
+    } catch (err) {
+      deps.logger.warn(`[bus-runtime] rotation: peek session for ${agentId} failed`, err);
+    }
+
+    await deps.restart(agentId);
+
+    const summaryPath = deps.getSummaryPath();
+    if (oldSessionId && summaryPath) {
+      void deps
+        .summarize(oldSessionId, summaryPath)
+        .catch((err) =>
+          deps.logger.warn(`[bus-runtime] rotation summary for ${agentId} failed`, err),
+        );
+    }
+  };
+}
+
+/**
  * Mount the Bus runtime stack and return a teardown handle.
  *
  * Idempotency: each call returns a fresh handle. Callers must invoke
@@ -274,6 +334,32 @@ export async function mountBusRuntime(
         log: (msg, fields) => logger.error("[mcp-reconcile]", msg, fields),
       }),
     );
+
+    // #227 restart-based session rotation. The bus PTY is spawned once at boot
+    // and kept alive, so the session JSONL grows unbounded and per-prompt
+    // latency creeps up (#213). When the per-agent message/age threshold trips,
+    // the bridge calls this to actually rotate: restart() drops the live PTY,
+    // mints+persists a FRESH session id, and respawns (criticals 1 & 2 — the
+    // counter re-arms because a new session.json exists). The summary is the
+    // rotation caller's concern per restart()'s contract: generated against the
+    // now-freed OLD id (never the live one — critical 3) and in the background
+    // so the turn that tripped the threshold isn't blocked on the summarizer.
+    // (Injecting that summary into the fresh PTY's bootstrap has no bus consumer
+    // yet — the legacy runner consumes loadLatestSummary, the bus spawn path
+    // does not — so it stays a follow-up.)
+    const rotateAgent = createRotateAgent({
+      restart: (id) => sessionManager.restart(id, { reason: "rotation" }),
+      peekSessionId: async (id) => (await peekSession(id))?.sessionId,
+      summarize: generateSummary,
+      getSummaryPath: () => {
+        try {
+          return getSettings().session.summaryPath ?? "";
+        } catch {
+          return ""; // settings not loaded (early boot / tests) — skip summary
+        }
+      },
+      logger,
+    });
 
     const declaredAgents = opts.agents ?? [];
 
@@ -352,6 +438,7 @@ export async function mountBusRuntime(
       bus,
       sessionManager,
       socketPath,
+      rotateAgent,
       get spawnedAgentIds() {
         // Snapshot via getter so the handle reflects the current state
         // even after stop() empties the list.

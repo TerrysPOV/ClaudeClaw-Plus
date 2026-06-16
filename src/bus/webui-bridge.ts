@@ -69,6 +69,17 @@ export interface StreamBusPromptOptions {
    * process-wide singleton (`getDefaultReceiptStore`). Override is for tests.
    */
   receiptStore?: ReceiptStore;
+  /**
+   * Restart-based session rotation hook (#227). When the per-agent message/age
+   * threshold trips after a successful turn, the bridge calls this to drop the
+   * live PTY and respawn it on a fresh session id (`restart()`, #226), which is
+   * what actually rotates the live bus conversation. Injected by the daemon
+   * (it owns the SessionManager — `BusRuntimeHandle.rotateAgent`). When omitted
+   * (early boot / tests / webui without a SessionManager) the bridge falls back
+   * to a WARN, the pre-#227 behaviour. Awaited so the next prompt (serialized
+   * on the same per-agent slot) lands on the fresh PTY.
+   */
+  rotateAgent?: (agentId: string) => Promise<void>;
 }
 
 export interface BusPromptResult {
@@ -132,11 +143,12 @@ export async function streamBusPrompt(
       // global bootstrap tracker. Best-effort: a tracking failure must
       // never break the prompt the caller is awaiting.
       //
-      // The rotation MECHANISM is intentionally NOT wired here. Filesystem
-      // rotation can't rotate a live bus PTY — it keeps the same session
-      // id and process alive — so when the gate trips we only surface a
-      // WARN. The restart-based rotation that actually delivers #213 is
-      // tracked in #227 (built on the restart() primitive, #226).
+      // #227: when the threshold trips we now perform RESTART-BASED rotation
+      // via the injected `rotateAgent` hook — restart() drops the live PTY and
+      // respawns it on a fresh session id, which is the only thing that
+      // actually rotates a live bus conversation (filesystem rotation alone
+      // keeps the same process + id alive). Without the hook (early boot /
+      // tests / no SessionManager) we keep the pre-#227 WARN.
       try {
         await incrementMessageCount(agentId);
         let sessionConfig: ReturnType<typeof getSettings>["session"] | null = null;
@@ -148,11 +160,20 @@ export async function streamBusPrompt(
         if (sessionConfig?.autoRotate) {
           const peeked = await peekSession(agentId);
           if (peeked && needsRotation(peeked, sessionConfig)) {
-            console.warn(
-              `[${new Date().toLocaleTimeString()}] [bus] agent=${agentId} session needs rotation ` +
-                `(${peeked.messageCount ?? 0} msgs >= ${sessionConfig.maxMessages}) — ` +
-                `restart-based rotation not yet wired; deferred to #227.`,
-            );
+            if (opts.rotateAgent) {
+              await opts.rotateAgent(agentId);
+              console.log(
+                `[${new Date().toLocaleTimeString()}] [bus] agent=${agentId} session rotated ` +
+                  `(${peeked.messageCount ?? 0} msgs >= ${sessionConfig.maxMessages}) — ` +
+                  `fresh PTY + session id; next prompt lands on the new session.`,
+              );
+            } else {
+              console.warn(
+                `[${new Date().toLocaleTimeString()}] [bus] agent=${agentId} session needs rotation ` +
+                  `(${peeked.messageCount ?? 0} msgs >= ${sessionConfig.maxMessages}) — ` +
+                  `no rotateAgent hook injected; rotation skipped.`,
+              );
+            }
           }
         }
       } catch (e) {
