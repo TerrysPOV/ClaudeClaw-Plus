@@ -212,6 +212,72 @@ describe("wireBusAdapters — gating", () => {
   });
 });
 
+describe("wireBusAdapters — Telegram explicit-busRouting send-only pass-through (#201)", () => {
+  /** Minimal bus that supports the outbound subscribe/close the adapter needs. */
+  function subscribeBus(): BusCore {
+    return {
+      subscribe: () => {
+        const sub = {
+          id: "sub",
+          close() {},
+          get overflowCount() {
+            return 0;
+          },
+          get depth() {
+            return 0;
+          },
+        };
+        return sub;
+      },
+    } as unknown as BusCore;
+  }
+
+  it("mounts the adapter but never starts the inbound poll (guards the cfg.receiveEnabled wiring line)", async () => {
+    // Unlike the token-only send-only path (skipped entirely), an explicit
+    // busRouting send-only config MUST mount so outbound stays wired — but the
+    // inbound long-poll must not start. pollLoop calls api.getUpdates()
+    // synchronously on its first iteration, so if the `receiveEnabled` line in
+    // mountTelegram were dropped (defaulting to polling), a getUpdates fetch
+    // would fire during start(). Stub fetch just long enough to witness that.
+    const fetchCalls: string[] = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = ((input: unknown) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : String((input as { url?: string } | undefined)?.url ?? input);
+      fetchCalls.push(url);
+      return Promise.reject(new Error("network blocked in test"));
+    }) as unknown as typeof fetch;
+    try {
+      const result = await wireBusAdapters({
+        bus: subscribeBus(),
+        settings: baseSettings({
+          telegram: {
+            token: "123:abc",
+            allowedUserIds: [],
+            listenChats: [],
+            receiveEnabled: false,
+            dmIsolation: "shared",
+            busRouting: { chats: { "100": "triage" } },
+          } as Settings["telegram"],
+        }),
+        defaultAgentId: "default",
+        logger: SILENT_LOGGER,
+      });
+      const tg = result.adapters.find((a) => a.name === "telegram");
+      expect(tg).toBeDefined();
+      expect(result.errors.telegram).toBeUndefined();
+      // getUpdates is dispatched synchronously inside start(); by the time
+      // wireBusAdapters resolved it would already be recorded if polling started.
+      expect(fetchCalls.some((u) => u.includes("getUpdates"))).toBe(false);
+      await tg?.stop();
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});
+
 describe("configuredBusAdapterNames — Telegram token-only mount (#197)", () => {
   const tgSettings = (token: string, busRouting?: { chats: Record<string, string> }) =>
     baseSettings({
