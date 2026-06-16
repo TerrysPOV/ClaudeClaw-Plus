@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mountBusRuntime, type BusRuntimeHandle } from "../runtime-mount";
 import type { BusCore } from "../core";
-import { SessionManager } from "../session-manager";
+import { SessionManager, type RestartOptions } from "../session-manager";
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* FakeBus — records start/stop + slash-handler installation.             */
@@ -382,6 +382,37 @@ function cfg(id: string, overrides: Partial<AgentConfig> = {}): AgentConfig {
     ...overrides,
   };
 }
+
+/** Captures the (id, opts) every restart() call receives. */
+class RestartSpySessionManager extends FakeSessionManager {
+  public readonly restartLog: Array<{ id: string; opts: RestartOptions }> = [];
+  async restart(id: string, opts: RestartOptions = {}): Promise<AgentProcess> {
+    this.restartLog.push({ id, opts });
+    return {
+      onData: () => () => {},
+      onExit: () => () => {},
+      send_prompt: async () => {},
+      send_slash: async () => {},
+      kill: async () => {},
+    } as unknown as AgentProcess;
+  }
+}
+
+describe("mountBusRuntime — rotateAgent wiring (#227)", () => {
+  it("forwards reason:'rotation' to sessionManager.restart (crash-loop budget exemption)", async () => {
+    const bus = createFakeBus();
+    const sm = new RestartSpySessionManager();
+    const handle = await mountBusRuntime({ bus, sessionManager: sm, logger: SILENT_LOGGER });
+    try {
+      await handle.rotateAgent("agent-x");
+      // The load-bearing literal: rotation must be budget-exempt, which depends
+      // entirely on restart() receiving { reason: "rotation" }.
+      expect(sm.restartLog).toEqual([{ id: "agent-x", opts: { reason: "rotation" } }]);
+    } finally {
+      await handle.stop();
+    }
+  });
+});
 
 describe("mountBusRuntime — auto-spawn happy path", () => {
   let handle: BusRuntimeHandle | null = null;

@@ -1100,6 +1100,11 @@ export async function start(args: string[] = []) {
                 origin: "webui",
                 originId: "chat",
                 onChunk,
+                // #227: actually rotate the live PTY when the threshold trips.
+                // Bare reference is safe — rotateAgent is a closure over the
+                // SessionManager (no `this`); evaluated per-call so the handle
+                // is set by the time a chat request runs.
+                rotateAgent: busRuntimeHandle?.rotateAgent,
               });
               // Codex P2 on #136: surface timeout / dispatch failure to
               // the SSE stream so a failed turn doesn't render as a
@@ -1132,6 +1137,8 @@ export async function start(args: string[] = []) {
                         origin: sendOpts?.origin as import("../bus/types").BusOrigin | undefined,
                         originId: sendOpts?.originId,
                         timeoutMs: sendOpts?.timeoutMs,
+                        // #227: rotate the live PTY when the threshold trips.
+                        rotateAgent: busRuntimeHandle?.rotateAgent,
                       },
                     ),
                 }

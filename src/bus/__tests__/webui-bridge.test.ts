@@ -362,9 +362,12 @@ describe("streamBusPrompt — per-agent bookkeeping (#213, split per #218)", () 
   let frozenCwd: string;
   let tmp: string;
 
-  async function driveOneTurn(agentId: string): Promise<void> {
+  async function driveOneTurn(
+    agentId: string,
+    extraOpts: { rotateAgent?: (id: string) => Promise<void> } = {},
+  ): Promise<void> {
     const bus = makeBus();
-    const pending = streamBusPrompt(bus, agentId, "hi", { timeoutMs: 2000 });
+    const pending = streamBusPrompt(bus, agentId, "hi", { timeoutMs: 2000, ...extraOpts });
     await Promise.resolve();
     await Promise.resolve();
     bus.ingestReply({ agent_id: agentId, text: "ok", intent: "final" });
@@ -393,7 +396,7 @@ describe("streamBusPrompt — per-agent bookkeeping (#213, split per #218)", () 
     expect((await peekSession("alpha"))?.messageCount).toBe(1);
   });
 
-  it("WARNs and defers to #227 when the agent crosses the threshold — without rotating", async () => {
+  it("WARNs (no rotation) when the threshold trips but no rotateAgent hook is injected", async () => {
     // Point config at a settings file inside this test's temp dir (removed in
     // afterEach) so we never read or write the developer's real settings.json.
     const settingsFile = join(tmp, ".claude", "claudeclaw", "settings.json");
@@ -407,17 +410,46 @@ describe("streamBusPrompt — per-agent bookkeeping (#213, split per #218)", () 
       await createSession("22222222-2222-2222-2222-222222222222", "beta");
       await incrementMessageCount("beta"); // 0 -> 1; the next turn trips the gate
 
-      await driveOneTurn("beta"); // 1 -> 2, needsRotation(2 >= 2) === true
+      await driveOneTurn("beta"); // 1 -> 2, needsRotation(2 >= 2) === true; no hook
 
-      const warned = warnSpy.mock.calls.some((c) => String(c[0]).includes("deferred to #227"));
+      const warned = warnSpy.mock.calls.some((c) =>
+        String(c[0]).includes("no rotateAgent hook injected"),
+      );
       expect(warned).toBe(true);
 
-      // The rotation MECHANISM is not wired: the session is counted, not reset.
+      // Without a hook the live conversation is NOT rotated: counted, not reset.
       const after = await peekSession("beta");
       expect(after?.messageCount).toBe(2);
       expect(after?.sessionId).toBe("22222222-2222-2222-2222-222222222222");
     } finally {
       warnSpy.mockRestore();
+    }
+  });
+
+  it("invokes the injected rotateAgent hook when the agent crosses the threshold (#227)", async () => {
+    const settingsFile = join(tmp, ".claude", "claudeclaw", "settings.json");
+    mkdirSync(join(tmp, ".claude", "claudeclaw"), { recursive: true });
+    writeFileSync(settingsFile, JSON.stringify({ session: { autoRotate: true, maxMessages: 2 } }));
+    _setSettingsFileForTests(settingsFile);
+
+    try {
+      await reloadSettings();
+      await createSession("33333333-3333-3333-3333-333333333333", "gamma");
+
+      const rotated: string[] = [];
+      const rotateAgent = async (id: string) => {
+        rotated.push(id);
+      };
+
+      // Turn 1: 0 -> 1, below threshold (maxMessages 2) — hook must NOT fire.
+      await driveOneTurn("gamma", { rotateAgent });
+      expect(rotated).toEqual([]);
+
+      // Turn 2: 1 -> 2, needsRotation(2 >= 2) === true — hook fires with the id.
+      await driveOneTurn("gamma", { rotateAgent });
+      expect(rotated).toEqual(["gamma"]);
+    } finally {
+      _setSettingsFileForTests();
     }
   });
 
