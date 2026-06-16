@@ -194,6 +194,15 @@ export interface BusCoreOptions {
    * the bus — same late-binding pattern as `slashCommandHandler`).
    */
   jobHandler?: AgentJobHandler;
+  /**
+   * Reply-tool enforcement (#215/#240). When an agent ends a channel-driven
+   * turn with text but never calls `reply`, the bus first nudges it to call
+   * `reply` (a curated reply beats a synthesized raw dump), and only synthesizes
+   * the labeled safety-net delivery if the nudged turn ALSO skips `reply`.
+   * Set to `false` to disable the nudge and synthesize immediately (the
+   * pre-nudge #217 behaviour) — a kill switch for the live path. Default true.
+   */
+  replyNudge?: boolean;
 }
 
 /* ───────────────────────────────────────────────────────────────────── */
@@ -421,7 +430,21 @@ export class BusCoreImpl implements BusCore {
    */
   private readonly currentTurnFinalPublished = new Map<string, boolean>();
 
+  /**
+   * Reply-tool enforcement (#215/#240). `replyNudged` records that the agent
+   * was already nudged once for the in-flight turn, so a nudged turn that again
+   * ends without `reply` falls through to the synthesized safety net instead of
+   * nudging forever. `pendingNudgeText` holds the original turn's text so the
+   * fallback can still deliver it if the nudged turn produces no fresh text.
+   * Both are cleared on prompt / final reply / disconnect / cancel / error,
+   * alongside the other per-turn flags.
+   */
+  private readonly replyNudgeEnabled: boolean;
+  private readonly replyNudged = new Map<string, boolean>();
+  private readonly pendingNudgeText = new Map<string, string>();
+
   constructor(opts: BusCoreOptions = {}) {
+    this.replyNudgeEnabled = opts.replyNudge ?? true;
     this.socketPath = opts.socketPath ?? null;
     this.ringbufferCapacity = opts.ringbufferCapacity ?? DEFAULT_RINGBUFFER_CAPACITY;
     this.deliveryBackstopMs = opts.deliveryBackstopMs ?? 4000;
@@ -476,6 +499,10 @@ export class BusCoreImpl implements BusCore {
           this.originAmbiguous.delete(agentId);
           this.currentTurnReplied.delete(agentId);
           this.currentTurnFinalPublished.delete(agentId);
+          // Reply-tool enforcement (#215/#240): drop nudge state with the rest
+          // of the per-turn flags so a dead session can't leave it dangling.
+          this.replyNudged.delete(agentId);
+          this.pendingNudgeText.delete(agentId);
           // The subprocess is gone -- tear down this agent's delivery-gate
           // state too, so a held prompt plus an armed backstop timer can never
           // flush a stale keystroke into a restart that reuses this agent_id.
@@ -605,6 +632,10 @@ export class BusCoreImpl implements BusCore {
     // #217 finding 2: a new turn starts undelivered — clear the
     // cross-transport "final already published" dedup flag.
     this.currentTurnFinalPublished.set(req.agent_id, false);
+    // Reply-tool enforcement (#215/#240): a fresh user turn — drop any nudge
+    // state from the previous turn so this turn gets its own one-shot nudge.
+    this.replyNudged.delete(req.agent_id);
+    this.pendingNudgeText.delete(req.agent_id);
 
     const ipcMsg: IpcPrompt = {
       type: "prompt",
@@ -1050,6 +1081,10 @@ export class BusCoreImpl implements BusCore {
       // the cross-transport race loser (real reply vs synthesized) is
       // suppressed above.
       this.currentTurnFinalPublished.set(req.agent_id, true);
+      // Reply-tool enforcement (#215/#240): a final was delivered (incl. one a
+      // nudge successfully produced) — clear the nudge state for the turn.
+      this.replyNudged.delete(req.agent_id);
+      this.pendingNudgeText.delete(req.agent_id);
     }
   }
 
@@ -1068,7 +1103,13 @@ export class BusCoreImpl implements BusCore {
     // #217 finding 2: if a final already published for this turn (e.g. the
     // real reply IPC landed first), don't synthesize a duplicate.
     if (this.currentTurnFinalPublished.get(agentId) === true) return;
-    if (!text || text.trim().length === 0) return;
+    // Effective text to deliver: this turn's own text, or — on a turn we already
+    // nudged that produced none — the original text stashed when we nudged, so a
+    // nudged-but-still-silent turn never loses the first turn's output (#215).
+    const nudged = this.replyNudged.get(agentId) === true;
+    const ownText = text && text.trim().length > 0 ? text : "";
+    const deliverText = ownText || (nudged ? (this.pendingNudgeText.get(agentId) ?? "") : "");
+    if (deliverText.trim().length === 0) return;
     // RESIDUAL RACE (#217 finding 3 → deferred #239): `lastPromptOrigin` and
     // the per-turn flags are single-slot, keyed by agent_id only, with no
     // prompt/turn identity. The JSONL tailer's `response.turn_end` is
@@ -1102,27 +1143,83 @@ export class BusCoreImpl implements BusCore {
     if (!CHANNEL_DRIVEN_ORIGINS.has(origin.origin)) {
       return;
     }
+    // ROOT-CAUSE FIRST (#215): the agent skipped the `reply` tool. Rather than
+    // immediately shipping the raw, uncurated turn text, give it ONE chance to
+    // deliver properly — inject a system reminder telling it to call `reply`
+    // now. A curated reply is what the user actually wants; the synthesized
+    // dump is a last resort. Bounded to one nudge per turn via `replyNudged`.
+    if (this.replyNudgeEnabled && !nudged) {
+      console.warn(
+        `[bus] silent-drop detected for agent=${agentId} (origin=${origin.origin}, ` +
+          `chars=${deliverText.length}): turn ended with text but no reply tool call — ` +
+          `nudging the agent to call reply. See issue #215.`,
+      );
+      this.replyNudged.set(agentId, true);
+      this.pendingNudgeText.set(agentId, deliverText);
+      this.nudgeForReply(agentId, origin);
+      return;
+    }
+    // FALLBACK (#217/#240): the nudge is disabled or already spent and the turn
+    // STILL ended without a reply — synthesize a labeled delivery so the user
+    // gets something rather than nothing.
     console.warn(
       `[bus] silent-drop recovered for agent=${agentId} (origin=${origin.origin}, ` +
-        `chars=${text.length}): the turn ended with text but the agent did not call the ` +
-        `reply tool — synthesizing ingestReply to deliver. See issue #215.`,
+        `chars=${deliverText.length}): no reply tool call${nudged ? " even after a nudge" : ""} — ` +
+        `synthesizing ingestReply to deliver. See issue #215/#240.`,
     );
     // Mark BEFORE the recursive ingestReply so the synthetic call itself
     // doesn't trigger another safety-net pass (it would no-op anyway
     // because we set the flag here, but the explicit ordering makes the
     // single-fire intent clearer).
     this.currentTurnReplied.set(agentId, true);
+    this.replyNudged.delete(agentId);
+    this.pendingNudgeText.delete(agentId);
     // `synthetic: true` lets this first delivery through the cross-transport
     // dedup (#217 finding 2); it sets `currentTurnFinalPublished`, so a
     // later real `reply` IPC for the same turn is suppressed.
     this.ingestReply(
       {
         agent_id: agentId,
-        text,
+        text: deliverText,
         intent: "final",
       },
       { synthetic: true },
     );
+  }
+
+  /**
+   * Reply-tool enforcement (#215/#240). Inject a one-shot system reminder
+   * telling the agent to call `reply` now, after it ended a channel-driven turn
+   * with text but no reply. Delivered over the same seams as a prompt — IPC for
+   * MCP-connected agents, PTY-stdin for headless ones — but best-effort: a
+   * failed IPC send is swallowed here (it must NOT trip the #222 respawn
+   * reconciler, which is for real prompts), and the synthesized safety net in
+   * `handleTurnEnd` still backs the nudge if it does not yield a reply.
+   *
+   * The nudged turn is a fresh turn that should end in `reply`, so reset the
+   * per-turn delivered/published flags: a real reply then lands cleanly, and if
+   * it doesn't, the next `response.turn_end` falls through to the fallback.
+   */
+  private nudgeForReply(agentId: string, origin: { origin: BusOrigin; origin_id: string }): void {
+    const text =
+      "You ended your turn without calling the `reply` tool, so the user received " +
+      "nothing — your transcript text does not reach them. Call `reply` now with " +
+      "intent:'final' to send your answer for this turn.";
+    this.currentTurnReplied.set(agentId, false);
+    this.currentTurnFinalPublished.set(agentId, false);
+    // IPC path (best-effort, no reconciler): reach an MCP-connected agent.
+    this.ipcServer?.send(agentId, {
+      type: "prompt",
+      agent_id: agentId,
+      origin: origin.origin,
+      origin_id: origin.origin_id,
+      user_id: "system",
+      text,
+      metadata: { nudge: "reply-tool" },
+    });
+    // PTY-stdin path for headless agents. A <system-reminder> wrap signals this
+    // is bus-injected guidance, not a user message from a surface.
+    this.deliverOrQueuePrompt(agentId, `<system-reminder>${escapeXmlText(text)}</system-reminder>`);
   }
 
   ingestSessionEvent(e: BusEvent): void {
@@ -1444,6 +1541,10 @@ export class BusCoreImpl implements BusCore {
         // tracking flag to keep the map bounded.
         this.currentTurnReplied.delete(agentId);
         this.currentTurnFinalPublished.delete(agentId);
+        // Reply-tool enforcement (#215/#240): no turn_end is coming — drop the
+        // nudge state too so it can't leak into a later turn for this agent.
+        this.replyNudged.delete(agentId);
+        this.pendingNudgeText.delete(agentId);
         // A cancelled/errored turn emits no response.turn_end, so the
         // neighbor-turn flag would never clear via the tailer — drop it here
         // too, else flush-verify defers forever for this agent (#252 stack ultra).
@@ -1538,6 +1639,10 @@ export class BusCoreImpl implements BusCore {
         // turn_end either — clear tracking too.
         this.currentTurnReplied.delete(agentId);
         this.currentTurnFinalPublished.delete(agentId);
+        // Reply-tool enforcement (#215/#240): no turn_end is coming — drop the
+        // nudge state too so it can't leak into a later turn for this agent.
+        this.replyNudged.delete(agentId);
+        this.pendingNudgeText.delete(agentId);
         // A cancelled/errored turn emits no response.turn_end, so the
         // neighbor-turn flag would never clear via the tailer — drop it here
         // too, else flush-verify defers forever for this agent (#252 stack ultra).
