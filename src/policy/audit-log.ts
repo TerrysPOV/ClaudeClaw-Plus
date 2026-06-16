@@ -17,6 +17,7 @@
 import { appendFile, readFile, mkdir, writeFile, rename } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
 
 // ============================================================================
 // Types
@@ -39,6 +40,10 @@ export interface AuditEntry {
   matchedRuleId?: string;
   operatorId?: string;
   metadata?: Record<string, unknown>;
+  /** Hash of the previous entry's `hash` field, forming a tamper-evident chain. */
+  prevHash?: string;
+  /** sha256(prevHash + JSON(entry-without-prevHash/hash)). */
+  hash?: string;
 }
 
 // ============================================================================
@@ -66,6 +71,54 @@ const AUDIT_DIR = join(process.cwd(), ".claude", "claudeclaw");
 const AUDIT_LOG_FILE = join(AUDIT_DIR, "audit-log.jsonl");
 const DEFAULT_RETENTION_DAYS = 30;
 const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
+const GENESIS_HASH = "0".repeat(64);
+
+// ============================================================================
+// Tamper-evident hash chain
+// ============================================================================
+//
+// Each entry carries `prevHash` (the previous entry's `hash`) and `hash`
+// (sha256 over prevHash + the entry's own content). Inserting, removing,
+// reordering or editing any entry breaks the chain at that point, which
+// `verifyChain()` detects. Writes are serialized through `writeChain` so the
+// chain stays consistent even with concurrent (fire-and-forget) callers.
+
+let lastHash: string | null = null;
+let writeChain: Promise<void> = Promise.resolve();
+
+/** Stable hash of an entry's content (prevHash/hash fields excluded by caller). */
+function computeEntryHash(prevHash: string, content: Record<string, unknown>): string {
+  return createHash("sha256")
+    .update(prevHash + JSON.stringify(content))
+    .digest("hex");
+}
+
+/** Resolve the chain tail hash, re-seeding from disk and resetting on file loss. */
+async function getLastHash(): Promise<string> {
+  if (!existsSync(AUDIT_LOG_FILE)) {
+    lastHash = GENESIS_HASH;
+    return lastHash;
+  }
+  if (lastHash !== null) return lastHash;
+  const content = await readFile(AUDIT_LOG_FILE, "utf8");
+  const lines = content.split("\n").filter((l) => l.trim());
+  if (lines.length === 0) {
+    lastHash = GENESIS_HASH;
+    return lastHash;
+  }
+  try {
+    const last = JSON.parse(lines[lines.length - 1]) as AuditEntry;
+    lastHash = last.hash ?? GENESIS_HASH;
+  } catch {
+    lastHash = GENESIS_HASH;
+  }
+  return lastHash;
+}
+
+/** Reset the in-memory chain cache (test isolation helper). */
+export function _resetChainCache(): void {
+  lastHash = null;
+}
 
 // ============================================================================
 // Core API
@@ -75,17 +128,29 @@ const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024; // 10MB
  * Log a policy decision or operator action.
  */
 export async function log(entry: AuditEntry): Promise<void> {
-  // Ensure directory exists
-  if (!existsSync(AUDIT_DIR)) {
-    await mkdir(AUDIT_DIR, { recursive: true });
-  }
+  // Serialize writes so the hash chain stays consistent under concurrent
+  // (often fire-and-forget) callers. A failed write must not stall the chain.
+  const result = writeChain.then(async () => {
+    if (!existsSync(AUDIT_DIR)) {
+      await mkdir(AUDIT_DIR, { recursive: true });
+    }
 
-  // Create a new object with timestamp if not provided (never mutate the input)
-  const finalEntry = entry.timestamp ? entry : { ...entry, timestamp: new Date().toISOString() };
+    // Never mutate the input; strip any caller-supplied chain fields so we
+    // hash only the entry content.
+    const { prevHash: _p, hash: _h, ...rest } = entry;
+    const content: AuditEntry = rest.timestamp
+      ? { ...rest }
+      : { ...rest, timestamp: new Date().toISOString() };
 
-  // Append to log file
-  const line = JSON.stringify(finalEntry) + "\n";
-  await appendFile(AUDIT_LOG_FILE, line, "utf8");
+    const prevHash = await getLastHash();
+    const hash = computeEntryHash(prevHash, content as Record<string, unknown>);
+    const chained = { ...content, prevHash, hash };
+
+    await appendFile(AUDIT_LOG_FILE, JSON.stringify(chained) + "\n", "utf8");
+    lastHash = hash;
+  });
+  writeChain = result.catch(() => {});
+  return result;
 }
 
 /**
@@ -367,17 +432,98 @@ export async function cleanupRetention(
     }
   }
 
-  // Write kept lines back atomically (temp file + rename)
+  // Write kept lines back atomically (temp file + rename). Removing entries
+  // necessarily breaks the original chain, so re-seal the survivors into a
+  // fresh chain — retention is an authorized operation and verifyChain() must
+  // still pass afterwards.
   if (deleted > 0) {
+    let prev = GENESIS_HASH;
+    const resealed = keptLines.map((line) => {
+      const parsed = JSON.parse(line) as AuditEntry;
+      const { prevHash: _p, hash: _h, ...content } = parsed;
+      const hash = computeEntryHash(prev, content as Record<string, unknown>);
+      const chained = { ...content, prevHash: prev, hash };
+      prev = hash;
+      return JSON.stringify(chained);
+    });
     const tmpPath = AUDIT_LOG_FILE + ".tmp";
-    await writeFile(tmpPath, keptLines.map((l) => l + "\n").join(""), "utf8");
+    await writeFile(tmpPath, resealed.map((l) => l + "\n").join(""), "utf8");
     await rename(tmpPath, AUDIT_LOG_FILE);
+    lastHash = resealed.length > 0 ? prev : GENESIS_HASH;
   }
 
   return {
     deleted,
     remaining: keptLines.length,
   };
+}
+
+// ============================================================================
+// Chain verification
+// ============================================================================
+
+export interface ChainVerification {
+  valid: boolean;
+  entries: number;
+  /** Index (0-based) of the first entry that breaks the chain, if any. */
+  brokenAt?: number;
+  reason?: string;
+}
+
+/**
+ * Verify the tamper-evident hash chain over the audit log.
+ *
+ * Walks every entry, recomputing each hash from the running previous hash and
+ * the entry content. Any insertion, deletion, reorder or edit surfaces as a
+ * prevHash or hash mismatch at the affected index.
+ */
+export async function verifyChain(): Promise<ChainVerification> {
+  if (!existsSync(AUDIT_LOG_FILE)) {
+    return { valid: true, entries: 0 };
+  }
+
+  const content = await readFile(AUDIT_LOG_FILE, "utf8");
+  const lines = content.split("\n").filter((l) => l.trim());
+  let prev = GENESIS_HASH;
+
+  for (let i = 0; i < lines.length; i++) {
+    let entry: AuditEntry;
+    try {
+      entry = JSON.parse(lines[i]);
+    } catch {
+      return { valid: false, entries: lines.length, brokenAt: i, reason: "unparseable entry" };
+    }
+
+    if (entry.prevHash === undefined || entry.hash === undefined) {
+      return {
+        valid: false,
+        entries: lines.length,
+        brokenAt: i,
+        reason: "entry missing chain fields (legacy or stripped)",
+      };
+    }
+    if (entry.prevHash !== prev) {
+      return {
+        valid: false,
+        entries: lines.length,
+        brokenAt: i,
+        reason: "prevHash mismatch (entry inserted, removed or reordered)",
+      };
+    }
+    const { prevHash: _p, hash: storedHash, ...entryContent } = entry;
+    const recomputed = computeEntryHash(prev, entryContent as Record<string, unknown>);
+    if (recomputed !== storedHash) {
+      return {
+        valid: false,
+        entries: lines.length,
+        brokenAt: i,
+        reason: "hash mismatch (entry content tampered)",
+      };
+    }
+    prev = storedHash;
+  }
+
+  return { valid: true, entries: lines.length };
 }
 
 /**
