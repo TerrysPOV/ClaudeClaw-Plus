@@ -17,8 +17,9 @@
 
 import { join } from "path";
 import { existsSync } from "fs";
-import { appendFile, readdir } from "fs/promises";
+import { appendFile, readdir, readFile } from "fs/promises";
 import { randomUUID } from "crypto";
+import { homedir } from "os";
 
 const USAGE_DIR = join(process.cwd(), ".claude", "claudeclaw", "usage");
 const USAGE_INDEX_FILE = join(USAGE_DIR, "usage-index.json");
@@ -40,6 +41,62 @@ export interface EstimatedCost {
   cacheCost?: number;
   totalCost?: number;
   pricingVersion?: string;
+}
+
+/**
+ * Sum the token usage of an invocation by reading claude's own session
+ * transcript. Both execution paths (legacy stream-json AND the PTY supervisor)
+ * leave the per-turn usage in `~/.claude/projects/<mangled-cwd>/<sessionId>.jsonl`
+ * — the daemon's only reliable, path-agnostic source of real token counts
+ * (the budget layer was previously fed `undefined`, so enforcement never fired).
+ * Sums every `assistant` message at or after `sinceIso` (the invocation start),
+ * which covers multi-message tool-use turns. Best-effort: returns null on any
+ * read/parse failure or if no usage is found, so a finalize never throws.
+ */
+export async function extractTranscriptUsage(
+  cwd: string,
+  sessionId: string,
+  sinceIso: string,
+): Promise<UsageMetrics | null> {
+  try {
+    if (!sessionId || sessionId === "unknown") return null;
+    const mangled = cwd.replace(/\//g, "-");
+    const jsonlPath = join(homedir(), ".claude", "projects", mangled, `${sessionId}.jsonl`);
+    if (!existsSync(jsonlPath)) return null;
+    const since = Date.parse(sinceIso);
+    const content = await readFile(jsonlPath, "utf8");
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let cacheCreationInputTokens = 0;
+    let cacheReadInputTokens = 0;
+    let found = false;
+    for (const line of content.split("\n")) {
+      if (!line.trim()) continue;
+      let entry: {
+        type?: string;
+        timestamp?: string;
+        message?: { usage?: Record<string, number> };
+      };
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (entry.type !== "assistant" || !entry.message?.usage) continue;
+      const ts = Date.parse(entry.timestamp ?? "");
+      if (Number.isFinite(since) && Number.isFinite(ts) && ts < since) continue;
+      const u = entry.message.usage;
+      found = true;
+      inputTokens += u.input_tokens ?? 0;
+      outputTokens += u.output_tokens ?? 0;
+      cacheCreationInputTokens += u.cache_creation_input_tokens ?? 0;
+      cacheReadInputTokens += u.cache_read_input_tokens ?? 0;
+    }
+    if (!found) return null;
+    return { inputTokens, outputTokens, cacheCreationInputTokens, cacheReadInputTokens };
+  } catch {
+    return null;
+  }
 }
 
 export interface InvocationUsageRecord {
@@ -514,19 +571,24 @@ export async function getAggregates(filters: UsageFilters = {}): Promise<{
         result.killedInvocations++;
       }
 
-      // Tokens
-      const inputTokens = record.usage?.inputTokens ?? 0;
-      const outputTokens = record.usage?.outputTokens ?? 0;
-      const cacheCreationTokens = record.usage?.cacheCreationInputTokens ?? 0;
-      const cacheReadTokens = record.usage?.cacheReadInputTokens ?? 0;
+      // Tokens — clamp to a finite, non-negative value. A corrupted or tampered
+      // record (negative, NaN, Infinity) must not poison the aggregate the
+      // budget engine reads, or skew spend up/down (governance audit).
+      const safe = (n: unknown): number =>
+        typeof n === "number" && Number.isFinite(n) && n >= 0 ? n : 0;
+      const inputTokens = safe(record.usage?.inputTokens);
+      const outputTokens = safe(record.usage?.outputTokens);
+      const cacheCreationTokens = safe(record.usage?.cacheCreationInputTokens);
+      const cacheReadTokens = safe(record.usage?.cacheReadInputTokens);
 
       result.totalInputTokens += inputTokens;
       result.totalOutputTokens += outputTokens;
       result.totalCacheCreationTokens += cacheCreationTokens;
       result.totalCacheReadTokens += cacheReadTokens;
 
-      // Cost
-      const cost = record.estimatedCost?.totalCost ?? 0;
+      // Cost — same clamp (a negative cost would let a tampered record reduce
+      // the aggregate and mask real spend below a block threshold).
+      const cost = safe(record.estimatedCost?.totalCost);
       result.totalEstimatedCost += cost;
 
       // By provider

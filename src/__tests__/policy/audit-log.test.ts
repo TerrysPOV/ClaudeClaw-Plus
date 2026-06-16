@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { rm, mkdir, readFile } from "node:fs/promises";
+import { rm, mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -18,6 +18,8 @@ import {
   getStats,
   cleanupRetention,
   getRetentionPolicy,
+  verifyChain,
+  _resetChainCache,
   type AuditEntry,
   type AuditAction,
 } from "../../policy/audit-log";
@@ -339,5 +341,119 @@ describe("Audit Log - Retention", () => {
 
     expect(result.deleted).toBe(1);
     expect(result.remaining).toBe(1);
+  });
+});
+
+describe("Audit Log - Tamper-evident hash chain", () => {
+  beforeEach(async () => {
+    _resetChainCache();
+    try {
+      await rm(AUDIT_LOG_FILE, { force: true });
+    } catch {
+      // ignore
+    }
+    await mkdir(AUDIT_DIR, { recursive: true });
+  });
+
+  afterEach(async () => {
+    try {
+      await rm(AUDIT_LOG_FILE, { force: true });
+    } catch {
+      // ignore
+    }
+  });
+
+  const sample = (id: string, action: AuditAction = "allow"): AuditEntry => ({
+    timestamp: new Date().toISOString(),
+    eventId: `event-${id}`,
+    requestId: `req-${id}`,
+    source: "telegram",
+    toolName: "Bash",
+    action,
+    reason: `reason ${id}`,
+  });
+
+  it("stamps each entry with prevHash and hash, chaining genesis -> tail", async () => {
+    await log(sample("1"));
+    await log(sample("2"));
+    await log(sample("3"));
+
+    const content = await readFile(AUDIT_LOG_FILE, "utf8");
+    const entries = content
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as AuditEntry);
+
+    expect(entries).toHaveLength(3);
+    expect(entries[0].prevHash).toBe("0".repeat(64));
+    expect(entries[0].hash).toBeDefined();
+    // each entry's prevHash is the previous entry's hash
+    expect(entries[1].prevHash).toBe(entries[0].hash);
+    expect(entries[2].prevHash).toBe(entries[1].hash);
+  });
+
+  it("verifyChain() reports a valid, intact chain", async () => {
+    await log(sample("1"));
+    await log(sample("2"));
+
+    const result = await verifyChain();
+    expect(result.valid).toBe(true);
+    expect(result.entries).toBe(2);
+    expect(result.brokenAt).toBeUndefined();
+  });
+
+  it("verifyChain() detects a tampered entry (content edited in place)", async () => {
+    await log(sample("1"));
+    await log(sample("2", "deny"));
+    await log(sample("3"));
+
+    // Tamper: flip the middle entry's action without recomputing its hash.
+    const lines = (await readFile(AUDIT_LOG_FILE, "utf8")).trim().split("\n");
+    const middle = JSON.parse(lines[1]) as AuditEntry;
+    middle.action = "allow"; // was "deny"
+    lines[1] = JSON.stringify(middle);
+    await writeFile(AUDIT_LOG_FILE, lines.join("\n") + "\n", "utf8");
+
+    const result = await verifyChain();
+    expect(result.valid).toBe(false);
+    expect(result.brokenAt).toBe(1);
+    expect(result.reason).toContain("hash mismatch");
+  });
+
+  it("verifyChain() detects a removed entry (chain link broken)", async () => {
+    await log(sample("1"));
+    await log(sample("2"));
+    await log(sample("3"));
+
+    // Remove the middle entry -> entry 3's prevHash no longer matches.
+    const lines = (await readFile(AUDIT_LOG_FILE, "utf8")).trim().split("\n");
+    await writeFile(AUDIT_LOG_FILE, [lines[0], lines[2]].join("\n") + "\n", "utf8");
+
+    const result = await verifyChain();
+    expect(result.valid).toBe(false);
+    expect(result.brokenAt).toBe(1);
+    expect(result.reason).toContain("prevHash mismatch");
+  });
+
+  it("cleanupRetention() re-seals survivors so the chain stays valid", async () => {
+    const oldDate = new Date();
+    oldDate.setDate(oldDate.getDate() - 90);
+    await log({ ...sample("old"), timestamp: oldDate.toISOString() });
+    await log(sample("recent-1"));
+    await log(sample("recent-2"));
+
+    const result = await cleanupRetention({ maxAgeDays: 30 });
+    expect(result.deleted).toBe(1);
+    expect(result.remaining).toBe(2);
+
+    const verified = await verifyChain();
+    expect(verified.valid).toBe(true);
+    expect(verified.entries).toBe(2);
+  });
+
+  it("verifyChain() returns valid for an empty/absent log", async () => {
+    const result = await verifyChain();
+    expect(result.valid).toBe(true);
+    expect(result.entries).toBe(0);
   });
 });

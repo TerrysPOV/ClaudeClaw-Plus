@@ -153,8 +153,21 @@ export function mergeScopedPolicies(
     ruleMap.set(rule.id, rule);
   }
 
-  // Add scoped rules (may override global rules with same ID)
+  // Restrictiveness rank used to resolve id collisions safely.
+  const rank = (a: string): number => (a === "deny" ? 2 : a === "require_approval" ? 1 : 0);
+
+  // Add scoped rules. On an id collision keep the MORE RESTRICTIVE action so a
+  // lower-trust scoped ALLOW (from the operator-writable scoped-policies.json)
+  // can never silently delete a global hardened DENY — that dedup-by-id override
+  // is a fail-OPEN. An operator wanting a per-channel exception must use a
+  // distinct, higher-priority allow id (resolved by sortRules), not reuse a
+  // deny's id. A scoped DENY overriding a same-id global allow is still allowed
+  // (hardening); same-rank collisions let the scoped rule win as before.
   for (const rule of enabledScoped) {
+    const existing = ruleMap.get(rule.id);
+    if (existing && rank(existing.action) > rank(rule.action)) {
+      continue; // keep the more-restrictive existing rule
+    }
     ruleMap.set(rule.id, rule);
   }
 

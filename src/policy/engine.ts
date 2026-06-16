@@ -19,6 +19,9 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "crypto";
+// Scoped per-channel/per-user policies. Imported for use at evaluate-time only
+// (not at module init), so the channel-policies↔engine cycle never hits a TDZ.
+import { getScopedRules, mergeScopedPolicies } from "./channel-policies";
 
 const POLICY_DIR = join(process.cwd(), ".claude", "claudeclaw");
 const POLICY_FILE = join(POLICY_DIR, "policies.json");
@@ -403,7 +406,19 @@ export function clearCache(): void {
 // ============================================================================
 
 function getApplicableRules(request: ToolRequestContext): PolicyRule[] {
-  return loadedRules.filter((rule) => {
+  // Evaluate against the GLOBAL rules merged with the scoped per-channel /
+  // per-user rules for THIS request — previously only `loadedRules` (global)
+  // was consulted, so any deny/require_approval an operator wrote in
+  // scoped-policies.json was silently inert (governance audit HIGH).
+  // getScopedRules() already folds in the globals; mergeScopedPolicies dedups by
+  // id (scoped overrides a same-id global). Falls back to globals on any error.
+  let candidates: PolicyRule[];
+  try {
+    candidates = mergeScopedPolicies(loadedRules, getScopedRules(request));
+  } catch {
+    candidates = loadedRules;
+  }
+  return candidates.filter((rule) => {
     // Skip disabled rules
     if (rule.enabled === false) return false;
 
