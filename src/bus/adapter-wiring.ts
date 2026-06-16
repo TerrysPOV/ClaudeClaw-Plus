@@ -202,13 +202,11 @@ async function mountTelegram(
   let routing = cfg.busRouting;
   if (!routing) {
     if (!defaultAgentId) return null;
-    // Respect send-only configs (Codex P2 on #197). TelegramAdapter.start()
-    // unconditionally begins polling for inbound, so deriving a token-only
-    // mount when `receiveEnabled: false` would start consuming messages a
-    // send-only operator explicitly opted out of. The legacy path gates
-    // polling on receiveEnabled (start.ts initTelegram); mirror that here by
-    // not auto-mounting. (Explicit busRouting is left as-is — the bus
-    // adapter's pre-existing receiveEnabled handling is out of scope for #197.)
+    // Respect send-only configs (Codex P2 on #197). A token-only mount has an
+    // empty chats map and no inbound to populate a target chat, so with
+    // receiveEnabled:false there is nothing to route outbound to either — skip
+    // entirely rather than mount a no-op. (Explicit busRouting honors
+    // receiveEnabled at the adapter level — see #201, below.)
     if (cfg.receiveEnabled === false) {
       logger.info(
         "[bus-adapters] telegram: token set but receiveEnabled=false and no busRouting — not mounting (send-only).",
@@ -236,6 +234,9 @@ async function mountTelegram(
     token: cfg.token,
     allowedUserIds: cfg.allowedUserIds,
     routing,
+    // #201: honor send-only configs even with explicit busRouting — the
+    // adapter wires outbound but skips the inbound long-poll. Default true.
+    receiveEnabled: cfg.receiveEnabled,
     logger,
   });
   await adapter.start();

@@ -154,6 +154,8 @@ class FakeTelegramApi implements TelegramApi {
   public readonly editMessages: Array<{ chat_id: number; message_id: number; text: string }> = [];
   public readonly reactions: SetReactionCall[] = [];
   public readonly callbackAcks: AnswerCallbackCall[] = [];
+  /** #201: count inbound polls so send-only configs can assert zero. */
+  public getUpdatesCalls = 0;
 
   private nextUpdateId = 1;
   private readonly pending: TelegramUpdate[][] = [];
@@ -165,6 +167,7 @@ class FakeTelegramApi implements TelegramApi {
     _timeoutSeconds: number,
     signal: AbortSignal,
   ): Promise<TelegramGetUpdatesResult> {
+    this.getUpdatesCalls += 1;
     const batch = this.pending.shift();
     if (batch !== undefined) {
       return { ok: true, result: batch };
@@ -503,6 +506,41 @@ describe("TelegramAdapter — bus.sendPrompt shape", () => {
 /* ────────────────────────────────────────────────────────────────────── */
 /* response.text → sendMessage                                              */
 /* ────────────────────────────────────────────────────────────────────── */
+
+describe("TelegramAdapter — receiveEnabled:false (send-only, #201)", () => {
+  it("never polls getUpdates when receiveEnabled is false", async () => {
+    adapter = await startAdapter({ receiveEnabled: false });
+    // Give a real poll loop time to fire at least once if it were started.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(api.getUpdatesCalls).toBe(0);
+  });
+
+  it("polls getUpdates by default (receiveEnabled omitted)", async () => {
+    adapter = await startAdapter();
+    await waitFor(() => api.getUpdatesCalls > 0);
+    expect(api.getUpdatesCalls).toBeGreaterThan(0);
+  });
+
+  it("still delivers outbound response.text via origin_id while send-only", async () => {
+    // No inbound is ever consumed, but a reply routed by origin_id (e.g. a
+    // cron/heartbeat-driven notification) must still reach the chat.
+    adapter = await startAdapter({
+      receiveEnabled: false,
+      routing: { chats: { "100": "triage" } },
+    });
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "send-only ping", origin: "telegram", origin_id: "100" },
+    });
+    await waitFor(() => api.sendMessages.length > 0);
+    expect(api.getUpdatesCalls).toBe(0);
+    expect(api.sendMessages[0]?.chat_id).toBe(100);
+    expect(api.sendMessages[0]?.text).toBe("send-only ping");
+  });
+});
 
 describe("TelegramAdapter — response.text outbound", () => {
   async function feedInbound(): Promise<void> {
