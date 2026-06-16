@@ -19,7 +19,17 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import { chmod, mkdir, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  stat,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { join } from "node:path";
 import { getMcpBridge } from "../mcp-bridge.js";
 
@@ -298,6 +308,11 @@ export class SessionPersistenceStore {
     const now = Date.now();
     const kept: PersistedSessionRecord[] = [];
     let mutated = false;
+    // Keys of entries we decide to drop. The prune-rewrite below filters the
+    // FRESHLY-read `current` by these keys (inside the mutex) instead of writing
+    // back this pre-computed snapshot — otherwise a record()/touch() that landed
+    // between this read and the rewrite is silently clobbered (lost update).
+    // (the prune-rewrite below re-validates fresh entries directly — no key set)
 
     for (const entry of parsed.entries) {
       if (!_isPersistedRecord(entry)) {
@@ -321,7 +336,11 @@ export class SessionPersistenceStore {
         continue;
       }
 
-      const ageMs = now - entry.issuedAt;
+      // Age from lastUsedAt (bumped by touch()), not issuedAt: the TTL is an
+      // IDLE timeout, so an actively-used session must not be force-expired a
+      // fixed hour after it was first minted (MCP-bridge audit). lastUsedAt is
+      // set to issuedAt at mint, so a never-touched session still ages normally.
+      const ageMs = now - entry.lastUsedAt;
       if (ageMs > this.maxAgeMs) {
         _audit("mcp_session_lost_on_restart", {
           server: serverName,
@@ -343,12 +362,25 @@ export class SessionPersistenceStore {
       });
     }
 
-    // If we dropped anything, rewrite the file with only the kept entries.
+    // If we dropped anything, rewrite — re-validating each FRESHLY-read entry
+    // inside the mutex rather than trusting the stale flags. A touch()/record()
+    // that refreshed an entry between this loadAll's read and the rewrite must
+    // RESCUE it (touch leaves ptyId/sessionId — the key — unchanged, so a stale
+    // key set would wrongly evict it and defeat the idle-TTL fix). Drop only
+    // entries that STILL fail integrity/TTL against their current on-disk state.
     if (mutated) {
-      await this._mutate(serverName, () => ({
+      const freshNow = Date.now();
+      await this._mutate(serverName, (current) => ({
+        ...current,
         version: CURRENT_VERSION,
         serverName,
-        entries: kept,
+        entries: current.entries.filter(
+          (e) =>
+            _isPersistedRecord(e) &&
+            e.serverName === serverName &&
+            e.hash === _hashFor(e.serverName, e.ptyId, e.sessionId) &&
+            freshNow - e.lastUsedAt <= this.maxAgeMs,
+        ),
       }));
     }
 
@@ -387,6 +419,26 @@ export class SessionPersistenceStore {
       scanned += before;
       kept += records.length;
       dropped += Math.max(0, before - records.length);
+    }
+
+    // Reclaim orphaned atomic-write tmpfiles (`<server>.json.tmp.<hex>`) left by
+    // a hard crash between writeFile and rename — the error path is handled in
+    // _atomicWrite. Only sweep clearly-stale ones (mtime well in the past) so we
+    // never race a concurrent in-flight write.
+    const tmpCutoff = Date.now() - 60_000;
+    // Match ONLY the actual atomic-write tmpfile shape `<server>.json.tmp.<hex>`
+    // (the suffix is randomBytes(4).toString("hex")). A bare `.includes(".json.tmp.")`
+    // would also match a legitimate persistence file for a server whose NAME
+    // contains ".json.tmp." and delete real data (#255 self-review).
+    const TMP_RE = /\.json\.tmp\.[0-9a-f]+$/;
+    for (const filename of files) {
+      if (!TMP_RE.test(filename)) continue;
+      const p = join(this.storageRoot, filename);
+      try {
+        if ((await stat(p)).mtimeMs < tmpCutoff) await this._unlinkSafe(p);
+      } catch {
+        // best-effort — gone already or unreadable
+      }
     }
 
     _audit("mcp_session_gc", { scanned, kept, dropped });
@@ -451,14 +503,22 @@ export class SessionPersistenceStore {
     await this._ensureDir();
     const tmpSuffix = randomBytes(4).toString("hex");
     const tmpPath = `${filePath}.tmp.${tmpSuffix}`;
-    await writeFile(tmpPath, payload, { mode: FILE_MODE, encoding: "utf8" });
-    // Some FS / umask combinations strip the mode bits from writeFile; force.
     try {
-      await chmod(tmpPath, FILE_MODE);
-    } catch {
-      // best-effort
+      await writeFile(tmpPath, payload, { mode: FILE_MODE, encoding: "utf8" });
+      // Some FS / umask combinations strip the mode bits from writeFile; force.
+      try {
+        await chmod(tmpPath, FILE_MODE);
+      } catch {
+        // best-effort
+      }
+      await rename(tmpPath, filePath);
+    } catch (err) {
+      // writeFile succeeded but chmod/rename threw → the tmpfile would leak in
+      // storageRoot forever. Reclaim it before rethrowing. (A hard crash between
+      // write and rename is swept by garbageCollect's stale-tmp pass.)
+      await this._unlinkSafe(tmpPath);
+      throw err;
     }
-    await rename(tmpPath, filePath);
   }
 
   /** Safe unlink — swallows ENOENT, silently ignores other errors. */

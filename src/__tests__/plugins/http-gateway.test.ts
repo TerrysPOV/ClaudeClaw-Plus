@@ -111,6 +111,18 @@ describe("PluginHttpGateway", () => {
     expect(body.error.code).toBe("callback_host_not_allowed");
   });
 
+  // 4a. register with an internal health_url is rejected (SSRF guard): health_url
+  // is fetched on demand by the unauthenticated health endpoint, so it must be
+  // host-allowlisted exactly like callback_url.
+  test("register with external/internal health_url → 400 (SSRF guard)", async () => {
+    const m = { ...validManifest, health_url: "http://169.254.169.254/latest/meta-data/" };
+    const r = req("POST", "/api/plugin/register", m, { Authorization: `Bearer ${token}` });
+    const resp = await gw.handleRequest(r, url("/api/plugin/register"));
+    expect(resp?.status).toBe(400);
+    const body = (await resp!.json()) as any;
+    expect(body.error.code).toBe("health_host_not_allowed");
+  });
+
   // 4b. register external host allowed via constructor allowedHosts
   test("register with allowedHosts override passes", async () => {
     const gwCustom = makeGateway({ allowedHosts: ["192.168.1.10"] });
@@ -276,7 +288,7 @@ describe("PluginHttpGateway", () => {
     await gw.handleRequest(r, url("/api/plugin/register"));
 
     const listResp = await gw.handleRequest(
-      req("GET", "/api/plugin/list"),
+      req("GET", "/api/plugin/list", undefined, { Authorization: `Bearer ${token}` }),
       url("/api/plugin/list"),
     );
     expect(listResp?.status).toBe(200);
@@ -285,6 +297,16 @@ describe("PluginHttpGateway", () => {
     expect(body.plugins[0].name).toBe("greg-voice");
     expect(body.plugins[0].tools).toContain("send_tts");
     expect(body.plugins[0].last_health_check).toBeNull();
+  });
+
+  test("list requires the bootstrap token (no longer world-readable)", async () => {
+    const listResp = await gw.handleRequest(
+      req("GET", "/api/plugin/list"),
+      url("/api/plugin/list"),
+    );
+    expect(listResp?.status).toBe(401);
+    const body = (await listResp!.json()) as any;
+    expect(body.error.code).toBe("invalid_bootstrap");
   });
 
   // 11. health endpoint

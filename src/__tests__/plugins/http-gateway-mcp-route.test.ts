@@ -8,10 +8,15 @@ import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { PluginHttpGateway, _resetHttpGateway } from "../../plugins/http-gateway.js";
 import { _resetMcpBridge } from "../../plugins/mcp-bridge.js";
 
-function req(method: string, path: string, body?: unknown): Request {
+function req(
+  method: string,
+  path: string,
+  body?: unknown,
+  extraHeaders?: Record<string, string>,
+): Request {
   return new Request(`http://localhost:4632${path}`, {
     method,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...extraHeaders },
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
 }
@@ -74,7 +79,14 @@ describe("PluginHttpGateway — /mcp/<server> route delegation", () => {
 
   it("does not interfere with /api/plugin/* routing", async () => {
     gw.registerMcpHandler("alpha", async () => new Response("from-mcp", { status: 200 }));
-    const r = await gw.handleRequest(req("GET", "/api/plugin/list"), url("/api/plugin/list"));
+    // /api/plugin/list now requires the bootstrap token; the point of this test
+    // is that the gateway HANDLES the route (rather than delegating it to the
+    // mcp handler), so authenticate and assert the real list response.
+    const token = (gw as unknown as { bootstrapToken: Buffer }).bootstrapToken.toString("hex");
+    const r = await gw.handleRequest(
+      req("GET", "/api/plugin/list", undefined, { Authorization: `Bearer ${token}` }),
+      url("/api/plugin/list"),
+    );
     expect(r?.status).toBe(200);
     const body = (await r!.json()) as { plugins: unknown[] };
     expect(Array.isArray(body.plugins)).toBe(true);

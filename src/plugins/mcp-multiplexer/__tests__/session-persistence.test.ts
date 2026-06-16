@@ -1,5 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, statSync, writeFileSync, readFileSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+  readFileSync,
+  existsSync,
+  utimesSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionPersistenceStore, type PersistedSessionRecord } from "../session-persistence.js";
@@ -282,10 +290,14 @@ describe("SessionPersistenceStore", () => {
       serverName: string;
       entries: PersistedSessionRecord[];
     };
-    // Back-date "tim" to well over the default 1h TTL.
+    // Back-date "tim" to well over the default 1h TTL. The TTL is now an IDLE
+    // timeout (measured from lastUsedAt, which touch() bumps), so back-date
+    // lastUsedAt — issuedAt alone no longer expires an actively-tracked session.
     const stale = parsed.entries.find((e) => e.ptyId === "tim");
     if (!stale) throw new Error("expected tim entry");
-    stale.issuedAt = Date.now() - 10 * 60 * 60 * 1000; // 10 hours ago
+    const tenHoursAgo = Date.now() - 10 * 60 * 60 * 1000;
+    stale.issuedAt = tenHoursAgo;
+    stale.lastUsedAt = tenHoursAgo;
     writeFileSync(filePath, JSON.stringify(parsed));
 
     const result = await store.garbageCollect();
@@ -301,6 +313,30 @@ describe("SessionPersistenceStore", () => {
   it("garbageCollect on an empty directory returns zero counts", async () => {
     const result = await store.garbageCollect();
     expect(result).toEqual({ scanned: 0, kept: 0, dropped: 0 });
+  });
+
+  it("garbageCollect sweeps only stale atomic-write tmpfiles, never real persistence files", async () => {
+    await store.record("graphiti", "suzy", "sess-1"); // creates the real graphiti.json
+    // A real persistence file whose server name merely CONTAINS ".json.tmp."
+    // must NOT be swept — the sweep regex is anchored to the <hex> suffix, so a
+    // bare substring match (the original bug) would have deleted real data.
+    const decoy = join(storageRoot, "weird.json.tmp.name.json");
+    writeFileSync(decoy, '{"version":1,"serverName":"weird.json.tmp.name","entries":[]}');
+    // A stale orphaned tmpfile (mtime well past the 60s cutoff) IS reclaimed.
+    const staleTmp = join(storageRoot, "graphiti.json.tmp.deadbeef");
+    writeFileSync(staleTmp, "{}");
+    const past = new Date(Date.now() - 5 * 60_000);
+    utimesSync(staleTmp, past, past);
+    // A fresh tmpfile (an in-flight write) is left alone.
+    const freshTmp = join(storageRoot, "graphiti.json.tmp.cafe1234");
+    writeFileSync(freshTmp, "{}");
+
+    await store.garbageCollect();
+
+    expect(existsSync(join(storageRoot, "graphiti.json"))).toBe(true); // real file kept
+    expect(existsSync(decoy)).toBe(true); // real file kept (not a tmpfile shape)
+    expect(existsSync(staleTmp)).toBe(false); // stale tmp reclaimed
+    expect(existsSync(freshTmp)).toBe(true); // fresh tmp untouched
   });
 
   // ── 11. concurrent writes don't corrupt the file ──────────────────────

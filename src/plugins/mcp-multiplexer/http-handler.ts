@@ -275,10 +275,15 @@ export class McpHttpHandler {
       return _errResponse(401, "missing_pty_id", `missing ${PTY_ID_HEADER} header`);
     }
     if (!bearer || !verifyBearer(ptyId, bearer)) {
-      // Audit, but only the failure event — do not log the bearer itself.
+      // Audit, but only the failure event — do not log the bearer itself. The
+      // ptyId is attacker-controlled on this pre-auth path: bound its length and
+      // strip anything outside the valid charset before it reaches the audit
+      // log, so a rejected caller can't inject control chars / newlines or bloat
+      // the log with a megabyte header (MCP-bridge security audit).
+      const safePtyId = ptyId.replace(/[^A-Za-z0-9_.:-]/g, "").slice(0, 128);
       getMcpBridge().audit("multiplexer_auth_rejected", {
         server: this.serverName,
-        pty_id: ptyId,
+        pty_id: safePtyId,
       });
       return _errResponse(401, "invalid_bearer", "HMAC verification failed");
     }
