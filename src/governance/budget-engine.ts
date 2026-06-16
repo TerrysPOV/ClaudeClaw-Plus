@@ -576,12 +576,21 @@ export async function getBudgetState(scope: BudgetScope): Promise<BudgetStateSum
     // was compared against everyone's total (governance audit). Map the single-
     // value scope fields onto the usage filter (UsageFilters can't express the
     // string[] multi-value form; those still aggregate broadly — noted).
+    //
+    // IMPORTANT: only filter on fields the PRODUCER actually populates on each
+    // usage record. recordInvocationStart currently persists channelId/userId as
+    // undefined (runner getPolicyContext does not thread them yet), so filtering
+    // on channelId here would match ZERO records -> spend reads 0 -> a per-channel
+    // budget would silently never trip (fail-OPEN). Until the producer carries
+    // channelId/userId, we deliberately DO NOT push those filters and instead
+    // aggregate broadly for channel/user-scoped policies (over-count = fail-SAFE).
+    // Tracked for Terry: thread channelId/userId from event context into the
+    // invocation record, then re-enable channelId filtering here.
     const asFilter = (v?: string | string[]) => (typeof v === "string" ? v : undefined);
     const filters: UsageFilters = {
       startDate,
       endDate,
       source: asFilter(policy.scope.source),
-      channelId: asFilter(policy.scope.channelId),
       sessionId: asFilter(policy.scope.sessionId),
       provider: asFilter(policy.scope.provider),
       model: asFilter(policy.scope.model),

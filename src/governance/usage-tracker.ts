@@ -575,7 +575,7 @@ export async function getAggregates(filters: UsageFilters = {}): Promise<{
       // record (negative, NaN, Infinity) must not poison the aggregate the
       // budget engine reads, or skew spend up/down (governance audit).
       const safe = (n: unknown): number =>
-        typeof n === "number" && Number.isFinite(n) && n > 0 ? n : 0;
+        typeof n === "number" && Number.isFinite(n) && n >= 0 ? n : 0;
       const inputTokens = safe(record.usage?.inputTokens);
       const outputTokens = safe(record.usage?.outputTokens);
       const cacheCreationTokens = safe(record.usage?.cacheCreationInputTokens);

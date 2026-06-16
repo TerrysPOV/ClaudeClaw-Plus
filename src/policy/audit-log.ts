@@ -78,10 +78,20 @@ const GENESIS_HASH = "0".repeat(64);
 // ============================================================================
 //
 // Each entry carries `prevHash` (the previous entry's `hash`) and `hash`
-// (sha256 over prevHash + the entry's own content). Inserting, removing,
-// reordering or editing any entry breaks the chain at that point, which
-// `verifyChain()` detects. Writes are serialized through `writeChain` so the
-// chain stays consistent even with concurrent (fire-and-forget) callers.
+// (sha256 over prevHash + the entry's own content). Editing, inserting,
+// reordering or deleting a MID-STREAM entry breaks the link at the following
+// entry, which `verifyChain()` detects. Writes are serialized through
+// `writeChain` so the chain stays consistent even with concurrent
+// (fire-and-forget) callers.
+//
+// KNOWN LIMITS (tracked for follow-up, no external anchor yet):
+// - Tail truncation (deleting the most recent N entries) is NOT detected,
+//   because nothing records the expected length/tail hash externally. Detecting
+//   it requires a sealed high-water mark (count + tail hash) in a separate store.
+// - Tamper-evidence assumes a SINGLE writer process (the cwd-rooted daemon). The
+//   in-memory lastHash cache is not shared across processes.
+// - Hashing uses JSON.stringify (engine key-order), not a canonical
+//   serialization, so cross-implementation verification is not guaranteed.
 
 let lastHash: string | null = null;
 let writeChain: Promise<void> = Promise.resolve();
@@ -406,56 +416,69 @@ export async function cleanupRetention(
   cutoffDate.setDate(cutoffDate.getDate() - maxAgeDays);
   const cutoffTimestamp = cutoffDate.toISOString();
 
-  if (!existsSync(AUDIT_LOG_FILE)) {
-    return { deleted: 0, remaining: 0 };
-  }
-
-  const content = await readFile(AUDIT_LOG_FILE, "utf8");
-  const lines = content.split("\n").filter((line) => line.trim());
-
-  const keptLines: string[] = [];
-  let deleted = 0;
-
-  for (const line of lines) {
-    try {
-      const entry: AuditEntry = JSON.parse(line);
-
-      if (entry.timestamp < cutoffTimestamp) {
-        deleted++;
-        continue;
-      }
-
-      keptLines.push(line);
-    } catch {
-      // Skip malformed entries - count as deleted
-      deleted++;
+  // Serialize the whole read -> reseal -> rename against concurrent log()
+  // appends. Outside writeChain, an append landing between readFile and rename
+  // would be silently clobbered, and the lastHash assignment could interleave
+  // with a log() write and leave the cache pointing at a tail no longer on disk.
+  const result = writeChain.then(async () => {
+    if (!existsSync(AUDIT_LOG_FILE)) {
+      return { deleted: 0, remaining: 0 };
     }
-  }
 
-  // Write kept lines back atomically (temp file + rename). Removing entries
-  // necessarily breaks the original chain, so re-seal the survivors into a
-  // fresh chain — retention is an authorized operation and verifyChain() must
-  // still pass afterwards.
-  if (deleted > 0) {
-    let prev = GENESIS_HASH;
-    const resealed = keptLines.map((line) => {
-      const parsed = JSON.parse(line) as AuditEntry;
-      const { prevHash: _p, hash: _h, ...content } = parsed;
-      const hash = computeEntryHash(prev, content as Record<string, unknown>);
-      const chained = { ...content, prevHash: prev, hash };
-      prev = hash;
-      return JSON.stringify(chained);
-    });
-    const tmpPath = AUDIT_LOG_FILE + ".tmp";
-    await writeFile(tmpPath, resealed.map((l) => l + "\n").join(""), "utf8");
-    await rename(tmpPath, AUDIT_LOG_FILE);
-    lastHash = resealed.length > 0 ? prev : GENESIS_HASH;
-  }
+    const content = await readFile(AUDIT_LOG_FILE, "utf8");
+    const lines = content.split("\n").filter((line) => line.trim());
 
-  return {
-    deleted,
-    remaining: keptLines.length,
-  };
+    const keptLines: string[] = [];
+    let deleted = 0;
+
+    for (const line of lines) {
+      try {
+        const entry: AuditEntry = JSON.parse(line);
+
+        if (entry.timestamp < cutoffTimestamp) {
+          deleted++;
+          continue;
+        }
+
+        keptLines.push(line);
+      } catch {
+        // Skip malformed entries - count as deleted
+        deleted++;
+      }
+    }
+
+    // Write kept lines back atomically (temp file + rename). Removing entries
+    // necessarily breaks the original chain, so re-seal the survivors into a
+    // fresh chain — retention is an authorized operation and verifyChain() must
+    // still pass afterwards.
+    if (deleted > 0) {
+      let prev = GENESIS_HASH;
+      const resealed = keptLines.map((line) => {
+        const parsed = JSON.parse(line) as AuditEntry;
+        const { prevHash: _p, hash: _h, ...entryContent } = parsed;
+        const hash = computeEntryHash(prev, entryContent as Record<string, unknown>);
+        const chained = { ...entryContent, prevHash: prev, hash };
+        prev = hash;
+        return JSON.stringify(chained);
+      });
+      const tmpPath = AUDIT_LOG_FILE + ".tmp";
+      await writeFile(tmpPath, resealed.map((l) => l + "\n").join(""), "utf8");
+      await rename(tmpPath, AUDIT_LOG_FILE);
+      lastHash = resealed.length > 0 ? prev : GENESIS_HASH;
+    }
+
+    return {
+      deleted,
+      remaining: keptLines.length,
+    };
+  });
+
+  // Keep the chain alive even if cleanup throws; surface the error to the caller.
+  writeChain = result.then(
+    () => {},
+    () => {},
+  );
+  return result;
 }
 
 // ============================================================================

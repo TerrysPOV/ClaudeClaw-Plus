@@ -285,6 +285,32 @@ describe("Channel Policies - Merge Scoped Policies", () => {
     expect(merged[0].action).toBe("deny");
   });
 
+  it("must NOT let a same-id scoped ALLOW delete a global DENY (fail-open guard, governance audit MEDIUM)", () => {
+    // A hardened global deny and a lower-trust scoped allow reuse the same id.
+    const globalRules: PolicyRule[] = [
+      { id: "hardened", tool: "Bash", action: "deny", reason: "global hardened deny" },
+    ];
+    const scopedRules: PolicyRule[] = [
+      { id: "hardened", tool: "Bash", action: "allow", reason: "scoped allow reusing the id" },
+    ];
+
+    const merged = mergeScopedPolicies(globalRules, scopedRules);
+
+    // The deny must survive (more restrictive wins on id collision).
+    expect(merged).toHaveLength(1);
+    expect(merged[0].action).toBe("deny");
+  });
+
+  it("still lets a same-id scoped DENY override a global ALLOW (hardening direction)", () => {
+    const globalRules: PolicyRule[] = [{ id: "x", tool: "Bash", action: "allow" }];
+    const scopedRules: PolicyRule[] = [{ id: "x", tool: "Bash", action: "deny" }];
+
+    const merged = mergeScopedPolicies(globalRules, scopedRules);
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0].action).toBe("deny");
+  });
+
   it("should filter out disabled rules", () => {
     const globalRules: PolicyRule[] = [
       { id: "disabled-global", tool: "View", action: "allow", enabled: false },
