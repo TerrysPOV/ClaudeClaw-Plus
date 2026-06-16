@@ -648,6 +648,53 @@ describe("TelegramAdapter — response.text outbound", () => {
     expect(api.sendMessages[0]?.text).toBe("curated answer");
   });
 
+  it("prefixes the notice on the edit-in-place path when a turn is live (#240)", async () => {
+    adapter = await startAdapter();
+    await feedInbound();
+
+    // Progress reply opens a live turn (fresh message + spinner) so the
+    // following final edits in place instead of sending fresh — the dominant
+    // path for a normal prompted turn, distinct from the send-fresh tests above.
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "working", intent: "progress" },
+    });
+    await waitFor(() => api.sendMessages.length === 1);
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "raw turn output", intent: "final", synthesized: true },
+    });
+    await waitFor(() => api.editMessages.some((e) => e.text.startsWith("⚠️")));
+    const edit = api.editMessages.find((e) => e.text.startsWith("⚠️"));
+    expect(edit?.text).toContain("without sending a reply");
+    expect(edit?.text).toContain("raw turn output");
+  });
+
+  it("does not emit a lone notice for a reaction-only synthesized final (#240)", async () => {
+    adapter = await startAdapter();
+    await feedInbound();
+
+    // Text is non-empty but becomes empty after reaction directives are
+    // stripped — the cleanedText.length>0 gate must suppress a bare notice.
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "[react:🪶]", intent: "final", synthesized: true },
+    });
+    await waitFor(() => api.reactions.length > 0);
+    expect(api.sendMessages).toHaveLength(0);
+    expect(api.editMessages).toHaveLength(0);
+  });
+
   it("IGNORES the JSONL tailer observability echo so replies are not double-posted (#217)", async () => {
     // The tailer re-emits a raw per-block response.text stamped with
     // _meta.source = "jsonl-tailer"; the real delivery comes from ingestReply

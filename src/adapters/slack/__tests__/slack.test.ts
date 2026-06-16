@@ -552,6 +552,21 @@ describe("SlackAdapter — response.text outbound", () => {
     expect(api.sent[0]?.text).toBe("on it");
   });
 
+  it("prefixes the synthesized notice on a safety-net delivery (#240)", async () => {
+    adapter = await startAdapter();
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "raw turn output", intent: "final", synthesized: true },
+    });
+    await waitFor(() => api.sent.length > 0);
+    expect(api.sent[0]?.text.startsWith("⚠️")).toBe(true);
+    expect(api.sent[0]?.text).toContain("without sending a reply");
+    expect(api.sent[0]?.text).toContain("raw turn output");
+  });
+
   it("ignores response.text for an unrelated agent", async () => {
     adapter = await startAdapter();
     bus.emit({
