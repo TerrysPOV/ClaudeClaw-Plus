@@ -240,7 +240,7 @@ export interface RotateAgentDeps {
   summarize: (sessionId: string, summaryPath: string) => Promise<unknown>;
   /** Resolve the configured summary dir, or "" to skip summarization. Must not throw. */
   getSummaryPath: () => string;
-  logger: Pick<Console, "warn">;
+  logger: Pick<Console, "warn" | "error">;
 }
 
 /**
@@ -262,7 +262,22 @@ export function createRotateAgent(deps: RotateAgentDeps): (agentId: string) => P
       deps.logger.warn(`[bus-runtime] rotation: peek session for ${agentId} failed`, err);
     }
 
-    await deps.restart(agentId);
+    // A rotation restart drops the live PTY BEFORE respawning. If the respawn
+    // throws (spawn-time fault), the agent is left with no live process — worse
+    // than the pre-#227 "warn and keep serving". restart() is budget-exempt for
+    // rotation so it won't rate-limit-throw, but a genuine spawn fault still can.
+    // Surface it as CRITICAL (watchdog-keyable) and rethrow so the caller does
+    // NOT mistake a failed rotation for a successful one.
+    try {
+      await deps.restart(agentId);
+    } catch (err) {
+      deps.logger.error(
+        `[bus-runtime] CRITICAL agent=${agentId} rotation restart failed — ` +
+          `the agent may have no live PTY until it is respawned (operator/watchdog action needed)`,
+        err,
+      );
+      throw err;
+    }
 
     const summaryPath = deps.getSummaryPath();
     if (oldSessionId && summaryPath) {
@@ -347,11 +362,17 @@ export async function mountBusRuntime(
     // (Injecting that summary into the fresh PTY's bootstrap has no bus consumer
     // yet — the legacy runner consumes loadLatestSummary, the bus spawn path
     // does not — so it stays a follow-up.)
+    // Declared before the rotation wiring so `getSummaryPath` can short-circuit
+    // once teardown has begun — never start a new ~60s summary subprocess while
+    // the handle is stopping (it would outlive stop()). Set true in stop().
+    let stopped = false;
+
     const rotateAgent = createRotateAgent({
       restart: (id) => sessionManager.restart(id, { reason: "rotation" }),
       peekSessionId: async (id) => (await peekSession(id))?.sessionId,
       summarize: generateSummary,
       getSummaryPath: () => {
+        if (stopped) return ""; // tearing down — don't spawn a new summarizer
         try {
           return getSettings().session.summaryPath ?? "";
         } catch {
@@ -433,7 +454,6 @@ export async function mountBusRuntime(
         : `adapters=[${adapters.map((a) => a.name).join(", ")}]`;
     logger.info(`[bus-runtime] mounted; socket=${socketPath}; ${spawnedLabel}; ${adaptersLabel}`);
 
-    let stopped = false;
     return {
       bus,
       sessionManager,

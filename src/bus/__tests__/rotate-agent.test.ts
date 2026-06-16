@@ -8,8 +8,6 @@
 import { describe, it, expect } from "bun:test";
 import { createRotateAgent, type RotateAgentDeps } from "../runtime-mount";
 
-const silentLogger = { warn: () => {} };
-
 interface Behaviour {
   /** Value peekSessionId resolves to. Default "old-session-id". */
   peekResult?: string | undefined;
@@ -31,6 +29,8 @@ function makeDeps(b: Behaviour = {}) {
   const calls: string[] = [];
   const restartArgs: string[] = [];
   const summarizeArgs: Array<[string, string]> = [];
+  const errors: unknown[][] = [];
+  const logger = { warn: () => {}, error: (...args: unknown[]) => errors.push(args) };
   const deps: RotateAgentDeps = {
     restart: async (id) => {
       calls.push("restart");
@@ -48,9 +48,9 @@ function makeDeps(b: Behaviour = {}) {
       if (b.summarizeThrows) throw new Error("summary blew up");
     },
     getSummaryPath: () => b.summaryPath ?? "/tmp/summaries",
-    logger: silentLogger,
+    logger,
   };
-  return { deps, calls, restartArgs, summarizeArgs };
+  return { deps, calls, restartArgs, summarizeArgs, errors };
 }
 
 describe("createRotateAgent (#227 rotation orchestrator)", () => {
@@ -96,12 +96,16 @@ describe("createRotateAgent (#227 rotation orchestrator)", () => {
     expect(restartArgs).toEqual(["agent-1"]);
   });
 
-  it("propagates a restart rejection and does NOT summarize", async () => {
-    const { deps, calls } = makeDeps({ restartThrows: true });
+  it("logs CRITICAL and propagates a restart rejection, and does NOT summarize", async () => {
+    const { deps, calls, errors } = makeDeps({ restartThrows: true });
     const rotate = createRotateAgent(deps);
 
     await expect(rotate("agent-1")).rejects.toThrow("restart failed");
     expect(calls).toEqual(["peek", "restart"]); // threw in restart, never summarized
+    // A failed rotation restart must be surfaced loudly (watchdog-keyable),
+    // and must rethrow so the caller doesn't log a false "rotated".
+    expect(errors).toHaveLength(1);
+    expect(String(errors[0][0])).toContain("CRITICAL");
   });
 
   it("a background summary failure does not reject rotate()", async () => {
