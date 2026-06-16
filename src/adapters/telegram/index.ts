@@ -16,6 +16,7 @@ import {
   type BusOrigin,
   type PermissionRequest,
   isTailerOriginEvent,
+  withSynthesizedNotice,
 } from "../../bus/types";
 import { createTelegramApi } from "./api";
 import { extractReactionDirectives } from "./directives";
@@ -515,13 +516,10 @@ export class TelegramAdapter {
     const isProgress = intent === "progress";
     const FRAMES = TelegramAdapter.SPINNER_FRAMES;
     // #240: a synthesized (silent-drop safety-net) final carries raw, uncurated
-    // turn output — prefix a notice so it is not mistaken for a curated reply.
-    // Synthesized deliveries are always finals, never progress frames.
-    const synthesized = (event.payload as { synthesized?: boolean })?.synthesized === true;
-    const displayText =
-      synthesized && !isProgress && cleanedText.length > 0
-        ? `${TelegramAdapter.SYNTHESIZED_REPLY_NOTICE}\n\n${cleanedText}`
-        : cleanedText;
+    // turn output — prefix the shared notice so it is not mistaken for a curated
+    // reply. No-op for curated replies and empty text; only the non-progress
+    // arms below use displayText, so progress frames are untouched.
+    const displayText = withSynthesizedNotice(cleanedText, event.payload);
     const key = this.convKey(agentId, target.chat_id);
     // Receipt timeout is INACTIVITY-based, not a wall-clock budget: any assistant
     // output for this turn — progress OR final — proves the turn is alive, so
@@ -714,17 +712,6 @@ export class TelegramAdapter {
       this.logger.error(`[telegram-adapter] editMessageText failed`, err);
     }
   }
-
-  /**
-   * Prefix for a silent-drop safety-net delivery (#240). The bus tags these
-   * `synthesized: true` because the agent ended its turn without calling the
-   * `reply` tool, so the text is raw, uncurated turn output rather than a
-   * message the agent chose to send. Label it so the user does not mistake it
-   * for a curated reply; the full text is preserved (the #217 safety net
-   * exists precisely because the user would otherwise get nothing).
-   */
-  private static readonly SYNTHESIZED_REPLY_NOTICE =
-    "⚠️ The agent ended its turn without sending a reply — raw output below:";
 
   /** Braille spinner frames — classic CLI animation. */
   private static readonly SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];

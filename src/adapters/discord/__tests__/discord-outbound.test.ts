@@ -48,6 +48,21 @@ describe("DiscordAdapter — outbound response.text", () => {
     expect(h.rest.sent[0]?.text).toBe("done");
   });
 
+  it("prefixes the synthesized notice on a safety-net delivery (#240)", async () => {
+    adapter = await startAdapter(h);
+    h.bus.emit({
+      ts: Date.now(),
+      agent_id: "ops",
+      session_id: "s",
+      topic: "response.text",
+      payload: { text: "raw turn output", intent: "final", synthesized: true },
+    });
+    await new Promise((r) => setTimeout(r, 5));
+    expect(h.rest.sent[0]?.text.startsWith("⚠️")).toBe(true);
+    expect(h.rest.sent[0]?.text).toContain("without sending a reply");
+    expect(h.rest.sent[0]?.text).toContain("raw turn output");
+  });
+
   it("IGNORES the JSONL tailer's observability echo so replies aren't double-posted (#217)", async () => {
     // The silent-drop net (#217) wires the JSONL tailer into the live bus.
     // The tailer re-emits a raw per-block `response.text` for every assistant
