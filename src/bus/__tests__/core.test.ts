@@ -1085,11 +1085,20 @@ describe("BusCore IPC", () => {
     }
 
     function captureReplies(b: BusCore, agentId: string) {
-      const replies: { text: string; origin?: string }[] = [];
+      const replies: { text: string; origin?: string; synthesized?: boolean }[] = [];
       b.subscribe({ agent_id: agentId, topics: ["response.text"] }, (event) => {
-        const payload = event.payload as { text?: string; intent?: string; origin?: string };
+        const payload = event.payload as {
+          text?: string;
+          intent?: string;
+          origin?: string;
+          synthesized?: boolean;
+        };
         if (payload?.intent === "final") {
-          replies.push({ text: payload.text ?? "", origin: payload.origin });
+          replies.push({
+            text: payload.text ?? "",
+            origin: payload.origin,
+            synthesized: payload.synthesized,
+          });
         }
       });
       return replies;
@@ -1119,6 +1128,30 @@ describe("BusCore IPC", () => {
       expect(replies.length).toBe(1);
       expect(replies[0].text).toBe("hi there, this is the silent-dropped text");
       expect(replies[0].origin).toBe("webui");
+    });
+
+    it("tags the synthesized delivery with synthesized:true so surfaces can label it (#240)", async () => {
+      const b = makeBus();
+      const replies = captureReplies(b, "alpha");
+
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "webui",
+        origin_id: "test-240",
+        user_id: "u1",
+        text: "say hi",
+      });
+
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: "alpha",
+        session_id: "",
+        topic: "response.turn_end",
+        payload: { stop_reason: "end_turn", text: "uncurated working prose" },
+      });
+
+      expect(replies.length).toBe(1);
+      expect(replies[0].synthesized).toBe(true);
     });
 
     it("does NOT synthesize when the agent already called reply with intent: final", async () => {
@@ -1152,6 +1185,8 @@ describe("BusCore IPC", () => {
       // Only the real reply, no duplicate from the safety net.
       expect(replies.length).toBe(1);
       expect(replies[0].text).toBe("hello — delivered properly via reply tool");
+      // A curated reply is NOT tagged synthesized (#240).
+      expect(replies[0].synthesized).toBeUndefined();
     });
 
     it("does NOT synthesize when turn_end text is empty", async () => {

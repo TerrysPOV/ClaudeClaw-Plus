@@ -614,6 +614,40 @@ describe("TelegramAdapter — response.text outbound", () => {
     expect(sent?.chat_id).toBe(100);
   });
 
+  it("prefixes a synthesized (safety-net) final with the uncurated-output notice (#240)", async () => {
+    adapter = await startAdapter();
+    await feedInbound();
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "raw turn output", intent: "final", synthesized: true },
+    });
+    await waitFor(() => api.sendMessages.length > 0);
+    const sent = api.sendMessages[0];
+    expect(sent?.text.startsWith("⚠️")).toBe(true);
+    expect(sent?.text).toContain("without sending a reply");
+    // The full uncurated text is preserved (the safety net's whole point).
+    expect(sent?.text).toContain("raw turn output");
+  });
+
+  it("does NOT prefix a normal curated final (#240)", async () => {
+    adapter = await startAdapter();
+    await feedInbound();
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "curated answer", intent: "final" },
+    });
+    await waitFor(() => api.sendMessages.length > 0);
+    expect(api.sendMessages[0]?.text).toBe("curated answer");
+  });
+
   it("IGNORES the JSONL tailer observability echo so replies are not double-posted (#217)", async () => {
     // The tailer re-emits a raw per-block response.text stamped with
     // _meta.source = "jsonl-tailer"; the real delivery comes from ingestReply
