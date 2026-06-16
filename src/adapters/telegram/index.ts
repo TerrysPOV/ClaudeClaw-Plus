@@ -43,6 +43,13 @@ export interface TelegramAdapterOptions {
   };
   /** Poll interval ms between successive `getUpdates` calls. Default 1000. */
   pollIntervalMs?: number;
+  /**
+   * When false, the adapter wires outbound (`response.text` → send) but never
+   * starts the inbound `getUpdates` long-poll — a send-only deployment. Mirrors
+   * the legacy pty path (`if (receiveEnabled) startPolling()` in
+   * `start.ts` initTelegram). Defaults to true. See #201.
+   */
+  receiveEnabled?: boolean;
   /** Milliseconds before an unanswered turn's receipt (#211) auto-closes as
    *  `timeout`. Defaults to 5 min (RECEIPT_TIMEOUT_MS). Lowered in tests. */
   receiptTimeoutMs?: number;
@@ -103,6 +110,8 @@ export class TelegramAdapter {
   private readonly routingChats: Record<string, string>;
   private readonly defaultAgentId: string | undefined;
   private readonly pollIntervalMs: number;
+  /** When false, skip the inbound long-poll (send-only). See #201. */
+  private readonly receiveEnabled: boolean;
   private readonly receiptTimeoutMs: number;
   private readonly receiptMaxBudgetMultiplier: number;
   private readonly receiptStore: ReceiptStore;
@@ -201,6 +210,7 @@ export class TelegramAdapter {
     this.routingChats = { ...opts.routing.chats };
     this.defaultAgentId = opts.routing.defaultAgentId;
     this.pollIntervalMs = opts.pollIntervalMs ?? 1000;
+    this.receiveEnabled = opts.receiveEnabled ?? true;
     this.receiptTimeoutMs = opts.receiptTimeoutMs ?? TelegramAdapter.RECEIPT_TIMEOUT_MS;
     this.receiptMaxBudgetMultiplier =
       opts.receiptMaxBudgetMultiplier ?? TelegramAdapter.DEFAULT_MAX_TURN_BUDGET_MULTIPLIER;
@@ -219,6 +229,16 @@ export class TelegramAdapter {
     if (this.defaultAgentId) agentIds.add(this.defaultAgentId);
     for (const agentId of agentIds) {
       this.subscribeForAgent(agentId);
+    }
+
+    // Send-only (#201): outbound subscriptions are wired above, but a config
+    // with receiveEnabled:false explicitly opted out of consuming inbound, so
+    // never start the long-poll. Mirrors the legacy pty gate.
+    if (!this.receiveEnabled) {
+      this.logger.info(
+        "[telegram-adapter] receiveEnabled=false — outbound only, not polling for inbound updates.",
+      );
+      return;
     }
 
     const gen = this.generation;

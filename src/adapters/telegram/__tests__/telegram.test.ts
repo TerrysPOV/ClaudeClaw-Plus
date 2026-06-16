@@ -154,6 +154,8 @@ class FakeTelegramApi implements TelegramApi {
   public readonly editMessages: Array<{ chat_id: number; message_id: number; text: string }> = [];
   public readonly reactions: SetReactionCall[] = [];
   public readonly callbackAcks: AnswerCallbackCall[] = [];
+  /** #201: count inbound polls so send-only configs can assert zero. */
+  public getUpdatesCalls = 0;
 
   private nextUpdateId = 1;
   private readonly pending: TelegramUpdate[][] = [];
@@ -165,6 +167,7 @@ class FakeTelegramApi implements TelegramApi {
     _timeoutSeconds: number,
     signal: AbortSignal,
   ): Promise<TelegramGetUpdatesResult> {
+    this.getUpdatesCalls += 1;
     const batch = this.pending.shift();
     if (batch !== undefined) {
       return { ok: true, result: batch };
@@ -503,6 +506,80 @@ describe("TelegramAdapter — bus.sendPrompt shape", () => {
 /* ────────────────────────────────────────────────────────────────────── */
 /* response.text → sendMessage                                              */
 /* ────────────────────────────────────────────────────────────────────── */
+
+describe("TelegramAdapter — receiveEnabled:false (send-only, #201)", () => {
+  it("never polls getUpdates and drops enqueued inbound when receiveEnabled is false", async () => {
+    adapter = await startAdapter({ receiveEnabled: false });
+    // Structural guarantee: an inbound update that IS waiting is never consumed
+    // (the long-poll loop was never started), so it never reaches the bus. This
+    // asserts the real "inbound ignored" contract rather than a wall-clock proxy.
+    api.enqueueUpdates([
+      {
+        message: {
+          message_id: 50,
+          from: { id: 42 },
+          chat: { id: 100, type: "private" },
+          text: "should be ignored",
+        },
+      },
+    ]);
+    // A started poll loop calls getUpdates synchronously on its first iteration;
+    // a short tick gives any erroneously-started loop room to consume + route.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(api.getUpdatesCalls).toBe(0);
+    expect(bus.prompts).toHaveLength(0);
+  });
+
+  it("polls getUpdates by default (receiveEnabled omitted)", async () => {
+    adapter = await startAdapter();
+    await waitFor(() => api.getUpdatesCalls > 0);
+    expect(api.getUpdatesCalls).toBeGreaterThan(0);
+  });
+
+  it("still delivers outbound response.text via origin_id while send-only", async () => {
+    // No inbound is ever consumed, but a reply routed by origin_id (e.g. a
+    // cron/heartbeat-driven notification) must still reach the chat.
+    adapter = await startAdapter({
+      receiveEnabled: false,
+      routing: { chats: { "100": "triage" } },
+    });
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "send-only ping", origin: "telegram", origin_id: "100" },
+    });
+    await waitFor(() => api.sendMessages.length > 0);
+    expect(api.getUpdatesCalls).toBe(0);
+    expect(api.sendMessages[0]?.chat_id).toBe(100);
+    expect(api.sendMessages[0]?.text).toBe("send-only ping");
+  });
+
+  it("stop() cleanly tears down a send-only start (subscriptions closed)", async () => {
+    adapter = await startAdapter({
+      receiveEnabled: false,
+      routing: { chats: { "100": "triage" } },
+    });
+    const reply = (text: string) =>
+      bus.emit({
+        ts: Date.now(),
+        agent_id: "triage",
+        session_id: "s1",
+        topic: "response.text",
+        payload: { text, origin: "telegram", origin_id: "100" },
+      });
+    reply("first");
+    await waitFor(() => api.sendMessages.length === 1);
+    // The send-only branch never set loopPromise/inflightAbort; stop() must
+    // still resolve and close the outbound subscriptions symmetrically.
+    await adapter.stop();
+    adapter = null; // afterEach already stopped — avoid a double stop()
+    reply("second");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(api.sendMessages).toHaveLength(1);
+  });
+});
 
 describe("TelegramAdapter — response.text outbound", () => {
   async function feedInbound(): Promise<void> {
