@@ -1004,6 +1004,7 @@ export class BusCoreImpl implements BusCore {
       intent: string;
       origin?: BusOrigin;
       origin_id?: string;
+      synthesized?: true;
     }> = {
       ts: Date.now(),
       agent_id: req.agent_id,
@@ -1013,6 +1014,11 @@ export class BusCoreImpl implements BusCore {
         text: req.text,
         intent: req.intent,
         ...(origin ? { origin: origin.origin, origin_id: origin.origin_id } : {}),
+        // #240: tag the silent-drop safety-net delivery so surfaces can tell it
+        // apart from a curated `reply` and choose to label, truncate, or
+        // suppress it. The text was never curated through the `reply` tool — it
+        // is the raw concatenated turn output #217 falls back to delivering.
+        ...(opts?.synthetic ? { synthesized: true as const } : {}),
       },
     };
     this.publish(event);
