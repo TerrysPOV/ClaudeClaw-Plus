@@ -158,6 +158,8 @@ export class Gateway {
   private async checkToolApproval(
     event: NormalizedEvent,
     decision: PolicyDecision,
+    toolName: string,
+    toolArgs?: Record<string, unknown>,
   ): Promise<{ needsApproval: boolean; approvalId?: string }> {
     if (decision.action !== "require_approval") {
       return { needsApproval: false };
@@ -170,7 +172,11 @@ export class Gateway {
       channelId: event.channelId,
       threadId: event.threadId,
       userId: event.userId,
-      toolName: decision.matchedRuleId || "unknown",
+      // Use the REAL tool identity, not the matched rule id — the approval
+      // record/queue must carry what is being approved, not which rule fired
+      // (governance audit: toolName was being overwritten with matchedRuleId).
+      toolName,
+      toolArgs,
       timestamp: new Date(event.timestamp).toISOString(),
     };
 
@@ -224,13 +230,19 @@ export class Gateway {
 
       // Step 2b: Evaluate policy for inbound event
       // This evaluates the incoming message as a "tool" request
-      const policyDecision = this.evaluatePolicy(event, "InboundMessage", {
+      const inboundToolArgs = {
         messageLength: event.text?.length ?? 0,
         hasAttachments: (event.attachments ?? []).length > 0,
-      });
+      };
+      const policyDecision = this.evaluatePolicy(event, "InboundMessage", inboundToolArgs);
 
       // Check if approval is required
-      const { needsApproval, approvalId } = await this.checkToolApproval(event, policyDecision);
+      const { needsApproval, approvalId } = await this.checkToolApproval(
+        event,
+        policyDecision,
+        "InboundMessage",
+        inboundToolArgs,
+      );
       if (needsApproval) {
         return {
           success: false,

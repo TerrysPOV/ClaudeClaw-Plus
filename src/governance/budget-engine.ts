@@ -571,10 +571,20 @@ export async function getBudgetState(scope: BudgetScope): Promise<BudgetStateSum
     // Get period bounds
     const { startDate, endDate } = getPeriodBounds(policy.period);
 
-    // Get usage for the period
+    // Get usage for the period, SCOPED to the policy — previously this summed
+    // GLOBAL spend against a scoped threshold, so a per-channel/per-model budget
+    // was compared against everyone's total (governance audit). Map the single-
+    // value scope fields onto the usage filter (UsageFilters can't express the
+    // string[] multi-value form; those still aggregate broadly — noted).
+    const asFilter = (v?: string | string[]) => (typeof v === "string" ? v : undefined);
     const filters: UsageFilters = {
       startDate,
       endDate,
+      source: asFilter(policy.scope.source),
+      channelId: asFilter(policy.scope.channelId),
+      sessionId: asFilter(policy.scope.sessionId),
+      provider: asFilter(policy.scope.provider),
+      model: asFilter(policy.scope.model),
     };
 
     const aggregates = await getAggregates(filters);

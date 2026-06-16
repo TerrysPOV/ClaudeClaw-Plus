@@ -571,19 +571,24 @@ export async function getAggregates(filters: UsageFilters = {}): Promise<{
         result.killedInvocations++;
       }
 
-      // Tokens
-      const inputTokens = record.usage?.inputTokens ?? 0;
-      const outputTokens = record.usage?.outputTokens ?? 0;
-      const cacheCreationTokens = record.usage?.cacheCreationInputTokens ?? 0;
-      const cacheReadTokens = record.usage?.cacheReadInputTokens ?? 0;
+      // Tokens — clamp to a finite, non-negative value. A corrupted or tampered
+      // record (negative, NaN, Infinity) must not poison the aggregate the
+      // budget engine reads, or skew spend up/down (governance audit).
+      const safe = (n: unknown): number =>
+        typeof n === "number" && Number.isFinite(n) && n > 0 ? n : 0;
+      const inputTokens = safe(record.usage?.inputTokens);
+      const outputTokens = safe(record.usage?.outputTokens);
+      const cacheCreationTokens = safe(record.usage?.cacheCreationInputTokens);
+      const cacheReadTokens = safe(record.usage?.cacheReadInputTokens);
 
       result.totalInputTokens += inputTokens;
       result.totalOutputTokens += outputTokens;
       result.totalCacheCreationTokens += cacheCreationTokens;
       result.totalCacheReadTokens += cacheReadTokens;
 
-      // Cost
-      const cost = record.estimatedCost?.totalCost ?? 0;
+      // Cost — same clamp (a negative cost would let a tampered record reduce
+      // the aggregate and mask real spend below a block threshold).
+      const cost = safe(record.estimatedCost?.totalCost);
       result.totalEstimatedCost += cost;
 
       // By provider
