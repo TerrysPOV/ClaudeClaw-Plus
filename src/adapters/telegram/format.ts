@@ -44,7 +44,11 @@ export function markdownToTelegramHtml(text: string): string {
   text = text.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>");
   text = text.replace(/__(.+?)__/g, "<b>$1</b>");
 
-  // 8. Italic _text_ (avoid matching inside words like some_var_name)
+  // 8. Italic *text* (after bold consumed **…**) and _text_.
+  //    *…*: opening not preceded by word/asterisk, not followed by whitespace,
+  //    so bullet markers ("* item") and stray asterisks are left alone.
+  text = text.replace(/(?<![\w*])\*(?![\s*])([^*\n]+?)\*(?![\w*])/g, "<i>$1</i>");
+  //    _…_: avoid matching inside words like some_var_name.
   text = text.replace(/(?<![a-zA-Z0-9])_([^_]+)_(?![a-zA-Z0-9])/g, "<i>$1</i>");
 
   // 9. Strikethrough ~~text~~

@@ -633,13 +633,15 @@ describe("TelegramAdapter — response.text outbound", () => {
       agent_id: "triage",
       session_id: "s1",
       topic: "response.text",
-      payload: { text: "**bold** and `code` and [link](https://example.com)" },
+      payload: {
+        text: "**bold** and *italic* and `code` and [link](https://example.com)",
+      },
     });
     await waitFor(() => api.sendMessages.length > 0);
     const sent = api.sendMessages[0];
     expect(sent?.parse_mode).toBe("HTML");
     expect(sent?.text).toBe(
-      '<b>bold</b> and <code>code</code> and <a href="https://example.com">link</a>',
+      '<b>bold</b> and <i>italic</i> and <code>code</code> and <a href="https://example.com">link</a>',
     );
   });
 
