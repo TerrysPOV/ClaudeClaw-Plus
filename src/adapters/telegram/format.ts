@@ -7,9 +7,9 @@
 // correctly. Unsupported constructs (headers, blockquotes, lists) are flattened
 // rather than dropped.
 //
-// This is the same converter the legacy `commands/telegram.ts` path uses; it is
-// lifted here so the bus adapter and the legacy command share one implementation
-// instead of diverging.
+// Single source of truth for this conversion: both the bus adapter and the
+// legacy `commands/telegram.ts` path import this function, so the two paths
+// can't drift apart.
 
 export function markdownToTelegramHtml(text: string): string {
   if (!text) return "";
