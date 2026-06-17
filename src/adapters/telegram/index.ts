@@ -3,7 +3,8 @@
  * `src/bus/SPRINT_3_PLAN.md`. Mirrors `src/commands/telegram.ts` (legacy
  * PTY listener) but speaks only to `BusCore`. The legacy file stays;
  * Sprint 5 flips `runtime: bus` and retires it. Out of scope: file-bytes
- * upload pipeline (file_ids only); Markdown polish (plain text only).
+ * upload pipeline (file_ids only). Agent-reply text is converted to Telegram
+ * HTML (see {@link sendHtml} / `./format`) so Claude's markdown renders.
  */
 
 import type { BusCore, Subscription } from "../../bus/core";
@@ -18,6 +19,7 @@ import {
 } from "../../bus/types";
 import { createTelegramApi } from "./api";
 import { extractReactionDirectives } from "./directives";
+import { markdownToTelegramHtml } from "./format";
 import { buildPromptMetadata } from "./metadata";
 import type {
   TelegramApi,
@@ -538,13 +540,23 @@ export class TelegramAdapter {
       if (live) {
         const editText = isProgress ? `${FRAMES[0]} ${cleanedText}` : cleanedText;
         try {
-          await this.api.editMessageText({
+          await this.editHtml({
             chat_id: live.chat_id,
             message_id: live.message_id,
             text: editText,
           });
-        } catch (err) {
-          this.logger.error(`[telegram-adapter] turn edit failed`, err);
+        } catch {
+          // Telegram rejects malformed HTML (400) — retry as plain text so the
+          // edit still lands (unformatted) rather than being dropped.
+          try {
+            await this.api.editMessageText({
+              chat_id: live.chat_id,
+              message_id: live.message_id,
+              text: editText,
+            });
+          } catch (err) {
+            this.logger.error(`[telegram-adapter] turn edit failed`, err);
+          }
         }
         if (isProgress) {
           this.startSpinner(key, cleanedText, live.chat_id, live.message_id);
@@ -559,11 +571,21 @@ export class TelegramAdapter {
       // No live turn (unprompted reply / second final) — send fresh.
       const sendText = isProgress ? `${FRAMES[0]} ${cleanedText}` : cleanedText;
       try {
-        const res = await this.api.sendMessage({
-          chat_id: target.chat_id,
-          text: sendText,
-          message_thread_id: target.message_thread_id,
-        });
+        let res: { ok: boolean; result?: { message_id: number } };
+        try {
+          res = await this.sendHtml({
+            chat_id: target.chat_id,
+            text: sendText,
+            message_thread_id: target.message_thread_id,
+          });
+        } catch {
+          // Malformed-markup 400 — fall back to plain text so the reply lands.
+          res = await this.api.sendMessage({
+            chat_id: target.chat_id,
+            text: sendText,
+            message_thread_id: target.message_thread_id,
+          });
+        }
         const id = res?.ok && res.result ? res.result.message_id : null;
         // Only retain the message for follow-up edits while a turn is live
         // (progress). A fresh final reply needs no future edit, so leaving no
@@ -616,11 +638,21 @@ export class TelegramAdapter {
     if (!last) {
       // No prior outbound for this conversation — fall back to a new message.
       try {
-        const res = await this.api.sendMessage({
-          chat_id: target.chat_id,
-          text: newText,
-          message_thread_id: target.message_thread_id,
-        });
+        let res: { ok: boolean; result?: { message_id: number } };
+        try {
+          res = await this.sendHtml({
+            chat_id: target.chat_id,
+            text: newText,
+            message_thread_id: target.message_thread_id,
+          });
+        } catch {
+          // Malformed-markup 400 — fall back to plain text so the reply lands.
+          res = await this.api.sendMessage({
+            chat_id: target.chat_id,
+            text: newText,
+            message_thread_id: target.message_thread_id,
+          });
+        }
         const id = res?.ok && res.result ? res.result.message_id : null;
         if (id != null) {
           this.lastBotMessage.set(key, {
@@ -639,11 +671,20 @@ export class TelegramAdapter {
     this.stopSpinner(key);
     const sendText = wasSpinning ? `${FRAMES[0]} ${newText}` : newText;
     try {
-      await this.api.editMessageText({
-        chat_id: last.chat_id,
-        message_id: last.message_id,
-        text: sendText,
-      });
+      try {
+        await this.editHtml({
+          chat_id: last.chat_id,
+          message_id: last.message_id,
+          text: sendText,
+        });
+      } catch {
+        // Malformed-markup 400 — retry as plain text so the edit still lands.
+        await this.api.editMessageText({
+          chat_id: last.chat_id,
+          message_id: last.message_id,
+          text: sendText,
+        });
+      }
       if (wasSpinning) {
         this.startSpinner(key, newText, last.chat_id, last.message_id);
       }
@@ -1019,6 +1060,46 @@ export class TelegramAdapter {
     } catch (err) {
       this.logger.error(`[telegram-adapter] ${label} failed`, err);
     }
+  }
+
+  /**
+   * Send agent-reply content as Telegram HTML. Claude emits markdown, which
+   * Telegram renders raw unless converted and sent with `parse_mode: "HTML"`.
+   * (Mirrors the legacy `commands/telegram.ts` path; both share the converter
+   * in `./format`.)
+   *
+   * Deliberately NOT `async` and free of `.then`/`.catch`: it returns the
+   * underlying API promise unwrapped, so `await this.sendHtml(x)` settles in
+   * exactly one microtask hop — identical to `await this.api.sendMessage(x)`.
+   * An extra hop would defer the caller's post-send bookkeeping (`turnActive` /
+   * `lastBotMessage`) past a back-to-back follow-up event, making a final reply
+   * fresh-send instead of editing the live message in place (regresses #141).
+   * The plain-text fallback for malformed-markup 400s lives in each caller's
+   * `catch` (error path only, so it never affects success-path timing).
+   */
+  private sendHtml(params: {
+    chat_id: number;
+    text: string;
+    message_thread_id?: number;
+  }): Promise<{ ok: boolean; result?: { message_id: number } }> {
+    return this.api.sendMessage({
+      ...params,
+      text: markdownToTelegramHtml(params.text),
+      parse_mode: "HTML",
+    });
+  }
+
+  /** Edit-in-place counterpart of {@link sendHtml}; same single-hop contract. */
+  private editHtml(params: {
+    chat_id: number;
+    message_id: number;
+    text: string;
+  }): Promise<{ ok: boolean; result?: { message_id: number } | true }> {
+    return this.api.editMessageText({
+      ...params,
+      text: markdownToTelegramHtml(params.text),
+      parse_mode: "HTML",
+    });
   }
 
   private safeSendMessage(params: {
