@@ -15,16 +15,13 @@
   <a href="https://github.com/TerrysPOV/ClaudeClaw-Plus/graphs/contributors">
     <img src="https://img.shields.io/github/contributors/TerrysPOV/ClaudeClaw-Plus?style=flat-square&color=a855f7" alt="Contributors" />
   </a>
-  <a href="https://github.com/moazbuilds/claudeclaw">
-    <img src="https://img.shields.io/badge/synced%20from-moazbuilds%2Fclaudeclaw-2da44e?style=flat-square" alt="Synced from moazbuilds/claudeclaw" />
-  </a>
 </p>
 
 <p align="center"><b>ClaudeClaw, plus the heavy stuff. Governance, orchestration, persistent memory, hardened web UI.</b></p>
 
 ClaudeClaw+ is a sister project to [`moazbuilds/claudeclaw`](https://github.com/moazbuilds/claudeclaw) — the lightweight Claude Code daemon you already know. Plus exists to house the features that are too heavy or too opinionated for the core repo: a full governance and policy layer, durable multi-step orchestration, persistent cross-session memory, and a hardened web UI.
 
-Everything from upstream lives here too. ClaudeClaw+ syncs from upstream automatically every day, so you never fall behind.
+Everything from upstream lives here too. Plus has now diverged significantly from upstream, so alignment is maintained on a best-effort manual basis rather than via an automated sync.
 
 > Note: Please don't use ClaudeClaw+ for hacking any bank system or doing anything illegal. Same rules apply.
 
@@ -40,11 +37,11 @@ ClaudeClaw+ is built on top of the original [`moazbuilds/claudeclaw`](https://gi
   <img src="https://contrib.rocks/image?repo=moazbuilds/claudeclaw" />
 </a>
 
-### How the sync works
+### Staying aligned with upstream
 
-A GitHub Actions workflow (`.github/workflows/sync-upstream.yml`) runs at 07:00 UTC every day. It pulls `moazbuilds/claudeclaw master` and opens a PR if there are new commits. Every fix and feature that lands upstream is here within a day.
+Plus has diverged significantly from `moazbuilds/claudeclaw`, so the previous automated daily sync has been retired. Alignment is now best-effort and manual: upstream fixes and features are reviewed and ported by hand when they make sense for Plus.
 
-If you see a PR titled **"chore: sync upstream"** — that's the robot doing its job. Review it, resolve any conflicts if needed, and merge.
+There is no guaranteed turnaround on upstream changes landing here. If you need a specific upstream commit applied to Plus, open an issue.
 
 ---
 
@@ -449,8 +446,7 @@ Watch the [Issues](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues) tab for 
 <details open>
   <summary><strong>Is this a hard fork?</strong></summary>
   <p>
-    No. ClaudeClaw+ syncs from <a href="https://github.com/moazbuilds/claudeclaw">moazbuilds/claudeclaw</a> every day.
-    Upstream fixes land here within 24 hours. It's a sister project — same foundation, wider scope.
+    It's a sister project — same foundation, wider scope. Plus has diverged enough from <a href="https://github.com/moazbuilds/claudeclaw">moazbuilds/claudeclaw</a> that the previous daily automated sync has been retired; alignment is now maintained on a best-effort manual basis, with no guaranteed turnaround on upstream changes.
   </p>
 </details>
 

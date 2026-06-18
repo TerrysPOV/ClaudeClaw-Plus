@@ -81,9 +81,9 @@ Or via MCP: `mcp__plugin_sentrux_sentrux__scan`. Keep scores above C. Flag any d
 
 ## Syncing with upstream
 
-ClaudeClaw+ stays aligned with [`moazbuilds/claudeclaw`](https://github.com/moazbuilds/claudeclaw) via a daily automated sync. The `.github/workflows/sync-upstream.yml` workflow runs at 07:00 UTC and opens a PR if there are new commits upstream.
+Plus has diverged significantly from [`moazbuilds/claudeclaw`](https://github.com/moazbuilds/claudeclaw), so the previous daily automated sync workflow has been retired. Alignment is now best-effort and manual: upstream fixes and features are reviewed and cherry-picked or merged by hand when they're relevant to Plus.
 
-**If you see a PR titled "chore: sync upstream":** that's the robot. Review the diff, resolve conflicts if any, and merge. Conflicts are expected when Plus has diverged from upstream in the same files — resolve them manually and document why.
+**If you need a specific upstream commit on Plus:** open an issue with the upstream SHA and a short rationale. Manual ports are reviewed on the same gates as any other PR.
 
 **If you're working on a branch:** rebase onto `main` before opening your PR to minimise merge surface.
 

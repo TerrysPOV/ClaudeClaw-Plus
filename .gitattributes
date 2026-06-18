@@ -1,7 +1,6 @@
-# Plus-specific files that must not be overwritten by upstream syncs.
-# The 'ours' merge driver keeps our version whenever git merges in upstream changes.
-# Requires: git config merge.ours.driver true  (set in sync-upstream.yml before merge)
+# Plus-specific files that must not be overwritten when manually merging upstream.
+# The 'ours' merge driver keeps our version on conflict during a manual upstream pull.
+# Enable before merging: git config merge.ours.driver true
 .github/workflows/plugin-version-guard.yml   merge=ours
 .github/workflows/marketplace-version-guard.yml merge=ours
-.github/workflows/sync-upstream.yml          merge=ours
 .github/workflows/claude-review.yml          merge=ours
