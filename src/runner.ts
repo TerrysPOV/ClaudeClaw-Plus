@@ -48,6 +48,7 @@ import { calculateEstimatedCost } from "./governance/budget-engine";
 import {
   recordExecutionMetric,
   checkLimits,
+  clearInvocation as watchdogClearInvocation,
   handleTrigger as watchdogHandleTrigger,
 } from "./governance/watchdog";
 import {
@@ -2157,6 +2158,18 @@ async function execClaude(
       } catch (escalationError) {
         console.error("[escalation] Failed to send watchdog notification:", escalationError);
       }
+    }
+
+    // Lifecycle hook (#268): drop the invocation record now that the turn has
+    // completed cleanly. Without this, `activeInvocations` accumulates a
+    // record per cron firing; once any record is older than maxRuntimeSeconds
+    // (default 2h), `checkLimits` returns suspend forever and a CRITICAL
+    // watchdog handoff fires on every tick. Best-effort: a clear failure
+    // must not break the invocation lifecycle.
+    try {
+      await watchdogClearInvocation(invocationId);
+    } catch (clearErr) {
+      console.warn(`[watchdog] clearInvocation(${invocationId}) failed:`, clearErr);
     }
 
     // Plugins: agent_end — fire-and-forget, does not block response

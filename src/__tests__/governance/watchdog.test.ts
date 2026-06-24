@@ -298,4 +298,96 @@ describe("Watchdog", () => {
     expect(decision.state).toBe("healthy");
     expect(decision.reason).toContain("No execution metrics");
   });
+
+  // ---- #268 lifecycle leak fix ----
+
+  describe("#268 leak fix — populator short-circuit when disabled", () => {
+    test("recordExecutionMetric is a no-op when enabled=false", async () => {
+      configureWatchdog({ enabled: false });
+      await recordExecutionMetric(
+        { invocationId: "leak-test-record", sessionId: "s" },
+        { toolCallCount: 7, turnCount: 3 },
+      );
+      const record = await getActiveInvocation("leak-test-record");
+      expect(record).toBeNull();
+    });
+
+    test("incrementToolCall is a no-op when enabled=false", async () => {
+      configureWatchdog({ enabled: false });
+      await incrementToolCall("leak-test-tc", "bash", { cmd: "ls" });
+      const record = await getActiveInvocation("leak-test-tc");
+      expect(record).toBeNull();
+    });
+
+    test("incrementTurnCount is a no-op when enabled=false", async () => {
+      configureWatchdog({ enabled: false });
+      await incrementTurnCount("leak-test-turn");
+      const record = await getActiveInvocation("leak-test-turn");
+      expect(record).toBeNull();
+    });
+
+    test("populators resume writing once re-enabled", async () => {
+      configureWatchdog({ enabled: false });
+      await recordExecutionMetric(
+        { invocationId: "leak-test-resume", sessionId: "s" },
+        { toolCallCount: 1 },
+      );
+      expect(await getActiveInvocation("leak-test-resume")).toBeNull();
+
+      configureWatchdog({ enabled: true });
+      await recordExecutionMetric(
+        { invocationId: "leak-test-resume", sessionId: "s" },
+        { toolCallCount: 2 },
+      );
+      const record = await getActiveInvocation("leak-test-resume");
+      expect(record).not.toBeNull();
+      expect(record!.toolCallCount).toBe(2);
+    });
+  });
+
+  describe("#268 leak fix — startup eviction of stale records", () => {
+    test("initWatchdog evicts records older than 24h on load", async () => {
+      // Seed a stale record on disk by writing the index directly.
+      const { writeFile, mkdir } = await import("fs/promises");
+      await mkdir(WATCHDOG_DIR, { recursive: true });
+      const indexPath = join(WATCHDOG_DIR, "watchdog-index.json");
+      const stale = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+      const fresh = new Date().toISOString();
+      await writeFile(
+        indexPath,
+        JSON.stringify(
+          {
+            version: 1,
+            activeInvocations: {
+              "stale-rec": {
+                invocationId: "stale-rec",
+                toolCallCount: 0,
+                turnCount: 0,
+                toolCalls: [],
+                startedAt: stale,
+                lastActivityAt: stale,
+              },
+              "fresh-rec": {
+                invocationId: "fresh-rec",
+                toolCallCount: 0,
+                turnCount: 0,
+                toolCalls: [],
+                startedAt: fresh,
+                lastActivityAt: fresh,
+              },
+            },
+            updatedAt: fresh,
+          },
+          null,
+          2,
+        ),
+      );
+
+      resetWatchdog();
+      await initWatchdog();
+
+      expect(await getActiveInvocation("stale-rec")).toBeNull();
+      expect(await getActiveInvocation("fresh-rec")).not.toBeNull();
+    });
+  });
 });

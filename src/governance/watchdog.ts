@@ -135,6 +135,15 @@ export async function initWatchdog(): Promise<void> {
   return initializationPromise;
 }
 
+/**
+ * Hard cap on how long an `activeInvocations` record can live before startup
+ * eviction drops it. Defense-in-depth against the lifecycle leak (#268): even
+ * if the per-invocation `clearInvocation` hook misses, a daemon restart
+ * garbage-collects anything older than 24h so `maxRuntimeSeconds` can't trip
+ * on a record that's been forgotten about.
+ */
+const STARTUP_EVICTION_AGE_MS = 24 * 60 * 60 * 1000;
+
 async function doInit(): Promise<void> {
   // Ensure directory exists
   await Bun.write(join(WATCHDOG_DIR, ".gitkeep"), "");
@@ -148,6 +157,24 @@ async function doInit(): Promise<void> {
       activeInvocations: {},
       updatedAt: new Date().toISOString(),
     };
+    await saveWatchdogIndex();
+    return;
+  }
+
+  // Defense-in-depth eviction (#268): drop records whose lastActivityAt is
+  // older than STARTUP_EVICTION_AGE_MS. If clearInvocation() is ever missed
+  // on the lifecycle hook, this guarantees a daemon restart resets the floor
+  // so an ancient record can't silently trip maxRuntimeSeconds.
+  const nowMs = Date.now();
+  let evicted = 0;
+  for (const [id, record] of Object.entries(watchdogIndex.activeInvocations)) {
+    const lastActivityMs = new Date(record.lastActivityAt).getTime();
+    if (Number.isNaN(lastActivityMs) || nowMs - lastActivityMs > STARTUP_EVICTION_AGE_MS) {
+      delete watchdogIndex.activeInvocations[id];
+      evicted++;
+    }
+  }
+  if (evicted > 0) {
     await saveWatchdogIndex();
   }
 }
@@ -234,6 +261,11 @@ export async function recordExecutionMetric(
     toolCalls?: Array<{ tool: string; input: unknown; timestamp?: string }>;
   },
 ): Promise<void> {
+  // Short-circuit when disabled — otherwise we keep writing activeInvocations
+  // records to disk even though checkLimits short-circuits. That's the leak
+  // PR #270's user-visible fix did not address (F3 from review).
+  if (!watchdogConfig.enabled) return;
+
   await initWatchdog();
 
   const now = new Date().toISOString();
@@ -284,6 +316,8 @@ export async function incrementToolCall(
   tool: string,
   input: unknown,
 ): Promise<void> {
+  if (!watchdogConfig.enabled) return;
+
   await initWatchdog();
 
   const now = new Date().toISOString();
@@ -316,6 +350,8 @@ export async function incrementToolCall(
  * Increment turn count for an invocation.
  */
 export async function incrementTurnCount(invocationId: string): Promise<void> {
+  if (!watchdogConfig.enabled) return;
+
   await initWatchdog();
 
   const now = new Date().toISOString();
