@@ -276,7 +276,7 @@ export class PtyAgentProcess implements AgentProcess {
         }
         // A turn-start is POSITIVE evidence -- the streaming view replaced the
         // footer. An EMPTY confirm window is NOT that: a long-idle, quiet REPL
-        // emits nothing, so `!includes("to cycle")` on an empty buffer falsely
+        // emits nothing, so `!/to\s*cycle/.test(...)` on an empty buffer falsely
         // reads as turn-started, stops the nudging, and leaves the prompt
         // un-submitted until the 5-min receipt timeout. This is the residual
         // idle-REPL wedge (dossier 20260612T080557: idle 7h, stdin written,

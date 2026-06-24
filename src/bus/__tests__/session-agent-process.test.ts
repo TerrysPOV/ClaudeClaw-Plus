@@ -387,3 +387,44 @@ describe("PtyAgentProcess boot-dialog watcher (structural / ANSI-resilient)", ()
     expect(writes).toEqual([]); // disengaged -> no key into a live REPL
   });
 });
+
+// #271 regression: the CLI renders the REPL footer with CHA cursor positioning
+// (ESC[NG between tokens), not literal spaces. After the ANSI stripper runs the
+// markers collapse — "shift+tab to cycle" -> "shift+tabtocycle" — so the OLD
+// literal-substring matchers (`includes("to cycle")` / `includes("tab to
+// cycle")`) never matched on the real render. Every test above feeds a
+// PRE-SPACED footer, which is exactly why the bug hid. These feed the raw
+// CHA-sequenced footer through the real `stripAnsiEscapes` path so a future
+// regression to literal matching is caught.
+describe("PtyAgentProcess CHA-collapsed REPL footer (#271)", () => {
+  // The captured raw footer from the PR: cursor-positioned tokens with no
+  // literal spaces. `\x1b[NG` is the CHA (Cursor Horizontal Absolute) escape.
+  const CHA_IDLE_FOOTER = "\n⏵ accept edits on (shift+tab\x1b[39Gto\x1b[42Gcycle)";
+
+  it("delivery-confirm: re-nudges on the CHA-collapsed idle footer (turn never started)", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("z", handle, { submitConfirmMs: 60, maxSubmitNudges: 2 });
+    const p = proc.send_prompt_stream("hello");
+    // Idle REPL re-rendering its footer via CHA positioning. With the old
+    // `includes("to cycle")` this stripped to "tocycle" and never matched, so
+    // the loop read every window as turn-started and emitted only 1 CR.
+    const iv = setInterval(() => emit(CHA_IDLE_FOOTER), 8);
+    await p;
+    clearInterval(iv);
+    // 1 initial submit + 2 re-nudges — the `/to\s*cycle/` matcher fires on the
+    // collapsed render exactly as it would on the spaced one.
+    expect(writes.filter((w) => w === "\r").length).toBe(3);
+  });
+
+  it("boot-ready: disengages the watcher on the CHA-collapsed footer", async () => {
+    const { handle, writes, emit } = bootPty();
+    new PtyAgentProcess("epsilon", handle);
+    // Raw CHA footer with the boot-ready "tab to cycle" core collapsed to
+    // "tabtocycle". The `/tab\s*to\s*cycle/` matcher must still disengage.
+    emit("⏵⏵ bypass permissions on (shift+tab\x1b[39Gto\x1b[42Gcycle) · ← for agents");
+    writes.length = 0;
+    emit(" ❯ 1. I am using this for local development\r\n Enter to confirm");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(writes).toEqual([]); // disengaged -> no key into a live REPL
+  });
+});
