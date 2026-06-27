@@ -276,7 +276,7 @@ export class PtyAgentProcess implements AgentProcess {
         }
         // A turn-start is POSITIVE evidence -- the streaming view replaced the
         // footer. An EMPTY confirm window is NOT that: a long-idle, quiet REPL
-        // emits nothing, so `!includes("to cycle")` on an empty buffer falsely
+        // emits nothing, so `!/to\s*cycle/.test(...)` on an empty buffer falsely
         // reads as turn-started, stops the nudging, and leaves the prompt
         // un-submitted until the 5-min receipt timeout. This is the residual
         // idle-REPL wedge (dossier 20260612T080557: idle 7h, stdin written,
@@ -284,7 +284,7 @@ export class PtyAgentProcess implements AgentProcess {
         // fix stack already active). Require real output before trusting the
         // footer's absence; an empty/whitespace window stays inconclusive and
         // spends a nudge instead of claiming a phantom success.
-        if (this.recentOut.trim().length > 0 && !this.recentOut.includes("to cycle")) {
+        if (this.recentOut.trim().length > 0 && !/to\s*cycle/.test(this.recentOut)) {
           outcome = "turn-started";
           // A turn confirmed → re-arm the one-shot wedge warning, so a LATER
           // genuine wedge on this long-lived process still surfaces a diagnostic
@@ -359,7 +359,7 @@ export class PtyAgentProcess implements AgentProcess {
     // cycle" / a future "tab to cycle permission modes"); "tab to cycle" is its
     // version-stable core and — unlike the bare "to cycle" — cannot trip on
     // arbitrary boot prose, which would disengage early and re-expose #195.
-    if (buf.includes("tab to cycle")) {
+    if (/tab\s*to\s*cycle/.test(buf)) {
       this.endBootDialogPhase();
       return;
     }
