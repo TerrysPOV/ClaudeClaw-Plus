@@ -76,6 +76,10 @@ interface WatchdogIndex {
 }
 
 // Default configuration
+// Default: disabled. activeInvocations are not yet cleaned up on turn-end, so
+// stale records older than maxRuntimeSeconds silently suspend healthy agents
+// (see issue: governance watchdog activeInvocations leak). Re-enable via
+// settings.governance.watchdog.enabled once the lifecycle hook lands.
 let watchdogConfig: WatchdogConfig = {
   limits: {
     maxToolCalls: 100,
@@ -84,7 +88,7 @@ let watchdogConfig: WatchdogConfig = {
     maxRepeatedTools: 5,
     repeatedToolThreshold: 3, // 3+ repeated patterns triggers warning
   },
-  enabled: true,
+  enabled: false,
   checkIntervalMs: 5000, // Check every 5 seconds
 };
 
@@ -343,6 +347,22 @@ export async function checkLimits(context: {
   await initWatchdog();
 
   const now = new Date().toISOString();
+
+  // Short-circuit when disabled. Without a lifecycle hook to delete invocations
+  // on turn-end, even a single long-lived agent process accumulates stale
+  // records that eventually trip maxRuntimeSeconds. Honour `enabled` so
+  // operators can opt out until that lifecycle path is wired.
+  if (!watchdogConfig.enabled) {
+    return {
+      invocationId: context.invocationId,
+      state: "healthy",
+      reason: "Watchdog disabled via config",
+      triggeredLimits: [],
+      recommendedAction: "continue",
+      evaluatedAt: now,
+    };
+  }
+
   const record = watchdogIndex!.activeInvocations[context.invocationId];
 
   if (!record) {
