@@ -366,6 +366,7 @@ function matchesScope(
   record: {
     source?: string;
     channelId?: string;
+    userId?: string;
     sessionId?: string;
     provider?: string;
     model?: string;
@@ -384,6 +385,14 @@ function matchesScope(
   if (scope.channelId) {
     const channels = Array.isArray(scope.channelId) ? scope.channelId : [scope.channelId];
     if (!record.channelId || !channels.includes(record.channelId)) {
+      return false;
+    }
+  }
+
+  // Check userId (#258 item 1: per-user budget scoping)
+  if (scope.userId) {
+    const users = Array.isArray(scope.userId) ? scope.userId : [scope.userId];
+    if (!record.userId || !users.includes(record.userId)) {
       return false;
     }
   }

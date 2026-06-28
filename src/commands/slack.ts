@@ -1215,7 +1215,19 @@ async function handleMessage(event: SlackMessage): Promise<void> {
 
     let result: Awaited<ReturnType<typeof runUserMessage>>;
     try {
-      result = await runUserMessage("slack", prefixedPrompt, sessionThreadId, agentName);
+      result = await runUserMessage(
+        "slack",
+        prefixedPrompt,
+        sessionThreadId,
+        agentName,
+        undefined,
+        undefined,
+        undefined,
+        {
+          userId: userId !== undefined ? String(userId) : undefined,
+          skillName: skillContext ? command!.replace(/^\//, "") : undefined,
+        },
+      );
     } finally {
       clearInterval(statusRefreshInterval);
     }

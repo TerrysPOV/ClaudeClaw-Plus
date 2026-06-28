@@ -178,6 +178,27 @@ describe("BudgetEngine", () => {
     expect(scoped.some((e) => e.policyId === policy.id)).toBe(true);
   });
 
+  // Regression guard for #258 item 1 (userId half): per-user budgets only
+  // participate once userId is threaded from the surface into the request.
+  test("user-scoped policy participates only when userId is threaded (#258)", async () => {
+    const policy = await upsertBudgetPolicy({
+      name: "User-Scoped Block",
+      scope: { userId: "user-42" },
+      thresholds: { warnAt: 0.001, degradeAt: 0.002, blockAt: 0.003 },
+      period: "daily",
+      currency: "USD",
+      enabled: true,
+    });
+
+    // No userId on the request -> scoped policy must be skipped.
+    const unscoped = await evaluateBudget({});
+    expect(unscoped.some((e) => e.policyId === policy.id)).toBe(false);
+
+    // userId threaded -> the same policy now participates.
+    const scoped = await evaluateBudget({ userId: "user-42" });
+    expect(scoped.some((e) => e.policyId === policy.id)).toBe(true);
+  });
+
   test("should evaluate warn state at threshold", async () => {
     const policy = await upsertBudgetPolicy({
       name: "Warn Test",

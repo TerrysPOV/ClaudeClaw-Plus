@@ -54,6 +54,8 @@ describe("UsageTracker", () => {
     const context = {
       sessionId: "session-123",
       channelId: "telegram:12345",
+      userId: "user-42",
+      skillName: "quant",
       source: "telegram",
       provider: "anthropic",
       model: "claude-3-5-sonnet",
@@ -64,6 +66,10 @@ describe("UsageTracker", () => {
     expect(record.invocationId).toBeDefined();
     expect(record.sessionId).toBe("session-123");
     expect(record.channelId).toBe("telegram:12345");
+    // #258 item 1: userId/skillName threaded from the surface are persisted for
+    // per-user spend attribution and skill-level cost reporting.
+    expect(record.userId).toBe("user-42");
+    expect(record.skillName).toBe("quant");
     expect(record.provider).toBe("anthropic");
     expect(record.model).toBe("claude-3-5-sonnet");
     expect(record.status).toBe("started");

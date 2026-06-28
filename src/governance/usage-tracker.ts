@@ -107,6 +107,8 @@ export interface InvocationUsageRecord {
   source?: string;
   channelId?: string;
   threadId?: string;
+  userId?: string;
+  skillName?: string;
   provider: string;
   model: string;
   startedAt: string;
@@ -128,6 +130,8 @@ export interface InvocationContext {
   source?: string;
   channelId?: string;
   threadId?: string;
+  userId?: string;
+  skillName?: string;
   provider: string;
   model: string;
   metadata?: Record<string, unknown>;
@@ -259,6 +263,8 @@ export async function recordInvocationStart(
       source: context.source,
       channelId: context.channelId,
       threadId: context.threadId,
+      userId: context.userId,
+      skillName: context.skillName,
       provider: context.provider,
       model: context.model,
       startedAt: now,
