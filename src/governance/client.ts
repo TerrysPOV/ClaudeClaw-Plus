@@ -21,6 +21,7 @@ import {
 } from "../policy/approval-queue";
 import { logPolicyDecision } from "../policy/audit-log";
 import * as governance from "./index";
+import type { BudgetScope } from "./budget-engine";
 
 export interface GovernanceClientConfig {
   policyEnabled?: boolean;
@@ -140,8 +141,8 @@ export class GovernanceClient {
   /**
    * Get budget state.
    */
-  async getBudgetState(channelId?: string) {
-    return governance.getBudgetState(channelId);
+  async getBudgetState(scope?: BudgetScope) {
+    return governance.getBudgetState(scope ?? {});
   }
 
   /**

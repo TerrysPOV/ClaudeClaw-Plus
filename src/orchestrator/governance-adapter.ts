@@ -10,7 +10,7 @@
  *
  * Real GovernanceClient (source):
  *   evaluateToolRequest(request: ToolRequestContext): PolicyDecision
- *   getBudgetState(channelId?: string)
+ *   getBudgetState(scope?: BudgetScope)
  */
 
 import type { GovernanceClient as RealGovernanceClient } from "../governance/client";
