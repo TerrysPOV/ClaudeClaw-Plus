@@ -495,8 +495,7 @@ export async function evaluateBudget(context: {
     const filters: UsageFilters = {
       startDate,
       endDate,
-      sessionId:
-        policy.period === "session" ? context.sessionId : asFilter(policy.scope.sessionId),
+      sessionId: policy.period === "session" ? context.sessionId : asFilter(policy.scope.sessionId),
       channelId: asFilter(policy.scope.channelId),
       userId: asFilter(policy.scope.userId),
       source: asFilter(policy.scope.source),

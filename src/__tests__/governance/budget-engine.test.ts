@@ -381,7 +381,11 @@ describe("BudgetEngine", () => {
       enabled: true,
     });
     for (const channelId of ["chan-A", "chan-B"]) {
-      const s = await recordInvocationStart({ channelId, provider: "anthropic", model: "claude-3-haiku" });
+      const s = await recordInvocationStart({
+        channelId,
+        provider: "anthropic",
+        model: "claude-3-haiku",
+      });
       await recordInvocationCompletion(
         s.invocationId,
         { inputTokens: 100, outputTokens: 100 },
@@ -407,7 +411,11 @@ describe("BudgetEngine", () => {
       enabled: true,
     });
     for (const channelId of ["chan-A", "chan-B"]) {
-      const s = await recordInvocationStart({ channelId, provider: "anthropic", model: "claude-3-haiku" });
+      const s = await recordInvocationStart({
+        channelId,
+        provider: "anthropic",
+        model: "claude-3-haiku",
+      });
       await recordInvocationCompletion(
         s.invocationId,
         { inputTokens: 100, outputTokens: 100 },
@@ -430,7 +438,11 @@ describe("BudgetEngine", () => {
       enabled: true,
     });
     for (const userId of ["user-x", "user-y"]) {
-      const s = await recordInvocationStart({ userId, provider: "anthropic", model: "claude-3-haiku" });
+      const s = await recordInvocationStart({
+        userId,
+        provider: "anthropic",
+        model: "claude-3-haiku",
+      });
       await recordInvocationCompletion(
         s.invocationId,
         { inputTokens: 100, outputTokens: 100 },
