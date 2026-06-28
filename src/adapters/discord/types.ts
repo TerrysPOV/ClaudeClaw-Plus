@@ -17,6 +17,7 @@
  */
 
 import type { BusCore } from "../../bus/core";
+import type { AttachmentsConfig } from "../../config";
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* Public adapter options                                                 */
@@ -65,6 +66,16 @@ export interface DiscordAdapterOptions {
    * `src/commands/discord.ts:148`. Pass `() => true` in tests to disable.
    */
   rateLimitCheck?: (userId: string) => boolean;
+  /**
+   * Inbound attachment pipeline config. When omitted the adapter reads
+   * `settings.attachments` at message time. Tests pass a config with a tmp
+   * `rootDir` to isolate writes.
+   */
+  attachments?: AttachmentsConfig;
+  /** Voice transcription dep. Defaults to `transcribeAudioToText`. */
+  transcribe?: (inputPath: string) => Promise<string>;
+  /** Fetch override for downloading attachments. Defaults to global `fetch`. */
+  fetchFn?: typeof fetch;
 }
 
 /* ────────────────────────────────────────────────────────────────────── */
