@@ -232,6 +232,18 @@ export class BusCoreImpl implements BusCore {
   >();
 
   /**
+   * Agents whose `lastPromptOrigin` is currently AMBIGUOUS for security
+   * attribution: a second prompt overwrote the slot while a prior prompt was
+   * still in flight (the residual #239 interleave race). Best-effort *routing*
+   * tolerates this, but the per-tool permission gate must NOT make a deny
+   * decision from a possibly mis-attributed user/skill — when an agent is in
+   * this set the gate ignores the cached identity and falls through to the
+   * human card (fail-OPEN). Cleared whenever the slot returns to a clean
+   * single-prompt state (a `set` onto an empty slot) or is torn down (#284 MEDIUM).
+   */
+  private readonly originAmbiguous = new Set<string>();
+
+  /**
    * Delivery gate. A prompt typed into a PTY-resident agent while its session
    * is (re)initialising — `session.init` seen but `bus.events.replay_done` not
    * yet — is swallowed by the not-yet-ready TUI and never starts a turn
@@ -414,6 +426,7 @@ export class BusCoreImpl implements BusCore {
           // agent (after a reconnect) would inherit the dead session's
           // origin and misroute (5-agent review on PR #138, A1 finding).
           this.lastPromptOrigin.delete(agentId);
+          this.originAmbiguous.delete(agentId);
           this.currentTurnReplied.delete(agentId);
           this.currentTurnFinalPublished.delete(agentId);
           // The subprocess is gone -- tear down this agent's delivery-gate
@@ -476,6 +489,7 @@ export class BusCoreImpl implements BusCore {
     this.flushVerify.clear();
     this.inFlightDeliveries.clear();
     this.agentTurnActive.clear();
+    this.originAmbiguous.clear();
     this.pendingRedelivery.clear();
   }
 
@@ -514,6 +528,17 @@ export class BusCoreImpl implements BusCore {
     this.publish(promptEvent);
     // Remember the origin so `ingestReply` can attach it to the
     // outbound `response.text` event for surface-aware routing.
+    //
+    // #284 MEDIUM: if a prior prompt is still in flight (the slot is already
+    // occupied), this overwrite makes the cached identity ambiguous for the
+    // security gate — mark the agent so the permission gate won't attribute a
+    // deny to the wrong user/skill. A `set` onto an empty slot is a clean,
+    // unambiguous single prompt, so clear any prior taint.
+    if (this.lastPromptOrigin.has(req.agent_id)) {
+      this.originAmbiguous.add(req.agent_id);
+    } else {
+      this.originAmbiguous.delete(req.agent_id);
+    }
     this.lastPromptOrigin.set(req.agent_id, {
       origin: req.origin,
       origin_id: req.origin_id,
@@ -959,6 +984,7 @@ export class BusCoreImpl implements BusCore {
     //   - `permission_request` IPC handler (origin on channel.permission_request)
     if (req.intent === "final") {
       this.lastPromptOrigin.delete(req.agent_id);
+      this.originAmbiguous.delete(req.agent_id);
       // Silent-drop safety net (#215): the agent called `reply` with a final
       // intent → mark this turn as delivered, so the `response.turn_end`
       // handler skips the synthetic-delivery fallback for this turn.
@@ -1089,8 +1115,11 @@ export class BusCoreImpl implements BusCore {
    * so tools stay available when no rules are configured. Fail-OPEN: any
    * evaluation error returns false so the request falls through to the card.
    *
-   * skillName / userId are not yet threaded to this seam, so skill overlays and
-   * per-user rules engage once that context reaches the bus (follow-up slice).
+   * `origin` carries the inbound channel/user/skill (slice 2) so skill overlays
+   * and per-user rules can scope the decision. The caller passes it ONLY when
+   * attribution is unambiguous (see the gate's `gateOrigin`): under a same-agent
+   * interleave the cached identity may belong to a different prompt, so the
+   * caller passes `undefined` and only tool-only/global rules apply (#284 MEDIUM).
    */
   private permissionPolicyDenies(
     agentId: string,
@@ -1259,6 +1288,7 @@ export class BusCoreImpl implements BusCore {
         // this agent doesn't inherit it and misroute (5-agent review
         // on PR #138, A1 finding).
         this.lastPromptOrigin.delete(agentId);
+        this.originAmbiguous.delete(agentId);
         // Silent-drop safety net (#215): cancelled turn won't produce
         // a real reply OR a `response.turn_end` event — drop the
         // tracking flag to keep the map bounded.
@@ -1300,12 +1330,23 @@ export class BusCoreImpl implements BusCore {
         // surface so the prompt UI lands only on the channel that
         // triggered the tool call.
         const permOrigin = this.lastPromptOrigin.get(agentId);
+        // #284 MEDIUM: `lastPromptOrigin` is single-slot / last-write-wins with
+        // no per-request correlation (residual #239 interleave race). It is fine
+        // for best-effort *routing* of the operator card below, but it must NOT
+        // drive a SECURITY deny when a concurrent same-agent prompt may have
+        // overwritten the identity — a wrong user/skill could auto-deny the wrong
+        // request or skip a deny that applies. Only feed identity into the gate
+        // when attribution is unambiguous (a clean single in-flight prompt);
+        // otherwise evaluate with no origin so identity/channel-scoped rules fall
+        // through to the human card (fail-OPEN) while tool-only/global denies still apply.
+        const gateOrigin =
+          permOrigin && !this.originAmbiguous.has(agentId) ? permOrigin : undefined;
         // #258 item 3 (minimal slice): consult policy before the operator card.
         // Only an EXPLICIT matched deny rule auto-denies (deny-wins); the
         // engine's no-match default-deny must NOT short-circuit here, or every
         // tool would be blocked when no rules are configured. Fail-OPEN: any
         // evaluation error falls through to the normal human-in-the-loop card.
-        if (this.permissionPolicyDenies(agentId, msg.request, permOrigin)) {
+        if (this.permissionPolicyDenies(agentId, msg.request, gateOrigin)) {
           this.ingestPermissionDecision({
             agent_id: agentId,
             request_id: msg.request.request_id,
@@ -1335,6 +1376,7 @@ export class BusCoreImpl implements BusCore {
         // scheduler events for this agent don't inherit the stale
         // origin (5-agent review on PR #138, A1 finding).
         this.lastPromptOrigin.delete(agentId);
+        this.originAmbiguous.delete(agentId);
         // Silent-drop safety net (#215): error path won't produce a
         // turn_end either — clear tracking too.
         this.currentTurnReplied.delete(agentId);

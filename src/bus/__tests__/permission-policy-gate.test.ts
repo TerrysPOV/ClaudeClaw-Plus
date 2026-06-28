@@ -87,6 +87,38 @@ describe("Bus permission policy gate (#258 item 3)", () => {
     expect(captured!.channelId).toBe("chat-1");
   });
 
+  it("ignores mis-attributable identity when same-agent prompts interleave (#284 MEDIUM)", async () => {
+    let captured: { userId?: string; skillName?: string; channelId?: string } | undefined;
+    const { bus } = makeBus((ctx) => {
+      captured = { userId: ctx.userId, skillName: ctx.skillName, channelId: ctx.channelId };
+      return defaultDeny(); // don't auto-deny — only assert the threaded context
+    });
+    // Two prompts on the SAME agent, the second arriving before the first
+    // completes: the origin slot is overwritten while P1 is still in flight, so
+    // the cached identity is ambiguous and must NOT reach the security gate.
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "chat-A",
+      user_id: "user-A",
+      text: "/quant a",
+      metadata: { command: "/quant" },
+    });
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "webui",
+      origin_id: "chat-B",
+      user_id: "user-B",
+      text: "/admin b",
+      metadata: { command: "/admin" },
+    });
+    feed(bus, "Bash", "abcde");
+    expect(captured).toBeDefined();
+    expect(captured!.userId).toBeUndefined();
+    expect(captured!.skillName).toBeUndefined();
+    expect(captured!.channelId).toBeUndefined();
+  });
+
   it("fails OPEN to the operator card when policy evaluation throws", () => {
     const { bus, events } = makeBus(() => {
       throw new Error("engine boom");

@@ -1298,6 +1298,11 @@ async function handleMessageCreate(
           threadInfo?.agentName,
           streamCb?.onChunk,
           streamCb?.onToolEvent,
+          undefined, // modelOverride
+          // #284 LOW: thread the inbound identity so the policy gate can scope by
+          // user and (for a slash command) by skill, matching the bus adapter.
+          // `command` is "/x" → skillName "x"; undefined for plain chat.
+          { userId, skillName: command ? command.replace(/^\//, "") : undefined },
         );
       } finally {
         if (streamCb) {
