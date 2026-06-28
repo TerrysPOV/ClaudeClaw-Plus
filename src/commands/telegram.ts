@@ -25,6 +25,7 @@ import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { resolve, sep } from "node:path";
 import { resolveSkillPrompt, listSkills } from "../skills";
+import { cacheSkillOverlayFromContent } from "../policy/skill-overlays";
 import { fireJob, parseFireArgs } from "./fire";
 import { extname, join } from "node:path";
 import { submitTelegramToGateway } from "../gateway";
@@ -1641,6 +1642,9 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
         skillContext = await resolveSkillPrompt(command);
         if (skillContext) {
           debugLog(`Skill resolved for ${command}: ${skillContext.length} chars`);
+          // #258 item 2: cache this skill's deny-tool overlay so the policy
+          // engine can consult it synchronously during evaluation.
+          cacheSkillOverlayFromContent(command.replace(/^\//, ""), skillContext);
         }
       } catch (err) {
         debugLog(

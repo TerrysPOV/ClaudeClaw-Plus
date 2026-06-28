@@ -10,6 +10,7 @@ import { extractErrorDetail } from "../messaging";
 import { listThreadSessions, peekThreadSession, removeThreadSession } from "../sessionManager";
 import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt } from "../skills";
+import { cacheSkillOverlayFromContent } from "../policy/skill-overlays";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
 import { mkdir, realpath } from "node:fs/promises";
 import { extname, join, resolve, isAbsolute, sep } from "node:path";
@@ -1130,6 +1131,10 @@ async function handleMessage(event: SlackMessage): Promise<void> {
     if (command) {
       try {
         skillContext = await resolveSkillPrompt(command);
+        if (skillContext) {
+          // #258 item 2: cache the skill's deny-tool overlay for sync policy eval.
+          cacheSkillOverlayFromContent(command.replace(/^\//, ""), skillContext);
+        }
       } catch (err) {
         debugLog(
           `Skill resolution failed for ${command}: ${err instanceof Error ? err.message : err}`,
