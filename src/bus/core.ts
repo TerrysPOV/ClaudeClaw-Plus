@@ -226,7 +226,10 @@ export class BusCoreImpl implements BusCore {
    * sending another prompt; interleaved prompts on the same agent
    * fall back to broadcast behaviour at the adapter level.
    */
-  private readonly lastPromptOrigin = new Map<string, { origin: BusOrigin; origin_id: string }>();
+  private readonly lastPromptOrigin = new Map<
+    string,
+    { origin: BusOrigin; origin_id: string; userId?: string; skillName?: string }
+  >();
 
   /**
    * Delivery gate. A prompt typed into a PTY-resident agent while its session
@@ -514,6 +517,14 @@ export class BusCoreImpl implements BusCore {
     this.lastPromptOrigin.set(req.agent_id, {
       origin: req.origin,
       origin_id: req.origin_id,
+      // #258 item 3 slice 2: carry the inbound identity so the per-tool
+      // permission gate can scope policy by user and (when a surface tags the
+      // submit with metadata.command) by skill.
+      userId: req.user_id || undefined,
+      skillName:
+        typeof req.metadata?.command === "string"
+          ? req.metadata.command.replace(/^\//, "")
+          : undefined,
     });
     // Silent-drop safety net (#215): new prompt → reset the "did this
     // turn call reply?" flag. If the agent ends the turn (response.turn_end)
@@ -1084,13 +1095,15 @@ export class BusCoreImpl implements BusCore {
   private permissionPolicyDenies(
     agentId: string,
     request: PermissionRequest,
-    origin?: { origin: BusOrigin; origin_id: string },
+    origin?: { origin: BusOrigin; origin_id: string; userId?: string; skillName?: string },
   ): boolean {
     try {
       const ctx: ToolRequestContext = {
         eventId: randomUUID(),
         source: origin?.origin ?? "bus",
         channelId: origin?.origin_id,
+        userId: origin?.userId,
+        skillName: origin?.skillName,
         toolName: request.tool_name,
         timestamp: new Date().toISOString(),
       };
