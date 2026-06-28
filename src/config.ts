@@ -226,6 +226,7 @@ const DEFAULT_SETTINGS: Settings = {
     },
   },
   watchdog: { maxConsecutiveTimeouts: null, maxRuntimeSeconds: null },
+  governance: { watchdog: {} },
   session: { autoRotate: false, maxMessages: 50, maxAgeHours: 24, summaryPath: "" },
   // Default runtime: `bus` (Sprint 5.4 flip after Hetzner staging soak ended
   // 2026-05-25). `runtime: "pty"` remains as a permanent first-class option
@@ -679,6 +680,7 @@ export interface Settings {
   pty: PtyConfig;
   mcp: McpConfig;
   watchdog: WatchdogSettings;
+  governance: GovernanceConfig;
   plugins: Record<string, PluginEntry>;
   session: SessionConfig;
   memorySearch: MemorySearchSettings;
@@ -699,6 +701,26 @@ export interface LlmRouterConfig {
   openRouterBaseUrl: string;
   /** Optional local Ollama OpenAI-compatible base (e.g. http://127.0.0.1:11434/v1). */
   ollamaBaseUrl?: string;
+}
+
+/**
+ * Operator-facing config for the governance watchdog (`src/governance/watchdog.ts`).
+ *
+ * The fields here mirror the runtime `WatchdogConfig` but are kept narrow so
+ * settings.json doesn't have to deal with the internal in-memory shape. Unset
+ * fields fall back to the hardcoded runtime defaults.
+ */
+export interface GovernanceWatchdogConfig {
+  enabled?: boolean;
+  maxToolCalls?: number;
+  maxTurns?: number;
+  maxRuntimeSeconds?: number;
+  maxRepeatedTools?: number;
+  repeatedToolThreshold?: number;
+}
+
+export interface GovernanceConfig {
+  watchdog: GovernanceWatchdogConfig;
 }
 
 export interface AgenticMode {
@@ -1069,6 +1091,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
     agents: parseBusAgents(raw.agents),
     mcp: parseMcpConfig(raw.mcp, raw.web?.enabled),
     watchdog: parseWatchdogConfig(raw.watchdog),
+    governance: parseGovernanceConfig(raw.governance),
     plugins: parsePlugins(raw.plugins),
     memorySearch: parseMemorySearchSettings(raw.memorySearch),
     llmRouter: parseLlmRouterConfig(raw.llmRouter),
@@ -1221,6 +1244,34 @@ function parseBusAgents(raw: unknown): BusAgentSettings[] {
     out.push(parsed);
   }
   return out;
+}
+
+/**
+ * Parse the `settings.governance` block. Today only `watchdog` is exposed —
+ * fields are narrow and optional; unset values fall back to the in-memory
+ * runtime defaults inside `src/governance/watchdog.ts:configureWatchdog`.
+ */
+function parseGovernanceConfig(raw: unknown): GovernanceConfig {
+  const empty: GovernanceConfig = { watchdog: {} };
+  if (!raw || typeof raw !== "object") return empty;
+  const r = raw as Record<string, unknown>;
+  const w = r.watchdog;
+  if (!w || typeof w !== "object") return empty;
+  const wr = w as Record<string, unknown>;
+
+  const numIfFinitePositive = (v: unknown): number | undefined =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined;
+
+  return {
+    watchdog: {
+      enabled: typeof wr.enabled === "boolean" ? wr.enabled : undefined,
+      maxToolCalls: numIfFinitePositive(wr.maxToolCalls),
+      maxTurns: numIfFinitePositive(wr.maxTurns),
+      maxRuntimeSeconds: numIfFinitePositive(wr.maxRuntimeSeconds),
+      maxRepeatedTools: numIfFinitePositive(wr.maxRepeatedTools),
+      repeatedToolThreshold: numIfFinitePositive(wr.repeatedToolThreshold),
+    },
+  };
 }
 
 /**
