@@ -507,6 +507,7 @@ export async function getChannelUsage(channelId: string): Promise<InvocationUsag
 export interface UsageFilters {
   sessionId?: string;
   channelId?: string;
+  userId?: string;
   source?: string;
   provider?: string;
   model?: string;
@@ -559,6 +560,7 @@ export async function getAggregates(filters: UsageFilters = {}): Promise<{
       // Apply filters
       if (filters.sessionId && record.sessionId !== filters.sessionId) continue;
       if (filters.channelId && record.channelId !== filters.channelId) continue;
+      if (filters.userId && record.userId !== filters.userId) continue;
       if (filters.source && record.source !== filters.source) continue;
       if (filters.provider && record.provider !== filters.provider) continue;
       if (filters.model && record.model !== filters.model) continue;
