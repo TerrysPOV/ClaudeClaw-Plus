@@ -376,6 +376,37 @@ export async function start(args: string[] = []) {
   const settings = await loadSettings();
   await ensureProjectClaudeMd();
 
+  // Wire operator-facing governance config into the in-memory watchdog state
+  // (#268). Without this, `settings.governance.watchdog.{enabled,limits}` is
+  // parsed but never reaches the runtime, leaving the hardcoded defaults
+  // (currently `enabled: false` after #270's band-aid) in effect.
+  try {
+    const { configureWatchdog } = await import("../governance/watchdog");
+    const w = settings.governance.watchdog;
+    // Build the limits object only with defined fields — `configureWatchdog`
+    // spreads `config.limits` onto the existing defaults, so any `undefined`
+    // would clobber a sane default with nothing.
+    const limits: Partial<{
+      maxToolCalls: number;
+      maxTurns: number;
+      maxRuntimeSeconds: number;
+      maxRepeatedTools: number;
+      repeatedToolThreshold: number;
+    }> = {};
+    if (w.maxToolCalls !== undefined) limits.maxToolCalls = w.maxToolCalls;
+    if (w.maxTurns !== undefined) limits.maxTurns = w.maxTurns;
+    if (w.maxRuntimeSeconds !== undefined) limits.maxRuntimeSeconds = w.maxRuntimeSeconds;
+    if (w.maxRepeatedTools !== undefined) limits.maxRepeatedTools = w.maxRepeatedTools;
+    if (w.repeatedToolThreshold !== undefined)
+      limits.repeatedToolThreshold = w.repeatedToolThreshold;
+    configureWatchdog({
+      ...(w.enabled !== undefined ? { enabled: w.enabled } : {}),
+      ...(Object.keys(limits).length > 0 ? { limits } : {}),
+    });
+  } catch (err) {
+    console.warn("[start] governance watchdog config wiring failed:", err);
+  }
+
   // Wire deployed claudeclaw's skills/commands into Claude Code's user-level
   // discovery paths (~/.claude/skills/, ~/.claude/commands/). No-op in local
   // dev. Idempotent and non-destructive.

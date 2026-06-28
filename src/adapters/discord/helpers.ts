@@ -12,6 +12,7 @@
  */
 
 import type { PermissionRequest } from "../../bus/types";
+import type { AttachmentKind } from "../attachment-pipeline";
 import { PERMISSION_BUTTON_PREFIX, type DiscordAttachment } from "./types";
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -61,52 +62,65 @@ export function isVoiceAttachment(a: DiscordAttachment): boolean {
   return Boolean(a.content_type?.startsWith("audio/"));
 }
 
-export function isTextAttachment(a: DiscordAttachment): boolean {
-  if (a.content_type?.startsWith("text/")) return true;
-  const lower = a.filename.toLowerCase();
-  return lower.endsWith(".txt") || lower.endsWith(".md");
-}
+/** Text-like attachments whose contents are safe to inline into the prompt. */
+const INLINE_TEXT_EXTENSIONS = [
+  ".txt",
+  ".md",
+  ".markdown",
+  ".json",
+  ".jsonl",
+  ".csv",
+  ".tsv",
+  ".log",
+  ".yaml",
+  ".yml",
+  ".xml",
+  ".html",
+  ".htm",
+  ".css",
+  ".ts",
+  ".tsx",
+  ".js",
+  ".jsx",
+  ".py",
+  ".sh",
+  ".bash",
+  ".rb",
+  ".go",
+  ".rs",
+  ".java",
+  ".sql",
+  ".toml",
+  ".ini",
+  ".env",
+  ".conf",
+];
 
-export interface AttachmentSummary {
-  images: DiscordAttachment[];
-  voices: DiscordAttachment[];
-  texts: DiscordAttachment[];
-  hasAny: boolean;
+export function isTextAttachment(a: DiscordAttachment): boolean {
+  const ct = a.content_type?.toLowerCase() ?? "";
+  if (ct.startsWith("text/")) return true;
+  if (
+    ct === "application/json" ||
+    ct === "application/xml" ||
+    ct.includes("+json") ||
+    ct.includes("+xml")
+  ) {
+    return true;
+  }
+  const lower = a.filename.toLowerCase();
+  return INLINE_TEXT_EXTENSIONS.some((ext) => lower.endsWith(ext));
 }
 
 /**
- * Build the attachment summary that rides on the BusEvent payload.
- * Field names match legacy (`images`, `voices`, `texts`) so Sprint 4
- * downstream rendering can lift them directly without renaming.
+ * Single source of truth for an attachment's processing kind. Precedence:
+ * image > voice > text > file (generic binary). Mirrors the pipeline's
+ * `AttachmentKind`.
  */
-export function summariseAttachments(attachments: DiscordAttachment[]): AttachmentSummary {
-  const images = attachments.filter(isImageAttachment);
-  const voices = attachments.filter(isVoiceAttachment);
-  const texts = attachments.filter(isTextAttachment);
-  return {
-    images,
-    voices,
-    texts,
-    hasAny: images.length + voices.length + texts.length > 0,
-  };
-}
-
-export interface AttachmentMeta {
-  id: string;
-  filename: string;
-  url: string;
-  content_type?: string;
-  size: number;
-}
-
-export function attachmentMeta(a: DiscordAttachment): AttachmentMeta {
-  return {
-    id: a.id,
-    filename: a.filename,
-    url: a.url,
-    content_type: a.content_type,
-    size: a.size,
-  };
+export function classifyAttachmentKind(a: DiscordAttachment): AttachmentKind {
+  if (isImageAttachment(a)) return "image";
+  if (isVoiceAttachment(a)) return "voice";
+  if (isTextAttachment(a)) return "text";
+  return "file";
 }
 
 /* ────────────────────────────────────────────────────────────────────── */

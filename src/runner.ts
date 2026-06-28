@@ -48,6 +48,7 @@ import { calculateEstimatedCost } from "./governance/budget-engine";
 import {
   recordExecutionMetric,
   checkLimits,
+  clearInvocation as watchdogClearInvocation,
   handleTrigger as watchdogHandleTrigger,
 } from "./governance/watchdog";
 import {
@@ -1589,6 +1590,10 @@ async function execClaude(
 ): Promise<RunResult> {
   mainRunCount++;
   persistRunCount();
+  // Invocation ID for watchdog tracking. Declared OUTSIDE the try so the
+  // `finally` can always clear the activeInvocations record on EVERY exit
+  // path — early returns, throws, and normal completion alike (#268).
+  const invocationId = crypto.randomUUID();
   try {
     await mkdir(LOGS_DIR, { recursive: true });
 
@@ -1614,8 +1619,6 @@ async function execClaude(
     const settings = getSettings();
     const { security, model, api, fallback, agentic, watchdog } = settings;
 
-    // Generate invocation ID for tracking
-    const invocationId = crypto.randomUUID();
     const invocationSessionId = existing?.sessionId;
 
     // Initialize watchdog metrics
@@ -2390,6 +2393,18 @@ async function execClaude(
 
     return result;
   } finally {
+    // Lifecycle hook (#268): drop the invocation record on EVERY exit path —
+    // normal completion, early returns (budget block, consecutive-timeout
+    // abort, auto-compact retry) and throws. Without this, `activeInvocations`
+    // accumulates a record per cron firing; once any record ages past
+    // maxRuntimeSeconds (default 2h) `checkLimits` returns suspend forever and
+    // a CRITICAL watchdog handoff fires on every tick. Best-effort: a clear
+    // failure must never mask the original result or throw.
+    try {
+      await watchdogClearInvocation(invocationId);
+    } catch (clearErr) {
+      console.warn(`[watchdog] clearInvocation(${invocationId}) failed:`, clearErr);
+    }
     mainRunCount--;
     persistRunCount();
   }
