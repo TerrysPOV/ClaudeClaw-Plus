@@ -278,6 +278,22 @@ describe("Watchdog", () => {
     expect(metrics).toBeNull();
   });
 
+  test("clearInvocation is idempotent and a no-op on an unknown id (finally guard, #268)", async () => {
+    // runner.ts now calls clearInvocation in a `finally` on EVERY exit path, so
+    // it can fire on an id whose record was already removed or never created.
+    await recordExecutionMetric({ invocationId: "inv-twice" }, { toolCallCount: 2 });
+    await clearInvocation("inv-twice");
+    expect(await getActiveInvocation("inv-twice")).toBeNull();
+
+    // Second clear (e.g. a finally after an early return that already cleared) — no throw.
+    await clearInvocation("inv-twice");
+
+    // Clearing a never-seen id is a no-op and must not disturb other records.
+    await recordExecutionMetric({ invocationId: "inv-keep" }, { toolCallCount: 1 });
+    await clearInvocation("never-existed");
+    expect(await getActiveInvocation("inv-keep")).not.toBeNull();
+  });
+
   test("should get watchdog stats", async () => {
     await recordExecutionMetric({ invocationId: "stats-inv-1" }, { toolCallCount: 5 });
     await recordExecutionMetric({ invocationId: "stats-inv-2" }, { toolCallCount: 3 });
@@ -297,5 +313,162 @@ describe("Watchdog", () => {
 
     expect(decision.state).toBe("healthy");
     expect(decision.reason).toContain("No execution metrics");
+  });
+
+  // ---- #268 lifecycle leak fix ----
+
+  describe("#268 leak fix — populator short-circuit when disabled", () => {
+    test("recordExecutionMetric is a no-op when enabled=false", async () => {
+      configureWatchdog({ enabled: false });
+      await recordExecutionMetric(
+        { invocationId: "leak-test-record", sessionId: "s" },
+        { toolCallCount: 7, turnCount: 3 },
+      );
+      const record = await getActiveInvocation("leak-test-record");
+      expect(record).toBeNull();
+    });
+
+    test("incrementToolCall is a no-op when enabled=false", async () => {
+      configureWatchdog({ enabled: false });
+      await incrementToolCall("leak-test-tc", "bash", { cmd: "ls" });
+      const record = await getActiveInvocation("leak-test-tc");
+      expect(record).toBeNull();
+    });
+
+    test("incrementTurnCount is a no-op when enabled=false", async () => {
+      configureWatchdog({ enabled: false });
+      await incrementTurnCount("leak-test-turn");
+      const record = await getActiveInvocation("leak-test-turn");
+      expect(record).toBeNull();
+    });
+
+    test("populators resume writing once re-enabled", async () => {
+      configureWatchdog({ enabled: false });
+      await recordExecutionMetric(
+        { invocationId: "leak-test-resume", sessionId: "s" },
+        { toolCallCount: 1 },
+      );
+      expect(await getActiveInvocation("leak-test-resume")).toBeNull();
+
+      configureWatchdog({ enabled: true });
+      await recordExecutionMetric(
+        { invocationId: "leak-test-resume", sessionId: "s" },
+        { toolCallCount: 2 },
+      );
+      const record = await getActiveInvocation("leak-test-resume");
+      expect(record).not.toBeNull();
+      expect(record!.toolCallCount).toBe(2);
+    });
+  });
+
+  describe("#268 leak fix — startup eviction of stale records", () => {
+    test("initWatchdog evicts records older than 24h on load", async () => {
+      // Seed a stale record on disk by writing the index directly.
+      const { writeFile, mkdir } = await import("fs/promises");
+      await mkdir(WATCHDOG_DIR, { recursive: true });
+      const indexPath = join(WATCHDOG_DIR, "watchdog-index.json");
+      const stale = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+      const fresh = new Date().toISOString();
+      await writeFile(
+        indexPath,
+        JSON.stringify(
+          {
+            version: 1,
+            activeInvocations: {
+              "stale-rec": {
+                invocationId: "stale-rec",
+                toolCallCount: 0,
+                turnCount: 0,
+                toolCalls: [],
+                startedAt: stale,
+                lastActivityAt: stale,
+              },
+              "fresh-rec": {
+                invocationId: "fresh-rec",
+                toolCallCount: 0,
+                turnCount: 0,
+                toolCalls: [],
+                startedAt: fresh,
+                lastActivityAt: fresh,
+              },
+            },
+            updatedAt: fresh,
+          },
+          null,
+          2,
+        ),
+      );
+
+      resetWatchdog();
+      await initWatchdog();
+
+      expect(await getActiveInvocation("stale-rec")).toBeNull();
+      expect(await getActiveInvocation("fresh-rec")).not.toBeNull();
+    });
+
+    test("evicts a malformed lastActivityAt and respects the 24h boundary", async () => {
+      const { writeFile, mkdir } = await import("fs/promises");
+      await mkdir(WATCHDOG_DIR, { recursive: true });
+      const indexPath = join(WATCHDOG_DIR, "watchdog-index.json");
+      const fresh = new Date().toISOString();
+      const justUnder = new Date(Date.now() - 23 * 60 * 60 * 1000).toISOString();
+      const mk = (id: string, last: string) => ({
+        invocationId: id,
+        toolCallCount: 0,
+        turnCount: 0,
+        toolCalls: [],
+        startedAt: last,
+        lastActivityAt: last,
+      });
+      await writeFile(
+        indexPath,
+        JSON.stringify(
+          {
+            version: 1,
+            activeInvocations: {
+              "nan-rec": { ...mk("nan-rec", fresh), lastActivityAt: "not-a-date" },
+              "under-24h": mk("under-24h", justUnder),
+            },
+            updatedAt: fresh,
+          },
+          null,
+          2,
+        ),
+      );
+
+      resetWatchdog();
+      await initWatchdog();
+
+      expect(await getActiveInvocation("nan-rec")).toBeNull(); // malformed → evicted
+      expect(await getActiveInvocation("under-24h")).not.toBeNull(); // ~23h → retained
+    });
+  });
+
+  describe("#268 — checkLimits escalation + disabled-state cleanup", () => {
+    test("a hard limit reached after a warning escalates to suspend (worstState fix)", async () => {
+      configureWatchdog({
+        limits: { maxToolCalls: 10, maxTurns: 5, maxRuntimeSeconds: 60 },
+        enabled: true,
+      });
+      const invocationId = "escalation-rec";
+      // 8/10 tool calls => warn (80%); 5/5 turns => hard suspend. The old guard
+      // left worstState stuck at "warn"; it must now escalate to "suspend".
+      await recordExecutionMetric({ invocationId }, { toolCallCount: 8, turnCount: 5 });
+
+      const decision = await checkLimits({ invocationId });
+      expect(decision.state).toBe("suspend");
+    });
+
+    test("clearInvocation purges a record created while enabled even after disabling", async () => {
+      const invocationId = "clear-after-disable";
+      await recordExecutionMetric({ invocationId }, { toolCallCount: 1 });
+      expect(await getActiveInvocation(invocationId)).not.toBeNull();
+
+      // Disable AFTER the record exists — clearInvocation must NOT be gated by
+      // `enabled` (the runner's finally still has to purge it).
+      configureWatchdog({ enabled: false });
+      await clearInvocation(invocationId);
+      expect(await getActiveInvocation(invocationId)).toBeNull();
+    });
   });
 });

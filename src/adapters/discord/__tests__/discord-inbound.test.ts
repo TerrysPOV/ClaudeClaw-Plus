@@ -9,6 +9,9 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { DiscordAdapter } from "../index";
 import {
   type AdapterHarness,
@@ -31,6 +34,16 @@ afterEach(async () => {
     adapter = null;
   }
 });
+
+/** Poll until a predicate holds — the attachment pipeline awaits real fs +
+ *  network, so the two-microtask `flushMicrotasks` is not enough. */
+async function until(pred: () => boolean, ms = 2000): Promise<void> {
+  const start = Date.now();
+  while (!pred()) {
+    if (Date.now() - start > ms) throw new Error("until: timed out");
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
 
 describe("DiscordAdapter — lifecycle", () => {
   it("start subscribes once per unique agent and wires the gateway", async () => {
@@ -222,8 +235,39 @@ describe("DiscordAdapter — channel routing", () => {
 });
 
 describe("DiscordAdapter — attachments", () => {
-  it("captures image/voice/text attachments in metadata", async () => {
-    adapter = await startAdapter(h);
+  let attRoot: string;
+  beforeEach(async () => {
+    attRoot = await mkdtemp(join(tmpdir(), "ccaw-disc-att-"));
+  });
+  afterEach(async () => {
+    await rm(attRoot, { recursive: true, force: true });
+  });
+
+  /** Adapter options that download via a stub and transcribe deterministically. */
+  function attachmentOpts() {
+    const fetchFn = (async (input: string | URL | Request) => {
+      const url = String(input);
+      const body = url.endsWith(".md") ? "# notes body" : "BINARY";
+      return new Response(new Uint8Array(Buffer.from(body)), { status: 200 });
+    }) as unknown as typeof fetch;
+    return {
+      attachments: {
+        enabled: true,
+        maxBytes: 25 * 1024 * 1024,
+        maxInlineTextBytes: 64 * 1024,
+        maxAttachmentsPerMessage: 10,
+        maxTranscribeBytes: 8 * 1024 * 1024,
+        rootDir: attRoot,
+        transcribeVoice: true,
+        retentionHours: 0,
+      },
+      fetchFn,
+      transcribe: async () => "spoken words",
+    };
+  }
+
+  it("downloads attachments and injects a manifest into the prompt text", async () => {
+    adapter = await startAdapter(h, attachmentOpts());
     h.gateway.push({
       type: "MESSAGE_CREATE",
       message: makeMessage({
@@ -233,14 +277,14 @@ describe("DiscordAdapter — attachments", () => {
             id: "a1",
             filename: "pic.png",
             content_type: "image/png",
-            url: "https://cdn/pic.png",
+            url: "https://cdn.discordapp.com/pic.png",
             size: 100,
           },
           {
             id: "a2",
             filename: "voice.ogg",
             content_type: "audio/ogg",
-            url: "https://cdn/voice.ogg",
+            url: "https://cdn.discordapp.com/voice.ogg",
             size: 200,
             flags: 1 << 13,
           },
@@ -248,28 +292,25 @@ describe("DiscordAdapter — attachments", () => {
             id: "a3",
             filename: "notes.md",
             content_type: "text/markdown",
-            url: "https://cdn/notes.md",
+            url: "https://cdn.discordapp.com/notes.md",
             size: 50,
           },
         ],
       }),
     });
-    await flushMicrotasks();
-    expect(h.bus.prompts).toHaveLength(1);
-    const meta = h.bus.prompts[0]?.metadata as {
-      attachments?: {
-        images: Array<{ id: string }>;
-        voices: Array<{ id: string }>;
-        texts: Array<{ id: string }>;
-      };
-    };
-    expect(meta.attachments?.images?.[0]?.id).toBe("a1");
-    expect(meta.attachments?.voices?.[0]?.id).toBe("a2");
-    expect(meta.attachments?.texts?.[0]?.id).toBe("a3");
+    await until(() => h.bus.prompts.length === 1);
+    const p = h.bus.prompts[0];
+    expect(p?.text).toContain("with media");
+    expect(p?.text).toContain("[Attachments: 3]");
+    expect(p?.text).toContain("notes.md");
+    expect(p?.text).toContain("# notes body"); // text inlined
+    expect(p?.text).toContain("use the Read tool"); // image hint
+    expect(p?.text).toContain('Transcript: "spoken words"'); // voice transcribed
+    expect((p?.metadata as { attachment_count?: number })?.attachment_count).toBe(3);
   });
 
-  it("forwards empty-text + image-only messages", async () => {
-    adapter = await startAdapter(h);
+  it("forwards image-only messages with the manifest as the prompt text", async () => {
+    adapter = await startAdapter(h, attachmentOpts());
     h.gateway.push({
       type: "MESSAGE_CREATE",
       message: makeMessage({
@@ -279,14 +320,37 @@ describe("DiscordAdapter — attachments", () => {
             id: "a1",
             filename: "pic.png",
             content_type: "image/png",
-            url: "https://cdn/pic.png",
+            url: "https://cdn.discordapp.com/pic.png",
             size: 100,
           },
         ],
       }),
     });
-    await flushMicrotasks();
-    expect(h.bus.prompts).toHaveLength(1);
+    await until(() => h.bus.prompts.length === 1);
+    expect(h.bus.prompts[0]?.text).toContain("[Attachments: 1]");
+    expect(h.bus.prompts[0]?.text).toContain("pic.png");
+  });
+
+  it("downloads a json-only message with no text (the #268 fix)", async () => {
+    adapter = await startAdapter(h, attachmentOpts());
+    h.gateway.push({
+      type: "MESSAGE_CREATE",
+      message: makeMessage({
+        content: "",
+        attachments: [
+          {
+            id: "a1",
+            filename: "data.json",
+            content_type: "application/json",
+            url: "https://cdn.discordapp.com/data.json",
+            size: 20,
+          },
+        ],
+      }),
+    });
+    await until(() => h.bus.prompts.length === 1);
+    expect(h.bus.prompts[0]?.text).toContain("[Attachments: 1]");
+    expect(h.bus.prompts[0]?.text).toContain("data.json");
   });
 
   it("drops empty messages with no attachments", async () => {
