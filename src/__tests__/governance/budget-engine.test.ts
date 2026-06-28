@@ -153,6 +153,31 @@ describe("BudgetEngine", () => {
     expect(evaluation[0].state).toBe("healthy");
   });
 
+  // Regression guard for #258 item 1: a per-channel budget policy must only
+  // participate when the request actually carries a channelId. The runner used
+  // to pass channelId: undefined into selectModel/recordInvocationStart, so
+  // channel-scoped budgets could never match and per-channel enforcement was
+  // silently inert. Threading threadId -> channelId in the runner is what makes
+  // these two assertions diverge.
+  test("channel-scoped policy participates only when channelId is threaded (#258)", async () => {
+    const policy = await upsertBudgetPolicy({
+      name: "Channel-Scoped Block",
+      scope: { channelId: "greg-chat" },
+      thresholds: { warnAt: 0.001, degradeAt: 0.002, blockAt: 0.003 },
+      period: "daily",
+      currency: "USD",
+      enabled: true,
+    });
+
+    // Pre-fix runner behaviour: no channelId on the request -> scoped policy skipped.
+    const unscoped = await evaluateBudget({});
+    expect(unscoped.some((e) => e.policyId === policy.id)).toBe(false);
+
+    // Post-fix: channelId threaded -> the same policy now participates.
+    const scoped = await evaluateBudget({ channelId: "greg-chat" });
+    expect(scoped.some((e) => e.policyId === policy.id)).toBe(true);
+  });
+
   test("should evaluate warn state at threshold", async () => {
     const policy = await upsertBudgetPolicy({
       name: "Warn Test",

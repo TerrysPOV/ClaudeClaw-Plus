@@ -1488,7 +1488,7 @@ async function evaluateToolForExecution(
 /**
  * Get context for policy evaluation from current session and settings.
  */
-async function getPolicyContext(source: string): Promise<{
+async function getPolicyContext(source: string, channelId?: string): Promise<{
   eventId: string;
   source: string;
   channelId?: string;
@@ -1502,7 +1502,7 @@ async function getPolicyContext(source: string): Promise<{
   return {
     eventId: crypto.randomUUID(),
     source,
-    channelId: undefined, // Will be populated from event context
+    channelId, // #258 item 1: threaded from inbound event (undefined for non-channel sources)
     userId: undefined,
     skillName: undefined,
     sessionId: existing?.sessionId,
@@ -1625,7 +1625,7 @@ async function execClaude(
         prompt,
         taskType: agentic.defaultMode,
         sessionId: existing?.sessionId,
-        channelId: undefined,
+        channelId: threadId, // #258 item 1: per-channel budget/policy scoping
         source: name,
       });
       primaryConfig = {
@@ -1777,7 +1777,7 @@ async function execClaude(
       sessionId: existing?.sessionId,
       claudeSessionId: existing?.sessionId ?? null,
       source: name,
-      channelId: undefined,
+      channelId: threadId, // #258 item 1: persist channel scope into usage record
       provider:
         primaryConfig.model.startsWith("gpt") ||
         primaryConfig.model.startsWith("o1") ||
