@@ -278,6 +278,22 @@ describe("Watchdog", () => {
     expect(metrics).toBeNull();
   });
 
+  test("clearInvocation is idempotent and a no-op on an unknown id (finally guard, #268)", async () => {
+    // runner.ts now calls clearInvocation in a `finally` on EVERY exit path, so
+    // it can fire on an id whose record was already removed or never created.
+    await recordExecutionMetric({ invocationId: "inv-twice" }, { toolCallCount: 2 });
+    await clearInvocation("inv-twice");
+    expect(await getActiveInvocation("inv-twice")).toBeNull();
+
+    // Second clear (e.g. a finally after an early return that already cleared) — no throw.
+    await clearInvocation("inv-twice");
+
+    // Clearing a never-seen id is a no-op and must not disturb other records.
+    await recordExecutionMetric({ invocationId: "inv-keep" }, { toolCallCount: 1 });
+    await clearInvocation("never-existed");
+    expect(await getActiveInvocation("inv-keep")).not.toBeNull();
+  });
+
   test("should get watchdog stats", async () => {
     await recordExecutionMetric({ invocationId: "stats-inv-1" }, { toolCallCount: 5 });
     await recordExecutionMetric({ invocationId: "stats-inv-2" }, { toolCallCount: 3 });

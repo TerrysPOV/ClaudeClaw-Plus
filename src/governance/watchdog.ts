@@ -76,10 +76,10 @@ interface WatchdogIndex {
 }
 
 // Default configuration
-// Default: disabled. activeInvocations are not yet cleaned up on turn-end, so
-// stale records older than maxRuntimeSeconds silently suspend healthy agents
-// (see issue: governance watchdog activeInvocations leak). Re-enable via
-// settings.governance.watchdog.enabled once the lifecycle hook lands.
+// Default: disabled. The activeInvocations lifecycle leak (#268) is now fixed —
+// runner.ts clears each record in a `finally` on every exit path — but the
+// default stays `false` pending a deliberate opt-in after production soak.
+// Enable via settings.governance.watchdog.enabled.
 let watchdogConfig: WatchdogConfig = {
   limits: {
     maxToolCalls: 100,
@@ -618,7 +618,9 @@ export async function getSessionActiveInvocations(sessionId: string): Promise<Ex
 }
 
 /**
- * Clear an invocation from the watchdog (when completed normally).
+ * Clear an invocation from the watchdog index. Called from runner.ts's `finally`
+ * on EVERY exit path (normal completion, early returns, throws); idempotent and
+ * a no-op when the id is absent.
  */
 export async function clearInvocation(invocationId: string): Promise<void> {
   await initWatchdog();
