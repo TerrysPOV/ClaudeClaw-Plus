@@ -47,9 +47,11 @@ import type {
   BusOrigin,
   IpcMessage,
   IpcPrompt,
+  PermissionRequest,
   PermissionResponse,
 } from "./types";
 import { CHANNEL_DRIVEN_ORIGINS } from "./types";
+import { evaluate, type PolicyDecision, type ToolRequestContext } from "../policy/engine";
 
 /** Escape XML text content (`&`, `<`, `>`) so a `</channel>` in user text
  *  can't close the wrapper element early and inject sibling markup. */
@@ -144,6 +146,12 @@ export interface BusCoreOptions {
   /** Logger; defaults to console.error. */
   onError?: (err: unknown, ctx?: Record<string, unknown>) => void;
   /**
+   * Policy evaluator for the per-tool permission gate (#258 item 3). Defaults to
+   * the policy-engine singleton `evaluate`; injectable so tests (and future
+   * callers) supply a deterministic decision without the global rule file.
+   */
+  evaluatePolicy?: (ctx: ToolRequestContext) => PolicyDecision;
+  /**
    * Reconciliation signal (issue #222). Fired when an IPC `send` to an agent
    * fails because Bus core has no live MCP connection for it. The daemon
    * wires this to a debounced reconciler that checks process liveness via
@@ -205,6 +213,7 @@ export class BusCoreImpl implements BusCore {
   private slashCommandHandler: SlashCommandHandler | null;
   private streamPromptHandler: StreamPromptHandler | null;
   private readonly onError: (err: unknown, ctx?: Record<string, unknown>) => void;
+  private readonly evaluatePolicy: (ctx: ToolRequestContext) => PolicyDecision;
   // Settable post-hoc (like streamPromptHandler): the bus is constructed
   // before the SessionManager exists, so the reconciler is wired afterwards.
   private onMcpSendFailed: (agentId: string, ctx: { reason: string }) => void = () => {};
@@ -362,6 +371,7 @@ export class BusCoreImpl implements BusCore {
     this.slashCommandHandler = opts.slashCommandHandler ?? null;
     this.streamPromptHandler = opts.streamPromptHandler ?? null;
     this.onError = opts.onError ?? ((err, ctx) => console.error("[bus]", err, ctx));
+    this.evaluatePolicy = opts.evaluatePolicy ?? evaluate;
     if (opts.onMcpSendFailed) this.onMcpSendFailed = opts.onMcpSendFailed;
   }
 
@@ -1059,6 +1069,42 @@ export class BusCoreImpl implements BusCore {
     this.publish(e);
   }
 
+  /**
+   * Consult the policy engine for a forwarded tool permission request and
+   * report whether an EXPLICIT deny rule matches (#258 item 3). Deny-wins: an
+   * operator-authored deny (skill overlay, scoped, or global) short-circuits to
+   * a deny response without bothering the operator. The engine's no-match
+   * default-deny (no matchedRuleId) is deliberately NOT treated as a deny here,
+   * so tools stay available when no rules are configured. Fail-OPEN: any
+   * evaluation error returns false so the request falls through to the card.
+   *
+   * skillName / userId are not yet threaded to this seam, so skill overlays and
+   * per-user rules engage once that context reaches the bus (follow-up slice).
+   */
+  private permissionPolicyDenies(
+    agentId: string,
+    request: PermissionRequest,
+    origin?: { origin: BusOrigin; origin_id: string },
+  ): boolean {
+    try {
+      const ctx: ToolRequestContext = {
+        eventId: randomUUID(),
+        source: origin?.origin ?? "bus",
+        channelId: origin?.origin_id,
+        toolName: request.tool_name,
+        timestamp: new Date().toISOString(),
+      };
+      const decision = this.evaluatePolicy(ctx);
+      return decision.action === "deny" && !!decision.matchedRuleId;
+    } catch (err) {
+      this.onError(err instanceof Error ? err : new Error(String(err)), {
+        ctx: "permission-policy-eval",
+        agentId,
+      });
+      return false;
+    }
+  }
+
   ingestPermissionDecision(req: IngestPermissionDecisionRequest): void {
     // Two side effects: emit an audit event AND forward the decision to the
     // MCP server so it can hand it back to claude.
@@ -1241,6 +1287,19 @@ export class BusCoreImpl implements BusCore {
         // surface so the prompt UI lands only on the channel that
         // triggered the tool call.
         const permOrigin = this.lastPromptOrigin.get(agentId);
+        // #258 item 3 (minimal slice): consult policy before the operator card.
+        // Only an EXPLICIT matched deny rule auto-denies (deny-wins); the
+        // engine's no-match default-deny must NOT short-circuit here, or every
+        // tool would be blocked when no rules are configured. Fail-OPEN: any
+        // evaluation error falls through to the normal human-in-the-loop card.
+        if (this.permissionPolicyDenies(agentId, msg.request, permOrigin)) {
+          this.ingestPermissionDecision({
+            agent_id: agentId,
+            request_id: msg.request.request_id,
+            behavior: "deny",
+          });
+          break;
+        }
         this.publish({
           ts: Date.now(),
           agent_id: agentId,
