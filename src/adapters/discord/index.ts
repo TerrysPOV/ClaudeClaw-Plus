@@ -49,6 +49,7 @@ import { getSettings, type AttachmentsConfig } from "../../config";
 import { transcribeAudioToText } from "../../whisper";
 import {
   buildAttachmentManifest,
+  cleanupAttachments,
   type InboundAttachment,
   processAttachments,
 } from "../attachment-pipeline";
@@ -58,7 +59,6 @@ import {
   formatPermissionPrompt,
   makeDefaultRateLimit,
   parsePermissionCustomId,
-  summariseAttachments,
 } from "./helpers";
 import { createDiscordRestApi } from "./rest-api";
 import { resolveAgentId, uniqueAgentIds, type RoutingConfig } from "./router";
@@ -74,6 +74,11 @@ import type {
 /* ────────────────────────────────────────────────────────────────────── */
 /* Adapter                                                                */
 /* ────────────────────────────────────────────────────────────────────── */
+
+/** Discord attachment URLs always live on these hosts. Restricting fetches to
+ *  them blocks SSRF via a forged gateway payload (the pipeline also enforces
+ *  https-only + private-IP blocking as defence-in-depth). */
+const DISCORD_CDN_HOSTS = ["cdn.discordapp.com", "media.discordapp.net"];
 
 export class DiscordAdapter {
   private readonly bus: BusCore;
@@ -260,12 +265,11 @@ export class DiscordAdapter {
       return;
     }
 
-    // 5. Classify attachments. `hasAny` now covers every kind (images,
-    //    voice, text, and generic files) — a .json/.pdf upload used to be
-    //    dropped here. The downloaded content is injected into the prompt
-    //    text below (step 6b), NOT the bus metadata: the PTY delivery path
-    //    stringifies object metadata to "[object Object]".
-    const { hasAny } = summariseAttachments(message.attachments);
+    // 5. Any attachment of any kind (image, voice, text, generic file) counts —
+    //    a .json/.pdf upload used to be dropped here. The downloaded content is
+    //    injected into the prompt text below (step 6b), NOT the bus metadata:
+    //    the PTY delivery path stringifies object metadata to "[object Object]".
+    const hasAny = message.attachments.length > 0;
 
     // 6. Drop empty messages with no attachments.
     if (!message.content.trim() && !hasAny) return;
@@ -281,6 +285,9 @@ export class DiscordAdapter {
         }
       } catch (err) {
         this.logger.error("[discord-adapter] attachment pipeline failed", err);
+        // Don't silently drop the uploads — tell the agent they were lost.
+        const notice = `[Attachments: ${message.attachments.length} could not be processed — pipeline error]`;
+        promptText = message.content.trim() ? `${message.content}\n\n${notice}` : notice;
       }
     }
 
@@ -347,7 +354,17 @@ export class DiscordAdapter {
 
     const baseRoot =
       cfg.rootDir.trim() || join(process.cwd(), ".claudeclaw", "inbound-attachments");
-    const rootDir = join(baseRoot, agentId, message.id);
+    // Sanitise path segments — agentId/message.id ride a (trusted) gateway
+    // payload, but never interpolate them into a filesystem path unguarded.
+    const safeSeg = (s: string) => s.replace(/[^0-9A-Za-z._-]/g, "_").slice(0, 64) || "x";
+    const rootDir = join(baseRoot, safeSeg(agentId), safeSeg(message.id));
+
+    // Fire-and-forget TTL cleanup of old attachment dirs (never blocks the turn).
+    if (cfg.retentionHours > 0) {
+      void cleanupAttachments(baseRoot, cfg.retentionHours * 60 * 60 * 1000, {
+        log: (m) => this.logger.warn(`[discord-adapter] ${m}`),
+      }).catch(() => {});
+    }
 
     const inbound: InboundAttachment[] = message.attachments.map((a) => ({
       id: a.id,
@@ -364,8 +381,11 @@ export class DiscordAdapter {
         enabled: cfg.enabled,
         maxBytes: cfg.maxBytes,
         maxInlineTextBytes: cfg.maxInlineTextBytes,
+        maxAttachmentsPerMessage: cfg.maxAttachmentsPerMessage,
+        maxTranscribeBytes: cfg.maxTranscribeBytes,
         rootDir,
         transcribeVoice: cfg.transcribeVoice,
+        allowedHosts: DISCORD_CDN_HOSTS,
       },
       {
         fetchFn: this.fetchFn,

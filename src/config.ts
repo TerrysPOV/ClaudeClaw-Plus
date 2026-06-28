@@ -172,8 +172,11 @@ const DEFAULT_SETTINGS: Settings = {
     enabled: true,
     maxBytes: 25 * 1024 * 1024,
     maxInlineTextBytes: 64 * 1024,
+    maxAttachmentsPerMessage: 10,
+    maxTranscribeBytes: 8 * 1024 * 1024,
     rootDir: "",
     transcribeVoice: true,
+    retentionHours: 24,
   },
   sessionTimeoutMs: DEFAULT_SESSION_TIMEOUT_MS,
   timeouts: { telegram: 5, discord: 5, heartbeat: 15, job: 30, default: 5 },
@@ -749,6 +752,13 @@ export interface AttachmentsConfig {
   rootDir: string;
   /** Transcribe voice/audio attachments via the STT pipeline. Default: true. */
   transcribeVoice: boolean;
+  /** Max attachments processed per message; the rest are noted. Default: 10. */
+  maxAttachmentsPerMessage: number;
+  /** Don't transcribe audio larger than this many bytes. Default: 8 MiB. */
+  maxTranscribeBytes: number;
+  /** Delete saved attachment dirs older than this many hours (TTL cleanup).
+   *  Default: 24. Set 0 to disable cleanup. */
+  retentionHours: number;
 }
 
 export interface SessionConfig {
@@ -965,8 +975,23 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
         Number(raw.attachments.maxInlineTextBytes) > 0
           ? Number(raw.attachments.maxInlineTextBytes)
           : 64 * 1024,
+      maxAttachmentsPerMessage:
+        Number.isFinite(raw.attachments?.maxAttachmentsPerMessage) &&
+        Number(raw.attachments.maxAttachmentsPerMessage) > 0
+          ? Number(raw.attachments.maxAttachmentsPerMessage)
+          : 10,
+      maxTranscribeBytes:
+        Number.isFinite(raw.attachments?.maxTranscribeBytes) &&
+        Number(raw.attachments.maxTranscribeBytes) > 0
+          ? Number(raw.attachments.maxTranscribeBytes)
+          : 8 * 1024 * 1024,
       rootDir: typeof raw.attachments?.rootDir === "string" ? raw.attachments.rootDir.trim() : "",
       transcribeVoice: raw.attachments?.transcribeVoice !== false,
+      retentionHours:
+        Number.isFinite(raw.attachments?.retentionHours) &&
+        Number(raw.attachments.retentionHours) >= 0
+          ? Number(raw.attachments.retentionHours)
+          : 24,
     },
     sessionTimeoutMs:
       Number.isFinite(raw.sessionTimeoutMs) && (raw.sessionTimeoutMs as number) > 0

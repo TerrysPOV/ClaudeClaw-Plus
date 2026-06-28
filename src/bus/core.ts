@@ -565,8 +565,19 @@ export class BusCoreImpl implements BusCore {
       if (req.metadata) {
         for (const [k, v] of Object.entries(req.metadata)) {
           // Objects/arrays must be JSON-encoded — `String(obj)` yields the
-          // useless literal "[object Object]" in the channel block.
-          const encoded = v !== null && typeof v === "object" ? JSON.stringify(v) : String(v);
+          // useless literal "[object Object]" in the channel block. Guard against
+          // circular refs (mirrors mcp-server's flattenChannelMeta) so a pathological
+          // metadata value can't throw on this PTY-delivery path.
+          let encoded: string;
+          if (v !== null && typeof v === "object") {
+            try {
+              encoded = JSON.stringify(v);
+            } catch {
+              encoded = "[unserializable]";
+            }
+          } else {
+            encoded = String(v);
+          }
           attrs.push(`${k}="${escapeXmlAttr(encoded)}"`);
         }
       }

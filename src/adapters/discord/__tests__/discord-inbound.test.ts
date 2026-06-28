@@ -255,8 +255,11 @@ describe("DiscordAdapter — attachments", () => {
         enabled: true,
         maxBytes: 25 * 1024 * 1024,
         maxInlineTextBytes: 64 * 1024,
+        maxAttachmentsPerMessage: 10,
+        maxTranscribeBytes: 8 * 1024 * 1024,
         rootDir: attRoot,
         transcribeVoice: true,
+        retentionHours: 0,
       },
       fetchFn,
       transcribe: async () => "spoken words",
@@ -274,14 +277,14 @@ describe("DiscordAdapter — attachments", () => {
             id: "a1",
             filename: "pic.png",
             content_type: "image/png",
-            url: "https://cdn/pic.png",
+            url: "https://cdn.discordapp.com/pic.png",
             size: 100,
           },
           {
             id: "a2",
             filename: "voice.ogg",
             content_type: "audio/ogg",
-            url: "https://cdn/voice.ogg",
+            url: "https://cdn.discordapp.com/voice.ogg",
             size: 200,
             flags: 1 << 13,
           },
@@ -289,7 +292,7 @@ describe("DiscordAdapter — attachments", () => {
             id: "a3",
             filename: "notes.md",
             content_type: "text/markdown",
-            url: "https://cdn/notes.md",
+            url: "https://cdn.discordapp.com/notes.md",
             size: 50,
           },
         ],
@@ -317,7 +320,7 @@ describe("DiscordAdapter — attachments", () => {
             id: "a1",
             filename: "pic.png",
             content_type: "image/png",
-            url: "https://cdn/pic.png",
+            url: "https://cdn.discordapp.com/pic.png",
             size: 100,
           },
         ],
@@ -326,6 +329,28 @@ describe("DiscordAdapter — attachments", () => {
     await until(() => h.bus.prompts.length === 1);
     expect(h.bus.prompts[0]?.text).toContain("[Attachments: 1]");
     expect(h.bus.prompts[0]?.text).toContain("pic.png");
+  });
+
+  it("downloads a json-only message with no text (the #268 fix)", async () => {
+    adapter = await startAdapter(h, attachmentOpts());
+    h.gateway.push({
+      type: "MESSAGE_CREATE",
+      message: makeMessage({
+        content: "",
+        attachments: [
+          {
+            id: "a1",
+            filename: "data.json",
+            content_type: "application/json",
+            url: "https://cdn.discordapp.com/data.json",
+            size: 20,
+          },
+        ],
+      }),
+    });
+    await until(() => h.bus.prompts.length === 1);
+    expect(h.bus.prompts[0]?.text).toContain("[Attachments: 1]");
+    expect(h.bus.prompts[0]?.text).toContain("data.json");
   });
 
   it("drops empty messages with no attachments", async () => {

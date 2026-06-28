@@ -123,50 +123,6 @@ export function classifyAttachmentKind(a: DiscordAttachment): AttachmentKind {
   return "file";
 }
 
-export interface AttachmentSummary {
-  images: DiscordAttachment[];
-  voices: DiscordAttachment[];
-  texts: DiscordAttachment[];
-  /** Generic binaries (pdf/zip/etc.) — previously dropped on the floor. */
-  files: DiscordAttachment[];
-  hasAny: boolean;
-}
-
-/**
- * Build the attachment summary that rides on the BusEvent payload. `hasAny`
- * now reflects EVERY attachment kind (incl. generic files) — a `.json`/`.pdf`
- * upload used to leave `hasAny` false and get silently dropped (#268 follow-up).
- */
-export function summariseAttachments(attachments: DiscordAttachment[]): AttachmentSummary {
-  const byKind = (k: AttachmentKind): DiscordAttachment[] =>
-    attachments.filter((a) => classifyAttachmentKind(a) === k);
-  return {
-    images: byKind("image"),
-    voices: byKind("voice"),
-    texts: byKind("text"),
-    files: byKind("file"),
-    hasAny: attachments.length > 0,
-  };
-}
-
-export interface AttachmentMeta {
-  id: string;
-  filename: string;
-  url: string;
-  content_type?: string;
-  size: number;
-}
-
-export function attachmentMeta(a: DiscordAttachment): AttachmentMeta {
-  return {
-    id: a.id,
-    filename: a.filename,
-    url: a.url,
-    content_type: a.content_type,
-    size: a.size,
-  };
-}
-
 /* ────────────────────────────────────────────────────────────────────── */
 /* Permission-prompt formatting                                           */
 /* ────────────────────────────────────────────────────────────────────── */
