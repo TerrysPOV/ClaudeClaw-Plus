@@ -48,6 +48,7 @@ import { calculateEstimatedCost } from "./governance/budget-engine";
 import {
   recordExecutionMetric,
   checkLimits,
+  clearInvocation as watchdogClearInvocation,
   handleTrigger as watchdogHandleTrigger,
 } from "./governance/watchdog";
 import {
@@ -1488,7 +1489,12 @@ async function evaluateToolForExecution(
 /**
  * Get context for policy evaluation from current session and settings.
  */
-async function getPolicyContext(source: string): Promise<{
+async function getPolicyContext(
+  source: string,
+  channelId?: string,
+  userId?: string,
+  skillName?: string,
+): Promise<{
   eventId: string;
   source: string;
   channelId?: string;
@@ -1502,9 +1508,9 @@ async function getPolicyContext(source: string): Promise<{
   return {
     eventId: crypto.randomUUID(),
     source,
-    channelId: undefined, // Will be populated from event context
-    userId: undefined,
-    skillName: undefined,
+    channelId, // #258 item 1: threaded from inbound event (undefined for non-channel sources)
+    userId,
+    skillName,
     sessionId: existing?.sessionId,
     claudeSessionId: existing?.sessionId ?? null,
   };
@@ -1562,6 +1568,14 @@ export async function compactCurrentThreadSession(
     : { success: false, message: `❌ Compact failed (${existing.sessionId.slice(0, 8)})` };
 }
 
+/**
+ * Identity fields threaded from the inbound surface for policy/budget scoping (#258 item 1).
+ */
+interface PolicyIdentity {
+  userId?: string;
+  skillName?: string;
+}
+
 async function execClaude(
   name: string,
   prompt: string,
@@ -1572,9 +1586,14 @@ async function execClaude(
   timeoutCategory?: string,
   onChunk?: (text: string) => void,
   onToolEvent?: (line: string) => void,
+  identity?: PolicyIdentity,
 ): Promise<RunResult> {
   mainRunCount++;
   persistRunCount();
+  // Invocation ID for watchdog tracking. Declared OUTSIDE the try so the
+  // `finally` can always clear the activeInvocations record on EVERY exit
+  // path — early returns, throws, and normal completion alike (#268).
+  const invocationId = crypto.randomUUID();
   try {
     await mkdir(LOGS_DIR, { recursive: true });
 
@@ -1600,8 +1619,6 @@ async function execClaude(
     const settings = getSettings();
     const { security, model, api, fallback, agentic, watchdog } = settings;
 
-    // Generate invocation ID for tracking
-    const invocationId = crypto.randomUUID();
     const invocationSessionId = existing?.sessionId;
 
     // Initialize watchdog metrics
@@ -1625,7 +1642,8 @@ async function execClaude(
         prompt,
         taskType: agentic.defaultMode,
         sessionId: existing?.sessionId,
-        channelId: undefined,
+        channelId: threadId, // #258 item 1: per-channel budget/policy scoping
+        userId: identity?.userId,
         source: name,
       });
       primaryConfig = {
@@ -1777,7 +1795,9 @@ async function execClaude(
       sessionId: existing?.sessionId,
       claudeSessionId: existing?.sessionId ?? null,
       source: name,
-      channelId: undefined,
+      channelId: threadId, // #258 item 1: persist channel scope into usage record
+      userId: identity?.userId,
+      skillName: identity?.skillName,
       provider:
         primaryConfig.model.startsWith("gpt") ||
         primaryConfig.model.startsWith("o1") ||
@@ -2373,6 +2393,18 @@ async function execClaude(
 
     return result;
   } finally {
+    // Lifecycle hook (#268): drop the invocation record on EVERY exit path —
+    // normal completion, early returns (budget block, consecutive-timeout
+    // abort, auto-compact retry) and throws. Without this, `activeInvocations`
+    // accumulates a record per cron firing; once any record ages past
+    // maxRuntimeSeconds (default 2h) `checkLimits` returns suspend forever and
+    // a CRITICAL watchdog handoff fires on every tick. Best-effort: a clear
+    // failure must never mask the original result or throw.
+    try {
+      await watchdogClearInvocation(invocationId);
+    } catch (clearErr) {
+      console.warn(`[watchdog] clearInvocation(${invocationId}) failed:`, clearErr);
+    }
     mainRunCount--;
     persistRunCount();
   }
@@ -2388,6 +2420,7 @@ export async function run(
   timeoutCategory?: string,
   onChunk?: (text: string) => void,
   onToolEvent?: (line: string) => void,
+  identity?: PolicyIdentity,
 ): Promise<RunResult> {
   return enqueue(
     () =>
@@ -2401,6 +2434,7 @@ export async function run(
         timeoutCategory,
         onChunk,
         onToolEvent,
+        identity,
       ),
     threadId,
   );
@@ -2674,6 +2708,7 @@ export async function runUserMessage(
   onChunk?: (text: string) => void,
   onToolEvent?: (line: string) => void,
   modelOverride?: string,
+  identity?: PolicyIdentity,
 ): Promise<RunResult> {
   return run(
     name,
@@ -2685,6 +2720,7 @@ export async function runUserMessage(
     undefined,
     onChunk,
     onToolEvent,
+    identity,
   );
 }
 

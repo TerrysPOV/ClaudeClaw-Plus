@@ -1745,6 +1745,10 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
         stream.onChunk,
         stream.onToolEvent,
         modelOverride,
+        {
+          userId: userId !== undefined ? String(userId) : undefined,
+          skillName: skillContext ? command!.replace(/^\//, "") : undefined,
+        },
       );
       const streamResult = await stream.waitForStreamMsg();
       streamMsgId = streamResult.msgId;

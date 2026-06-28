@@ -153,6 +153,52 @@ describe("BudgetEngine", () => {
     expect(evaluation[0].state).toBe("healthy");
   });
 
+  // Regression guard for #258 item 1: a per-channel budget policy must only
+  // participate when the request actually carries a channelId. The runner used
+  // to pass channelId: undefined into selectModel/recordInvocationStart, so
+  // channel-scoped budgets could never match and per-channel enforcement was
+  // silently inert. Threading threadId -> channelId in the runner is what makes
+  // these two assertions diverge.
+  test("channel-scoped policy participates only when channelId is threaded (#258)", async () => {
+    const policy = await upsertBudgetPolicy({
+      name: "Channel-Scoped Block",
+      scope: { channelId: "greg-chat" },
+      thresholds: { warnAt: 0.001, degradeAt: 0.002, blockAt: 0.003 },
+      period: "daily",
+      currency: "USD",
+      enabled: true,
+    });
+
+    // Pre-fix runner behaviour: no channelId on the request -> scoped policy skipped.
+    const unscoped = await evaluateBudget({});
+    expect(unscoped.some((e) => e.policyId === policy.id)).toBe(false);
+
+    // Post-fix: channelId threaded -> the same policy now participates.
+    const scoped = await evaluateBudget({ channelId: "greg-chat" });
+    expect(scoped.some((e) => e.policyId === policy.id)).toBe(true);
+  });
+
+  // Regression guard for #258 item 1 (userId half): per-user budgets only
+  // participate once userId is threaded from the surface into the request.
+  test("user-scoped policy participates only when userId is threaded (#258)", async () => {
+    const policy = await upsertBudgetPolicy({
+      name: "User-Scoped Block",
+      scope: { userId: "user-42" },
+      thresholds: { warnAt: 0.001, degradeAt: 0.002, blockAt: 0.003 },
+      period: "daily",
+      currency: "USD",
+      enabled: true,
+    });
+
+    // No userId on the request -> scoped policy must be skipped.
+    const unscoped = await evaluateBudget({});
+    expect(unscoped.some((e) => e.policyId === policy.id)).toBe(false);
+
+    // userId threaded -> the same policy now participates.
+    const scoped = await evaluateBudget({ userId: "user-42" });
+    expect(scoped.some((e) => e.policyId === policy.id)).toBe(true);
+  });
+
   test("should evaluate warn state at threshold", async () => {
     const policy = await upsertBudgetPolicy({
       name: "Warn Test",
@@ -320,5 +366,92 @@ describe("BudgetEngine", () => {
     const eval_ = await evaluateBudget({ sessionId: "test-session" });
     // Should evaluate session policy
     expect(eval_.some((e) => e.policyId === policy.id)).toBe(true);
+  });
+
+  // #277 (Terry HIGH): evaluateBudget must derive its spend filter from the
+  // policy scope, not the request context. A global / unscoped budget previously
+  // filtered by the current channelId -> under-count -> fail-open.
+  test("global budget aggregates spend across ALL channels — no per-channel fail-open (#277)", async () => {
+    await upsertBudgetPolicy({
+      name: "Global Daily",
+      scope: {},
+      thresholds: { warnAt: 0.001, degradeAt: 0.01, blockAt: 0.02 },
+      period: "daily",
+      currency: "USD",
+      enabled: true,
+    });
+    for (const channelId of ["chan-A", "chan-B"]) {
+      const s = await recordInvocationStart({
+        channelId,
+        provider: "anthropic",
+        model: "claude-3-haiku",
+      });
+      await recordInvocationCompletion(
+        s.invocationId,
+        { inputTokens: 100, outputTokens: 100 },
+        { currency: "USD", totalCost: 0.0008 },
+      );
+    }
+    // Evaluated as a request from chan-A: a GLOBAL budget must still see BOTH
+    // channels (0.0016), not just chan-A (0.0008) — the pre-fix under-count.
+    const evals = await evaluateBudget({ channelId: "chan-A" });
+    const global = evals.find((e) => e.policyName === "Global Daily");
+    expect(global).toBeDefined();
+    expect(global!.currentSpend).toBeCloseTo(0.0016, 5);
+    expect(global!.state).not.toBe("healthy");
+  });
+
+  test("channel-scoped budget meters only its own channel (#277)", async () => {
+    await upsertBudgetPolicy({
+      name: "ChanA Budget",
+      scope: { channelId: "chan-A" },
+      thresholds: { warnAt: 0.01, degradeAt: 0.02, blockAt: 0.05 },
+      period: "daily",
+      currency: "USD",
+      enabled: true,
+    });
+    for (const channelId of ["chan-A", "chan-B"]) {
+      const s = await recordInvocationStart({
+        channelId,
+        provider: "anthropic",
+        model: "claude-3-haiku",
+      });
+      await recordInvocationCompletion(
+        s.invocationId,
+        { inputTokens: 100, outputTokens: 100 },
+        { currency: "USD", totalCost: 0.0008 },
+      );
+    }
+    const evals = await evaluateBudget({ channelId: "chan-A" });
+    const chanA = evals.find((e) => e.policyName === "ChanA Budget");
+    expect(chanA).toBeDefined();
+    expect(chanA!.currentSpend).toBeCloseTo(0.0008, 5); // chan-A only, not chan-B
+  });
+
+  test("user-scoped budget meters only its own user (#277)", async () => {
+    await upsertBudgetPolicy({
+      name: "UserX Budget",
+      scope: { userId: "user-x" },
+      thresholds: { warnAt: 0.01, degradeAt: 0.02, blockAt: 0.05 },
+      period: "daily",
+      currency: "USD",
+      enabled: true,
+    });
+    for (const userId of ["user-x", "user-y"]) {
+      const s = await recordInvocationStart({
+        userId,
+        provider: "anthropic",
+        model: "claude-3-haiku",
+      });
+      await recordInvocationCompletion(
+        s.invocationId,
+        { inputTokens: 100, outputTokens: 100 },
+        { currency: "USD", totalCost: 0.0008 },
+      );
+    }
+    const evals = await evaluateBudget({ userId: "user-x" });
+    const userX = evals.find((e) => e.policyName === "UserX Budget");
+    expect(userX).toBeDefined();
+    expect(userX!.currentSpend).toBeCloseTo(0.0008, 5); // user-x only, not user-y
   });
 });

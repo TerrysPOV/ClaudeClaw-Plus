@@ -89,62 +89,10 @@ Both `plugin-version-guard` and `marketplace-version-guard` are required CI chec
 
 ## Software Development Cycle (SDC)
 
-This project follows a **9-stage Claude-Code-managed SDC**. The Claude Code agent loop is the orchestrator; specialised sub-agents do the focused work, parallelised where independent and sequential where dependent. Worktrees isolate parallel work streams.
+This project follows the 9-stage Claude-Code-managed SDC. **Canonical spec: `~/.claude/rules/sdc.md`** (+ `~/.claude/rules/pr-review.md`). The stage table, marker mechanics, override, and rationale live there — not duplicated here.
 
-The SDC is **ClaudeClaw+ specific** — it is not proposed for upstream `moazbuilds/claudeclaw`.
+ClaudeClaw+ specifics (the delta from the generic rules):
 
-**The hook + mark-script implementation lives in the operator's home (`~/.claude/`), NOT in the repo.** Repo stays free of local Claude Code config; hooks stay active across every worktree and branch independent of what's checked out. The previous in-repo location was branch-coupled and trivially bypassable.
-
-### The 9 stages
-
-| # | Stage | Owner | Enforcement |
-|---|---|---|---|
-| 1 | **Architect** | `architect` / `feature-dev:code-architect` sub-agents | Intent-based |
-| 2 | **Plan** | `Plan` agent / plan mode | Intent-based |
-| 3 | **Human review** | Terrence | Conversational gate (no hook) |
-| 4 | **Implementation** | Claude Code + focused sub-agents (parallel where independent) | Intent-based |
-| 5 | **Write tests** | `tdd-guide` / implementer | **Hook-enforced** (`tests-written` marker) |
-| 6 | **Run tests / QA** | `~/.claude/scripts/sdc/mark-tests-passing.sh` (runs `bun test` + `bun run lint`) | **Hook-enforced** (`tests-passing` marker) |
-| 7 | **Security review** | `security-reviewer` agent (or equivalent) | **Hook-enforced** (`security-reviewed` marker) |
-| 8 | **5-agent code review** | `/code-review:code-review` skill + human sign-off | **Hook-enforced** (`pr-review` marker) |
-| 9 | **PR** | `gh pr create` once all four markers are in place | Allowed by the gate hook |
-
-### Parallel and sequential sub-agents
-
-- **Parallel where independent.** Stage 1 architect explorations, stage 4 implementation of unrelated modules, stage 6 running unrelated test suites — fan out into multiple Agent calls in a single message.
-- **Sequential where dependent.** Stage 2 plan depends on stage 1 output; stage 4 implementation depends on stage 3 human sign-off; stages 5–7 sequence after a clean stage 4.
-- **Worktrees as appropriate.** Each independent parallel work stream should occupy its own `.claude/worktrees/<branch>` so subagents don't collide on the working tree.
-- Use `feature-dev:code-explorer` for read-only reconnaissance, `feature-dev:code-architect` for design synthesis, `codex:codex-rescue` for second-opinion / hand-off after two failed fix attempts on the same issue.
-
-### Hook-enforced gates (stages 5–8)
-
-Each enforced gate is keyed by `<branch>` + first 12 chars of `HEAD` sha. A fresh commit invalidates every marker — re-run the relevant gates. Markers live under `.claude/state/` (gitignored) per project.
-
-| Gate | Marker | How to mark |
-|---|---|---|
-| `tests-written` | `.claude/state/tests-written-<branch>-<sha-12>.json` | `~/.claude/scripts/sdc/mark-tests-written.sh "<note>"` |
-| `tests-passing` | `.claude/state/tests-passing-<branch>-<sha-12>.json` | `~/.claude/scripts/sdc/mark-tests-passing.sh` (verifying — runs `bun test` + `bun run lint`, marks only on green) |
-| `security-reviewed` | `.claude/state/security-reviewed-<branch>-<sha-12>.json` | `~/.claude/scripts/sdc/mark-security-reviewed.sh "<reviewer + summary>"` |
-| `pr-review` | `.claude/state/pr-review-<branch>-<sha-12>.json` | `~/.claude/scripts/sdc/mark-pr-reviewed.sh "<note>"` |
-
-The gate hook lives at `~/.claude/hooks/sdc-gate-claudeclaw-plus.sh` (wired in `~/.claude/settings.json` as `PreToolUse` on `Bash`). It scopes itself to `ClaudeClaw-Plus` repos by checking `git remote` — other projects' `gh pr create` is unaffected. If any of the four markers is missing for the current branch + sha, the PR creation is blocked with a checklist of what's missing.
-
-### Override
-
-For emergencies, docs-only PRs, or follow-up commits already covered by an earlier review on the same branch:
-
-```bash
-ALLOW_PR_PUBLISH=1 gh pr create ...
-```
-
-Inline `ALLOW_PR_PUBLISH=1` prefix on the command works too.
-
-### Why these four are hook-enforced and the other five aren't
-
-Stages 1–4 are intent-based by nature — architecture, planning, human review, and implementation can't be deterministically verified by a script. Stages 5–8 are verifiable (tests exist; tests pass; security review ran; code review ran) and have a strong "zero-exception" property. So they're hooks, not docstrings.
-
-### Posting gate (separate)
-
-Two posting gates layer together:
-- `~/.claude/hooks/sdc-gate-claudeclaw-plus.sh` (this project) — gates *creating* the PR
-- `~/.claude/hooks/block-pr-write.sh` (global) — gates *commenting on* or *reviewing* a PR. See `~/.claude/rules/pr-review.md` for why: "Posting unreviewed AI-generated comments under Terrence's maintainer identity to other contributors' PRs is a trust and reputation risk."
+- The SDC is **ClaudeClaw+ only** — not proposed for upstream `moazbuilds/claudeclaw`.
+- The hook + mark-script implementation lives in the operator's home (`~/.claude/`), **NOT in the repo** — so the repo stays free of local Claude Code config and the gates stay active across every worktree/branch regardless of what's checked out (the old in-repo location was branch-coupled and bypassable).
+- The PR-creation gate is `~/.claude/hooks/sdc-gate-claudeclaw-plus.sh`, which scopes itself to `ClaudeClaw-Plus` repos by `git remote`. It requires the four markers (`tests-written`, `tests-passing`, `security-reviewed`, `pr-review`) under `.claude/state/` (gitignored) — except `pr-review` is auto-waived when this repo's CI 5-agent review (`claude-code-review.yml`) is active (see `rules/pr-review.md` → "Automation-aware exemption"). Override: `ALLOW_PR_PUBLISH=1 gh pr create ...`.
