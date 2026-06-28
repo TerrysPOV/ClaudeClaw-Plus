@@ -573,7 +573,6 @@ describe("Policy Engine - Cache", () => {
   });
 });
 
-
 describe("Policy Engine - Skill Overlay engine participation (#258 item 2)", () => {
   // These exercise ENGINE-LEVEL PARTICIPATION — that evaluate() consults a cached
   // skill overlay when a request carries both a skillName and a toolName. They are
