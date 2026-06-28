@@ -547,6 +547,20 @@ export async function getBudgetState(scope: BudgetScope): Promise<BudgetStateSum
 
   const summaries: BudgetStateSummary[] = [];
 
+  // An empty query scope means "every policy" — the budget-health / dashboard
+  // view passes {}. matchesScope() answers "does this query select this policy?",
+  // and with no fields set it rejects every SCOPED policy (the scoped field has
+  // nothing in the empty query to match against), so getBudgetHealth() silently
+  // dropped all channel/user/model-scoped budgets. Treat an empty query as
+  // "select all"; a non-empty query still filters as before.
+  const selectsAllPolicies =
+    !scope.source &&
+    !scope.channelId &&
+    !scope.userId &&
+    !scope.sessionId &&
+    !scope.provider &&
+    !scope.model;
+
   for (const policy of budgetPolicies!) {
     if (!policy.enabled) {
       continue;
@@ -554,6 +568,7 @@ export async function getBudgetState(scope: BudgetScope): Promise<BudgetStateSum
 
     // Check if policy matches the requested scope
     if (
+      !selectsAllPolicies &&
       !matchesScope(
         scope as {
           source?: string;
