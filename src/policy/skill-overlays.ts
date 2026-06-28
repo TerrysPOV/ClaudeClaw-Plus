@@ -7,7 +7,9 @@
  * IMPORTANT: Skill overlays must not become a privilege-escalation path.
  * - "preferredTools" influences recommendation, not security overrides
  * - "requiredTools" surfaces actionable policy errors when unavailable
- * - "deniedTools" are enforced as restrictions even when globally allowed
+ * - "deniedTools" become deny rules at priority 150 (basePriority + 50): they
+ *   restrict tools a broader rule allows, but the deny is NOT absolute — a
+ *   higher-priority (or equal-priority, more-specific) allow still outranks it.
  */
 
 import type { PolicyRule, ToolRequestContext } from "./engine";
@@ -166,7 +168,9 @@ export function overlayToRules(overlay: SkillOverlay, basePriority: number = 100
     for (const tool of overlay.deniedTools) {
       rules.push({
         id: `skill-${overlay.skillName}-deny-${tool}`,
-        priority: basePriority + 50, // Higher than typical rules
+        // Above typical rules so an overlay deny outranks a broad allow — but
+        // NOT absolute: an equal/higher-priority allow still wins (see sortRules).
+        priority: basePriority + 50,
         scope: {
           skillName: overlay.skillName,
         },
@@ -178,6 +182,40 @@ export function overlayToRules(overlay: SkillOverlay, basePriority: number = 100
   }
 
   return rules;
+}
+
+// ============================================================================
+// Sync Overlay Rules Cache (#258 item 2)
+// ============================================================================
+
+/**
+ * Skill overlays live in SKILL.md files (async to read). The policy engine's
+ * getApplicableRules is synchronous, so overlay-derived deny rules are cached
+ * here keyed by skillName. The cache is populated when a surface resolves a
+ * slash command to a skill (the SKILL.md content is already in hand at that
+ * point), then read synchronously during evaluation.
+ */
+const overlayRulesCache = new Map<string, PolicyRule[]>();
+
+/**
+ * Parse a skill's overlay from its (already-loaded) SKILL.md content and cache
+ * the derived deny rules under skillName. Overlay-less skills cache an empty
+ * array so repeat lookups stay sync and allocation-free.
+ */
+export function cacheSkillOverlayFromContent(skillName: string, content: string): void {
+  const overlay = parseSkillMetadata(content, skillName);
+  overlayRulesCache.set(skillName, overlay ? overlayToRules(overlay) : []);
+}
+
+/** Synchronously get cached overlay deny rules for a skill (empty if none). */
+export function getCachedSkillOverlayRules(skillName?: string): PolicyRule[] {
+  if (!skillName) return [];
+  return overlayRulesCache.get(skillName) ?? [];
+}
+
+/** Clear the overlay rules cache (tests / skill reload). */
+export function clearSkillOverlayRulesCache(): void {
+  overlayRulesCache.clear();
 }
 
 // ============================================================================

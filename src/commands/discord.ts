@@ -16,6 +16,7 @@ import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt } from "../skills";
+import { cacheSkillOverlayFromContent } from "../policy/skill-overlays";
 import { fireJob, parseFireArgs } from "./fire";
 import { mkdir } from "node:fs/promises";
 import { extname, join, basename, sep } from "node:path";
@@ -1158,6 +1159,9 @@ async function handleMessageCreate(
         skillContext = await resolveSkillPrompt(command);
         if (skillContext) {
           debugLog(`Skill resolved for ${command}: ${skillContext.length} chars`);
+          // #258 item 2: cache this skill's deny-tool overlay so the policy
+          // engine can consult it synchronously during evaluation.
+          cacheSkillOverlayFromContent(command.replace(/^\//, ""), skillContext);
         }
       } catch (err) {
         debugLog(

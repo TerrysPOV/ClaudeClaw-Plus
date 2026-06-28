@@ -22,6 +22,7 @@ import { randomUUID } from "crypto";
 // Scoped per-channel/per-user policies. Imported for use at evaluate-time only
 // (not at module init), so the channel-policies↔engine cycle never hits a TDZ.
 import { getScopedRules, mergeScopedPolicies } from "./channel-policies";
+import { getCachedSkillOverlayRules } from "./skill-overlays";
 
 const POLICY_DIR = join(process.cwd(), ".claude", "claudeclaw");
 const POLICY_FILE = join(POLICY_DIR, "policies.json");
@@ -418,6 +419,12 @@ function getApplicableRules(request: ToolRequestContext): PolicyRule[] {
   } catch {
     candidates = loadedRules;
   }
+  // Fold in skill-overlay deny rules for this request's skill (#258 item 2).
+  // Overlays are deny-only and scoped by skillName, so they can only ADD a
+  // restriction for the matching skill — never widen access. Empty when the
+  // request carries no skillName or the skill declared no deniedTools.
+  const overlayRules = getCachedSkillOverlayRules(request.skillName);
+  if (overlayRules.length > 0) candidates = candidates.concat(overlayRules);
   return candidates.filter((rule) => {
     // Skip disabled rules
     if (rule.enabled === false) return false;

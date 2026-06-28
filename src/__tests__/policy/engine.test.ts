@@ -18,6 +18,10 @@ import {
   type ToolRequestContext,
   type PolicyRule,
 } from "../../policy/engine";
+import {
+  cacheSkillOverlayFromContent,
+  clearSkillOverlayRulesCache,
+} from "../../policy/skill-overlays";
 
 const POLICY_DIR = join(process.cwd(), ".claude", "claudeclaw");
 const POLICY_FILE = join(POLICY_DIR, "policies.json");
@@ -566,5 +570,68 @@ describe("Policy Engine - Cache", () => {
 
     expect(decision.action).toBe("require_approval");
     expect(decision.cacheable).toBe(false);
+  });
+});
+
+describe("Policy Engine - Skill Overlay engine participation (#258 item 2)", () => {
+  // These exercise ENGINE-LEVEL PARTICIPATION — that evaluate() consults a cached
+  // skill overlay when a request carries both a skillName and a toolName. They are
+  // NOT end-to-end enforcement: no production caller builds such a request yet (the
+  // gateway evaluates the "InboundMessage" pseudo-tool; the per-tool gate that
+  // supplies skillName is #258 item 3 / PR #284).
+  const SKILL_MD = ["---", "name: quant", "deniedTools:", "  - Bash", "---", "Quant skill."].join(
+    "\n",
+  );
+
+  beforeEach(async () => {
+    clearCache();
+    clearSkillOverlayRulesCache();
+    // Base policy: telegram is allowed to run any tool.
+    await writePolicyFile([
+      {
+        id: "allow-telegram",
+        priority: 100,
+        scope: { source: "telegram" },
+        tool: "*",
+        action: "allow",
+        reason: "Allow all tools on telegram",
+      },
+    ]);
+    await loadRules();
+  });
+
+  afterEach(async () => {
+    clearCache();
+    clearSkillOverlayRulesCache();
+    try {
+      await rm(POLICY_FILE, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  });
+
+  it("denies a tool the active skill's overlay forbids (overlay outranks base allow)", () => {
+    cacheSkillOverlayFromContent("quant", SKILL_MD);
+    const decision = evaluate(createRequest({ skillName: "quant", toolName: "Bash" }));
+    expect(decision.action).toBe("deny");
+    expect(decision.matchedRuleId).toBe("skill-quant-deny-Bash");
+  });
+
+  it("still allows tools the overlay does not deny", () => {
+    cacheSkillOverlayFromContent("quant", SKILL_MD);
+    const decision = evaluate(createRequest({ skillName: "quant", toolName: "Read" }));
+    expect(decision.action).toBe("allow");
+  });
+
+  it("does not apply the overlay when the request carries no skillName", () => {
+    cacheSkillOverlayFromContent("quant", SKILL_MD);
+    const decision = evaluate(createRequest({ skillName: undefined, toolName: "Bash" }));
+    expect(decision.action).toBe("allow");
+  });
+
+  it("does not apply one skill's overlay to a different skill", () => {
+    cacheSkillOverlayFromContent("quant", SKILL_MD);
+    const decision = evaluate(createRequest({ skillName: "other-skill", toolName: "Bash" }));
+    expect(decision.action).toBe("allow");
   });
 });

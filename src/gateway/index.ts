@@ -143,6 +143,11 @@ export class Gateway {
       channelId: event.channelId,
       threadId: event.threadId,
       userId: event.userId,
+      // #258 item 2: a slash command resolves to a skill of the same name.
+      skillName:
+        typeof event.metadata?.command === "string"
+          ? event.metadata.command.replace(/^\//, "")
+          : undefined,
       toolName,
       toolArgs,
       timestamp: new Date(event.timestamp).toISOString(),
