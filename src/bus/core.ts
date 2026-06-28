@@ -564,7 +564,10 @@ export class BusCoreImpl implements BusCore {
       ];
       if (req.metadata) {
         for (const [k, v] of Object.entries(req.metadata)) {
-          attrs.push(`${k}="${escapeXmlAttr(String(v))}"`);
+          // Objects/arrays must be JSON-encoded — `String(obj)` yields the
+          // useless literal "[object Object]" in the channel block.
+          const encoded = v !== null && typeof v === "object" ? JSON.stringify(v) : String(v);
+          attrs.push(`${k}="${escapeXmlAttr(encoded)}"`);
         }
       }
       const wrapped = `<channel ${attrs.join(" ")}>${escapeXmlText(req.text)}</channel>`;

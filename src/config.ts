@@ -168,6 +168,13 @@ const DEFAULT_SETTINGS: Settings = {
   security: { level: "moderate", allowedTools: [], disallowedTools: [] },
   web: { enabled: false, host: "127.0.0.1", port: 4632 },
   stt: { baseUrl: "", model: "" },
+  attachments: {
+    enabled: true,
+    maxBytes: 25 * 1024 * 1024,
+    maxInlineTextBytes: 64 * 1024,
+    rootDir: "",
+    transcribeVoice: true,
+  },
   sessionTimeoutMs: DEFAULT_SESSION_TIMEOUT_MS,
   timeouts: { telegram: 5, discord: 5, heartbeat: 15, job: 30, default: 5 },
   pty: {
@@ -642,6 +649,7 @@ export interface Settings {
   security: SecurityConfig;
   web: WebConfig;
   stt: SttConfig;
+  attachments: AttachmentsConfig;
   apiToken?: string;
   sessionTimeoutMs: number;
   timeouts: TimeoutsConfig;
@@ -727,6 +735,20 @@ export interface SttConfig {
    *  or "whisper"). When set, whisper is skipped and Claude is asked to call this tool directly
    *  with the audio file path. When unset (default), whisper handles transcription. */
   delegateTool?: string;
+}
+
+export interface AttachmentsConfig {
+  /** Master switch for the inbound attachment pipeline. Default: true. */
+  enabled: boolean;
+  /** Skip attachments larger than this many bytes. Default: 25 MiB. */
+  maxBytes: number;
+  /** Inlined text content is truncated to this many bytes. Default: 64 KiB. */
+  maxInlineTextBytes: number;
+  /** Base directory downloaded attachments are written under; per agent/message
+   *  subdirs are created beneath it. Empty → `<cwd>/.claudeclaw/inbound-attachments`. */
+  rootDir: string;
+  /** Transcribe voice/audio attachments via the STT pipeline. Default: true. */
+  transcribeVoice: boolean;
 }
 
 export interface SessionConfig {
@@ -931,6 +953,20 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
       ...(typeof raw.stt?.delegateTool === "string" && raw.stt.delegateTool.trim()
         ? { delegateTool: raw.stt.delegateTool.trim() }
         : {}),
+    },
+    attachments: {
+      enabled: raw.attachments?.enabled !== false,
+      maxBytes:
+        Number.isFinite(raw.attachments?.maxBytes) && Number(raw.attachments.maxBytes) > 0
+          ? Number(raw.attachments.maxBytes)
+          : 25 * 1024 * 1024,
+      maxInlineTextBytes:
+        Number.isFinite(raw.attachments?.maxInlineTextBytes) &&
+        Number(raw.attachments.maxInlineTextBytes) > 0
+          ? Number(raw.attachments.maxInlineTextBytes)
+          : 64 * 1024,
+      rootDir: typeof raw.attachments?.rootDir === "string" ? raw.attachments.rootDir.trim() : "",
+      transcribeVoice: raw.attachments?.transcribeVoice !== false,
     },
     sessionTimeoutMs:
       Number.isFinite(raw.sessionTimeoutMs) && (raw.sessionTimeoutMs as number) > 0

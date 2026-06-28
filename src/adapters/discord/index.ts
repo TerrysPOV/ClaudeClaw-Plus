@@ -44,9 +44,17 @@ import {
   isTailerOriginEvent,
 } from "../../bus/types";
 import { createDiscordGateway } from "./gateway";
+import { join } from "node:path";
+import { getSettings, type AttachmentsConfig } from "../../config";
+import { transcribeAudioToText } from "../../whisper";
 import {
-  attachmentMeta,
+  buildAttachmentManifest,
+  type InboundAttachment,
+  processAttachments,
+} from "../attachment-pipeline";
+import {
   buildPermissionButtons,
+  classifyAttachmentKind,
   formatPermissionPrompt,
   makeDefaultRateLimit,
   parsePermissionCustomId,
@@ -76,6 +84,9 @@ export class DiscordAdapter {
   private readonly rateLimitCheck: (userId: string) => boolean;
   private readonly gateway: DiscordGatewayLike;
   private readonly restApi: DiscordRestApiLike;
+  private readonly attachmentsCfg?: AttachmentsConfig;
+  private readonly transcribeFn: (inputPath: string) => Promise<string>;
+  private readonly fetchFn: typeof fetch;
 
   /** Active bus subscriptions, one per unique routed agent. */
   private subscriptions: Subscription[] = [];
@@ -123,6 +134,9 @@ export class DiscordAdapter {
     // `FakeDiscordGateway` / `FakeDiscordRestApi` to bypass the network.
     this.gateway = opts.gateway ?? createDiscordGateway({ token: this.token, logger: this.logger });
     this.restApi = opts.restApi ?? createDiscordRestApi({ token: this.token, logger: this.logger });
+    this.attachmentsCfg = opts.attachments;
+    this.transcribeFn = opts.transcribe ?? transcribeAudioToText;
+    this.fetchFn = opts.fetchFn ?? fetch;
   }
 
   /* ──────────────────────────── lifecycle ─────────────────────────── */
@@ -246,15 +260,29 @@ export class DiscordAdapter {
       return;
     }
 
-    // 5. Detect attachments and pin metadata to the BusEvent so future
-    //    surfaces can render them. Sprint 3 does NOT download or
-    //    transcribe — that's `discord.ts:980+` legacy behaviour and
-    //    belongs in a Sprint 4 attachment-pipeline component. Forward
-    //    URLs + flags only.
-    const { images, voices, texts, hasAny } = summariseAttachments(message.attachments);
+    // 5. Classify attachments. `hasAny` now covers every kind (images,
+    //    voice, text, and generic files) — a .json/.pdf upload used to be
+    //    dropped here. The downloaded content is injected into the prompt
+    //    text below (step 6b), NOT the bus metadata: the PTY delivery path
+    //    stringifies object metadata to "[object Object]".
+    const { hasAny } = summariseAttachments(message.attachments);
 
     // 6. Drop empty messages with no attachments.
     if (!message.content.trim() && !hasAny) return;
+
+    // 6b. Download + process attachments into a manifest appended to the
+    //     prompt text. Fail-soft: a broken pipeline never blocks the message.
+    let promptText = message.content;
+    if (hasAny) {
+      try {
+        const manifest = await this.processInboundAttachments(agentId, message);
+        if (manifest) {
+          promptText = message.content.trim() ? `${message.content}\n\n${manifest}` : manifest;
+        }
+      } catch (err) {
+        this.logger.error("[discord-adapter] attachment pipeline failed", err);
+      }
+    }
 
     // 7. Special-case: pending `request_human` for this (agent, channel).
     //    If one exists, route this message text as the answer rather
@@ -268,7 +296,7 @@ export class DiscordAdapter {
         this.bus.ingestAskAnswer({
           agent_id: pendingAsk.agent_id,
           ask_id: pendingAsk.ask_id,
-          answer: message.content,
+          answer: promptText,
         });
       } catch (err) {
         this.logger.error("[discord-adapter] ingestAskAnswer failed", err);
@@ -283,19 +311,11 @@ export class DiscordAdapter {
         origin: "discord",
         origin_id: channelId,
         user_id: userId,
-        text: message.content,
+        text: promptText,
         metadata: {
           message_id: message.id,
           username: message.author.username,
-          ...(hasAny
-            ? {
-                attachments: {
-                  images: images.map(attachmentMeta),
-                  voices: voices.map(attachmentMeta),
-                  texts: texts.map(attachmentMeta),
-                },
-              }
-            : {}),
+          ...(hasAny ? { attachment_count: message.attachments.length } : {}),
         },
       });
     } catch (err) {
@@ -310,6 +330,50 @@ export class DiscordAdapter {
     void this.restApi.sendTyping(channelId).catch((err) => {
       this.logger.warn("[discord-adapter] sendTyping failed", err);
     });
+  }
+
+  /**
+   * Download + process a message's attachments and return a manifest block to
+   * append to the prompt. Returns "" when disabled or nothing usable. Writes
+   * downloaded files under `<rootDir>/<agentId>/<messageId>/` so the PTY agent
+   * (same host) can `Read` them by absolute path.
+   */
+  private async processInboundAttachments(
+    agentId: string,
+    message: DiscordInboundMessage,
+  ): Promise<string> {
+    const cfg = this.attachmentsCfg ?? getSettings().attachments;
+    if (!cfg.enabled || message.attachments.length === 0) return "";
+
+    const baseRoot =
+      cfg.rootDir.trim() || join(process.cwd(), ".claudeclaw", "inbound-attachments");
+    const rootDir = join(baseRoot, agentId, message.id);
+
+    const inbound: InboundAttachment[] = message.attachments.map((a) => ({
+      id: a.id,
+      filename: a.filename,
+      url: a.url,
+      contentType: a.content_type,
+      size: a.size,
+      kind: classifyAttachmentKind(a),
+    }));
+
+    const processed = await processAttachments(
+      inbound,
+      {
+        enabled: cfg.enabled,
+        maxBytes: cfg.maxBytes,
+        maxInlineTextBytes: cfg.maxInlineTextBytes,
+        rootDir,
+        transcribeVoice: cfg.transcribeVoice,
+      },
+      {
+        fetchFn: this.fetchFn,
+        transcribe: this.transcribeFn,
+        log: (m) => this.logger.warn(`[discord-adapter] ${m}`),
+      },
+    );
+    return buildAttachmentManifest(processed);
   }
 
   /**
