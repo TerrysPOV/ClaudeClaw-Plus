@@ -574,7 +574,12 @@ describe("Policy Engine - Cache", () => {
 });
 
 
-describe("Policy Engine - Skill Overlay Wiring (#258 item 2)", () => {
+describe("Policy Engine - Skill Overlay engine participation (#258 item 2)", () => {
+  // These exercise ENGINE-LEVEL PARTICIPATION — that evaluate() consults a cached
+  // skill overlay when a request carries both a skillName and a toolName. They are
+  // NOT end-to-end enforcement: no production caller builds such a request yet (the
+  // gateway evaluates the "InboundMessage" pseudo-tool; the per-tool gate that
+  // supplies skillName is #258 item 3 / PR #284).
   const SKILL_MD = ["---", "name: quant", "deniedTools:", "  - Bash", "---", "Quant skill."].join(
     "\n",
   );

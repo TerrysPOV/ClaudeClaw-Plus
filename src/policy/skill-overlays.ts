@@ -7,7 +7,9 @@
  * IMPORTANT: Skill overlays must not become a privilege-escalation path.
  * - "preferredTools" influences recommendation, not security overrides
  * - "requiredTools" surfaces actionable policy errors when unavailable
- * - "deniedTools" are enforced as restrictions even when globally allowed
+ * - "deniedTools" become deny rules at priority 150 (basePriority + 50): they
+ *   restrict tools a broader rule allows, but the deny is NOT absolute — a
+ *   higher-priority (or equal-priority, more-specific) allow still outranks it.
  */
 
 import type { PolicyRule, ToolRequestContext } from "./engine";
@@ -166,7 +168,9 @@ export function overlayToRules(overlay: SkillOverlay, basePriority: number = 100
     for (const tool of overlay.deniedTools) {
       rules.push({
         id: `skill-${overlay.skillName}-deny-${tool}`,
-        priority: basePriority + 50, // Higher than typical rules
+        // Above typical rules so an overlay deny outranks a broad allow — but
+        // NOT absolute: an equal/higher-priority allow still wins (see sortRules).
+        priority: basePriority + 50,
         scope: {
           skillName: overlay.skillName,
         },
