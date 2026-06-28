@@ -131,7 +131,13 @@ export async function initWatchdog(): Promise<void> {
     return initializationPromise;
   }
 
-  initializationPromise = doInit();
+  // Reset the cached promise if init rejects so it's retryable — otherwise a
+  // single transient failure (e.g. an index-write error during eviction) would
+  // poison every later checkLimits/clearInvocation for the process lifetime.
+  initializationPromise = doInit().catch((err) => {
+    initializationPromise = null;
+    throw err;
+  });
   return initializationPromise;
 }
 
@@ -157,7 +163,13 @@ async function doInit(): Promise<void> {
       activeInvocations: {},
       updatedAt: new Date().toISOString(),
     };
-    await saveWatchdogIndex();
+    // Best-effort: a write failure here must not poison init — the in-memory
+    // index is valid and the next save will persist it.
+    try {
+      await saveWatchdogIndex();
+    } catch (err) {
+      console.warn("[watchdog] initial index save failed:", err);
+    }
     return;
   }
 
@@ -175,7 +187,13 @@ async function doInit(): Promise<void> {
     }
   }
   if (evicted > 0) {
-    await saveWatchdogIndex();
+    // Best-effort GC persist: records are already dropped from the in-memory
+    // index, so a write failure here is non-fatal (the next clean save persists).
+    try {
+      await saveWatchdogIndex();
+    } catch (err) {
+      console.warn("[watchdog] eviction index save failed:", err);
+    }
   }
 }
 
@@ -376,6 +394,20 @@ export async function incrementTurnCount(invocationId: string): Promise<void> {
 /**
  * Check limits for an invocation.
  */
+const STATE_SEVERITY: Record<WatchdogState, number> = {
+  healthy: 0,
+  warn: 1,
+  suspend: 2,
+  kill: 3,
+};
+
+/** Escalate to the more severe of two states. A hard limit reached AFTER a
+ *  warning must still upgrade to `suspend` — the old `=== "healthy" ? ...`
+ *  guard left worstState stuck at "warn" so the suspend never fired. */
+function escalateState(current: WatchdogState, next: WatchdogState): WatchdogState {
+  return STATE_SEVERITY[next] > STATE_SEVERITY[current] ? next : current;
+}
+
 export async function checkLimits(context: {
   invocationId: string;
   sessionId?: string;
@@ -384,10 +416,10 @@ export async function checkLimits(context: {
 
   const now = new Date().toISOString();
 
-  // Short-circuit when disabled. Without a lifecycle hook to delete invocations
-  // on turn-end, even a single long-lived agent process accumulates stale
-  // records that eventually trip maxRuntimeSeconds. Honour `enabled` so
-  // operators can opt out until that lifecycle path is wired.
+  // Short-circuit when disabled. The activeInvocations lifecycle leak (#268) —
+  // records were never cleared on turn-end, so watchdog-index.json grew
+  // unbounded — is now fixed (runner.ts clears each record in a `finally` on
+  // every exit path). `enabled` stays an operator opt-out pending prod soak.
   if (!watchdogConfig.enabled) {
     return {
       invocationId: context.invocationId,
@@ -421,19 +453,19 @@ export async function checkLimits(context: {
   // Check tool call limit
   if (limits.maxToolCalls && record.toolCallCount >= limits.maxToolCalls) {
     triggeredLimits.push(`maxToolCalls=${record.toolCallCount}/${limits.maxToolCalls}`);
-    worstState = worstState === "healthy" ? "suspend" : worstState;
+    worstState = escalateState(worstState, "suspend");
   } else if (limits.maxToolCalls && record.toolCallCount >= limits.maxToolCalls * 0.8) {
     triggeredLimits.push(`maxToolCalls_warning=${record.toolCallCount}/${limits.maxToolCalls}`);
-    if (worstState === "healthy") worstState = "warn";
+    worstState = escalateState(worstState, "warn");
   }
 
   // Check turn limit
   if (limits.maxTurns && record.turnCount >= limits.maxTurns) {
     triggeredLimits.push(`maxTurns=${record.turnCount}/${limits.maxTurns}`);
-    worstState = worstState === "healthy" ? "suspend" : worstState;
+    worstState = escalateState(worstState, "suspend");
   } else if (limits.maxTurns && record.turnCount >= limits.maxTurns * 0.8) {
     triggeredLimits.push(`maxTurns_warning=${record.turnCount}/${limits.maxTurns}`);
-    if (worstState === "healthy") worstState = "warn";
+    worstState = escalateState(worstState, "warn");
   }
 
   // Check runtime limit
@@ -442,12 +474,12 @@ export async function checkLimits(context: {
     const elapsedSeconds = (Date.now() - startedAt.getTime()) / 1000;
     if (elapsedSeconds >= limits.maxRuntimeSeconds) {
       triggeredLimits.push(`maxRuntimeSeconds=${elapsedSeconds}/${limits.maxRuntimeSeconds}`);
-      worstState = worstState === "healthy" ? "suspend" : worstState;
+      worstState = escalateState(worstState, "suspend");
     } else if (elapsedSeconds >= limits.maxRuntimeSeconds * 0.8) {
       triggeredLimits.push(
         `maxRuntimeSeconds_warning=${elapsedSeconds}/${limits.maxRuntimeSeconds}`,
       );
-      if (worstState === "healthy") worstState = "warn";
+      worstState = escalateState(worstState, "warn");
     }
   }
 
@@ -459,12 +491,12 @@ export async function checkLimits(context: {
       triggeredLimits.push(
         `maxRepeatedTools=${totalRepeatedCalls}/${limits.maxRepeatedTools} (patterns: ${repeatedPatterns.map((p) => `${p.pattern}=${p.count}`).join(", ")})`,
       );
-      worstState = worstState === "healthy" ? "suspend" : worstState;
+      worstState = escalateState(worstState, "suspend");
     } else if (totalRepeatedCalls >= limits.maxRepeatedTools * 0.7) {
       triggeredLimits.push(
         `maxRepeatedTools_warning=${totalRepeatedCalls}/${limits.maxRepeatedTools}`,
       );
-      if (worstState === "healthy") worstState = "warn";
+      worstState = escalateState(worstState, "warn");
     }
   }
 

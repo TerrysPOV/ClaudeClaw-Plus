@@ -1247,12 +1247,6 @@ function parseBusAgents(raw: unknown): BusAgentSettings[] {
 }
 
 /**
- * Parse `settings.llmRouter` (#70). Non-secret config only. Tier model lists
- * default to empty (operator chooses via the llm_models tool); invalid entries
- * are dropped with a warning rather than throwing. `OPENROUTER_API_KEY` is never
- * read here — it's an env-only secret consumed by the llm-router plugin.
- */
-/**
  * Parse the `settings.governance` block. Today only `watchdog` is exposed —
  * fields are narrow and optional; unset values fall back to the in-memory
  * runtime defaults inside `src/governance/watchdog.ts:configureWatchdog`.
@@ -1280,6 +1274,12 @@ function parseGovernanceConfig(raw: unknown): GovernanceConfig {
   };
 }
 
+/**
+ * Parse `settings.llmRouter` (#70). Non-secret config only. Tier model lists
+ * default to empty (operator chooses via the llm_models tool); invalid entries
+ * are dropped with a warning rather than throwing. `OPENROUTER_API_KEY` is never
+ * read here — it's an env-only secret consumed by the llm-router plugin.
+ */
 function parseLlmRouterConfig(raw: unknown): LlmRouterConfig {
   const defaults = DEFAULT_SETTINGS.llmRouter;
   if (!raw || typeof raw !== "object") return defaults;

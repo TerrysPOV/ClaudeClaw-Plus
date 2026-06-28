@@ -405,5 +405,70 @@ describe("Watchdog", () => {
       expect(await getActiveInvocation("stale-rec")).toBeNull();
       expect(await getActiveInvocation("fresh-rec")).not.toBeNull();
     });
+
+    test("evicts a malformed lastActivityAt and respects the 24h boundary", async () => {
+      const { writeFile, mkdir } = await import("fs/promises");
+      await mkdir(WATCHDOG_DIR, { recursive: true });
+      const indexPath = join(WATCHDOG_DIR, "watchdog-index.json");
+      const fresh = new Date().toISOString();
+      const justUnder = new Date(Date.now() - 23 * 60 * 60 * 1000).toISOString();
+      const mk = (id: string, last: string) => ({
+        invocationId: id,
+        toolCallCount: 0,
+        turnCount: 0,
+        toolCalls: [],
+        startedAt: last,
+        lastActivityAt: last,
+      });
+      await writeFile(
+        indexPath,
+        JSON.stringify(
+          {
+            version: 1,
+            activeInvocations: {
+              "nan-rec": { ...mk("nan-rec", fresh), lastActivityAt: "not-a-date" },
+              "under-24h": mk("under-24h", justUnder),
+            },
+            updatedAt: fresh,
+          },
+          null,
+          2,
+        ),
+      );
+
+      resetWatchdog();
+      await initWatchdog();
+
+      expect(await getActiveInvocation("nan-rec")).toBeNull(); // malformed → evicted
+      expect(await getActiveInvocation("under-24h")).not.toBeNull(); // ~23h → retained
+    });
+  });
+
+  describe("#268 — checkLimits escalation + disabled-state cleanup", () => {
+    test("a hard limit reached after a warning escalates to suspend (worstState fix)", async () => {
+      configureWatchdog({
+        limits: { maxToolCalls: 10, maxTurns: 5, maxRuntimeSeconds: 60 },
+        enabled: true,
+      });
+      const invocationId = "escalation-rec";
+      // 8/10 tool calls => warn (80%); 5/5 turns => hard suspend. The old guard
+      // left worstState stuck at "warn"; it must now escalate to "suspend".
+      await recordExecutionMetric({ invocationId }, { toolCallCount: 8, turnCount: 5 });
+
+      const decision = await checkLimits({ invocationId });
+      expect(decision.state).toBe("suspend");
+    });
+
+    test("clearInvocation purges a record created while enabled even after disabling", async () => {
+      const invocationId = "clear-after-disable";
+      await recordExecutionMetric({ invocationId }, { toolCallCount: 1 });
+      expect(await getActiveInvocation(invocationId)).not.toBeNull();
+
+      // Disable AFTER the record exists — clearInvocation must NOT be gated by
+      // `enabled` (the runner's finally still has to purge it).
+      configureWatchdog({ enabled: false });
+      await clearInvocation(invocationId);
+      expect(await getActiveInvocation(invocationId)).toBeNull();
+    });
   });
 });
