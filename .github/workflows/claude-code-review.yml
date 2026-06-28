@@ -2,27 +2,40 @@ name: Claude Code Review
 
 on:
   pull_request_target:
-    types: [opened, synchronize, ready_for_review, reopened]
-    # Optional: Only run on specific file changes
-    # paths:
-    #   - "src/**/*.ts"
-    #   - "src/**/*.tsx"
-    #   - "src/**/*.js"
-    #   - "src/**/*.jsx"
+    # `labeled` lets a maintainer opt an EXTERNAL PR in for review by adding the
+    # `claude-review` label (adding labels requires triage/write, so only
+    # maintainers can trigger it). Trusted-author PRs auto-run on the other types.
+    types: [opened, synchronize, ready_for_review, reopened, labeled]
 
 jobs:
   claude-review:
-    # Skip automated sync PRs — they're opened by github-actions[bot] and need no auto-review
-    if: github.event.pull_request.user.login != 'github-actions[bot]' && !startsWith(github.head_ref, 'sync/')
+    # SECURITY GATE. This is a `pull_request_target` job: it runs in the base
+    # repo's context with repo secrets (CLAUDE_CODE_OAUTH_TOKEN) and a
+    # write-capable GITHUB_TOKEN, and it checks out the (untrusted) PR head.
+    # The job-level `if` is the real trust control — it must NOT start for an
+    # arbitrary external contributor:
+    #   * Auto-run only for OWNER / MEMBER / COLLABORATOR authors (your own +
+    #     org/collaborator PRs).
+    #   * External authors (CONTRIBUTOR / FIRST_TIME_CONTRIBUTOR / NONE) never
+    #     auto-run — a maintainer must add the `claude-review` label, which fires
+    #     the `labeled` event. (Re-label to re-review after new commits.)
+    if: >-
+      github.event.pull_request.user.login != 'github-actions[bot]'
+      && !startsWith(github.head_ref, 'sync/')
+      && (
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+        || (github.event.action == 'labeled' && github.event.label.name == 'claude-review')
+      )
 
     runs-on: ubuntu-latest
-    # Informational only — transient action infrastructure errors shouldn't block PRs
+    # Informational only — transient action infrastructure errors shouldn't block PRs.
     continue-on-error: true
     permissions:
       contents: read
       pull-requests: write
       issues: write
-      id-token: write
+      # NOTE: `id-token: write` deliberately removed — OIDC is not used here and
+      # it needlessly widens the blast radius of this privileged job.
 
     steps:
       - name: Check token configured
@@ -52,6 +65,9 @@ jobs:
         with:
           github_token: ${{ github.token }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The job-level `if` is the trust gate. `'*'` here only lets Claude
+          # proceed on a maintainer-labeled external PR (whose author is non-write);
+          # the job would never have started without a trusted author or a label.
           allowed_non_write_users: '*'
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
