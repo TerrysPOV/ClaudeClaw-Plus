@@ -55,7 +55,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.ref }}
+          # Pin to the immutable commit SHA from the event payload, NOT the
+          # mutable branch ref. For a maintainer-labeled external PR this closes
+          # the TOCTOU race where a fork author pushes a new commit after the
+          # label but before checkout — the privileged job would otherwise run
+          # against code the maintainer never approved.
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1
 
       - name: Run Claude Code Review
