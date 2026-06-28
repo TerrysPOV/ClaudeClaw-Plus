@@ -839,7 +839,14 @@ describe("JSONL tailer wiring (issue #215)", () => {
     const enc = encodeCwdForProjectsDir(realpathSync(agentCwd));
     mkdirSync(join(projectsDir, enc), { recursive: true });
     sessionPath = join(projectsDir, enc, `${SID}.jsonl`);
-    bus = createBusCore({ eventLogAppend: (async () => ({})) as never });
+    // replyNudge:false: this suite proves the synthesis runtime wiring; the
+    // nudge-first path (#215/#240) is exercised in core.test.ts. With the nudge
+    // on, a turn_end would inject a reminder to /bin/cat (which never replies)
+    // instead of synthesizing, so the wiring assertion must target the fallback.
+    bus = createBusCore({
+      eventLogAppend: (async () => ({})) as never,
+      replyNudge: false,
+    });
     mgr = new SessionManager({
       commandOverride: "/bin/cat",
       argsOverride: [],

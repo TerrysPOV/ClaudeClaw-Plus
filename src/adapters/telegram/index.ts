@@ -15,6 +15,7 @@ import {
   type BusOrigin,
   type PermissionRequest,
   isTailerOriginEvent,
+  withSynthesizedNotice,
 } from "../../bus/types";
 import { createTelegramApi } from "./api";
 import { extractReactionDirectives } from "./directives";
@@ -512,6 +513,11 @@ export class TelegramAdapter {
     const intent = (event.payload as { intent?: string })?.intent;
     const isProgress = intent === "progress";
     const FRAMES = TelegramAdapter.SPINNER_FRAMES;
+    // #240: a synthesized (silent-drop safety-net) final carries raw, uncurated
+    // turn output — prefix the shared notice so it is not mistaken for a curated
+    // reply. No-op for curated replies and empty text; only the non-progress
+    // arms below use displayText, so progress frames are untouched.
+    const displayText = withSynthesizedNotice(cleanedText, event.payload);
     const key = this.convKey(agentId, target.chat_id);
     // Receipt timeout is INACTIVITY-based, not a wall-clock budget: any assistant
     // output for this turn — progress OR final — proves the turn is alive, so
@@ -536,7 +542,7 @@ export class TelegramAdapter {
       // Live turn message exists (placeholder or earlier progress) — edit in place.
       const live = this.lastBotMessage.get(key);
       if (live) {
-        const editText = isProgress ? `${FRAMES[0]} ${cleanedText}` : cleanedText;
+        const editText = isProgress ? `${FRAMES[0]} ${cleanedText}` : displayText;
         try {
           await this.api.editMessageText({
             chat_id: live.chat_id,
@@ -557,7 +563,7 @@ export class TelegramAdapter {
       }
     } else {
       // No live turn (unprompted reply / second final) — send fresh.
-      const sendText = isProgress ? `${FRAMES[0]} ${cleanedText}` : cleanedText;
+      const sendText = isProgress ? `${FRAMES[0]} ${cleanedText}` : displayText;
       try {
         const res = await this.api.sendMessage({
           chat_id: target.chat_id,
