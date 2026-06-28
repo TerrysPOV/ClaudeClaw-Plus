@@ -1489,7 +1489,12 @@ async function evaluateToolForExecution(
 /**
  * Get context for policy evaluation from current session and settings.
  */
-async function getPolicyContext(source: string): Promise<{
+async function getPolicyContext(
+  source: string,
+  channelId?: string,
+  userId?: string,
+  skillName?: string,
+): Promise<{
   eventId: string;
   source: string;
   channelId?: string;
@@ -1503,9 +1508,9 @@ async function getPolicyContext(source: string): Promise<{
   return {
     eventId: crypto.randomUUID(),
     source,
-    channelId: undefined, // Will be populated from event context
-    userId: undefined,
-    skillName: undefined,
+    channelId, // #258 item 1: threaded from inbound event (undefined for non-channel sources)
+    userId,
+    skillName,
     sessionId: existing?.sessionId,
     claudeSessionId: existing?.sessionId ?? null,
   };
@@ -1563,6 +1568,14 @@ export async function compactCurrentThreadSession(
     : { success: false, message: `❌ Compact failed (${existing.sessionId.slice(0, 8)})` };
 }
 
+/**
+ * Identity fields threaded from the inbound surface for policy/budget scoping (#258 item 1).
+ */
+interface PolicyIdentity {
+  userId?: string;
+  skillName?: string;
+}
+
 async function execClaude(
   name: string,
   prompt: string,
@@ -1573,6 +1586,7 @@ async function execClaude(
   timeoutCategory?: string,
   onChunk?: (text: string) => void,
   onToolEvent?: (line: string) => void,
+  identity?: PolicyIdentity,
 ): Promise<RunResult> {
   mainRunCount++;
   persistRunCount();
@@ -1628,7 +1642,8 @@ async function execClaude(
         prompt,
         taskType: agentic.defaultMode,
         sessionId: existing?.sessionId,
-        channelId: undefined,
+        channelId: threadId, // #258 item 1: per-channel budget/policy scoping
+        userId: identity?.userId,
         source: name,
       });
       primaryConfig = {
@@ -1780,7 +1795,9 @@ async function execClaude(
       sessionId: existing?.sessionId,
       claudeSessionId: existing?.sessionId ?? null,
       source: name,
-      channelId: undefined,
+      channelId: threadId, // #258 item 1: persist channel scope into usage record
+      userId: identity?.userId,
+      skillName: identity?.skillName,
       provider:
         primaryConfig.model.startsWith("gpt") ||
         primaryConfig.model.startsWith("o1") ||
@@ -2403,6 +2420,7 @@ export async function run(
   timeoutCategory?: string,
   onChunk?: (text: string) => void,
   onToolEvent?: (line: string) => void,
+  identity?: PolicyIdentity,
 ): Promise<RunResult> {
   return enqueue(
     () =>
@@ -2416,6 +2434,7 @@ export async function run(
         timeoutCategory,
         onChunk,
         onToolEvent,
+        identity,
       ),
     threadId,
   );
@@ -2689,6 +2708,7 @@ export async function runUserMessage(
   onChunk?: (text: string) => void,
   onToolEvent?: (line: string) => void,
   modelOverride?: string,
+  identity?: PolicyIdentity,
 ): Promise<RunResult> {
   return run(
     name,
@@ -2700,6 +2720,7 @@ export async function runUserMessage(
     undefined,
     onChunk,
     onToolEvent,
+    identity,
   );
 }
 

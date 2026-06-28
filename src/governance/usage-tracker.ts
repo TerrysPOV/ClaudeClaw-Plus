@@ -107,6 +107,8 @@ export interface InvocationUsageRecord {
   source?: string;
   channelId?: string;
   threadId?: string;
+  userId?: string;
+  skillName?: string;
   provider: string;
   model: string;
   startedAt: string;
@@ -128,6 +130,8 @@ export interface InvocationContext {
   source?: string;
   channelId?: string;
   threadId?: string;
+  userId?: string;
+  skillName?: string;
   provider: string;
   model: string;
   metadata?: Record<string, unknown>;
@@ -259,6 +263,8 @@ export async function recordInvocationStart(
       source: context.source,
       channelId: context.channelId,
       threadId: context.threadId,
+      userId: context.userId,
+      skillName: context.skillName,
       provider: context.provider,
       model: context.model,
       startedAt: now,
@@ -501,6 +507,7 @@ export async function getChannelUsage(channelId: string): Promise<InvocationUsag
 export interface UsageFilters {
   sessionId?: string;
   channelId?: string;
+  userId?: string;
   source?: string;
   provider?: string;
   model?: string;
@@ -553,6 +560,7 @@ export async function getAggregates(filters: UsageFilters = {}): Promise<{
       // Apply filters
       if (filters.sessionId && record.sessionId !== filters.sessionId) continue;
       if (filters.channelId && record.channelId !== filters.channelId) continue;
+      if (filters.userId && record.userId !== filters.userId) continue;
       if (filters.source && record.source !== filters.source) continue;
       if (filters.provider && record.provider !== filters.provider) continue;
       if (filters.model && record.model !== filters.model) continue;
