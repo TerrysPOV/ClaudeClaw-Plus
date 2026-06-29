@@ -11,10 +11,12 @@
 
 import {
   type DateRange,
+  type MetricSample,
   type PanelData,
   type TelemetryCapability,
   TELEMETRY_CONTRACT_VERSION,
   type TelemetryProvider,
+  type TelemetryStream,
   type ViewManifest,
 } from "../../skills-tuner/core/telemetry.js";
 import type { ProposalsStore } from "../../skills-tuner/storage/proposals.js";
@@ -42,7 +44,14 @@ export class TunerViewProvider implements TelemetryProvider {
     return [];
   }
 
-  async query(): Promise<never[]> {
+  // View-only provider: it serves panels (getView), not metric streams, but
+  // implements the full TelemetryProvider contract so it composes uniformly.
+  // query() therefore matches the interface signature and returns no samples.
+  async query(
+    _stream: TelemetryStream,
+    _range: DateRange,
+    _filters?: Record<string, string>,
+  ): Promise<MetricSample[]> {
     return [];
   }
 
