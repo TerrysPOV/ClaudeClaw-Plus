@@ -1,7 +1,7 @@
 /**
  * Telemetry over the MCP bridge — the single auditable telemetry surface.
  *
- * Per `~/simon-memory/decisions/tuner-outcome-loop.md` ("host exposes ONE
+ * Host-provided telemetry contract (option A) — the host exposes ONE
  * telemetry surface over the MCP bridge"), the HOST produces telemetry and
  * serves it as two MCP tools; the TUNER consumes it THROUGH those tools and
  * never reads journalctl/files in-process. This module has the two halves:

@@ -4,7 +4,7 @@
  * The OutcomeLoop measures whether an *applied* tuning change improved the
  * system. Fitness signals come from telemetry, NOT from the observation
  * collector (`collectObservations` yields qualitative correction/feedback
- * signals, not numeric metrics — see `~/simon-memory/decisions/tuner-outcome-loop.md`).
+ * signals, not numeric metrics).
  *
  * Decision (host-provided telemetry contract, option A): the ClaudeClaw-Plus
  * HOST exposes ONE standard, versioned telemetry surface that every subject
@@ -25,8 +25,9 @@
 /**
  * Canonical telemetry streams the host may advertise. Adding a stream here is
  * a contract change (bump `TELEMETRY_CONTRACT_VERSION`). `agent_dispatch` is
- * declared but not yet emitted by any reference host — AgentSubject's fitness
- * stays proposal-only until a producer lands (see producer-wiring follow-ups).
+ * emitted by `SessionJsonlTelemetryProducer` (from `Agent`/`Task` tool_use
+ * blocks in the session transcript); a stream with no live source advertises
+ * `available:false` + reason rather than faking data.
  */
 export const TELEMETRY_STREAMS = [
   "session_cost",
