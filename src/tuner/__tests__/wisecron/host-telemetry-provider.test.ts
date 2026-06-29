@@ -615,7 +615,7 @@ describe("SessionJsonlTelemetryProducer", () => {
           type: "tool_use",
           id: "r2",
           name: "Read",
-          input: { file_path: "/home/x/simon-memory/a.md" },
+          input: { file_path: "/home/x/memory/a.md" },
         },
         { type: "tool_use", id: "r3", name: "Read", input: { file_path: "/home/x/src/index.ts" } }, // not memory
       ]),
@@ -626,7 +626,7 @@ describe("SessionJsonlTelemetryProducer", () => {
     expect(samples.every((s) => s.value === 1)).toBe(true);
     expect(samples.map((s) => s.labels!.file).sort()).toEqual([
       "/home/x/CLAUDE.md",
-      "/home/x/simon-memory/a.md",
+      "/home/x/memory/a.md",
     ]);
   });
 

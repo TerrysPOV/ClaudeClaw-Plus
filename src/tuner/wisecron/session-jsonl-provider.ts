@@ -76,7 +76,7 @@ type ActiveStream = (typeof ACTIVE_STREAMS)[number];
 const AGENT_DISPATCH_TOOLS = new Set(["Agent", "Task"]);
 
 /** A Read is a memory access when its path is a CLAUDE.md file or under a memory/learnings dir. */
-const MEMORY_PATH_RE = /(?:CLAUDE\.md$|\/memory\/|simon-memory|\/learnings\/|session-state\.md$)/;
+const MEMORY_PATH_RE = /(?:CLAUDE\.md$|\/memory\/|\/learnings\/|session-state\.md$)/;
 
 export interface SessionJsonlProducerConfig {
   /** Projects dir root. Default `~/.claude/projects`. Tests pass a temp dir. */
