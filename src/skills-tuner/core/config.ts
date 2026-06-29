@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import yaml from "js-yaml";
 import { z } from "zod";
+import { type Scope, SCOPES, resolveScope } from "./scope.js";
 
 export const DEFAULT_CONFIG_PATH = join(homedir(), ".config", "tuner", "config.yaml");
 
@@ -43,6 +44,8 @@ const ModelConfigSchema = z.object({
 
 const SubjectConfigSchema = z.object({
   enabled: z.boolean().default(true),
+  /** Per-subject scope override. Falls back to the global `scope` when omitted. */
+  scope: z.enum(SCOPES).optional(),
   git_repo: z.string().optional(),
   auto_merge: z.union([z.boolean(), z.array(z.string())]).default(false),
   proposer: z.string().optional(),
@@ -83,7 +86,14 @@ const LLMConfigSchema = z.object({
   api_key: z.string().optional(),
 });
 
-const TunerConfigSchema = z.object({
+export const TunerConfigSchema = z.object({
+  /**
+   * Global tuning scope — the tuner's blast radius. `all` (default) tunes the
+   * whole Claude Code setup (`~/.claude/*` + all sessions); `agent` restricts
+   * every subject to the agent's own surface. Override per subject via
+   * `subjects.<name>.scope`. See core/scope.ts.
+   */
+  scope: z.enum(SCOPES).default("all"),
   models: ModelConfigSchema.default({}),
   llm: LLMConfigSchema.default({}),
   detection: DetectionConfigSchema.default({}),
@@ -93,6 +103,15 @@ const TunerConfigSchema = z.object({
   storage: StorageConfigSchema.default({}),
 });
 export type TunerConfig = z.infer<typeof TunerConfigSchema>;
+
+/**
+ * Effective scope of a subject under this config: `subjects.<name>.scope` wins,
+ * else the global `scope`, else `all`. Thin wrapper over `resolveScope` so callers
+ * read one config object.
+ */
+export function subjectScope(config: TunerConfig, name: string): Scope {
+  return resolveScope(config.scope, config.subjects[name]?.scope);
+}
 
 /**
  * Returns the effective config for a subject, merging user overrides with
@@ -169,6 +188,12 @@ const DEFAULT_YAML = `# Skills Tuner TS configuration
 #   skills    → ~/.claude/skills/              (Anthropic Skills, read by Claude Code)
 #   wisecron  → ~/.config/systemd/user/        (XDG systemd user units)
 #   cron      → ~/.config/cron/                (XDG sidecar for crontab snapshot)
+
+# Scope = the tuner's blast radius.
+#   all    tune your whole Claude Code setup (~/.claude/* + all sessions)  [default]
+#   agent  restrict every subject to the agent's own surface (~/agent/*, agent rows)
+# Override per subject below with subjects.<name>.scope.
+scope: all
 
 llm:
   backend: anthropic_api
