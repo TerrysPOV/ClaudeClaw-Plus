@@ -23,6 +23,18 @@ import type { RevertibleSubject } from "../wisecron/types.js";
 import type { DateRange, Metric, TelemetryProvider } from "../../skills-tuner/core/telemetry.js";
 import { ARTIFACT_SOURCE } from "../../skills-tuner/core/telemetry.js";
 import { nonzeroRate } from "../../skills-tuner/core/aggregate.js";
+import {
+  type EvidenceDrivenSubject,
+  type ResearchSpec,
+  type LocalSignal,
+  type StructuredEvidence,
+  type EvidenceVerdict,
+  meetsEvidenceBar,
+} from "../wisecron/evidence-driven.js";
+import { costSignal } from "./model-routing-signal.js";
+
+/** Recent median session cost (USD) above which routing is "expensive" regardless of trend. */
+const MODEL_ROUTING_MAX_RECENT_USD = 25;
 
 const DEAD_DAYS = 90;
 const MISTRIGGER_RATE = 0.3;
@@ -43,13 +55,18 @@ interface RoutingStats {
  */
 export interface ModelRoutingSubjectConfig {
   llm?: LLMClient;
+  /** Path to the session-cost SQLite store (the proactive signal source). */
+  costDbPath?: string;
   /** Modes config path. Default: ~/.claude/agentic.yaml. */
   modesConfigPath?: string;
   /** Injected dispatch-event reader. */
   dispatchReader?: (since: Date) => Array<Record<string, unknown>>;
 }
 
-export class ModelRoutingSubject extends BaseSubject implements RevertibleSubject {
+export class ModelRoutingSubject
+  extends BaseSubject
+  implements RevertibleSubject, EvidenceDrivenSubject
+{
   readonly name = "model_routing";
   readonly risk_tier = "medium" as const;
   readonly auto_merge_default = false;
@@ -59,6 +76,7 @@ export class ModelRoutingSubject extends BaseSubject implements RevertibleSubjec
   private readonly modesConfigPath: string;
   private readonly dispatchReader: (since: Date) => Array<Record<string, unknown>>;
   private readonly dispatchReaderInjected: boolean;
+  private readonly costDbPath: string;
 
   constructor(opts: ModelRoutingSubjectConfig = {}) {
     super();
@@ -68,6 +86,61 @@ export class ModelRoutingSubject extends BaseSubject implements RevertibleSubjec
     );
     this.dispatchReaderInjected = opts.dispatchReader !== undefined;
     this.dispatchReader = opts.dispatchReader ?? (() => []);
+    this.costDbPath = expandHome(opts.costDbPath ?? join(homedir(), "agent", "data", "costs.db"));
+  }
+
+  // ── Proactive face: EvidenceDrivenSubject (cost signal + faisceau de preuves) ──
+
+  researchSpec(): ResearchSpec {
+    return {
+      subject: "model_routing",
+      query: "llm routing cost quality model cascade speculative decoding semantic router",
+      sourceTiers: ["enterprise", "authoritative", "papers"],
+      technique: "cost-aware-routing",
+    };
+  }
+
+  async localSignal(): Promise<LocalSignal> {
+    const c = costSignal(this.costDbPath, MODEL_ROUTING_MAX_RECENT_USD);
+    return {
+      metric: "session_cost_usd",
+      value: c.value,
+      unit: "usd",
+      degraded: c.degraded,
+      trend: c.trend,
+      sampledAt: new Date().toISOString(),
+    };
+  }
+
+  evaluate(evidence: StructuredEvidence, signal: LocalSignal): EvidenceVerdict {
+    if (!signal.degraded) {
+      return {
+        propose: false,
+        reason: `routing cost healthy (${signal.value}${signal.unit}, ${signal.trend})`,
+        kind: "recommendation",
+        confidence: 0,
+      };
+    }
+    if (!meetsEvidenceBar(evidence)) {
+      return {
+        propose: false,
+        reason: `evidence below bar for '${evidence.technique}' (${evidence.independentSources} independent, ${evidence.highTrustSources} high-trust)`,
+        kind: "recommendation",
+        confidence: 0.2,
+      };
+    }
+    const confidence = Math.round(Math.min(1, evidence.independentSources / 5) * 100) / 100;
+    return {
+      propose: true,
+      reason: `routing cost ${signal.trend} (${signal.value}${signal.unit}) + ${evidence.independentSources} independent sources for '${evidence.technique}'`,
+      kind: "recommendation",
+      confidence,
+    };
+  }
+
+  async confirm(before: LocalSignal): Promise<boolean> {
+    const after = await this.localSignal();
+    return after.value < before.value;
   }
 
   async collectObservations(since: Date): Promise<Observation[]> {
@@ -243,7 +316,8 @@ export class ModelRoutingSubject extends BaseSubject implements RevertibleSubjec
     const alt = proposal.alternatives.find((a) => a.id === alternativeId);
     if (!alt)
       throw new Error(`model-routing-subject.apply: alternative ${alternativeId} not found`);
-    // Confinement: the only file this subject may write is its managed modes config.
+    // Confinement: the only file this subject may write is its managed modes
+    // config — never engine code or anything outside it.
     this.assertManagedTarget(proposal.target_path);
 
     // Never overwrite an existing .bak. On a double-apply (e.g. an operator
@@ -357,6 +431,7 @@ export class ModelRoutingSubject extends BaseSubject implements RevertibleSubjec
    * REAL paths (parent dir dereferenced via realpath) so a symlinked parent
    * cannot smuggle the write outside the managed config.
    */
+  /** The only writable file: the managed modes config. Anything else → throw. */
   private assertManagedTarget(target: string): void {
     if (isSymlinkPath(target)) {
       throw new Error(`target_path is a symlink — refusing to write through it: ${target}`);
