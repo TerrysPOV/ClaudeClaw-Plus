@@ -34,7 +34,8 @@ export class MemorySignalProducer implements TelemetryProvider {
   private readonly historyPath: string;
 
   constructor(cfg: { historyPath?: string } = {}) {
-    this.historyPath = cfg.historyPath ?? join(homedir(), ".config", "tuner", "memory-signal-history.jsonl");
+    this.historyPath =
+      cfg.historyPath ?? join(homedir(), ".config", "tuner", "memory-signal-history.jsonl");
   }
 
   contractVersion(): string {
@@ -58,7 +59,8 @@ export class MemorySignalProducer implements TelemetryProvider {
 
   capabilities(): TelemetryCapability[] {
     const has = this.readSamples().length > 0;
-    if (has) return [{ stream: STREAM, schemaVersion: TELEMETRY_CONTRACT_VERSION, available: true }];
+    if (has)
+      return [{ stream: STREAM, schemaVersion: TELEMETRY_CONTRACT_VERSION, available: true }];
     return [
       {
         stream: STREAM,
@@ -71,11 +73,21 @@ export class MemorySignalProducer implements TelemetryProvider {
     ];
   }
 
-  async query(stream: TelemetryStream, range: DateRange, filters?: Record<string, string>): Promise<MetricSample[]> {
+  async query(
+    stream: TelemetryStream,
+    range: DateRange,
+    filters?: Record<string, string>,
+  ): Promise<MetricSample[]> {
     if (stream !== STREAM) return [];
     const metric = filters?.metric ?? "loadMs";
     const pick = (s: RawSample): number =>
-      metric === "bytes" ? s.bytes : metric === "entries" ? s.entries : metric === "dead_ratio" ? s.deadRatio : s.loadMs;
+      metric === "bytes"
+        ? s.bytes
+        : metric === "entries"
+          ? s.entries
+          : metric === "dead_ratio"
+            ? s.deadRatio
+            : s.loadMs;
     const out: MetricSample[] = [];
     for (const s of this.readSamples()) {
       const ts = new Date(s.ts);
