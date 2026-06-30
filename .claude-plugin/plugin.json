@@ -1,5 +1,11 @@
 {
   "name": "claudeclaw-plus",
+<<<<<<< HEAD
   "version": "2.2.182",
+||||||| parent of 85d918b (feat(telemetry): skill_access producer — PostToolUse hook so the stream actually emits)
+  "version": "2.2.168",
+=======
+  "version": "2.2.169",
+>>>>>>> 85d918b (feat(telemetry): skill_access producer — PostToolUse hook so the stream actually emits)
   "description": "ClaudeClaw+ — governance, orchestration, persistent memory, and hardened web UI for Claude Code daemons. Sister project to moazbuilds/claudeclaw."
 }

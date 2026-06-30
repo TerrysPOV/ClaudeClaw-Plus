@@ -10,6 +10,14 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/log-skill-access.mjs\"" }
+        ]
+      }
     ]
   }
 }
