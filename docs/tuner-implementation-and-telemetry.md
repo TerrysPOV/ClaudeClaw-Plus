@@ -280,3 +280,47 @@ These have the same contract + fitness already written; they are held for later 
 | **Per‑subject drill‑down** | the decision sequence (§7) + that subject's signals/fitness/confinement (§8) |
 
 Three comparison kinds are always explicit and auditable: **baseline‑vs‑after** (keep/revert), **recent‑vs‑older trend** (proactive trigger + post‑apply confirm), and **convergence count** (evidence ≥ bar). No single‑point claims.
+
+---
+
+## 10. Scheduling, cadence & deployment
+
+The loop is **not** continuous — it runs as scheduled sweeps, and each subject has its **own adaptive cadence** so quiet subjects are polled less and active ones stay frequent.
+
+### The reactive sweep (daily)
+A daily trigger runs the reactive pipeline in three ordered phases:
+
+```
+  cron-run   → the SWEEP: for each DUE subject → collectObservations → detect → propose (pending)
+      ▼
+  mature     → VALIDATION: for each applied change, measure fitness over its window → keep or AUTO-REVERT
+      ▼
+  notify     → surface new pending proposals to the operator (chat / app)
+```
+
+- **`cron-run`** is the tournée: it asks the scheduler which subjects are *due*, sweeps only those, and writes signed proposals to the gate as `pending`.
+- **`mature`** is the runtime validation step (the OutcomeLoop close): it re‑measures each applied change against its baseline + guardrails and **keeps or auto‑reverts**.
+- **`notify`** pushes the pending proposals out (and the app's pending panel reads the same gate state).
+
+> *Reference deployment*: the three phases run as host cron a few minutes apart in the early morning, plus the notifier after quiet hours. The exact clock times are an operator deployment detail; what matters to the design is the **ordered phasing** (sweep → validate → notify) and that it is **at‑least‑daily**.
+
+### Per‑subject adaptive cadence (`AdaptiveScheduler`)
+The daily trigger fires the *sweep*, but the scheduler decides which subjects actually run, with deterministic **linear backoff**:
+
+| Event | Next interval |
+|---|---|
+| First run / reset | **24h** |
+| A run that proposes **0** changes | **+24h** (linear: 24 → 48 → 72 → …) |
+| Cap | **168h (1 week)** |
+| Any run that proposes **≥1** change | **reset to 24h** (consecutive‑zero counter → 0) |
+
+So a subject with nothing to fix is swept progressively less often (down to weekly), saving cost; the moment it surfaces a real finding it snaps back to daily. `wisecron resume` / `resetInterval` forces a subject back to 24h. The scheduler is **deterministic** (same state in → same next‑run out), so cadence is auditable and testable.
+
+### The proactive cycle (weekly)
+The proactive, evidence‑backed face (local signal → feeder → evidence → proposal) runs on a **separate, slower cadence** (weekly), because it is the expensive path (it can trigger external research). It is **cheap‑first**: it only researches a subject whose *local* signal is already degraded — a healthy subject is skipped before any feeder/LLM cost is incurred.
+
+### Summary
+- **Reactive tournée**: at‑least‑daily sweep, but **per‑subject adaptive (24h → 168h linear backoff, reset on any finding)**.
+- **Validation (mature)**: same daily phase, right after the sweep — keep/auto‑revert by fitness.
+- **Proactive tournée**: weekly, cheap‑first (no research on a healthy subject).
+- **PR/code validation** (orthogonal): GitHub CI on push — Biome, parse & build, version guards.
