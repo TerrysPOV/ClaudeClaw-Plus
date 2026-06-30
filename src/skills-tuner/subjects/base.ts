@@ -11,7 +11,16 @@ export abstract class BaseSubject extends TunableSubject {
     const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/);
     if (!match) return { frontmatter: {}, body: content };
     const yaml = await import("js-yaml");
-    const parsed = yaml.load(match[1]!);
+    // Real-world frontmatter (e.g. ~/agent/agents/*.md) contains unquoted
+    // values with embedded colons that js-yaml rejects as nested mappings.
+    // A parse failure here used to abort the whole subject; treat it as a
+    // missing frontmatter instead so one bad file doesn't zero the run.
+    let parsed: unknown;
+    try {
+      parsed = yaml.load(match[1]!);
+    } catch {
+      return { frontmatter: {}, body: match[2]! };
+    }
     return {
       frontmatter: (parsed != null && typeof parsed === "object" ? parsed : {}) as Record<
         string,
