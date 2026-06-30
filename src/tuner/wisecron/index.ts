@@ -28,6 +28,7 @@ import { ApplyPipeline } from "./apply-pipeline.js";
 import type { WisecronSettings } from "./types.js";
 
 import { ModelRoutingSubject } from "../subjects/model-routing-subject.js";
+import { MemorySubject } from "../subjects/memory-subject.js";
 // #275 staging: this brick ships the OutcomeLoop + ONLY the model-routing subject
 // (reversible, measurable) as the single-subject proof. The other 7 wisecron
 // subjects (cron, claude_md, hook, mcp_plugin, prompt_template, memory, agent)
@@ -109,6 +110,9 @@ export function registerWisecronSubjects(
         ),
       }),
     );
+
+  // memory subject: reactive index hygiene + proactive evidence face.
+  if (enabled("memory")) registerWithProbeCheck(new MemorySubject({ ...cfg("memory") }));
 
   // Resolve the active tuning scope (global + per-subject overrides) and record
   // it in the audit chain at registration — the certifier reads "the tuner
