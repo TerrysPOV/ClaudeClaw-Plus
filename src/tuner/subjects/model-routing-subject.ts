@@ -1,6 +1,6 @@
 import { existsSync, copyFileSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { BaseSubject } from "../../skills-tuner/subjects/base.js";
 import { sanitizeObservationContent } from "../../skills-tuner/core/security.js";
 import type { LLMClient } from "../../skills-tuner/core/llm.js";
@@ -236,6 +236,8 @@ export class ModelRoutingSubject extends BaseSubject implements RevertibleSubjec
     const alt = proposal.alternatives.find((a) => a.id === alternativeId);
     if (!alt)
       throw new Error(`model-routing-subject.apply: alternative ${alternativeId} not found`);
+    // Confinement: the only file this subject may write is its managed modes config.
+    this.assertManagedTarget(proposal.target_path);
 
     if (existsSync(proposal.target_path)) {
       copyFileSync(proposal.target_path, `${proposal.target_path}.bak`);
@@ -310,7 +312,15 @@ export class ModelRoutingSubject extends BaseSubject implements RevertibleSubjec
   }
 
   async revert(inversePatch: Patch): Promise<void> {
+    this.assertManagedTarget(inversePatch.target_path);
     writeFileSync(inversePatch.target_path, inversePatch.applied_content, "utf8");
+  }
+
+  /** The only writable file: the managed modes config. Anything else -> throw. */
+  private assertManagedTarget(target: string): void {
+    if (resolve(target) !== resolve(this.modesConfigPath)) {
+      throw new Error(`target_path is not the managed modes config: ${target}`);
+    }
   }
 
   async healthCheck(): Promise<{
