@@ -30,12 +30,14 @@ import type { WisecronSettings } from "./types.js";
 import { ModelRoutingSubject } from "../subjects/model-routing-subject.js";
 import { MemorySubject } from "../subjects/memory-subject.js";
 import { McpPluginSubject } from "../subjects/mcp-plugin-subject.js";
+import { SkillsSubject } from "../subjects/skills-subject.js";
 // #275 staging: this brick ships the OutcomeLoop + the model-routing subject
 // (the single-subject proof) AND the memory subject (reactive index hygiene +
 // proactive evidence face) AND the mcp_plugin subject (governed plugin-only
-// install boundary). The remaining wisecron subjects (cron, claude_md, hook,
-// prompt_template, agent) land in their own follow-up bricks once the loop has
-// earned its keep.
+// install boundary) AND the skills subject (reactive hygiene/scaffolding +
+// proactive content-patch face). The remaining wisecron subjects (cron,
+// claude_md, hook, prompt_template, agent) land in their own follow-up bricks
+// once the loop has earned its keep.
 import { makeModeDispatchReader } from "./observation-readers.js";
 
 export interface WisecronContext {
@@ -121,6 +123,9 @@ export function registerWisecronSubjects(
   // NEW-plugin install (the only sanctioned path for an architectural capability).
   if (enabled("mcp_plugin"))
     registerWithProbeCheck(new McpPluginSubject({ llm: opts.llm, ...cfg("mcp_plugin") }));
+  // skills subject: reactive skill hygiene/scaffolding + proactive content-patch face.
+  if (enabled("skills"))
+    registerWithProbeCheck(new SkillsSubject({ llm: opts.llm, ...cfg("skills") }));
 
   // Resolve the active tuning scope (global + per-subject overrides) and record
   // it in the audit chain at registration — the certifier reads "the tuner
