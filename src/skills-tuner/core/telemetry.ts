@@ -44,6 +44,9 @@ export const TELEMETRY_STREAMS = [
   // so the hub auto-discovers plugins with zero per-plugin code. `value` is the
   // call's `duration_ms`. Added in contract 1.1.0.
   "mcp.tool_call",
+  // Memory degradation signal (load latency / size / dead-ratio), sampled
+  // tuner-side from the memory index. Added in contract 1.2.0.
+  "memory_signal",
 ] as const;
 
 export type TelemetryStream = (typeof TELEMETRY_STREAMS)[number];
@@ -53,7 +56,7 @@ export type TelemetryStream = (typeof TELEMETRY_STREAMS)[number];
  * 1.1.0 adds the `mcp.tool_call` stream + the optional view-manifest surface
  * (`viewManifest`/`viewData`) — both additive, older consumers unaffected.
  */
-export const TELEMETRY_CONTRACT_VERSION = "1.1.0";
+export const TELEMETRY_CONTRACT_VERSION = "1.2.0";
 
 /** Half-open time window [start, end) for a fitness measurement. */
 export interface DateRange {

@@ -977,7 +977,11 @@ export class CompositeTelemetryProvider implements TelemetryProvider, ViewManife
   }
 }
 
+import { MemorySignalProducer } from "./memory-signal-provider.js";
+
 export interface HostTelemetryConfig {
+  /** Path to the memory-signal sampler history; when set, wires the `memory_signal` stream. */
+  memorySignalHistoryPath?: string;
   costDbPath?: string;
   hooksDir?: string;
   skillAccessLog?: string;
@@ -1045,6 +1049,9 @@ export function buildHostTelemetryProvider(
   // Phase A: universal MCP boundary stream — wired only when the gateway log is
   // configured, so existing capability tests (every stream unavailable on an
   // empty host) stay deterministic and machine-state-independent.
+  if (cfg.memorySignalHistoryPath) {
+    providers.push(new MemorySignalProducer({ historyPath: cfg.memorySignalHistoryPath }));
+  }
   if (cfg.mcpToolCallLog) {
     providers.push(new McpToolCallTelemetryProducer({ logPath: cfg.mcpToolCallLog }));
   }
