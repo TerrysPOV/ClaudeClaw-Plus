@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { dirname } from "node:path";
 import { homedir } from "node:os";
 import type { Registry } from "../../skills-tuner/core/registry.js";
@@ -47,6 +48,32 @@ type OutcomeRecorderHook = {
  *     exit code ≠ 0), auto-revert via subject.revert(inverse_patch).
  *   - Low/medium subjects: apply is final, revert only on explicit user action.
  */
+
+/**
+ * Commit a just-applied change to git when its target lives in a repo. Stages and
+ * commits ONLY `targetPath` on the current branch (so the operator's other
+ * uncommitted work is untouched), giving a `[tuner]` commit trail + `git revert`
+ * recovery on top of the inverse_patch. Best-effort: returns the commit sha, or
+ * null when the target is not in a repo / nothing changed / git is unavailable.
+ */
+function commitAppliedTarget(targetPath: string, message: string): string | null {
+  const dir = dirname(targetPath);
+  const git = (args: string[]) =>
+    spawnSync("git", ["-C", dir, ...args], { encoding: "utf8", timeout: 20_000 });
+  try {
+    if (git(["rev-parse", "--is-inside-work-tree"]).status !== 0) return null;
+    git(["add", "--", targetPath]);
+    // Nothing staged for this path → nothing to commit (idempotent re-apply).
+    if (git(["diff", "--cached", "--quiet", "--", targetPath]).status === 0) return null;
+    const c = git(["commit", "--no-verify", "-m", message, "--", targetPath]);
+    if (c.status !== 0) return null;
+    const sha = git(["rev-parse", "HEAD"]);
+    return sha.status === 0 ? sha.stdout.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
 export class ApplyPipeline {
   private readonly registry: Registry;
   private readonly db: WisecronStateDB;
@@ -140,6 +167,13 @@ export class ApplyPipeline {
 
         const forward_patch = await subject.apply(proposal, alternativeId);
 
+        // Git-commit the applied target (when it lives in a repo) for a clean,
+        // revertible trail alongside the .bak + inverse_patch.
+        const commit_sha = commitAppliedTarget(
+          forward_patch.target_path,
+          `[tuner] ${proposal.subject} proposal #${proposal.id} (alt ${alternativeId}) via ${appliedBy}`,
+        );
+
         const validation = await subject.validate(forward_patch);
         if (!validation.valid) {
           this.audit("wisecron_validate_failed", {
@@ -165,6 +199,7 @@ export class ApplyPipeline {
           alternative_id: alternativeId,
           applied_by: appliedBy,
           risk_tier: subject.risk_tier,
+          commit_sha,
         });
 
         return {
