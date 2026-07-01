@@ -16,8 +16,8 @@ into one: a single engine behind a single MCP surface, with `skills-tuner` retir
 |---|---|---|
 | `core/engine.ts` (`Engine` — detect→propose→apply loop) | `tuner/wisecron/outcome-loop.ts` + `proposal-engine.ts` + `apply-pipeline.ts` (detect → **human gate** → apply → **measure fitness** → **auto-revert**) | #287 |
 | `adapters/*` (cli/discord/slack/telegram surfaces) | the `tuner__*` MCP gate (`gate-mcp.ts`) + the pending→Telegram notifier/worker (inline approve/skip/reject) | #287 + ops scripts |
-| `subjects/skills.ts` (the single "skills" subject) | the 8 wisecron `TunableSubject`s (model_routing, mcp_plugin, memory, hook, prompt_template, agent, cron, claude_md) | #116/#287 |
-| ad-hoc measurement | the `telemetry__*` MCP surface (10 streams, one per subject) | #286 |
+| `subjects/skills.ts` (the single "skills" subject) | the 9 wisecron `TunableSubject`s (model_routing, mcp_plugin, memory, skills, hook, prompt_template, agent, cron, claude_md) — reference examples; the platform tunes ANY registered `TunableSubject`, so subjects 10/11/12+ are at the consumer discretion | #116/#287 |
+| ad-hoc measurement | the `telemetry__*` MCP surface (11 streams, contract 1.2.0) | #286 |
 
 ## What is SHARED (kept, not duplicated)
 The wisecron `tuner` reuses these v1 core primitives as-is (they are foundational,
@@ -29,7 +29,7 @@ back-compat), so the tuner no longer depends on a `skills-tuner` slated for remo
 ## Staging (no big-bang)
 1. **#286** — telemetry surface (measurement IN). *(open, draft)*
 2. **#287** — OutcomeLoop + model_routing subject + `tuner__*` gate. *(open, draft, stacked)*
-3. **THIS PR (draft)** — the map + `@deprecated` markers on the v1 `Engine`, v1 adapters,
+3. **THIS PR (draft)** — the map + `@deprecated` markers on the v1 `Engine`
    and the v1 `skills` subject, pointing at their wisecron replacements. No behavior change.
 4. **Follow-up (after #286/#287 merge)** — relocate shared core to `tuner/core`
    (re-export from `skills-tuner/core`), repoint the MCP gate from the legacy
