@@ -111,16 +111,11 @@ describe("MemorySubject — detectProblems", () => {
     expect(clusters[0]?.subjects_touched).toEqual(["memory"]);
   });
 
-  it("returns empty when total < 2", async () => {
+  it("returns empty when there are no observations", async () => {
     const s = new MemorySubject({ memoryIndex: indexPath });
-    const single: Observation = {
-      session_id: "t",
-      observed_at: new Date(),
-      signal_type: "orphan",
-      verbatim: "{}",
-      metadata: { subject: "memory" },
-    };
-    const clusters = await s.detectProblems([single]);
+    // A single real issue (dead ref, dup, or a verbose index) now warrants a
+    // cluster; only a truly empty observation set yields no proposal.
+    const clusters = await s.detectProblems([]);
     expect(clusters).toEqual([]);
   });
 });
@@ -455,8 +450,9 @@ describe("MemorySubject — Pass B: proposeChange emits unified diff", () => {
       subjects_touched: ["memory"],
     };
     const proposal = await s.proposeChange(cluster);
-    expect(proposal.alternatives).toHaveLength(3);
-    for (const alt of proposal.alternatives) {
+    // 3 dedup diffs (≤2KB each) + 1 full-content "shrink" alternative.
+    expect(proposal.alternatives).toHaveLength(4);
+    for (const alt of proposal.alternatives.filter((a) => a.id !== "shrink")) {
       expect(alt.diff_or_content.length).toBeLessThanOrEqual(2048);
     }
   });
@@ -509,7 +505,9 @@ describe("MemorySubject — Pass B: proposeChange emits unified diff", () => {
       subjects_touched: ["memory"],
     };
     const proposal = await s.proposeChange(cluster);
-    for (const alt of proposal.alternatives) {
+    // Dedup alternatives are unified diffs with a summary header; the "shrink"
+    // alternative is full content, not a diff.
+    for (const alt of proposal.alternatives.filter((a) => a.id !== "shrink")) {
       expect(alt.diff_or_content).toMatch(/@@ \d+ removed, \d+ added, \d+ reordered @@/);
     }
   });
