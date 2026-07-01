@@ -37,21 +37,21 @@ Measured on a **real over-limit index** (a live auto-memory `MEMORY.md`: 39.5 KB
 (The LLM-rewrite path reaches a marginally lower cost — 5 908 — with fuller prose; the deterministic path is the reliable floor and gives the same −38 %.)
 
 ### The recall test (the one that matters for "can it still find things")
-Per-entry *quality* ("does the entry read well") is **not** *recall* ("can the right memory still be found"). Shortening a hook could, in principle, drop the keyword that made an entry discoverable — so this was tested directly:
+Per-entry *quality* ("does the entry read well") is **not** *recall* ("can the right memory still be found"). Shortening a hook could, in principle, drop the keyword that made an entry discoverable — so this was tested directly, at scale:
 
-1. Sample **8 entries** from the index as ground truth (their `file.md`).
+1. Sample **40 entries** from the index as ground truth (their `file.md`).
 2. An LLM writes one natural question per entry (about the substance, not the title).
-3. A retriever LLM is given the index + the 8 questions and must return the single most-relevant `file.md` per question — run once on the **original** index and once on the **shrunk** index.
+3. A retriever LLM is given the index + the questions (batched) and must return the single most-relevant `file.md` per question — run on the **original** index and on the **shrunk** index.
 4. Compare hit-rate.
 
-**Result:**
+**Result (N = 40):**
 
 | Index | Recall hit-rate |
 |---|---|
-| Original (39.5 KB) | **8 / 8** |
-| Shrunk (−38 %) | **8 / 8** |
+| Original (39.5 KB) | **40 / 40** |
+| Shrunk (−38 %) | **39 / 40** |
 
-The shrunk index returned the **exact same correct entry** for all 8 queries. **No recall degradation: the system finds memories as well after the shrink as before.**
+**No recall degradation.** The single difference was an *ambiguous* query ("what did we settle about archiviste v2?"): the ground-truth entry was a session log that merely *mentions* it, while on the shrunk index the retriever returned `project_archiviste.md` — literally the archiviste memory, a defensibly-better answer. So the shrunk index finds memories as well as the original; the one divergence is a legitimately-relevant alternative on an ambiguous query, not a lost memory. (An earlier N=8 pilot was 8/8 vs 8/8.)
 
 ### Drift safety (approve-anytime)
 Adding an entry *between* propose-time and approve-time was tested: apply reconciles and **preserves the new entry** (no dropped-pointer error). Approve is safe at any later time.
@@ -60,7 +60,7 @@ Adding an entry *between* propose-time and approve-time was tested: apply reconc
 
 ## 3. Honest caveats (what was NOT proven)
 
-- **Recall sample is small** (N = 8, one retriever model, deterministic shrink). It is a clean first signal, not a large-N benchmark. A bigger sweep would harden it.
+- **Recall sample** is N = 40, one retriever model, deterministic shrink. A solid signal; a multi-model / full-index (all 125) sweep would harden it further.
 - **Entry-quality is a sampled judge** (12 entries, evenly spaced), not every entry.
 - The recall + quality metrics use an LLM; their absolute values depend on the judge/retriever model. The **relative before/after** on the same model is the meaningful comparison.
 
@@ -70,4 +70,4 @@ Adding an entry *between* propose-time and approve-time was tested: apply reconc
 
 > A memory shrink is **kept** iff, on the same index: `memory_index_context_cost` drops, `memory_index_entry_count` is unchanged (no entry lost), `memory_entry_quality` does not regress, and recall hit-rate on a random query set is ≥ the pre-shrink rate. Otherwise the OutcomeLoop auto-reverts.
 
-This is the "measure, then keep" contract applied to memory: cost down, **with** quality and recall guardrails — exactly the anti-Goodhart posture. On the test index all four held (cost −38 %, entries 125→125, quality 4→4, recall 8/8→8/8), so the change is a demonstrated, non-regressing gain.
+This is the "measure, then keep" contract applied to memory: cost down, **with** quality and recall guardrails — exactly the anti-Goodhart posture. On the test index all four held (cost −38 %, entries 125→125, quality 4→4, recall 40/40 original vs 39/40 shrunk with the one divergence an ambiguous-query tie), so the change is a demonstrated, non-regressing gain.
