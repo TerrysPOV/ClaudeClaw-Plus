@@ -8,7 +8,7 @@ This document is the *operational* companion to the RFC. It describes, exactly:
 3. the complete **telemetry surface** (every stream, its schema, its producer) — the data the visual control‑plane app (#285) renders;
 4. the **proposal payload** ("the charge") and the **choice structure** the operator acts on;
 5. the **gate surface** (the controls the app exposes);
-6. the **decision sequence per subject** — the 3 live subjects in detail, and the 5 held in reserve.
+6. the **decision sequence per subject** — the 3 live subjects in detail, and the 6 held in reserve.
 
 ---
 

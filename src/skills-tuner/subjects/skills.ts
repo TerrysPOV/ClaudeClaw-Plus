@@ -103,9 +103,9 @@ function stripFences(text: string): string {
 }
 
 /**
- * @deprecated The single v1 "skills" subject. Superseded by the 8 wisecron
- * TunableSubjects (model_routing, mcp_plugin, memory, hook, prompt_template, agent,
- * cron, claude_md), #116/#287. See docs/skills-tuner-to-tuner-migration.md.
+ * @deprecated The single v1 "skills" subject. Superseded by the 9 wisecron
+ * TunableSubjects (model_routing, mcp_plugin, memory, skills, hook, prompt_template,
+ * agent, cron, claude_md), #116/#287. See docs/skills-tuner-to-tuner-migration.md.
  */
 export class SkillsSubject extends BaseSubject {
   readonly name = "skills";
