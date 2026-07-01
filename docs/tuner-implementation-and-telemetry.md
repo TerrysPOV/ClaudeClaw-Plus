@@ -19,10 +19,12 @@ A **governed, evidence‑backed self‑tuning layer**: the agent proposes improv
 **Expected end state**, once the full stack lands:
 - A read‑only **measurement surface** (`telemetry__*`) the app reads to show health.
 - A **mutating gate** (`tuner__*`) the app drives to approve / refuse / apply / mature proposals.
-- **8 tunable subjects**, each two‑faced (reactive `detect()` + proactive evidence face), wired into the engine, each confined to its own managed dir.
+- **9 reference tunable subjects**, each two‑faced (reactive `detect()` + proactive evidence face), wired into the engine, each confined to its own managed dir.
 - An **OutcomeLoop** that snapshots a baseline at apply and keeps‑or‑reverts on a fitness window.
 - A **plugin‑only boundary** for architectural capabilities (`mcp_plugin` real install + `technique‑plugin‑registry`).
 - A **control‑plane app** (#285) that renders all of the above: telemetry, the gate, and a visual git‑tracking view of applied changes.
+
+> **The platform is subject‑agnostic — the 9 subjects are reference implementations, not a closed set.** The engine tunes anything that implements the `TunableSubject` contract (declare a telemetry signal + a confined target + a fitness measure); a consumer can register subject 10, 11, 12… at their own discretion. The value proposition is the *platform* — a governed loop you can point at almost any piece of your own config/data — not a fixed catalogue of nine. Nine are shipped as worked examples spanning the risk tiers.
 
 ---
 
@@ -206,7 +208,9 @@ PROACTIVE face (EvidenceDrivenSubject, the 3 live subjects):
 
 ## 8. Per‑subject decision sequences
 
-### Live now (the 3 subjects)
+*Nine reference subjects (3 with a live proactive face + 6 more), spanning the risk tiers — the extensible set from §1, not a closed list.*
+
+### Live proactive face (3 subjects)
 
 #### `memory` — risk **low**, no‑create
 - **Consumes**: `memory_access` (reactive), `memory_signal` (proactive).
@@ -227,7 +231,7 @@ PROACTIVE face (EvidenceDrivenSubject, the 3 live subjects):
 - **Proactive**: local signal = dead‑skill ratio (with a **stale‑log guard** — an old/empty access log is *broken telemetry*, not unused skills). Technique = `skill-description-optimization`. **This is the content‑patch case**: `evaluate()` returns `kind:"patch"` and `proposeEvidencePatch()` builds a gated patch on the worst dead skill — **content the subject applies itself, never a plugin, never a dead‑end note.**
 - **Confinement**: every apply target re‑checked inside `scan_dirs`.
 
-### In reserve (the 5 subjects — implemented, not yet upstreamed)
+### The other 6 subjects (implemented; `mcp_plugin` lands in #290, the rest staged)
 
 These have the same contract + fitness already written; they are held for later bricks.
 
