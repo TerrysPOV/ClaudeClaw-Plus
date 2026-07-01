@@ -44,7 +44,58 @@ function defaultMemoryIndex(): string {
 }
 
 const MAX_INDEX_LINES = 200;
+/** One-line budget per index entry (CLAUDE.md memory spec ~200 chars). */
+const MAX_INDEX_LINE_CHARS = 200;
 const HEADER = "# Memory Index";
+
+/** A memory index starts with the "# Memory Index" header OR (headerless live format) a "- [" entry. */
+function hasValidIndexStart(content: string): boolean {
+  const first = content.split("\n").find((l) => l.trim().length > 0) ?? "";
+  return first.startsWith(HEADER) || first.startsWith("- [");
+}
+
+/** One `.md` pointer of an entry line, or null if not exactly one. */
+function entryPointer(line: string): string | null {
+  const m = [...line.matchAll(/\]\(([^)]+\.md)\)/g)].map((x) => x[1]);
+  return m.length === 1 ? (m[0] as string) : null;
+}
+
+/**
+ * Reconcile a proposed (possibly stale) index against the LIVE index. Iterate
+ * the LIVE lines so no current entry is ever dropped: reuse the proposed
+ * shortened line where the entry still exists (by pointer), else deterministically
+ * shorten the new/changed live line. Non-entry lines come from live. Result's
+ * pointer set == live's pointer set (no loss), with propose-time shortening kept.
+ */
+function reconcileToLive(snapshot: string, live: string): string {
+  const shortByPtr = new Map<string, string>();
+  for (const l of snapshot.split("\n")) {
+    if (!l.startsWith("- [")) continue;
+    const p = entryPointer(l);
+    if (p) shortByPtr.set(p, l);
+  }
+  return live
+    .split("\n")
+    .map((l) => {
+      if (!l.startsWith("- [")) return l;
+      const p = entryPointer(l);
+      if (p && shortByPtr.has(p)) return shortByPtr.get(p) as string;
+      return shortenIndexLine(l);
+    })
+    .join("\n");
+}
+
+/** Deterministic shrink of one over-long index line: keep the link, trim the hook to budget. */
+function shortenIndexLine(line: string): string {
+  if (!line.startsWith("- [") || line.length <= MAX_INDEX_LINE_CHARS) return line;
+  const m = line.match(/^(- \[[^\]]*\]\([^)]+\.md\)\s*—\s*)([\s\S]*)$/);
+  if (!m) return `${line.slice(0, MAX_INDEX_LINE_CHARS - 1)}…`;
+  const head = m[1] as string;
+  const budget = MAX_INDEX_LINE_CHARS - head.length - 1;
+  if (budget <= 0) return `${line.slice(0, MAX_INDEX_LINE_CHARS - 1)}…`;
+  const hook = (m[2] as string).slice(0, budget).replace(/\s+\S*$/, "");
+  return `${head}${hook}…`;
+}
 // `- [Title](file.md) — hook` shape — em-dash or ASCII hyphen separator.
 const ENTRY_RE = /^- \[([^\]]+)\]\(([^)]+\.md)\)(?:\s+[—-]\s+(.+))?$/;
 
@@ -77,6 +128,8 @@ export interface MemorySubjectConfig {
   hookLog?: string;
   /** Path to the memory-signal sampler history (the local degradation signal). */
   signalHistoryPath?: string;
+  /** Path to the entry-quality judge cache (LLM-judged, sampled, cached). */
+  qualityCachePath?: string;
 }
 
 export class MemorySubject extends BaseSubject implements RevertibleSubject, EvidenceDrivenSubject {
@@ -89,6 +142,7 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
   private readonly memoryIndex: string;
   private readonly hookLog?: string;
   private readonly signalHistoryPath: string;
+  private readonly qualityCachePath: string;
 
   constructor(opts: MemorySubjectConfig = {}) {
     super();
@@ -100,6 +154,9 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
     this.hookLog = opts.hookLog;
     this.signalHistoryPath = (
       opts.signalHistoryPath ?? `${homedir()}/.config/tuner/memory-signal-history.jsonl`
+    ).replace(/^~(?=\/|$)/, homedir());
+    this.qualityCachePath = (
+      opts.qualityCachePath ?? `${homedir()}/.config/tuner/memory-quality-cache.json`
     ).replace(/^~(?=\/|$)/, homedir());
   }
 
@@ -224,11 +281,27 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
       });
     }
 
+    // Verbose-index signal: entries over the one-line budget bloat the per-session
+    // context cost. Emit one observation so a shrink is proposed even with 0 dead/dup.
+    const longLines = content.split("\n").filter((l) => l.length > MAX_INDEX_LINE_CHARS).length;
+    if (longLines > 0) {
+      observations.push({
+        session_id: `memory-verbose-${now.getTime()}`,
+        observed_at: now,
+        signal_type: "correction",
+        verbatim: sanitizeObservationContent(
+          JSON.stringify({ longLines, bytes: content.length }),
+          200,
+        ),
+        metadata: { subject: "memory", verbose: true, longLines, bytes: content.length },
+      });
+    }
+
     return observations;
   }
 
   async detectProblems(observations: Observation[]): Promise<Cluster[]> {
-    if (observations.length < 2) return [];
+    if (observations.length === 0) return [];
     return [
       {
         id: "memory-index-cleanup",
@@ -250,6 +323,9 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
     const dedupDead = applyStrategy(current, this.memoryIndex, "dedup-dead");
     const dedupReorder = applyStrategy(current, this.memoryIndex, "dedup-reorder");
     const dedupGroup = applyStrategy(current, this.memoryIndex, "dedup-group");
+    // Shrink: rewrite over-long entries to one line each (LLM, deterministic
+    // fallback). Unknown-strategy id → apply() writes this content verbatim.
+    const shrunk = await this.rewriteShort(current);
 
     // Emit unified diffs (≤2KB each) so the three alternatives stay visually
     // distinct in adapter surfaces. apply() re-runs the strategy against the
@@ -261,6 +337,13 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
       kind: "patch",
       target_path: this.memoryIndex,
       alternatives: [
+        {
+          id: "shrink",
+          label: "Shrink: rewrite over-long entries to one line (detail stays in topics)",
+          diff_or_content: shrunk,
+          tradeoff:
+            "Cuts per-session context cost + long-line count toward 0; keeps every entry + link.",
+        },
         {
           id: "dedup-dead",
           label: "Dedup + remove dead refs",
@@ -318,11 +401,20 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
           `memory-subject.apply: unknown strategy '${alternativeId}' and no diff_or_content`,
         );
       }
-      newContent = explicit;
-      // Pre-write validation for EXTERNAL content (M5/L5): structure + no live-pointer loss.
-      if (!newContent.startsWith(HEADER)) {
-        throw new Error("memory-subject.apply: external content missing index header");
+      // Accept both the "# Memory Index" header AND the headerless entry-first
+      // format the live auto-memory files actually use.
+      if (!hasValidIndexStart(explicit)) {
+        throw new Error(
+          "memory-subject.apply: external content is not a memory index (no header/entry start)",
+        );
       }
+      // Reconcile the (possibly stale) proposed index against the LIVE index at
+      // APPLY time: the proposal froze a snapshot at propose-time, but the user
+      // may have edited the memory before tapping Approve. Keep every current
+      // entry — using the proposed shortened line where the entry still exists,
+      // and deterministically shortening any new/changed entry — so Approve
+      // always succeeds on the current state and NEVER drops a live pointer.
+      newContent = reconcileToLive(explicit, current);
       const memDir = dirname(this.memoryIndex);
       const liveBefore = [...current.matchAll(/\]\(([^)]+\.md)\)/g)]
         .map((m) => m[1] as string)
@@ -331,9 +423,10 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
         [...newContent.matchAll(/\]\(([^)]+\.md)\)/g)].map((m) => m[1] as string),
       );
       const dropped = liveBefore.filter((file) => !afterPtrs.has(file));
+      // After reconciliation this should never fire; kept as a hard safety net.
       if (dropped.length > 0) {
         throw new Error(
-          `memory-subject.apply: external content drops ${dropped.length} live pointer(s): ${dropped.slice(0, 3).join(", ")}`,
+          `memory-subject.apply: reconciled content still drops ${dropped.length} live pointer(s): ${dropped.slice(0, 3).join(", ")}`,
         );
       }
     }
@@ -355,8 +448,11 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
 
   async validate(patch: Patch): Promise<ValidationResult> {
     const content = patch.applied_content;
-    if (!content.startsWith(HEADER)) {
-      return { valid: false, reason: `missing "${HEADER}" header` };
+    if (!hasValidIndexStart(content)) {
+      return {
+        valid: false,
+        reason: `not a memory index (no "${HEADER}" header or "- [" entry start)`,
+      };
     }
     const lines = content.split("\n");
     if (lines.length > MAX_INDEX_LINES) {
@@ -421,6 +517,40 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
         direction: "higher_is_better",
         windowDays: 7,
       },
+      {
+        // Context tax: MEMORY.md loads into context EVERY session, so its token
+        // footprint is a recurring cost. Lower is better. Gameable by deleting
+        // entries → guarded by memory_index_entry_count (higher_is_better).
+        name: "memory_index_context_cost",
+        source: ARTIFACT_SOURCE,
+        kind: "verifiable",
+        direction: "lower_is_better",
+        windowDays: 1,
+        guardrails: ["memory_index_entry_count"],
+      },
+      {
+        // Entry-verbosity defect: index lines over the one-line budget
+        // (~200 chars). Lower is better; the shrink strategy drives it to 0
+        // without dropping entries (entry_count guardrail).
+        name: "memory_index_long_line_count",
+        source: ARTIFACT_SOURCE,
+        kind: "verifiable",
+        direction: "lower_is_better",
+        windowDays: 1,
+        guardrails: ["memory_index_entry_count"],
+      },
+      {
+        // Semantic quality: an LLM judge rates a SAMPLE of entries 1–5 for
+        // clarity+specificity+actionability; the median is cached (sampled by a
+        // refresh, not measured inline — measureFitness stays fast). Higher is
+        // better. The anti-Goodhart pair to context_cost: shrinking must not
+        // gut the entries' usefulness.
+        name: "memory_entry_quality",
+        source: ARTIFACT_SOURCE,
+        kind: "verifiable",
+        direction: "higher_is_better",
+        windowDays: 7,
+      },
     ];
   }
 
@@ -451,16 +581,155 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
     if (scan !== null) {
       out.memory_index_entry_count = scan.entries;
       out.memory_index_defect_count = scan.defects;
+      out.memory_index_context_cost = scan.contextCostTokens;
+      out.memory_index_long_line_count = scan.longLines;
     }
 
+    // ── Tier 2: cached LLM entry-quality (judged out-of-band; read fast here) ─
+    const q = this.readQualityCache();
+    if (q !== null) out.memory_entry_quality = q;
+
     return out;
+  }
+
+  /** Read the cached median entry-quality (1–5), or null if absent/malformed. */
+  private readQualityCache(): number | null {
+    if (!existsSync(this.qualityCachePath)) return null;
+    try {
+      const c = JSON.parse(readFileSync(this.qualityCachePath, "utf8"));
+      return typeof c.median === "number" ? c.median : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * LLM-judge a random SAMPLE of index entries (1–5 for clarity + specificity +
+   * actionability), cache the median. Expensive (one LLM call) → run out-of-band
+   * (a refresh timer / on demand), NOT inside measureFitness. Returns the median,
+   * or null when there's no LLM or nothing to judge.
+   */
+  async measureEntryQuality(sampleSize = 12): Promise<number | null> {
+    if (!this.llm || !existsSync(this.memoryIndex)) return null;
+    const entryLines = readFileSync(this.memoryIndex, "utf8")
+      .split("\n")
+      .filter((l) => l.startsWith("- ["));
+    if (entryLines.length === 0) return null;
+    // Deterministic-ish sample: evenly spaced across the index.
+    const step = Math.max(1, Math.floor(entryLines.length / sampleSize));
+    const sample = entryLines.filter((_, i) => i % step === 0).slice(0, sampleSize);
+    const system =
+      "You are a strict memory-index reviewer. For EACH line, rate the entry 1-5 on " +
+      "clarity + specificity + actionability (5 = crisp, specific, immediately useful; " +
+      "1 = vague/redundant/noise). Reply ONLY with a JSON array of integers, one per " +
+      "line, in order. No prose.";
+    try {
+      const raw = await this.llm.call(
+        "judge",
+        system,
+        [{ role: "user", content: sample.join("\n") }],
+        400,
+      );
+      const nums = JSON.parse((raw.match(/\[[\s\S]*\]/) ?? ["[]"])[0]) as unknown[];
+      const scores = nums.filter((n): n is number => typeof n === "number" && n >= 1 && n <= 5);
+      if (scores.length === 0) return null;
+      const med = median(scores);
+      writeFileSync(
+        this.qualityCachePath,
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          median: med,
+          sampleSize: scores.length,
+          scores,
+        }),
+        "utf8",
+      );
+      return med;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Rough per-session context cost of the index in tokens (~4 chars/token). */
+  private estimateContextTokens(content: string): number {
+    return Math.ceil(content.length / 4);
+  }
+
+  /**
+   * Produce a shrunk index: each over-long entry becomes one line ≤200 chars,
+   * keeping its exact `[Title](file.md)` link (detail lives in the topic file).
+   * LLM rewrite when available (better prose); deterministic truncation as the
+   * fallback AND as the guard — if the LLM drops/adds an entry or a pointer, we
+   * fall back so the result always preserves every entry + link.
+   */
+  private async rewriteShort(content: string): Promise<string> {
+    const lines = content.split("\n");
+    if (!this.llm) return lines.map(shortenIndexLine).join("\n");
+    // Only over-long entry lines need rewriting; batch them so each LLM call is
+    // small + fast (a one-shot rewrite of a big index times out). Per-line guard:
+    // the output line must keep the SAME single pointer as its input, else that
+    // whole batch falls back to deterministic truncation. Non-entry + short lines
+    // are untouched and order is preserved.
+    const targets = lines
+      .map((l, i) => ({ l, i }))
+      .filter((x) => x.l.startsWith("- [") && x.l.length > MAX_INDEX_LINE_CHARS)
+      .map((x) => x.i);
+    if (targets.length === 0) return content;
+    const onePtr = (s: string) => {
+      const m = [...s.matchAll(/\]\(([^)]+\.md)\)/g)].map((x) => x[1]);
+      return m.length === 1 ? m[0] : null;
+    };
+    const system =
+      'You tighten memory-index lines of the form "- [Title](file.md) — hook". For EACH input ' +
+      "line, shorten the hook so the whole line is <=200 characters, KEEP the exact " +
+      '"[Title](file.md)" link, and return exactly ONE line per input line, in the SAME order. ' +
+      "Do NOT drop, add, merge, or reorder. Reply ONLY with the revised lines, nothing else.";
+    const BATCH = 15;
+    for (let b = 0; b < targets.length; b += BATCH) {
+      const idxs = targets.slice(b, b + BATCH);
+      const src = idxs.map((i) => lines[i] as string);
+      let ok = false;
+      try {
+        const raw = await this.llm.call(
+          "proposer",
+          system,
+          [{ role: "user", content: src.join("\n") }],
+          4000,
+        );
+        const out = raw
+          .trim()
+          .split("\n")
+          .filter((l) => l.startsWith("- ["));
+        ok =
+          out.length === src.length &&
+          out.every((o, k) => onePtr(o) !== null && onePtr(o) === onePtr(src[k] as string));
+        if (ok) {
+          idxs.forEach((i, k) => {
+            lines[i] = out[k] as string;
+          });
+        }
+      } catch {
+        ok = false;
+      }
+      if (!ok) {
+        idxs.forEach((i) => {
+          lines[i] = shortenIndexLine(lines[i] as string);
+        });
+      }
+    }
+    return lines.join("\n");
   }
 
   /**
    * Scan MEMORY.md: defects = entries whose referenced file is missing (dead) +
    * duplicate-slug entries. Returns null when the index file is absent.
    */
-  private scanIndex(): { entries: number; defects: number } | null {
+  private scanIndex(): {
+    entries: number;
+    defects: number;
+    contextCostTokens: number;
+    longLines: number;
+  } | null {
     if (!existsSync(this.memoryIndex)) return null;
     let content: string;
     try {
@@ -481,7 +750,14 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
       if (!existsSync(resolve(memoryDir, e.file))) defects += 1;
       else if ((slugCounts.get(slug) ?? 0) > 1) defects += 1;
     }
-    return { entries: entries.length, defects };
+    // Entry lines over the ~200-char one-line budget (CLAUDE.md memory spec).
+    const longLines = content.split("\n").filter((l) => l.length > MAX_INDEX_LINE_CHARS).length;
+    return {
+      entries: entries.length,
+      defects,
+      contextCostTokens: this.estimateContextTokens(content),
+      longLines,
+    };
   }
 }
 
