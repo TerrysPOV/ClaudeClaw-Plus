@@ -171,3 +171,42 @@ export function lookupCapability(
     (e) => e.capability === capability && (opts.includeUnverified === true || e.verified),
   );
 }
+
+/** All resolvable entries (operator ∪ built-ins, operator wins on id). */
+export function allRegistryEntries(
+  opts: { registryPath?: string; includeBuiltins?: boolean } = {},
+): PluginEntry[] {
+  const operator = loadOperatorEntries(opts.registryPath);
+  const builtins = opts.includeBuiltins === false ? [] : BUILTIN_REGISTRY;
+  const overridden = new Set(operator.map((e) => e.pluginId));
+  return [...operator, ...builtins.filter((e) => !overridden.has(e.pluginId))];
+}
+
+/**
+ * Does an install spec match an approved registry entry EXACTLY (pluginId +
+ * manager + source + server.command + server.args)? The apply-time gate: a
+ * proposal (incl. externally-ingested ones) may only install a spec that a
+ * curated registry entry authorises — the propose-time approved-list check is
+ * not enough on its own. Returns the matching entry, or null.
+ */
+export function matchRegistryEntry(
+  spec: {
+    pluginId: string;
+    manager: string;
+    source: string;
+    server: { command: string; args: string[] };
+  },
+  opts: { registryPath?: string; includeBuiltins?: boolean } = {},
+): PluginEntry | null {
+  return (
+    allRegistryEntries(opts).find(
+      (e) =>
+        e.pluginId === spec.pluginId &&
+        e.manager === spec.manager &&
+        e.source === spec.source &&
+        e.server.command === spec.server.command &&
+        e.server.args.length === spec.server.args.length &&
+        e.server.args.every((a, i) => a === spec.server.args[i]),
+    ) ?? null
+  );
+}
