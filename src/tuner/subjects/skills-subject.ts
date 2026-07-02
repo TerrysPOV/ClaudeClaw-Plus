@@ -273,6 +273,9 @@ export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject 
   async collectObservations(since: Date): Promise<Observation[]> {
     const skills = await this.loadSkillsMap();
     if (skills.size === 0) return [];
+    // Out-of-band, best-effort: refresh the LLM description-quality cache if stale
+    // (gated on an LLM → dormant + zero cost by default).
+    await this.refreshQualityIfStale();
 
     const observations: Observation[] = [];
     const sessionFiles = await this.findSessionFiles(since);
@@ -566,6 +569,23 @@ export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject 
       return typeof c.median === "number" ? c.median : null;
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * Wire for the quality judge: refresh the cache if older than `maxAgeDays`.
+   * Gated on an LLM (default: none → no-op), so the judge is reachable from the
+   * normal cycle without adding cost by default.
+   */
+  private async refreshQualityIfStale(maxAgeDays = 7): Promise<void> {
+    if (!this.llm) return;
+    try {
+      const fresh =
+        existsSync(this.qualityCachePath) &&
+        Date.now() - statSync(this.qualityCachePath).mtimeMs < maxAgeDays * 86_400_000;
+      if (!fresh) await this.measureDescriptionQuality();
+    } catch {
+      /* best-effort; never block observation collection */
     }
   }
 
