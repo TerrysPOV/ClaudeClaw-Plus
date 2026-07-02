@@ -17,11 +17,15 @@ import type { RevertibleSubject } from "../wisecron/types.js";
 import type { DateRange, Metric, TelemetryProvider } from "../../skills-tuner/core/telemetry.js";
 import { ARTIFACT_SOURCE } from "../../skills-tuner/core/telemetry.js";
 import { nonzeroRate } from "../../skills-tuner/core/aggregate.js";
+import { detectCapabilityGaps, type CapabilityGap } from "../wisecron/capability-gap.js";
+import { lookupCapability } from "../wisecron/technique-plugin-registry.js";
 
 const BROKEN_MIN_CALLS = 100;
 const BROKEN_SUCCESS_RATE = 0.5;
 const DEAD_WINDOW_DAYS = 90;
 const TRUST_BLOCKED_THRESHOLD = 0.7;
+/** Minimum unmet-intent count before a capability gap is worth a proposal. */
+const CAPABILITY_GAP_MIN = 3;
 
 /** Install subprocess wall-clock cap. */
 const INSTALL_TIMEOUT_MS = 120_000;
@@ -89,6 +93,14 @@ export interface McpPluginSubjectConfig {
   managedPluginsDir?: string;
   /** Injected installer for tests (default = real spawnSync git/npm). */
   installer?: PluginInstaller;
+  /** Session-transcript dirs mined for capability gaps. Default: ~/.claude/projects. */
+  transcriptDirs?: string[];
+  /** Min unmet-intent count before a capability gap becomes an observation. */
+  capabilityGapMin?: number;
+  /** Operator approved-list path for capability offers. Default registry path. */
+  registryPath?: string;
+  /** Injected capability-gap detector for tests. */
+  gapDetector?: (opts: { transcriptDirs?: string[]; since?: Date }) => CapabilityGap[];
 }
 
 export class McpPluginSubject extends BaseSubject implements RevertibleSubject {
@@ -106,10 +118,21 @@ export class McpPluginSubject extends BaseSubject implements RevertibleSubject {
   private readonly managedPluginsDir: string;
   private readonly manifestPath: string;
   private readonly installer: PluginInstaller;
+  private readonly transcriptDirs?: string[];
+  private readonly capabilityGapMin: number;
+  private readonly registryPath?: string;
+  private readonly gapDetector: (opts: {
+    transcriptDirs?: string[];
+    since?: Date;
+  }) => CapabilityGap[];
 
   constructor(opts: McpPluginSubjectConfig = {}) {
     super();
     this.llm = opts.llm;
+    this.transcriptDirs = opts.transcriptDirs;
+    this.capabilityGapMin = opts.capabilityGapMin ?? CAPABILITY_GAP_MIN;
+    this.registryPath = opts.registryPath;
+    this.gapDetector = opts.gapDetector ?? detectCapabilityGaps;
     this.auditLog = expandHome(
       opts.auditLog ?? join(homedir(), ".claudeclaw", "journal", "operations.jsonl"),
     );
@@ -126,7 +149,8 @@ export class McpPluginSubject extends BaseSubject implements RevertibleSubject {
 
   async collectObservations(since: Date): Promise<Observation[]> {
     const events = this.auditReader(this.auditLog, since);
-    if (events.length === 0) return [];
+    // NOTE: do NOT early-return on empty events — a capability GAP is precisely
+    // the absence of a tool, so it must be detected even with no MCP activity.
 
     const stats = new Map<string, ToolStats>();
     for (const ev of events) {
@@ -197,6 +221,41 @@ export class McpPluginSubject extends BaseSubject implements RevertibleSubject {
         },
       });
     }
+
+    // ── Capability-gap face: needs detected from the operator's OWN behaviour ──
+    // (session transcripts = trusted internal data; no external source can inject
+    // a need). A gap ≥ the min becomes an observation → a governed install offer.
+    let gaps: CapabilityGap[] = [];
+    try {
+      gaps = this.gapDetector({ transcriptDirs: this.transcriptDirs, since });
+    } catch {
+      gaps = [];
+    }
+    for (const g of gaps) {
+      if (g.unmetIntentCount < this.capabilityGapMin) continue;
+      observations.push({
+        session_id: `mcp-capgap-${g.capability}-${now.getTime()}`,
+        observed_at: now,
+        signal_type: "repeated_trigger",
+        verbatim: sanitizeObservationContent(
+          JSON.stringify({
+            capability: g.capability,
+            unmet: g.unmetIntentCount,
+            sessions_with_gap: g.sessionsWithGap,
+            examples: g.examples,
+          }),
+          500,
+        ),
+        metadata: {
+          subject: "mcp_plugin",
+          kind: "capability_gap",
+          capability: g.capability,
+          unmet: g.unmetIntentCount,
+          sessions_with_gap: g.sessionsWithGap,
+          examples: g.examples,
+        },
+      });
+    }
     return observations;
   }
 
@@ -205,9 +264,14 @@ export class McpPluginSubject extends BaseSubject implements RevertibleSubject {
     const broken: Observation[] = [];
     const dead: Observation[] = [];
     const blockedAllow: Observation[] = [];
+    const capGap: Observation[] = [];
 
     for (const obs of observations) {
       const meta = obs.metadata as Record<string, unknown>;
+      if (meta.kind === "capability_gap") {
+        capGap.push(obs);
+        continue;
+      }
       const calls = (meta.calls as number) ?? 0;
       const successRate = (meta.success_rate as number) ?? 1;
       const blocked = (meta.blocked as number) ?? 0;
@@ -224,6 +288,17 @@ export class McpPluginSubject extends BaseSubject implements RevertibleSubject {
     if (dead.length > 0) clusters.push(makeCluster("mcp-dead", dead, 0.0, "neutral"));
     if (blockedAllow.length > 0)
       clusters.push(makeCluster("mcp-blocked-allow", blockedAllow, 0.6, "neutral"));
+    // One cluster per distinct missing capability.
+    const byCap = new Map<string, Observation[]>();
+    for (const o of capGap) {
+      const cap = String((o.metadata as Record<string, unknown>).capability ?? "unknown");
+      const arr = byCap.get(cap) ?? [];
+      arr.push(o);
+      byCap.set(cap, arr);
+    }
+    for (const [cap, obs] of byCap) {
+      clusters.push(makeCluster(`mcp-capability-gap:${cap}`, obs, 0.8, "neutral"));
+    }
     return clusters;
   }
 
@@ -231,6 +306,9 @@ export class McpPluginSubject extends BaseSubject implements RevertibleSubject {
     const firstObs = cluster.observations[0];
     if (!firstObs) throw new Error("mcp-plugin-subject.proposeChange: cluster empty");
     const meta = firstObs.metadata as Record<string, unknown>;
+    // ── Capability-gap → offer an APPROVED plugin install (need from the
+    //    operator's behaviour, offer from the operator-approved registry). ──
+    if (meta.kind === "capability_gap") return this.proposeCapabilityInstall(cluster, meta);
     const server = meta.server as string;
     const tool = meta.tool as string;
 
@@ -284,6 +362,62 @@ export class McpPluginSubject extends BaseSubject implements RevertibleSubject {
         },
       ],
       pattern_signature: `mcp_plugin:${cluster.id}:${server}:${tool}`,
+      created_at: new Date(),
+    };
+  }
+
+  /**
+   * Turn a detected capability gap into a governed install proposal. The NEED
+   * came from the operator's own transcripts; the OFFER comes from the approved
+   * registry (`lookupCapability`). Approved (verified) entries first; if none,
+   * seeds are surfaced flagged UNVERIFIED; if the registry has nothing, a
+   * detect-only note (nothing is ever written without an approved entry). Each
+   * install alternative carries a `PluginInstallSpec` → apply() routes it through
+   * the confined, reversible install path.
+   */
+  private proposeCapabilityInstall(
+    cluster: Cluster,
+    meta: Record<string, unknown>,
+  ): UnsignedProposal {
+    const capability = String(meta.capability ?? "unknown");
+    const unmet = Number(meta.unmet ?? 0);
+    let offers = lookupCapability(capability, { registryPath: this.registryPath });
+    if (offers.length === 0) {
+      offers = lookupCapability(capability, {
+        registryPath: this.registryPath,
+        includeUnverified: true,
+      });
+    }
+    const alternatives = offers.map((e) => ({
+      id: `install:${e.pluginId}`,
+      label: `Install ${e.pluginId} for ${capability}${e.verified ? "" : " (UNVERIFIED — verify at gate)"}`,
+      diff_or_content: stableJson({
+        op: INSTALL_OP,
+        pluginId: e.pluginId,
+        manager: e.manager,
+        source: e.source,
+        server: e.server,
+      }),
+      tradeoff: `${e.description}${e.note ? ` — ${e.note}` : ""}`,
+    }));
+    if (alternatives.length === 0) {
+      alternatives.push({
+        id: "detect-only",
+        label: `Capability gap: ${capability} — no approved plugin in the registry`,
+        diff_or_content: stableJson({
+          note: `${unmet} unmet ${capability} intents. Curate an approved entry in the registry to offer an install.`,
+        }),
+        tradeoff: "Detect-only: nothing is installed until an approved entry exists.",
+      });
+    }
+    return {
+      id: Date.now(),
+      cluster_id: cluster.id,
+      subject: "mcp_plugin",
+      kind: "patch",
+      target_path: this.settingsPath,
+      alternatives,
+      pattern_signature: `mcp_plugin:capability_gap:${capability}`,
       created_at: new Date(),
     };
   }
