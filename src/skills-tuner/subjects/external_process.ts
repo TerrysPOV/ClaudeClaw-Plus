@@ -17,6 +17,7 @@ import {
 } from "../core/types.js";
 import type { Proposal } from "../core/types.js";
 import type { RiskTier } from "../core/interfaces.js";
+import type { DateRange, Metric, TelemetryProvider } from "../core/telemetry.js";
 
 export interface ExternalProcessConfig {
   name: string;
@@ -30,6 +31,15 @@ export interface ExternalProcessConfig {
   cwd?: string;
   env?: Record<string, string>;
   config?: Record<string, unknown>;
+  /**
+   * OutcomeLoop fitness metrics this external subject is scored on. Declared
+   * STATICALLY in TS config (not via RPC) because `fitnessSignals()` is a sync
+   * method while the subprocess protocol is async — a sync RPC would be a
+   * footgun. The subprocess only implements the async `measure_fitness` half.
+   * Each metric's `source` is normally `"artifact"` (Tier 1b: the subprocess
+   * scans its own journal/file, always activatable, no host stream gate).
+   */
+  fitnessSignals?: Metric[];
 }
 
 const RpcResponseSchema = z.union([
@@ -152,5 +162,33 @@ export class ExternalProcessSubject extends TunableSubject {
   async validate(patch: Patch): Promise<ValidationResult> {
     const result = await this.callMethod("validate", { patch });
     return ValidationResultSchema.parse(result);
+  }
+
+  /**
+   * Static fitness declaration (sync, no RPC). Mirrors the config — the host's
+   * activation gate intersects these sources against its telemetry
+   * capabilities; artifact-source metrics always activate. Returns a copy so a
+   * caller can't mutate the config array.
+   */
+  override fitnessSignals(): Metric[] {
+    return this.opts.fitnessSignals ? [...this.opts.fitnessSignals] : [];
+  }
+
+  /**
+   * Measure declared fitness over `range` by proxying to the subprocess'
+   * `measure_fitness` method. The subprocess reads its own artifact (e.g. a
+   * per-scan conformity journal) over [start,end] and returns metric→value.
+   * `_provider` is unused: artifact metrics are self-contained on the Python
+   * side (the subprocess owns the journal), so no host stream is queried here.
+   */
+  override async measureFitness(
+    range: DateRange,
+    _provider: TelemetryProvider,
+  ): Promise<Record<string, number>> {
+    const result = await this.callMethod("measure_fitness", {
+      start: range.start.toISOString(),
+      end: range.end.toISOString(),
+    });
+    return z.record(z.string(), z.number()).parse(result);
   }
 }
