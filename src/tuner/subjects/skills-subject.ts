@@ -1,5 +1,5 @@
 import { writeFile, copyFile, mkdir, readdir } from "node:fs/promises";
-import { existsSync, statSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, statSync, readdirSync, readFileSync, writeFileSync, lstatSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, dirname, basename, resolve, sep } from "node:path";
 import { homedir } from "node:os";
@@ -391,6 +391,11 @@ export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject 
       }
 
       await mkdir(actualDir, { recursive: true });
+      // M3: never write THROUGH a planted symlink (lexical containment above
+      // doesn't resolve symlinks; writeFile follows them).
+      if (existsSync(target) && lstatSync(target).isSymbolicLink()) {
+        throw new Error("Refusing to write through a symlink: " + target);
+      }
       await writeFile(target, alt.diff_or_content, "utf8");
       this.skillsCache = null;
       return { target_path: target, kind: proposal.kind, applied_content: alt.diff_or_content };
@@ -404,6 +409,10 @@ export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject 
     }
     if (!existsSync(target)) {
       throw new Error("Target " + target + " does not exist for kind=" + proposal.kind);
+    }
+    // M3: refuse a symlinked target — copyFile/writeFile would follow it out of the tree.
+    if (lstatSync(target).isSymbolicLink()) {
+      throw new Error("Refusing to write through a symlink: " + target);
     }
     await copyFile(target, target + ".bak");
     await writeFile(target, alt.diff_or_content, "utf8");
@@ -532,7 +541,10 @@ export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject 
     if (scan !== null) {
       out.skills_count = scan.count;
       out.skills_description_context_cost = scan.descriptionTokens;
-      out.skills_dead_ratio = scan.deadRatio;
+      // M5: omit dead_ratio when the access log is not fresh — 0 is the OPTIMAL
+      // value (lower_is_better), so emitting it would let broken telemetry read
+      // as a perfect score and bias the OutcomeLoop toward keeping changes.
+      if (scan.deadRatio !== null) out.skills_dead_ratio = scan.deadRatio;
     }
     const q = this.readQualityCache();
     if (q !== null) out.skills_description_quality = q;
@@ -543,7 +555,7 @@ export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject 
   private async scanSkills(): Promise<{
     count: number;
     descriptionTokens: number;
-    deadRatio: number;
+    deadRatio: number | null;
   } | null> {
     const skills = await this.loadSkillsMap();
     if (skills.size === 0) return null;
@@ -556,8 +568,8 @@ export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject 
     return {
       count: skills.size,
       descriptionTokens: Math.ceil(descChars / 4),
-      // Trust the dead ratio only when the access log is actively written.
-      deadRatio: h.logFresh ? h.deadRatio : 0,
+      // null (not 0) when the access log is stale → measureFitness omits it (M5).
+      deadRatio: h.logFresh ? h.deadRatio : null,
     };
   }
 
@@ -580,10 +592,18 @@ export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject 
   private async refreshQualityIfStale(maxAgeDays = 7): Promise<void> {
     if (!this.llm) return;
     try {
-      const fresh =
-        existsSync(this.qualityCachePath) &&
-        Date.now() - statSync(this.qualityCachePath).mtimeMs < maxAgeDays * 86_400_000;
-      if (!fresh) await this.measureDescriptionQuality();
+      if (existsSync(this.qualityCachePath)) {
+        const ageMs = Date.now() - statSync(this.qualityCachePath).mtimeMs;
+        let cooldownMs = maxAgeDays * 86_400_000;
+        try {
+          const c = JSON.parse(readFileSync(this.qualityCachePath, "utf8"));
+          if (c && c.failed === true) cooldownMs = 6 * 3_600_000; // short retry after failure (L8)
+        } catch {
+          /* unreadable → refresh */
+        }
+        if (ageMs < cooldownMs) return;
+      }
+      await this.measureDescriptionQuality();
     } catch {
       /* best-effort; never block observation collection */
     }
@@ -621,7 +641,10 @@ export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject 
       const raw = await this.llm.call("judge", system, [{ role: "user", content: user }], 400);
       const nums = JSON.parse((raw.match(/\[[\s\S]*\]/) ?? ["[]"])[0]) as unknown[];
       const scores = nums.filter((n): n is number => typeof n === "number" && n >= 1 && n <= 5);
-      if (scores.length === 0) return null;
+      if (scores.length === 0) {
+        this.stampQualityFailure();
+        return null;
+      }
       const med = median(scores);
       writeFileSync(
         this.qualityCachePath,
@@ -635,7 +658,22 @@ export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject 
       );
       return med;
     } catch {
+      this.stampQualityFailure();
       return null;
+    }
+  }
+
+  /** L8: short-TTL failure stamp so refreshQualityIfStale won't re-fire a blocking
+   * LLM call every cycle after an error/timeout/unparseable reply. */
+  private stampQualityFailure(): void {
+    try {
+      writeFileSync(
+        this.qualityCachePath,
+        JSON.stringify({ ts: new Date().toISOString(), median: null, failed: true }),
+        "utf8",
+      );
+    } catch {
+      /* best-effort */
     }
   }
 
