@@ -1,5 +1,5 @@
 import { writeFile, copyFile, mkdir, readdir } from "node:fs/promises";
-import { existsSync, statSync, readdirSync } from "node:fs";
+import { existsSync, statSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join, dirname, basename, resolve, sep } from "node:path";
 import { homedir } from "node:os";
@@ -17,6 +17,9 @@ import {
   meetsEvidenceBar,
 } from "../wisecron/evidence-driven.js";
 import { skillsHealth, accessedSkills } from "./skills-signal.js";
+import { ARTIFACT_SOURCE } from "../../skills-tuner/core/telemetry.js";
+import type { DateRange, Metric, TelemetryProvider } from "../../skills-tuner/core/telemetry.js";
+import { median } from "../../skills-tuner/core/aggregate.js";
 
 const SKILLS_MIN = 4; // need a few skills before "dead ratio" means anything
 const SKILLS_MAX_DEAD_RATIO = 0.5;
@@ -95,6 +98,8 @@ export interface SkillOverride {
 export interface SkillsSubjectConfig {
   /** skill_access log (the proactive signal source). Default ~/.config/tuner/skill_accesses.jsonl */
   skillAccessLog?: string;
+  /** LLM-judged description-quality cache. Default ~/.config/tuner/skills-quality-cache.json */
+  qualityCachePath?: string;
   llm?: LLMClient;
   scanDirs?: string[];
   emotionalPatterns?: RegExp[];
@@ -142,6 +147,7 @@ export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject 
   private readonly overrides: Record<string, SkillOverride>;
   private readonly sessionProjectDirs?: string[];
   private readonly projectsDir: string;
+  private readonly qualityCachePath: string;
   private skillsCache: Map<string, SkillEntry> | null = null;
 
   constructor(opts: SkillsSubjectConfig = {}) {
@@ -150,6 +156,8 @@ export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject 
     this.scanDirs = opts.scanDirs ?? [DEFAULT_SKILLS_DIR];
     this.skillAccessLog =
       opts.skillAccessLog ?? join(homedir(), ".config", "tuner", "skill_accesses.jsonl");
+    this.qualityCachePath =
+      opts.qualityCachePath ?? join(homedir(), ".config", "tuner", "skills-quality-cache.json");
     this.negRe = combineRegex(opts.negativePatterns ?? DEFAULT_NEGATIVE_PATTERNS);
     this.posRe = combineRegex(opts.positivePatterns ?? DEFAULT_POSITIVE_PATTERNS);
     this.emotRe = combineRegex(opts.emotionalPatterns ?? DEFAULT_EMOTIONAL_PATTERNS);
@@ -461,6 +469,155 @@ export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject 
   }
 
   // ── Private helpers ──
+
+  /**
+   * OutcomeLoop fitness for the skills subject — the governed measurement the v1
+   * skills-tuner lacked. Target `skills_description_context_cost` (Tier 1b
+   * artifact): the tokens of ALL skill descriptions the matcher loads to route a
+   * task — lower is better, but gameable by deleting skills, so guarded by
+   * `skills_count` (higher_is_better). `skills_dead_ratio` (fraction of skills
+   * never accessed, trusted only when the access log is fresh).
+   * `skills_description_quality` (LLM judge, cached out-of-band): descriptions
+   * must stay discoverable — the anti-Goodhart pair to context cost.
+   */
+  fitnessSignals(): Metric[] {
+    return [
+      {
+        name: "skills_description_context_cost",
+        source: ARTIFACT_SOURCE,
+        kind: "verifiable",
+        direction: "lower_is_better",
+        windowDays: 1,
+        guardrails: ["skills_count"],
+      },
+      {
+        name: "skills_count",
+        source: ARTIFACT_SOURCE,
+        kind: "verifiable",
+        direction: "higher_is_better",
+        windowDays: 7,
+      },
+      {
+        name: "skills_dead_ratio",
+        source: ARTIFACT_SOURCE,
+        kind: "verifiable",
+        direction: "lower_is_better",
+        windowDays: 7,
+        guardrails: ["skills_count"],
+      },
+      {
+        name: "skills_description_quality",
+        source: ARTIFACT_SOURCE,
+        kind: "verifiable",
+        direction: "higher_is_better",
+        windowDays: 7,
+      },
+    ];
+  }
+
+  /**
+   * Artifact-based fitness: scan the skill set (descriptions + count + dead
+   * ratio) and read the cached description-quality. No telemetry stream needed —
+   * fast + deterministic, so the OutcomeLoop can keep/revert a skills change.
+   */
+  async measureFitness(
+    _range: DateRange,
+    _provider: TelemetryProvider,
+  ): Promise<Record<string, number>> {
+    const out: Record<string, number> = {};
+    const scan = await this.scanSkills();
+    if (scan !== null) {
+      out.skills_count = scan.count;
+      out.skills_description_context_cost = scan.descriptionTokens;
+      out.skills_dead_ratio = scan.deadRatio;
+    }
+    const q = this.readQualityCache();
+    if (q !== null) out.skills_description_quality = q;
+    return out;
+  }
+
+  /** Scan the skill set: count + total description tokens (~4 chars/token) + dead ratio. */
+  private async scanSkills(): Promise<{
+    count: number;
+    descriptionTokens: number;
+    deadRatio: number;
+  } | null> {
+    const skills = await this.loadSkillsMap();
+    if (skills.size === 0) return null;
+    let descChars = 0;
+    for (const e of skills.values()) {
+      const d = e.frontmatter?.description;
+      if (typeof d === "string") descChars += d.length;
+    }
+    const h = skillsHealth(this.scanDirs, this.skillAccessLog);
+    return {
+      count: skills.size,
+      descriptionTokens: Math.ceil(descChars / 4),
+      // Trust the dead ratio only when the access log is actively written.
+      deadRatio: h.logFresh ? h.deadRatio : 0,
+    };
+  }
+
+  /** Read the cached median description-quality (1–5), or null if absent/malformed. */
+  private readQualityCache(): number | null {
+    if (!existsSync(this.qualityCachePath)) return null;
+    try {
+      const c = JSON.parse(readFileSync(this.qualityCachePath, "utf8"));
+      return typeof c.median === "number" ? c.median : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * LLM-judge a SAMPLE of skill descriptions (1–5 for how discoverable +
+   * discriminative each is to the matcher), cache the median. Expensive (one LLM
+   * call) → run out-of-band, NOT inside measureFitness. The anti-Goodhart pair
+   * to context cost: tightening descriptions must not make them vaguer. Returns
+   * the median, or null when there's no LLM or nothing to judge.
+   */
+  async measureDescriptionQuality(sampleSize = 12): Promise<number | null> {
+    if (!this.llm) return null;
+    const skills = await this.loadSkillsMap();
+    const items = [...skills.entries()]
+      .map(([name, e]) => ({
+        name,
+        desc:
+          typeof e.frontmatter?.description === "string"
+            ? (e.frontmatter.description as string)
+            : "",
+      }))
+      .filter((x) => x.desc.length > 0);
+    if (items.length === 0) return null;
+    const step = Math.max(1, Math.floor(items.length / sampleSize));
+    const sample = items.filter((_, i) => i % step === 0).slice(0, sampleSize);
+    const system =
+      "You review AGENT SKILL descriptions used by a matcher to route a task to the " +
+      "right skill. Rate EACH 1-5 on how discoverable + discriminative it is (5 = crisp, " +
+      "says exactly what it does AND when to use it, easy to match; 1 = vague/generic/" +
+      "overlapping/noise). Reply ONLY with a JSON array of integers, one per line, in order.";
+    const user = sample.map((s) => `- ${s.name}: ${s.desc}`).join("\n");
+    try {
+      const raw = await this.llm.call("judge", system, [{ role: "user", content: user }], 400);
+      const nums = JSON.parse((raw.match(/\[[\s\S]*\]/) ?? ["[]"])[0]) as unknown[];
+      const scores = nums.filter((n): n is number => typeof n === "number" && n >= 1 && n <= 5);
+      if (scores.length === 0) return null;
+      const med = median(scores);
+      writeFileSync(
+        this.qualityCachePath,
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          median: med,
+          sampleSize: scores.length,
+          scores,
+        }),
+        "utf8",
+      );
+      return med;
+    } catch {
+      return null;
+    }
+  }
 
   private async loadSkillsMap(): Promise<Map<string, SkillEntry>> {
     if (this.skillsCache) return this.skillsCache;
