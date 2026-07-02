@@ -1,4 +1,11 @@
-import { existsSync, copyFileSync, readFileSync, writeFileSync, renameSync } from "node:fs";
+import {
+  existsSync,
+  copyFileSync,
+  readFileSync,
+  writeFileSync,
+  renameSync,
+  statSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import { BaseSubject } from "../../skills-tuner/subjects/base.js";
@@ -233,6 +240,9 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
 
   async collectObservations(_since: Date): Promise<Observation[]> {
     if (!existsSync(this.memoryIndex)) return [];
+    // Out-of-band, best-effort: refresh the LLM entry-quality cache if it's stale
+    // (gated on an LLM being configured → dormant + zero cost by default).
+    await this.refreshQualityIfStale();
     const content = readFileSync(this.memoryIndex, "utf8");
     const entries = parseEntries(content);
     if (entries.length === 0) return [];
@@ -600,6 +610,23 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
       return typeof c.median === "number" ? c.median : null;
     } catch {
       return null;
+    }
+  }
+
+  /**
+   * Wire for the quality judge: refresh the cache if older than `maxAgeDays`.
+   * Gated on an LLM being configured (default: none → no-op, zero cost), so the
+   * judge is reachable from the normal cycle without adding cost by default.
+   */
+  private async refreshQualityIfStale(maxAgeDays = 7): Promise<void> {
+    if (!this.llm) return;
+    try {
+      const fresh =
+        existsSync(this.qualityCachePath) &&
+        Date.now() - statSync(this.qualityCachePath).mtimeMs < maxAgeDays * 86_400_000;
+      if (!fresh) await this.measureEntryQuality();
+    } catch {
+      /* best-effort; never block observation collection */
     }
   }
 
