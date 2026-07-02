@@ -27,6 +27,12 @@ export type PluginManager = "npm" | "git";
 export interface PluginEntry {
   /** The research technique this plugin implements (matches ResearchSpec.technique). */
   technique: string;
+  /**
+   * Optional capability tag (e.g. "web_search"). Lets a plugin be resolved by a
+   * detected behavioural NEED (capability-gap detection), not only by a research
+   * technique — a detected gap resolves to the entries carrying this capability.
+   */
+  capability?: string;
   /** Stable id; also the `mcpServers` key written into settings. */
   pluginId: string;
   /** npm = `npm install <source>` into the managed dir; git = `git clone <source>`. */
@@ -59,6 +65,29 @@ export const BUILTIN_REGISTRY: readonly PluginEntry[] = [
     verified: false,
     note: "Seed (UNVERIFIED): confirm the repo + pin a commit before approving.",
   },
+  {
+    technique: "web-search",
+    capability: "web_search",
+    pluginId: "brave-search",
+    manager: "npm",
+    source: "@modelcontextprotocol/server-brave-search",
+    server: { command: "npx", args: ["-y", "@modelcontextprotocol/server-brave-search"] },
+    description:
+      "Web search via the Brave Search API — answer research questions with fresh results.",
+    verified: false,
+    note: "Seed (UNVERIFIED): pin the package version + set BRAVE_API_KEY before approving.",
+  },
+  {
+    technique: "web-search",
+    capability: "web_search",
+    pluginId: "perplexity-ask",
+    manager: "npm",
+    source: "@modelcontextprotocol/server-perplexity-ask",
+    server: { command: "npx", args: ["-y", "@modelcontextprotocol/server-perplexity-ask"] },
+    description: "Web research via the Perplexity API — synthesised answers with citations.",
+    verified: false,
+    note: "Seed (UNVERIFIED): pin the package version + set PERPLEXITY_API_KEY before approving.",
+  },
 ];
 
 /** Default operator-curated registry file (JSON array of PluginEntry). */
@@ -90,6 +119,7 @@ function isValidEntry(e: unknown): e is PluginEntry {
   const server = o.server as Record<string, unknown> | undefined;
   return (
     typeof o.technique === "string" &&
+    (o.capability === undefined || typeof o.capability === "string") &&
     typeof o.pluginId === "string" &&
     (o.manager === "npm" || o.manager === "git") &&
     typeof o.source === "string" &&
@@ -117,4 +147,27 @@ export function lookupPlugin(
   const overridden = new Set(operator.map((e) => e.pluginId));
   const merged = [...operator, ...builtins.filter((e) => !overridden.has(e.pluginId))];
   return merged.find((e) => e.technique === technique) ?? null;
+}
+
+/**
+ * Resolve a detected capability NEED (e.g. "web_search") to its APPROVED
+ * installable options. Unlike `lookupPlugin` (one technique → one plugin), a
+ * need can have several options (Brave OR Perplexity), so this returns all
+ * matches. By default only `verified` (operator-approved) entries are returned —
+ * the approved-list gate — since a capability-gap proposal is an install
+ * recommendation, not a demo. Pass `includeUnverified: true` to also surface the
+ * conservative seeds (shown as UNVERIFIED, still human-gated at apply).
+ * Operator entries override built-in seeds on pluginId collision.
+ */
+export function lookupCapability(
+  capability: string,
+  opts: { registryPath?: string; includeBuiltins?: boolean; includeUnverified?: boolean } = {},
+): PluginEntry[] {
+  const operator = loadOperatorEntries(opts.registryPath);
+  const builtins = opts.includeBuiltins === false ? [] : BUILTIN_REGISTRY;
+  const overridden = new Set(operator.map((e) => e.pluginId));
+  const merged = [...operator, ...builtins.filter((e) => !overridden.has(e.pluginId))];
+  return merged.filter(
+    (e) => e.capability === capability && (opts.includeUnverified === true || e.verified),
+  );
 }
