@@ -25,6 +25,12 @@ export class SecurityError extends Error {
   }
 }
 
+/**
+ * @deprecated v1 tuner engine. Superseded by the wisecron OutcomeLoop
+ * (src/tuner/wisecron/outcome-loop.ts + apply-pipeline.ts, #287): detect -> human
+ * gate -> apply -> measure fitness -> auto-revert. Scheduled for removal after the
+ * wisecron tuner lands. See docs/skills-tuner-to-tuner-migration.md.
+ */
 export class Engine {
   private secret: Buffer;
   private readonly _applying = new Set<number>(); // in-memory lock: prevents concurrent double-apply
