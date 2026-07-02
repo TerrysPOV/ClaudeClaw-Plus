@@ -63,12 +63,12 @@ describe("SkillsSubject — measureFitness (deterministic)", () => {
     expect(high).toBeGreaterThan(low);
   });
 
-  it("dead_ratio is 0 when the access log is not fresh (untrusted)", async () => {
+  it("OMITS dead_ratio when the access log is not fresh (untrusted, not 0)", async () => {
     skill("alpha", "Alpha");
     skill("beta", "Beta");
     const f = await subject().measureFitness(range, stub);
-    // No/absent access log → not fresh → we do not trust the ratio → 0.
-    expect(f.skills_dead_ratio).toBe(0);
+    // M5: not fresh → omit (0 would read as the OPTIMAL value and reward broken telemetry).
+    expect(f.skills_dead_ratio).toBeUndefined();
   });
 
   it("returns no scan fields for an empty skills dir", async () => {
