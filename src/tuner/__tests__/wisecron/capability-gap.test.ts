@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { detectCapabilityGaps } from "../../wisecron/capability-gap.js";
 import { lookupCapability } from "../../wisecron/technique-plugin-registry.js";
+import { McpPluginSubject } from "../../subjects/mcp-plugin-subject.js";
 
 let dir: string;
 const userLine = (text: string) =>
@@ -74,6 +75,55 @@ describe("lookupCapability (approved-list gate)", () => {
       includeUnverified: true,
     });
     expect(got.map((e) => e.pluginId).sort()).toEqual(["brave-search", "perplexity-ask"]);
+  });
+
+  it("wires a detected gap through mcp_plugin into an install proposal", async () => {
+    const noRegistry = join(dir, "no-registry.json");
+    const sub = new McpPluginSubject({
+      auditReader: () => [],
+      registryPath: noRegistry,
+      gapDetector: () => [
+        {
+          capability: "web_search",
+          unmetIntentCount: 5,
+          sessionsScanned: 10,
+          sessionsWithGap: 3,
+          examples: ["what's the latest bun version"],
+        },
+      ],
+    });
+    const obs = await sub.collectObservations(new Date(0));
+    const capObs = obs.filter(
+      (o) => (o.metadata as Record<string, unknown>).kind === "capability_gap",
+    );
+    expect(capObs).toHaveLength(1);
+    const clusters = await sub.detectProblems(obs);
+    const gapCluster = clusters.find((c) => c.id.startsWith("mcp-capability-gap"));
+    expect(gapCluster).toBeDefined();
+    const prop = await sub.proposeChange(gapCluster as NonNullable<typeof gapCluster>);
+    // No approved entry → seeds surface as UNVERIFIED install options carrying an install spec.
+    expect(prop.alternatives.some((a) => a.id.startsWith("install:"))).toBe(true);
+    expect(prop.alternatives.some((a) => a.diff_or_content.includes("install-plugin"))).toBe(true);
+  });
+
+  it("does not raise a gap observation below the min threshold", async () => {
+    const sub = new McpPluginSubject({
+      auditReader: () => [],
+      capabilityGapMin: 10,
+      gapDetector: () => [
+        {
+          capability: "web_search",
+          unmetIntentCount: 2,
+          sessionsScanned: 5,
+          sessionsWithGap: 1,
+          examples: [],
+        },
+      ],
+    });
+    const obs = await sub.collectObservations(new Date(0));
+    expect(
+      obs.filter((o) => (o.metadata as Record<string, unknown>).kind === "capability_gap"),
+    ).toHaveLength(0);
   });
 
   it("returns an operator-approved (verified) entry", () => {
