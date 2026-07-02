@@ -8,6 +8,7 @@ import type { Proposal } from "../../../../skills-tuner/core/types.js";
 let tmpRoot: string;
 let settingsPath: string;
 let pluginsDir: string;
+let registryPath: string;
 let installerCalls: Array<{ manager: string; source: string; destDir: string }>;
 
 /** Fake installer: records the call and drops a marker file in destDir (success). */
@@ -30,6 +31,22 @@ function installProposal(target: string, pluginId = "mcp-server-qdrant"): Propos
     source: "https://github.com/qdrant/mcp-server-qdrant",
     server: { command: "uvx", args: ["mcp-server-qdrant"] },
   };
+  // Approve this exact spec in the operator registry (apply-time gate M1).
+  writeFileSync(
+    registryPath,
+    JSON.stringify([
+      {
+        technique: "test",
+        capability: "test",
+        pluginId,
+        manager: spec.manager,
+        source: spec.source,
+        server: spec.server,
+        description: "test entry",
+        verified: true,
+      },
+    ]),
+  );
   return {
     id: 1,
     cluster_id: "c",
@@ -50,18 +67,53 @@ function installProposal(target: string, pluginId = "mcp-server-qdrant"): Propos
 }
 
 function subject(installer: PluginInstaller) {
-  return new McpPluginSubject({ settingsPath, managedPluginsDir: pluginsDir, installer });
+  return new McpPluginSubject({
+    settingsPath,
+    managedPluginsDir: pluginsDir,
+    installer,
+    registryPath,
+  });
 }
 
 beforeEach(() => {
   tmpRoot = mkdtempSync(join(tmpdir(), "mcpinst-"));
   settingsPath = join(tmpRoot, "settings.json");
   pluginsDir = join(tmpRoot, "plugins");
+  registryPath = join(tmpRoot, "registry.json");
+  writeFileSync(registryPath, "[]");
   installerCalls = [];
 });
 afterEach(() => rmSync(tmpRoot, { recursive: true, force: true }));
 
 describe("McpPluginSubject — real plugin install (confined + reversible)", () => {
+  it("M1: an off-registry install spec is REJECTED at apply (approved-list gate)", async () => {
+    writeFileSync(settingsPath, JSON.stringify({ allowedTools: [] }));
+    // Empty registry ("[]") + a hand-crafted proposal that does NOT register itself.
+    const spec = {
+      op: "install-plugin",
+      pluginId: "evil-plugin",
+      manager: "git",
+      source: "https://github.com/attacker/evil",
+      server: { command: "node", args: ["evil.js"] },
+    };
+    const proposal = {
+      id: 9,
+      cluster_id: "c",
+      subject: "mcp_plugin",
+      kind: "patch",
+      target_path: settingsPath,
+      alternatives: [
+        { id: "install-plugin", label: "x", diff_or_content: JSON.stringify(spec), tradeoff: "" },
+      ],
+      pattern_signature: "x",
+      created_at: new Date(),
+    } as unknown as Proposal;
+    await expect(subject(okInstaller).apply(proposal, "install-plugin")).rejects.toThrow(
+      /approved registry/,
+    );
+    expect(installerCalls).toHaveLength(0); // never reached the installer
+  });
+
   it("installs into the managed dir + registers the server in settings + records a manifest", async () => {
     writeFileSync(settingsPath, JSON.stringify({ allowedTools: ["x"] }));
     const sub = subject(okInstaller);

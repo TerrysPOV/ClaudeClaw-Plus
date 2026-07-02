@@ -1,4 +1,12 @@
-import { existsSync, copyFileSync, readFileSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  copyFileSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  rmSync,
+  lstatSync,
+} from "node:fs";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -18,7 +26,11 @@ import type { DateRange, Metric, TelemetryProvider } from "../../skills-tuner/co
 import { ARTIFACT_SOURCE } from "../../skills-tuner/core/telemetry.js";
 import { nonzeroRate } from "../../skills-tuner/core/aggregate.js";
 import { detectCapabilityGaps, type CapabilityGap } from "../wisecron/capability-gap.js";
-import { lookupCapability } from "../wisecron/technique-plugin-registry.js";
+import {
+  lookupCapability,
+  matchRegistryEntry,
+  allRegistryEntries,
+} from "../wisecron/technique-plugin-registry.js";
 
 const BROKEN_MIN_CALLS = 100;
 const BROKEN_SUCCESS_RATE = 0.5;
@@ -124,6 +136,7 @@ export class McpPluginSubject extends BaseSubject implements RevertibleSubject {
   private readonly gapDetector: (opts: {
     transcriptDirs?: string[];
     since?: Date;
+    providedCapabilities?: string[];
   }) => CapabilityGap[];
 
   constructor(opts: McpPluginSubjectConfig = {}) {
@@ -225,9 +238,23 @@ export class McpPluginSubject extends BaseSubject implements RevertibleSubject {
     // ── Capability-gap face: needs detected from the operator's OWN behaviour ──
     // (session transcripts = trusted internal data; no external source can inject
     // a need). A gap ≥ the min becomes an observation → a governed install offer.
+    // Install-aware: suppress a gap whose capability is ALREADY provisioned by an
+    // installed mcpServers entry (not just "a tool was used this session").
+    const providedCapabilities: string[] = [];
+    try {
+      if (existsSync(this.settingsPath)) {
+        const st = JSON.parse(readFileSync(this.settingsPath, "utf8")) as Record<string, unknown>;
+        const servers = Object.keys((st.mcpServers as Record<string, unknown>) ?? {});
+        for (const e of allRegistryEntries({ registryPath: this.registryPath })) {
+          if (e.capability && servers.includes(e.pluginId)) providedCapabilities.push(e.capability);
+        }
+      }
+    } catch {
+      /* ignore malformed settings */
+    }
     let gaps: CapabilityGap[] = [];
     try {
-      gaps = this.gapDetector({ transcriptDirs: this.transcriptDirs, since });
+      gaps = this.gapDetector({ transcriptDirs: this.transcriptDirs, since, providedCapabilities });
     } catch {
       gaps = [];
     }
@@ -438,6 +465,7 @@ export class McpPluginSubject extends BaseSubject implements RevertibleSubject {
     // ── allowedTools / disable-server path (existing behaviour) ─────────────────
     // Parse + restringify to guarantee stable key order even if alt source skipped it.
     const normalized = stableJson(parsed);
+    assertNotSymlink(proposal.target_path);
     if (existsSync(proposal.target_path)) {
       copyFileSync(proposal.target_path, `${proposal.target_path}.bak`);
     }
@@ -456,6 +484,14 @@ export class McpPluginSubject extends BaseSubject implements RevertibleSubject {
    * entry. On success we record a manifest row so revert can uninstall.
    */
   private applyInstall(spec: PluginInstallSpec, settingsTarget: string): Patch {
+    // Apply-time approved-list gate: the propose-time `verified` check is not
+    // enough — an externally-ingested proposal could carry an off-registry
+    // source behind a benign label. Require an EXACT match to a curated entry.
+    if (!matchRegistryEntry(spec, { registryPath: this.registryPath })) {
+      throw new Error(
+        `mcp-plugin-subject.applyInstall: spec for '${spec.pluginId}' matches no approved registry entry — refusing install`,
+      );
+    }
     const destDir = this.pluginDir(spec.pluginId);
     this.assertInsidePlugins(destDir);
 
@@ -489,6 +525,7 @@ export class McpPluginSubject extends BaseSubject implements RevertibleSubject {
     }
 
     // Register the server in settings (.bak first), then record the manifest.
+    assertNotSymlink(settingsTarget);
     if (existsSync(settingsTarget)) copyFileSync(settingsTarget, `${settingsTarget}.bak`);
     writeFileSync(settingsTarget, normalizedSettings, "utf8");
     this.recordInstall({
@@ -571,6 +608,7 @@ export class McpPluginSubject extends BaseSubject implements RevertibleSubject {
     this.assertManagedSettings(inversePatch.target_path);
     // Roundtrip parse to keep formatting stable + reject malformed inputs early.
     const restored = JSON.parse(inversePatch.applied_content) as Record<string, unknown>;
+    assertNotSymlink(inversePatch.target_path);
     writeFileSync(inversePatch.target_path, inversePatch.applied_content, "utf8");
     // Reconcile installs: uninstall any tuner-installed plugin that the restored
     // settings no longer reference (so reverting an install also removes it).
@@ -809,6 +847,23 @@ function sanitizePluginId(id: string): string {
   return safe;
 }
 
+/**
+ * Refuse to write THROUGH a symlink. Lexical path confinement (resolve()) does
+ * not resolve symlinks, but copyFile/writeFile follow them — a planted symlink
+ * at a managed target could redirect the write to engine code. lstat (no follow)
+ * catches it before any write.
+ */
+function assertNotSymlink(target: string): void {
+  try {
+    if (lstatSync(target).isSymbolicLink()) {
+      throw new Error(`refusing to write through a symlink: ${target}`);
+    }
+  } catch (e) {
+    // ENOENT (target doesn't exist yet) is fine; re-throw our own guard error.
+    if (e instanceof Error && e.message.startsWith("refusing to write")) throw e;
+  }
+}
+
 /** https git URL only — blocks file://, ssh, shell metachars, SSRF-ish hosts. */
 function isSafeGitUrl(url: string): boolean {
   let u: URL;
@@ -819,6 +874,10 @@ function isSafeGitUrl(url: string): boolean {
   }
   if (u.protocol !== "https:") return false;
   const h = u.hostname.toLowerCase();
+  // Reject ALL IPv6 literals (bracketed `.hostname` contains ':') — the IPv4-only
+  // denylist below missed `[::1]`, `[::ffff:127.0.0.1]`, `fe80::/10`, `fc00::/7`,
+  // `[::]` (SSRF to loopback/link-local/internal). No git host is an IPv6 literal.
+  if (h.includes(":") || h.includes("[")) return false;
   if (h === "localhost" || /^(127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(h)) return false;
   if (/^172\.(1[6-9]|2\d|3[01])\./.test(h)) return false;
   return true;
@@ -826,7 +885,9 @@ function isSafeGitUrl(url: string): boolean {
 
 /** npm spec: package name (optionally @scope) + optional @version. No shell metachars/paths. */
 function isSafeNpmSpec(spec: string): boolean {
-  return /^(@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*(@[\w.\-^~*x>=<| ]+)?$/i.test(spec);
+  // Leading char classes exclude '-' so a spec can never begin with a flag
+  // (belt-and-suspenders with the `--` end-of-options separator at the call site).
+  return /^(@[a-z0-9~][a-z0-9-._~]*\/)?[a-z0-9~][a-z0-9-._~]*(@[\w.\-^~*x>=<| ]+)?$/i.test(spec);
 }
 
 /**
@@ -838,9 +899,10 @@ function defaultInstaller(spec: { manager: "npm" | "git"; source: string; destDi
   ok: boolean;
   output: string;
 } {
-  const run = (cmd: string, args: string[], cwd?: string) => {
+  const run = (cmd: string, args: string[], cwd?: string, env?: NodeJS.ProcessEnv) => {
     const r = spawnSync(cmd, args, {
       cwd,
+      env,
       timeout: INSTALL_TIMEOUT_MS,
       maxBuffer: INSTALL_MAX_BUFFER,
       encoding: "utf8",
@@ -857,7 +919,26 @@ function defaultInstaller(spec: { manager: "npm" | "git"; source: string; destDi
     return run("git", ["clone", "--depth", "1", "--", spec.source, spec.destDir]);
   }
   if (!isSafeNpmSpec(spec.source)) return { ok: false, output: `unsafe npm spec: ${spec.source}` };
-  return run("npm", ["install", "--no-fund", "--no-audit", "--prefix", spec.destDir, spec.source]);
+  // --ignore-scripts: npm runs package pre/post-install lifecycle scripts by
+  // default, which execute arbitrary package-authored code OUTSIDE the managed
+  // dir (filesystem confinement doesn't confine execution) — install-time RCE
+  // that would break the "tuner never writes engine code" invariant. `--` ends
+  // option parsing so a spec can't smuggle a flag. env scrubs npm_config_* too.
+  return run(
+    "npm",
+    [
+      "install",
+      "--ignore-scripts",
+      "--no-fund",
+      "--no-audit",
+      "--prefix",
+      spec.destDir,
+      "--",
+      spec.source,
+    ],
+    undefined,
+    { ...process.env, npm_config_ignore_scripts: "true" },
+  );
 }
 
 function makeCluster(

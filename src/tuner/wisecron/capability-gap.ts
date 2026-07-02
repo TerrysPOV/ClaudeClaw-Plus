@@ -12,9 +12,13 @@
  * signal ("you asked N research questions with no search tool"), not a proof;
  * the number carries the argument, the human decides. Never throws.
  */
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, lstatSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+
+/** Bound transcript-tree recursion + per-file read so a hostile/huge tree can't DoS the scan. */
+const MAX_WALK_DEPTH = 12;
+const MAX_TRANSCRIPT_BYTES = 32 * 1024 * 1024;
 
 /** Prompts longer than this are treated as system/tool/harness text, not a natural operator ask. */
 const MAX_PROMPT_CHARS = 400;
@@ -59,6 +63,15 @@ export const DEFAULT_CAPABILITY_SPECS: CapabilitySpec[] = [
   },
 ];
 
+/**
+ * Negation / meta-discussion guard: a prompt that mentions searching only to
+ * decline it ("I'll look it up myself", "no need to search", "the web search
+ * tool is broken") is NOT an unmet need. A prompt matching this is excluded even
+ * if it matches an intent pattern — cuts the biggest false-positive class.
+ */
+const INTENT_NEGATION =
+  /\b(don'?t|do not|won'?t|will not|myself|already|no need|not (?:need|going|gonna)|is broken|isn'?t working|pas besoin|moi-?même|d[eé]j[aà])\b/i;
+
 type Ev = {
   type?: string;
   role?: string;
@@ -81,15 +94,24 @@ function isUser(ev: Ev): boolean {
 
 function userText(ev: Ev): string | null {
   const c = content(ev);
-  if (typeof c === "string") return c;
-  if (Array.isArray(c)) {
-    const t = (c as Block[])
-      .filter((b) => b?.type === "text" && typeof b.text === "string")
-      .map((b) => b.text as string)
-      .join(" ");
-    return t.length > 0 ? t : null;
-  }
-  return null;
+  const raw =
+    typeof c === "string"
+      ? c
+      : Array.isArray(c)
+        ? (c as Block[])
+            .filter((b) => b?.type === "text" && typeof b.text === "string")
+            .map((b) => b.text as string)
+            .join(" ")
+        : "";
+  // Strip injected scaffolding (hook system-reminders, command wrappers) so only
+  // the operator's own words count — and a short ask sharing a turn with a big
+  // reminder isn't pushed over MAX_PROMPT_CHARS and dropped.
+  const clean = raw
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/gi, " ")
+    .replace(/<command-[a-z-]*>[\s\S]*?<\/command-[a-z-]*>/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return clean.length > 0 ? clean : null;
 }
 
 function toolNames(ev: Ev): string[] {
@@ -100,7 +122,8 @@ function toolNames(ev: Ev): string[] {
     .map((b) => b.name as string);
 }
 
-function walk(dir: string, out: string[]): void {
+function walk(dir: string, out: string[], depth = 0): void {
+  if (depth > MAX_WALK_DEPTH) return;
   let names: string[];
   try {
     names = readdirSync(dir);
@@ -112,13 +135,14 @@ function walk(dir: string, out: string[]): void {
     let isDir = false;
     let isFile = false;
     try {
-      const st = statSync(p);
+      // lstat (no symlink follow) → a symlinked dir can't redirect/loop the walk.
+      const st = lstatSync(p);
       isDir = st.isDirectory();
       isFile = st.isFile();
     } catch {
       continue;
     }
-    if (isDir) walk(p, out);
+    if (isDir) walk(p, out, depth + 1);
     else if (isFile && name.endsWith(".jsonl")) out.push(p);
   }
 }
@@ -133,12 +157,15 @@ export function detectCapabilityGaps(
     since?: Date;
     specs?: CapabilitySpec[];
     maxExamples?: number;
+    /** Capabilities already provisioned (e.g. an installed MCP server) → never a gap. */
+    providedCapabilities?: string[];
   } = {},
 ): CapabilityGap[] {
   const dirs = (opts.transcriptDirs ?? [join(homedir(), ".claude", "projects")]).map(expandHome);
   const specs = opts.specs ?? DEFAULT_CAPABILITY_SPECS;
   const sinceMs = opts.since ? opts.since.getTime() : 0;
   const maxEx = opts.maxExamples ?? 5;
+  const provided = new Set(opts.providedCapabilities ?? []);
 
   const acc = new Map<
     string,
@@ -152,7 +179,9 @@ export function detectCapabilityGaps(
   for (const f of files) {
     let lines: string[];
     try {
-      if (sinceMs && statSync(f).mtimeMs < sinceMs) continue;
+      const st = statSync(f);
+      if (sinceMs && st.mtimeMs < sinceMs) continue;
+      if (st.size > MAX_TRANSCRIPT_BYTES) continue; // skip pathologically huge files
       lines = readFileSync(f, "utf8").split("\n");
     } catch {
       continue;
@@ -177,11 +206,14 @@ export function detectCapabilityGaps(
     }
     if (prompts.length === 0) continue;
     for (const s of specs) {
+      if (provided.has(s.capability)) continue; // capability already provisioned → no gap
       const a = acc.get(s.capability);
       if (!a) continue;
       a.sessions++;
       if (tools.some((n) => s.tools.some((re) => re.test(n)))) continue;
-      const hits = prompts.filter((p) => s.intent.some((re) => re.test(p)));
+      const hits = prompts.filter(
+        (p) => !INTENT_NEGATION.test(p) && s.intent.some((re) => re.test(p)),
+      );
       if (hits.length > 0) {
         a.unmet += hits.length;
         a.gap++;
