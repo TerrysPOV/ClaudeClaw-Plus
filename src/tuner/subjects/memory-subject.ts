@@ -5,6 +5,7 @@ import {
   writeFileSync,
   renameSync,
   statSync,
+  lstatSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
@@ -81,12 +82,27 @@ function reconcileToLive(snapshot: string, live: string): string {
     const p = entryPointer(l);
     if (p) shortByPtr.set(p, l);
   }
-  return live
-    .split("\n")
+  const liveLines = live.split("\n");
+  // Count live pointer occurrences so a duplicated slug never collapses two
+  // distinct live lines into one snapshot line (L1).
+  const ptrCount = new Map<string, number>();
+  for (const l of liveLines) {
+    if (!l.startsWith("- [")) continue;
+    const p = entryPointer(l);
+    if (p) ptrCount.set(p, (ptrCount.get(p) ?? 0) + 1);
+  }
+  return liveLines
     .map((l) => {
       if (!l.startsWith("- [")) return l;
+      // Within budget → KEEP the live line verbatim. This preserves any edit the
+      // operator made between propose-time and approve-time (M4): only over-budget
+      // lines are touched, and shortening is exactly what needs doing there.
+      if (l.length <= MAX_INDEX_LINE_CHARS) return l;
       const p = entryPointer(l);
-      if (p && shortByPtr.has(p)) return shortByPtr.get(p) as string;
+      // Over-budget + a UNIQUE pointer → use the proposed shortened line;
+      // duplicated pointers shorten each occurrence individually (no collapse).
+      if (p && (ptrCount.get(p) ?? 0) === 1 && shortByPtr.has(p))
+        return shortByPtr.get(p) as string;
       return shortenIndexLine(l);
     })
     .join("\n");
@@ -441,6 +457,12 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
       }
     }
 
+    // M3: refuse to operate on a symlinked index (defence-in-depth — the rename
+    // below replaces the link rather than following it, but a planted symlink
+    // still signals tampering).
+    if (existsSync(this.memoryIndex) && lstatSync(this.memoryIndex).isSymbolicLink()) {
+      throw new Error(`memory-subject.apply: index is a symlink, refusing: ${this.memoryIndex}`);
+    }
     if (existsSync(this.memoryIndex)) {
       copyFileSync(this.memoryIndex, `${this.memoryIndex}.bak`);
     }
@@ -621,10 +643,18 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
   private async refreshQualityIfStale(maxAgeDays = 7): Promise<void> {
     if (!this.llm) return;
     try {
-      const fresh =
-        existsSync(this.qualityCachePath) &&
-        Date.now() - statSync(this.qualityCachePath).mtimeMs < maxAgeDays * 86_400_000;
-      if (!fresh) await this.measureEntryQuality();
+      if (existsSync(this.qualityCachePath)) {
+        const ageMs = Date.now() - statSync(this.qualityCachePath).mtimeMs;
+        let cooldownMs = maxAgeDays * 86_400_000;
+        try {
+          const c = JSON.parse(readFileSync(this.qualityCachePath, "utf8"));
+          if (c && c.failed === true) cooldownMs = 6 * 3_600_000; // short retry after a failure (L8)
+        } catch {
+          /* unreadable → treat as stale, refresh */
+        }
+        if (ageMs < cooldownMs) return;
+      }
+      await this.measureEntryQuality();
     } catch {
       /* best-effort; never block observation collection */
     }
@@ -659,7 +689,10 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
       );
       const nums = JSON.parse((raw.match(/\[[\s\S]*\]/) ?? ["[]"])[0]) as unknown[];
       const scores = nums.filter((n): n is number => typeof n === "number" && n >= 1 && n <= 5);
-      if (scores.length === 0) return null;
+      if (scores.length === 0) {
+        this.stampQualityFailure();
+        return null;
+      }
       const med = median(scores);
       writeFileSync(
         this.qualityCachePath,
@@ -673,7 +706,22 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
       );
       return med;
     } catch {
+      this.stampQualityFailure();
       return null;
+    }
+  }
+
+  /** L8: record a short-TTL failure stamp so refreshQualityIfStale won't re-fire a
+   * blocking LLM call every cycle after an error/timeout/unparseable reply. */
+  private stampQualityFailure(): void {
+    try {
+      writeFileSync(
+        this.qualityCachePath,
+        JSON.stringify({ ts: new Date().toISOString(), median: null, failed: true }),
+        "utf8",
+      );
+    } catch {
+      /* best-effort */
     }
   }
 
@@ -729,7 +777,15 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
           .filter((l) => l.startsWith("- ["));
         ok =
           out.length === src.length &&
-          out.every((o, k) => onePtr(o) !== null && onePtr(o) === onePtr(src[k] as string));
+          // Preserve pointers AND actually shorten: an LLM line that keeps the
+          // pointer but stays over-budget must not pass (L2) — else the shrink
+          // reports success while long_line_count never reaches 0.
+          out.every(
+            (o, k) =>
+              onePtr(o) !== null &&
+              onePtr(o) === onePtr(src[k] as string) &&
+              o.length <= MAX_INDEX_LINE_CHARS,
+          );
         if (ok) {
           idxs.forEach((i, k) => {
             lines[i] = out[k] as string;
@@ -772,10 +828,15 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
       slugCounts.set(slug, (slugCounts.get(slug) ?? 0) + 1);
     }
     let defects = 0;
+    const countedDupSlugs = new Set<string>();
     for (const e of entries) {
       const slug = e.file.replace(/\.md$/, "");
       if (!existsSync(resolve(memoryDir, e.file))) defects += 1;
-      else if ((slugCounts.get(slug) ?? 0) > 1) defects += 1;
+      // A duplicated slug is ONE defect, not one per occurrence (L9).
+      else if ((slugCounts.get(slug) ?? 0) > 1 && !countedDupSlugs.has(slug)) {
+        defects += 1;
+        countedDupSlugs.add(slug);
+      }
     }
     // Entry lines over the ~200-char one-line budget (CLAUDE.md memory spec).
     const longLines = content.split("\n").filter((l) => l.length > MAX_INDEX_LINE_CHARS).length;
