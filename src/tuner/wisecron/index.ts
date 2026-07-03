@@ -29,10 +29,11 @@ import type { WisecronSettings } from "./types.js";
 
 import { ModelRoutingSubject } from "../subjects/model-routing-subject.js";
 import { MemorySubject } from "../subjects/memory-subject.js";
-// #275 staging: this brick ships the OutcomeLoop + ONLY the model-routing subject
-// (reversible, measurable) as the single-subject proof. The other 7 wisecron
-// subjects (cron, claude_md, hook, mcp_plugin, prompt_template, memory, agent)
-// land in their own follow-up bricks once the loop has earned its keep.
+// #275 staging: this brick ships the OutcomeLoop + the model-routing subject
+// (the single-subject proof) AND the memory subject (reactive index hygiene +
+// proactive evidence face). The remaining wisecron subjects (cron, claude_md,
+// hook, mcp_plugin, prompt_template, agent) land in their own follow-up bricks
+// once the loop has earned its keep.
 import { makeModeDispatchReader } from "./observation-readers.js";
 
 export interface WisecronContext {
@@ -97,7 +98,8 @@ export function registerWisecronSubjects(
     warnIfMissingHealthProbe(subject);
   };
 
-  // Single-subject proof (#275): only model-routing is wired in this brick.
+  // Single-subject proof (#275): model-routing is the reference subject; the
+  // memory subject is wired just below.
   if (enabled("model_routing"))
     registerWithProbeCheck(
       new ModelRoutingSubject({
