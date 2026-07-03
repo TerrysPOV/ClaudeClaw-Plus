@@ -19,7 +19,7 @@ import {
 } from "../../bus/types";
 import { createTelegramApi } from "./api";
 import { extractReactionDirectives } from "./directives";
-import { markdownToTelegramHtml } from "./format";
+import { markdownToTelegramHtml, isTelegramHtmlParseError } from "./format";
 import { buildPromptMetadata } from "./metadata";
 import type {
   TelegramApi,
@@ -545,18 +545,23 @@ export class TelegramAdapter {
             message_id: live.message_id,
             text: editText,
           });
-        } catch {
-          // Telegram rejects malformed HTML (400) — retry as plain text so the
-          // edit still lands (unformatted) rather than being dropped.
-          try {
-            await this.api.editMessageText({
-              chat_id: live.chat_id,
-              message_id: live.message_id,
-              text: editText,
-            });
-          } catch (err) {
-            this.logger.error(`[telegram-adapter] turn edit failed`, err);
+        } catch (err) {
+          if (isTelegramHtmlParseError(err)) {
+            // Malformed HTML → retry as plain text so the edit still lands
+            // (unformatted) rather than being dropped.
+            try {
+              await this.api.editMessageText({
+                chat_id: live.chat_id,
+                message_id: live.message_id,
+                text: editText,
+              });
+            } catch (err2) {
+              this.logger.error(`[telegram-adapter] turn edit failed`, err2);
+            }
           }
+          // else: a benign/non-format error (e.g. "message is not modified",
+          // "message to edit not found", 429) — leave the formatted message as
+          // is; do NOT resend raw markdown (that would downgrade it).
         }
         if (isProgress) {
           this.startSpinner(key, cleanedText, live.chat_id, live.message_id);
@@ -578,8 +583,11 @@ export class TelegramAdapter {
             text: sendText,
             message_thread_id: target.message_thread_id,
           });
-        } catch {
-          // Malformed-markup 400 — fall back to plain text so the reply lands.
+        } catch (err) {
+          // Only a malformed-HTML 400 warrants sending raw text; for anything
+          // else (429 flood, network, benign 400) rethrow to the outer catch
+          // instead of silently shipping unformatted markdown.
+          if (!isTelegramHtmlParseError(err)) throw err;
           res = await this.api.sendMessage({
             chat_id: target.chat_id,
             text: sendText,
@@ -645,8 +653,10 @@ export class TelegramAdapter {
             text: newText,
             message_thread_id: target.message_thread_id,
           });
-        } catch {
-          // Malformed-markup 400 — fall back to plain text so the reply lands.
+        } catch (err) {
+          // Only a malformed-HTML 400 warrants sending raw text; rethrow the
+          // rest to the outer catch rather than shipping unformatted markdown.
+          if (!isTelegramHtmlParseError(err)) throw err;
           res = await this.api.sendMessage({
             chat_id: target.chat_id,
             text: newText,
@@ -677,13 +687,17 @@ export class TelegramAdapter {
           message_id: last.message_id,
           text: sendText,
         });
-      } catch {
-        // Malformed-markup 400 — retry as plain text so the edit still lands.
-        await this.api.editMessageText({
-          chat_id: last.chat_id,
-          message_id: last.message_id,
-          text: sendText,
-        });
+      } catch (err) {
+        // Only retry as plain text on a malformed-HTML 400; a benign 400
+        // ("message is not modified" / "to edit not found") must NOT resend raw
+        // markdown over the already-formatted live message.
+        if (isTelegramHtmlParseError(err)) {
+          await this.api.editMessageText({
+            chat_id: last.chat_id,
+            message_id: last.message_id,
+            text: sendText,
+          });
+        }
       }
       if (wasSpinning) {
         this.startSpinner(key, newText, last.chat_id, last.message_id);
