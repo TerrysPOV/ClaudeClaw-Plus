@@ -23,8 +23,14 @@ export function median(xs: number[]): number {
 /** Per-day median session cost over the recent window (oldest first). Graceful: [] if no DB. */
 export function readDailyCost(dbPath: string, limitDays = 30): DayCost[] {
   if (!existsSync(dbPath)) return [];
-  const db = new Database(dbPath, { readonly: true });
+  // The constructor itself can throw (corrupt/partially-written DB, non-SQLite
+  // file, EACCES from a differently-privileged writer) — keep it INSIDE the try
+  // so the documented "graceful: [] on any failure" contract actually holds and
+  // a bad cost DB can never stall the proactive loop (matches the sibling
+  // session-cost / host-telemetry readers).
+  let db: Database | null = null;
   try {
+    db = new Database(dbPath, { readonly: true });
     const rows = db
       .query(
         "SELECT date, cost_usd FROM session_costs WHERE date >= date('now', '-' || ?1 || ' days') ORDER BY date",
@@ -42,7 +48,11 @@ export function readDailyCost(dbPath: string, limitDays = 30): DayCost[] {
   } catch {
     return [];
   } finally {
-    db.close();
+    try {
+      db?.close();
+    } catch {
+      // best-effort close
+    }
   }
 }
 
@@ -75,9 +85,16 @@ export interface CostSignal {
 /** The degradation verdict: cost trending up (above noise floor) = degraded. */
 export function costSignal(dbPath: string, maxRecentUsd = Infinity): CostSignal {
   const days = readDailyCost(dbPath);
-  const recent = days.length ? days[days.length - 1]!.medianUsd : 0;
+  const lastDay = days.at(-1);
+  const recent = lastDay ? lastDay.medianUsd : 0;
   const trend = costTrend(days);
-  const degraded = trend === "degrading" || recent > maxRecentUsd;
+  // Both degradation paths must share the same sample discipline: costTrend
+  // already refuses a verdict below 4 days, and the absolute `recent > cap`
+  // branch now does too — otherwise a single outlier day on a fresh/sparse DB
+  // (e.g. one $30 batch job on day one) would flip `degraded` and fire a
+  // spurious proactive proposal.
+  const enoughSamples = days.length >= 4;
+  const degraded = enoughSamples && (trend === "degrading" || recent > maxRecentUsd);
   return { value: Math.round(recent * 1e4) / 1e4, trend, degraded, days: days.length };
 }
 
