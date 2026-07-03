@@ -8,7 +8,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 
 /** A skill_access log older than this is treated as STALE (logging broken) → untrusted. */
 export const SKILL_LOG_MAX_AGE_MS = 14 * 86_400_000;
-import { join, basename } from "node:path";
+import { join, basename, dirname } from "node:path";
 
 export interface SkillsHealth {
   totalSkills: number;
@@ -45,7 +45,14 @@ export function accessedSkills(accessLog: string): Set<string> {
     try {
       const o = JSON.parse(line) as Record<string, unknown>;
       const p = String(o.skill_path ?? o.skill ?? "");
-      if (p) out.add(basename(p).replace(/\.md$/, ""));
+      if (p) {
+        const base = basename(p).replace(/\.md$/, "");
+        // Directory-format skills are `<skill>/SKILL.md` — the skill name is the
+        // parent directory (matching listSkillNames), not the literal "SKILL"
+        // file. Single-file skills are `<skill>.md` → the basename is the name.
+        const name = base === "SKILL" ? basename(dirname(p)) : base;
+        if (name) out.add(name);
+      }
     } catch {
       /* skip */
     }

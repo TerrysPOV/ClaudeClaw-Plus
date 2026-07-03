@@ -103,7 +103,7 @@ export function registerWisecronSubjects(
   };
 
   // Single-subject proof (#275): model-routing is the reference subject; the
-  // memory subject is wired just below.
+  // memory + skills subjects are wired just below.
   if (enabled("model_routing"))
     registerWithProbeCheck(
       new ModelRoutingSubject({
