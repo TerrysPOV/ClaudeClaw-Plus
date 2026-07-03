@@ -96,9 +96,18 @@ export class TunerViewProvider implements TelemetryProvider {
 
       const id = String(rec.proposal.id);
       const outcomes = this.sources.outcomesFor(id);
-      // Prefer a matured outcome (non-null verdict); else the first row so the
-      // timeline still shows the pending change with delta/verdict blank.
-      const outcome = outcomes.find((o) => o.verdict !== null) ?? outcomes[0];
+      // A proposal can have several matured outcomes (target + guardrails).
+      // getOutcomes orders by metric ASC, so `find(verdict != null)` would surface
+      // whichever metric sorts first alphabetically — often a neutral guardrail
+      // rather than the metric that drove the decision. Prefer a DECISIVE verdict
+      // (improved/regressed) so the panel shows the outcome that actually
+      // determined the change; else any matured row; else the first (pending) row
+      // so a not-yet-matured change still appears with delta/verdict blank.
+      const matured = outcomes.filter((o) => o.verdict !== null);
+      const outcome =
+        matured.find((o) => o.verdict === "improved" || o.verdict === "regressed") ??
+        matured[0] ??
+        outcomes[0];
 
       rows.push({
         ts: rec.ts,

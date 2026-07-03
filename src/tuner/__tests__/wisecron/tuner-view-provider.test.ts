@@ -74,9 +74,9 @@ describe("TunerViewProvider", () => {
     const m = p.viewManifest();
     expect(m.plugin).toBe(TUNER_PLUGIN);
     expect(m.panels).toHaveLength(1);
-    expect(m.panels[0]!.kind).toBe("timeline");
-    expect(m.panels[0]!.id).toBe(TUNER_TIMELINE_PANEL);
-    expect(m.panels[0]!.columns).toEqual([
+    expect(m.panels[0]?.kind).toBe("timeline");
+    expect(m.panels[0]?.id).toBe(TUNER_TIMELINE_PANEL);
+    expect(m.panels[0]?.columns).toEqual([
       "ts",
       "subject",
       "change",
@@ -132,6 +132,33 @@ describe("TunerViewProvider", () => {
       branch: "tune/proposal-7",
       commit: "cafe01",
     });
+  });
+
+  it("surfaces the decisive verdict, not the alphabetically-first matured guardrail", async () => {
+    writeFileSync(
+      proposalsPath,
+      proposalLine({
+        id: 11,
+        subject: "model_routing",
+        kind: "patch",
+        target_path: "p",
+        event: "applied",
+        ts: "2026-05-13T12:00:00.000Z",
+        commit_sha: "dec01",
+      }),
+    );
+    // Ordered by metric ASC: a neutral guardrail ("cost_guard") sorts before the
+    // target ("latency") that actually regressed. The panel must show the target.
+    const rows: OutcomeRow[] = [
+      outcome({ proposal_id: "11", metric: "cost_guard", delta: 0, verdict: "neutral" }),
+      outcome({ proposal_id: "11", metric: "latency", delta: 42, verdict: "regressed" }),
+    ];
+    const p = new TunerViewProvider({
+      proposals: new ProposalsStore(proposalsPath),
+      outcomesFor: () => rows,
+    });
+    const data = await p.viewData(TUNER_TIMELINE_PANEL, RANGE);
+    expect(data?.rows[0]).toMatchObject({ verdict: "regressed", delta: 42 });
   });
 
   it("shows an applied proposal with blank delta/verdict when no outcome matured yet", async () => {

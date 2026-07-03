@@ -67,7 +67,12 @@ export class SessionCostTelemetryProvider implements TelemetryProvider {
   private opened = false;
 
   constructor(cfg: SessionCostProviderConfig = {}) {
-    this.dbPath = (cfg.dbPath ?? `${homedir()}/agent/data/costs.db`).replace(/^~/, homedir());
+    // `^~(?=/|$)` so we only expand a leading `~` that means "home" — a bare `~`
+    // or `~/...`, never `~otheruser/...` (which is a different account's home).
+    this.dbPath = (cfg.dbPath ?? `${homedir()}/agent/data/costs.db`).replace(
+      /^~(?=\/|$)/,
+      homedir(),
+    );
     this.schemaVersion = cfg.schemaVersion ?? TELEMETRY_CONTRACT_VERSION;
   }
 
