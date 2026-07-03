@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, renameSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 import { homedir } from "node:os";
 import type { RevisionRecord, ScheduleState, AppliedBy } from "./types.js";
@@ -180,6 +180,29 @@ CREATE INDEX IF NOT EXISTS idx_outcomes_pending ON outcomes(verdict, window_end)
 CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status, created_at DESC);
 `;
 
+/**
+ * Target schema version. The baseline schema above (all `CREATE TABLE IF NOT
+ * EXISTS`) is version 1. Bump this and append a migration to `MIGRATIONS` for
+ * the first change that a plain `IF NOT EXISTS` cannot express (e.g. an
+ * `ALTER TABLE ... ADD COLUMN` on a table that already exists in older DBs).
+ */
+const CURRENT_SCHEMA_VERSION = 1;
+
+/**
+ * Forward-only migrations. `MIGRATIONS[v]` upgrades a DB that is at
+ * `user_version = v` to `v + 1`. Index 0 (v0 → v1) is intentionally empty:
+ * the baseline tables are already materialised by `SCHEMA` via
+ * `IF NOT EXISTS`, so first init only needs to stamp `user_version = 1`.
+ *
+ * To add the first real migration, set `CURRENT_SCHEMA_VERSION = 2` and push a
+ * function here that runs the `ALTER TABLE`. Use only static SQL literals — no
+ * interpolated identifiers.
+ */
+const MIGRATIONS: ReadonlyArray<(db: Database) => void> = [
+  // v0 → v1: baseline schema (created by SCHEMA). No forward work required.
+  () => {},
+];
+
 export class WisecronStateDB {
   private db: Database;
   private readonly path: string;
@@ -190,6 +213,26 @@ export class WisecronStateDB {
     this.db = new Database(this.path);
     this.db.exec("PRAGMA journal_mode=WAL;");
     this.db.exec(SCHEMA);
+    this.runMigrations();
+  }
+
+  /**
+   * Apply forward-only migrations from the DB's current `user_version` up to
+   * `CURRENT_SCHEMA_VERSION`, then stamp the new version. On a fresh DB
+   * `user_version` is 0, so this simply runs the (empty) v0 → v1 step and marks
+   * the DB at version 1. Idempotent: a DB already at the target version does no
+   * work. `PRAGMA user_version` cannot be parameterized; the value written is a
+   * static integer constant, never user input.
+   */
+  private runMigrations(): void {
+    const { user_version: from } = this.db.prepare("PRAGMA user_version").get() as {
+      user_version: number;
+    };
+    if (from >= CURRENT_SCHEMA_VERSION) return;
+    for (let v = from; v < CURRENT_SCHEMA_VERSION; v++) {
+      MIGRATIONS[v]?.(this.db);
+    }
+    this.db.exec(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION};`);
   }
 
   close(): void {
@@ -458,19 +501,24 @@ export class WisecronStateDB {
 
   // ── priors (Phase 2 substrate; unused in Phase 1) ─────────────────────────
 
-  /** EWMA-update the prior for (subject, kind) with a new observed delta. */
+  /**
+   * EWMA-update the prior for (subject, kind) with a new observed delta.
+   *
+   * Done as a single atomic `INSERT ... ON CONFLICT DO UPDATE` so concurrent
+   * callers cannot lose an update via a read-modify-write race: on first insert
+   * the prior seeds to `delta` with `n = 1`; on conflict the blend
+   * `alpha*delta + (1-alpha)*ewma_delta` and `n = n + 1` are computed against
+   * the row's live values inside the statement. All inputs are `?`-bound.
+   */
   upsertPrior(subject: string, kind: string, delta: number, alpha = 0.3): void {
-    const existing = this.db
-      .prepare("SELECT ewma_delta, n FROM priors WHERE subject = ? AND kind = ?")
-      .get(subject, kind) as { ewma_delta: number; n: number } | undefined;
-    const ewma = existing ? alpha * delta + (1 - alpha) * existing.ewma_delta : delta;
-    const n = (existing?.n ?? 0) + 1;
     this.db
       .prepare(`
-      INSERT INTO priors(subject, kind, ewma_delta, n) VALUES (?, ?, ?, ?)
-      ON CONFLICT(subject, kind) DO UPDATE SET ewma_delta = excluded.ewma_delta, n = excluded.n
+      INSERT INTO priors(subject, kind, ewma_delta, n) VALUES (?, ?, ?, 1)
+      ON CONFLICT(subject, kind) DO UPDATE SET
+        ewma_delta = ? * ? + (1 - ?) * priors.ewma_delta,
+        n = priors.n + 1
     `)
-      .run(subject, kind, ewma, n);
+      .run(subject, kind, delta, alpha, delta, alpha);
   }
 
   getPrior(subject: string, kind: string): { ewma_delta: number; n: number } | null {
@@ -512,8 +560,20 @@ export class WisecronStateDB {
     } catch {
       /* ignore if missing */
     }
+    // Drop the WAL/SHM sidecars of the corrupt DB. If left behind, SQLite would
+    // treat them as belonging to the brand-new file at this.path and try to
+    // replay the stale WAL into it — resurrecting corrupt pages or failing the
+    // open. Best-effort: they may not exist (e.g. a checkpointed DB).
+    for (const sidecar of [`${this.path}-wal`, `${this.path}-shm`]) {
+      try {
+        unlinkSync(sidecar);
+      } catch {
+        /* ignore if missing */
+      }
+    }
     this.db = new Database(this.path);
     this.db.exec("PRAGMA journal_mode=WAL;");
     this.db.exec(SCHEMA);
+    this.runMigrations();
   }
 }

@@ -473,6 +473,10 @@ function defaultHookLogReader(dir: string): HookExecEntry[] {
         const hook = (obj.hook as string) ?? f.replace(/\.log$/, "");
         const exitCode = Number(obj.exit_code ?? 0);
         const durationMs = Number(obj.duration_ms ?? 0);
+        // `duration_ms` is the sample `value`; a non-numeric field (e.g. "oops")
+        // yields NaN which would poison downstream mean/p95. Drop the sample
+        // rather than emit NaN (mirrors the template-feedback rating guard).
+        if (!Number.isFinite(durationMs)) continue;
         const event = (obj.event as string) ?? "unknown";
         const tsRaw = obj.ts as string | number | undefined;
         const ts = tsRaw ? new Date(tsRaw) : new Date();

@@ -76,12 +76,28 @@ export class ToolCallSink {
    *  past the cap we DROP events rather than block or grow — telemetry is
    *  best-effort and must never threaten the daemon. */
   private static readonly MAX_BUFFER = 10_000;
+  /** Bound the in-memory chain window on the high-volume tool-call log so the
+   *  process-lifetime singleton can't leak; reads go through the file producer. */
+  private static readonly MAX_RECORDS = 5_000;
+  /** Rotate the tool-call JSONL past this size so an append-only file can't grow
+   *  without bound and the producer's per-query full-file read stays cheap. */
+  private static readonly ROTATE_BYTES = 32 * 1024 * 1024;
+  /** Cap a captured tool `error` string: error text is not redacted and can be
+   *  arbitrarily large (echoed bodies, paths). Truncate before it is retained on
+   *  disk + in memory. */
+  private static readonly MAX_ERROR_LEN = 2_000;
 
   constructor(opts: ToolCallSinkOptions = {}) {
     this.path = opts.path === undefined ? DEFAULT_TOOL_CALL_LOG : opts.path;
     this.autoFlush = opts.autoFlush !== false;
     this.policy = opts.policy ?? "best-effort";
-    this.logFactory = opts.logFactory ?? ((p) => new AuditLog(p ?? ":memory:"));
+    this.logFactory =
+      opts.logFactory ??
+      ((p) =>
+        new AuditLog(p ?? ":memory:", {
+          maxRecords: ToolCallSink.MAX_RECORDS,
+          rotateBytes: ToolCallSink.ROTATE_BYTES,
+        }));
   }
 
   setEnabled(enabled: boolean): void {
@@ -181,10 +197,18 @@ export class ToolCallSink {
    */
   flush(): void {
     if (this.buffer.length === 0) return;
+    // Materialise the chain BEFORE detaching the batch: if the backing log can't
+    // be built, keep the events buffered (bounded by MAX_BUFFER) for the next
+    // flush rather than silently dropping the batch and wedging telemetry.
+    let log: AuditLogLike;
+    try {
+      log = this.ensureLog();
+    } catch {
+      return;
+    }
     const batch = this.buffer;
     this.buffer = [];
     try {
-      const log = this.ensureLog();
       for (const e of batch) {
         log.append({
           event: MCP_TOOL_CALL_EVENT,
@@ -196,13 +220,21 @@ export class ToolCallSink {
             duration_ms: e.duration_ms,
             args_hash: e.args_hash,
             event_ts: e.ts,
-            ...(e.error !== undefined ? { error: e.error } : {}),
+            ...(e.error !== undefined ? { error: ToolCallSink.clampError(e.error) } : {}),
           },
         });
       }
     } catch {
       // Fire-and-forget: a sink failure must never surface on the call path.
     }
+  }
+
+  /** Bound an unredacted tool-error string before it is persisted + retained. */
+  private static clampError(error: string): string {
+    if (error.length <= ToolCallSink.MAX_ERROR_LEN) return error;
+    return `${error.slice(0, ToolCallSink.MAX_ERROR_LEN)}…[truncated ${
+      error.length - ToolCallSink.MAX_ERROR_LEN
+    } chars]`;
   }
 
   /** Test helper — events buffered but not yet flushed. */

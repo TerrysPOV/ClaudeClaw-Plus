@@ -165,7 +165,14 @@ export class SessionJsonlTelemetryProducer implements TelemetryProvider {
       } catch {
         continue;
       }
-      this.scanFile(file, range, acc);
+      // Per-file tolerance mirrors the per-line JSON.parse skip: one unreadable
+      // or malformed transcript must never take down the whole telemetry surface
+      // (`capabilities()` is sync and feeds the activation gate).
+      try {
+        this.scanFile(file, range, acc);
+      } catch {
+        // skip a bad file
+      }
     }
 
     // Keep the memo small (different subjects use 7d/1d windows).
@@ -212,7 +219,11 @@ export class SessionJsonlTelemetryProducer implements TelemetryProvider {
       if (!ts || Number.isNaN(ts.getTime())) continue;
       if (ts.getTime() < range.start.getTime() || ts.getTime() >= range.end.getTime()) continue;
 
-      for (const block of a.message?.content ?? []) {
+      // `message.content` comes from an untrusted transcript; a non-array
+      // (e.g. `{"message":{"content":{}}}`) would make `for...of` throw. Guard
+      // so a malformed line contributes nothing instead of crashing the scan.
+      const content = Array.isArray(a.message?.content) ? a.message.content : [];
+      for (const block of content) {
         if (!block || (block as { type?: string }).type !== "tool_use") continue;
         const tu = block as AssistantToolUseBlock;
         const name = tu.name ?? "";

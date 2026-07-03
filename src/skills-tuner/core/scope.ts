@@ -28,7 +28,7 @@
  */
 
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import type {
   DateRange,
   MetricSample,
@@ -76,6 +76,12 @@ export interface AgentSurface {
    * Substrings that mark a `session_cost` / `cron_run` row as agent-originated
    * (matched against the `job` / `unit` label). The cost store's `job` is
    * free-text, so attribution is substring-based, mirroring CronSubject.costJobMatch.
+   *
+   * MUST be AGENT-SPECIFIC markers only (e.g. the bus-scheduler tag the agent's
+   * own cron jobs carry, or the agent root path a unit name is anchored under).
+   * A GENERIC tag every cron row carries (e.g. `source="cron"`) does NOT narrow
+   * anything — it attributes the whole cron/cost stream to the agent, defeating
+   * the scope. Empty markers are ignored (they would match every row).
    */
   jobMarkers: string[];
 }
@@ -110,7 +116,12 @@ export function defaultAgentSurface(home: string = homedir()): AgentSurface {
     roots: [agentRoot],
     skillsDirs: [join(agentRoot, "skills")],
     sessionProjectDirs: [encodeProjectDir(agentRoot)],
-    jobMarkers: ['source="cron"', "bus-scheduler", agentRoot],
+    // AGENT-SPECIFIC markers only. `bus-scheduler` is the tag the agent's own
+    // cron jobs carry; `agentRoot` matches a unit/job label anchored under the
+    // agent's home. The generic `source="cron"` tag was REMOVED — nearly every
+    // cron row carries it, so including it attributed the entire cron/cost
+    // stream to the agent and made `scope: agent` a no-op for those streams.
+    jobMarkers: ["bus-scheduler", agentRoot],
   };
 }
 
@@ -127,19 +138,66 @@ export const SCOPE_FILTER_KEY = "__scope";
 export const AGENT_SESSION_DIRS_FILTER_KEY = "__agent_session_dirs";
 
 /**
+ * Label a scope-aware producer stamps on the samples it returns to ATTEST that
+ * it already restricted them to the agent surface at the source (e.g. after
+ * honouring the `__agent_session_dirs` hint). This is the explicit ack that lets
+ * a stream WITHOUT a label-based attribution predicate still pass agent scope —
+ * instead of failing closed. Value must equal the active scope ("agent").
+ */
+export const SCOPE_ACK_LABEL = "__scoped";
+
+/**
+ * Streams whose returned samples carry a REAL, label-based agent-attribution
+ * predicate applied post-hoc in `sampleInAgentScope`. These narrow by data.
+ */
+export const PREDICATE_STREAMS: ReadonlySet<TelemetryStream> = new Set<TelemetryStream>([
+  "session_cost",
+  "cron_run",
+  "memory_access",
+]);
+
+/**
+ * Streams narrowed at the SOURCE by the injected `__agent_session_dirs` filter,
+ * whose host producer (`SessionJsonlTelemetryProducer`) is known to honour it:
+ * the rows it returns are already agent-only, so a post-filter would be
+ * redundant. This is a CLOSED allowlist — any stream not named here and lacking
+ * a predicate fails closed rather than being kept.
+ */
+export const SOURCE_SCOPED_STREAMS: ReadonlySet<TelemetryStream> = new Set<TelemetryStream>([
+  "tool_call",
+  "agent_dispatch",
+]);
+
+/** True when `file` lives at or under one of `roots` on a path-SEGMENT boundary
+ * (so root `/home/simon/agent` does NOT match `/home/simon/agent-backup/...`). */
+function fileUnderRoot(file: string, roots: readonly string[]): boolean {
+  if (file === "") return false;
+  return roots.some((r) => {
+    if (r === "") return false;
+    const root = r.endsWith(sep) ? r.slice(0, -1) : r;
+    return file === root || file.startsWith(root + sep);
+  });
+}
+
+/**
  * Per-stream agent-attribution predicate applied to a sample AFTER the inner
  * provider returns it. Decides whether `sample` belongs to the agent surface.
+ * FAILS CLOSED: a sample is kept only when it can be POSITIVELY attributed.
  *
  *  - `session_cost` / `cron_run` — attributed by a job/unit-label substring match
- *    against `surface.jobMarkers`. Real, label-based narrowing.
- *  - `memory_access` — attributed by `file` label living under an agent root.
- *  - everything else — KEPT (returns true). Two reasons: session-derived streams
- *    (tool_call / agent_dispatch) are already narrowed upstream by the session-dir
- *    filter, so re-filtering here would be redundant and wrong; and hook_exec /
- *    skill_access / template_feedback carry NO agent-vs-general signal in their
- *    labels on the reference host (FLAGGED — agent-scoping those streams requires
- *    pointing their producer at an agent-specific source via config, not a label
- *    filter). Keeping them is the documented limit of label-based scoping.
+ *    against `surface.jobMarkers` (agent-specific markers only). Real narrowing.
+ *  - `memory_access` — attributed by `file` label living under an agent root,
+ *    matched on a path-segment boundary (see `fileUnderRoot`).
+ *  - `tool_call` / `agent_dispatch` (SOURCE_SCOPED_STREAMS) — already narrowed
+ *    upstream by the injected session-dir filter, whose producer honours it, so
+ *    they are kept without a post-filter.
+ *  - everything else (hook_exec / skill_access / template_feedback /
+ *    mode_dispatch / mcp.tool_call …) — carries NO agent-vs-general signal in its
+ *    labels AND is not a trusted source-scoped stream. Previously these were
+ *    KEPT (return true), which made `scope: agent` a SILENT NO-OP whenever the
+ *    producer ignored the injected hint (e.g. the mode-dispatch reader). Now they
+ *    fail CLOSED — DROPPED unless the producer stamped the explicit
+ *    `SCOPE_ACK_LABEL` ack asserting it already scoped the row itself.
  */
 export function sampleInAgentScope(
   stream: TelemetryStream,
@@ -150,15 +208,17 @@ export function sampleInAgentScope(
   switch (stream) {
     case "session_cost":
     case "cron_run": {
-      const hay = `${labels["job"] ?? ""} ${labels["unit"] ?? ""}`;
-      return surface.jobMarkers.some((m) => hay.includes(m));
+      const hay = `${labels.job ?? ""} ${labels.unit ?? ""}`;
+      return surface.jobMarkers.some((m) => m !== "" && hay.includes(m));
     }
-    case "memory_access": {
-      const file = labels["file"] ?? "";
-      return file !== "" && surface.roots.some((r) => file.startsWith(r));
-    }
+    case "memory_access":
+      return fileUnderRoot(labels.file ?? "", surface.roots);
     default:
-      return true;
+      // Trusted source-scoped streams were already narrowed at the producer.
+      if (SOURCE_SCOPED_STREAMS.has(stream)) return true;
+      // No predicate + not source-scoped ⇒ fail closed. A producer that scoped
+      // the row itself opts in by echoing the ack label.
+      return labels[SCOPE_ACK_LABEL] === "agent";
   }
 }
 
