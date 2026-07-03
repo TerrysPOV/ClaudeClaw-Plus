@@ -29,7 +29,17 @@ export interface WatchdogLimits {
   maxRuntimeSeconds?: number;
   maxRepeatedTools?: number;
   repeatedToolThreshold?: number; // Number of repeated patterns before action
+  /**
+   * Hard-ceiling multiplier for `kill` escalation. A metric that reaches
+   * `limit * killCeilingMultiplier` — i.e. well past the `suspend` line — is a
+   * runaway that escalated to `kill` (terminate), not merely paused. Default 2.
+   * Set ≤1 to disable the kill tier (suspend stays the highest state).
+   */
+  killCeilingMultiplier?: number;
 }
+
+/** Default hard-ceiling multiple at which `suspend` escalates to `kill`. */
+export const DEFAULT_KILL_CEILING_MULTIPLIER = 2;
 
 export interface ExecutionMetrics {
   invocationId: string;
@@ -449,9 +459,17 @@ export async function checkLimits(context: {
   let worstState: WatchdogState = "healthy";
 
   const { limits } = watchdogConfig;
+  // Kill = a runaway well past the suspend line. `>1` gates the tier so a config
+  // of ≤1 keeps suspend as the highest state (opt-out).
+  const killMult = limits.killCeilingMultiplier ?? DEFAULT_KILL_CEILING_MULTIPLIER;
+  const killsAt = (limit: number): number | null => (killMult > 1 ? limit * killMult : null);
 
   // Check tool call limit
-  if (limits.maxToolCalls && record.toolCallCount >= limits.maxToolCalls) {
+  const toolKill = limits.maxToolCalls ? killsAt(limits.maxToolCalls) : null;
+  if (limits.maxToolCalls && toolKill !== null && record.toolCallCount >= toolKill) {
+    triggeredLimits.push(`maxToolCalls_kill=${record.toolCallCount}/${toolKill}`);
+    worstState = escalateState(worstState, "kill");
+  } else if (limits.maxToolCalls && record.toolCallCount >= limits.maxToolCalls) {
     triggeredLimits.push(`maxToolCalls=${record.toolCallCount}/${limits.maxToolCalls}`);
     worstState = escalateState(worstState, "suspend");
   } else if (limits.maxToolCalls && record.toolCallCount >= limits.maxToolCalls * 0.8) {
@@ -460,7 +478,11 @@ export async function checkLimits(context: {
   }
 
   // Check turn limit
-  if (limits.maxTurns && record.turnCount >= limits.maxTurns) {
+  const turnKill = limits.maxTurns ? killsAt(limits.maxTurns) : null;
+  if (limits.maxTurns && turnKill !== null && record.turnCount >= turnKill) {
+    triggeredLimits.push(`maxTurns_kill=${record.turnCount}/${turnKill}`);
+    worstState = escalateState(worstState, "kill");
+  } else if (limits.maxTurns && record.turnCount >= limits.maxTurns) {
     triggeredLimits.push(`maxTurns=${record.turnCount}/${limits.maxTurns}`);
     worstState = escalateState(worstState, "suspend");
   } else if (limits.maxTurns && record.turnCount >= limits.maxTurns * 0.8) {
@@ -472,7 +494,11 @@ export async function checkLimits(context: {
   if (limits.maxRuntimeSeconds) {
     const startedAt = new Date(record.startedAt);
     const elapsedSeconds = (Date.now() - startedAt.getTime()) / 1000;
-    if (elapsedSeconds >= limits.maxRuntimeSeconds) {
+    const runtimeKill = killsAt(limits.maxRuntimeSeconds);
+    if (runtimeKill !== null && elapsedSeconds >= runtimeKill) {
+      triggeredLimits.push(`maxRuntimeSeconds_kill=${elapsedSeconds}/${runtimeKill}`);
+      worstState = escalateState(worstState, "kill");
+    } else if (elapsedSeconds >= limits.maxRuntimeSeconds) {
       triggeredLimits.push(`maxRuntimeSeconds=${elapsedSeconds}/${limits.maxRuntimeSeconds}`);
       worstState = escalateState(worstState, "suspend");
     } else if (elapsedSeconds >= limits.maxRuntimeSeconds * 0.8) {
@@ -487,9 +513,16 @@ export async function checkLimits(context: {
   if (limits.maxRepeatedTools) {
     const repeatedPatterns = detectRepeatedPatterns(record.toolCalls);
     const totalRepeatedCalls = repeatedPatterns.reduce((sum, p) => sum + p.count, 0);
-    if (totalRepeatedCalls >= limits.maxRepeatedTools) {
+    const repeatedKill = killsAt(limits.maxRepeatedTools);
+    const patternDetail = repeatedPatterns.map((p) => `${p.pattern}=${p.count}`).join(", ");
+    if (repeatedKill !== null && totalRepeatedCalls >= repeatedKill) {
       triggeredLimits.push(
-        `maxRepeatedTools=${totalRepeatedCalls}/${limits.maxRepeatedTools} (patterns: ${repeatedPatterns.map((p) => `${p.pattern}=${p.count}`).join(", ")})`,
+        `maxRepeatedTools_kill=${totalRepeatedCalls}/${repeatedKill} (patterns: ${patternDetail})`,
+      );
+      worstState = escalateState(worstState, "kill");
+    } else if (totalRepeatedCalls >= limits.maxRepeatedTools) {
+      triggeredLimits.push(
+        `maxRepeatedTools=${totalRepeatedCalls}/${limits.maxRepeatedTools} (patterns: ${patternDetail})`,
       );
       worstState = escalateState(worstState, "suspend");
     } else if (totalRepeatedCalls >= limits.maxRepeatedTools * 0.7) {
@@ -506,9 +539,10 @@ export async function checkLimits(context: {
 
   if (triggeredLimits.length > 0) {
     reason = `Limits triggered: ${triggeredLimits.join(", ")}`;
-    // Note: kill state escalation requires explicit handling at execution layer
-    // suspend is the highest state returned by checkLimits
-    recommendedAction = worstState === "suspend" ? "pause" : "review";
+    // kill (runaway past the hard ceiling) → terminate; suspend → pause; warn →
+    // review. handleTrigger() maps kill to the audited terminate path.
+    recommendedAction =
+      worstState === "kill" ? "terminate" : worstState === "suspend" ? "pause" : "review";
   }
 
   const decision: WatchdogDecision = {
