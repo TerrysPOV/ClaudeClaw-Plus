@@ -9,8 +9,13 @@ import {
   sanitizeObservationContent,
   auditLog,
 } from "../../skills-tuner/core/security.js";
+import { renderDiff } from "./render-diff.js";
 import type { WisecronStateDB } from "./state-db.js";
 import type { ProposalCycleResult, ProposalSummary } from "./types.js";
+
+/** Preview byte cap, shared with renderDiff's default — a proposal diff must fit
+ *  a Telegram/Discord message and never dump a whole managed file. */
+const DIFF_PREVIEW_MAX_BYTES = 2048;
 
 type AuditFn = (event: string, payload: Record<string, unknown>) => void;
 type SignFn = (proposal: UnsignedProposal) => string;
@@ -187,31 +192,27 @@ export class ProposalEngine {
   computeDiff(targetPath: string, proposedContent: string): string {
     const current = this.readTarget(targetPath);
     if (current === null) {
-      return [
+      const out = [
         `--- ${targetPath} (new file)`,
         `+++ ${targetPath}`,
         ...proposedContent.split("\n").map((line) => `+${line}`),
       ].join("\n");
+      // Even a brand-new file can be large — cap the preview.
+      if (out.length <= DIFF_PREVIEW_MAX_BYTES) return out;
+      return `${out.slice(0, DIFF_PREVIEW_MAX_BYTES - 22)}\n... [diff truncated]`;
     }
     if (current === proposedContent) {
       return `--- ${targetPath}\n+++ ${targetPath}\n(no changes)`;
     }
-    const before = current.split("\n");
-    const after = proposedContent.split("\n");
-    const head = [`--- ${targetPath}`, `+++ ${targetPath}`];
-    const body: string[] = [];
-    const maxLen = Math.max(before.length, after.length);
-    for (let i = 0; i < maxLen; i++) {
-      const b = before[i];
-      const a = after[i];
-      if (b === a) {
-        if (b !== undefined) body.push(` ${b}`);
-        continue;
-      }
-      if (b !== undefined) body.push(`-${b}`);
-      if (a !== undefined) body.push(`+${a}`);
-    }
-    return [...head, ...body].join("\n");
+    // Delegate the change case to the capped unified-diff renderer: the previous
+    // inline diff emitted every UNCHANGED line too, so a large managed file
+    // (MEMORY.md ~50KB) produced a wall-of-text that silently truncates on
+    // Telegram/Discord. renderDiff emits only removed/added lines under a byte cap.
+    return renderDiff(current, proposedContent, {
+      fromLabel: targetPath,
+      toLabel: targetPath,
+      maxBytes: DIFF_PREVIEW_MAX_BYTES,
+    });
   }
 
   /**

@@ -236,6 +236,26 @@ describe("ProposalEngine — renderProposalSummary", () => {
     expect(summary.diff_preview).toContain("+line B");
   });
 
+  it("caps the diff preview for a large managed file (no wall-of-text)", async () => {
+    registry.registerSubject(new FakeSubject("fake"));
+    const targetPath = join(tmpDir, "big.md");
+    const before = Array.from({ length: 4000 }, (_, i) => `line ${i}`).join("\n");
+    const after = Array.from({ length: 4000 }, (_, i) => `LINE ${i}`).join("\n"); // every line changed
+    writeFileSync(targetPath, before);
+    const engine = new ProposalEngine(registry, db, {
+      audit: captureAudit(auditEvents),
+      sign: () => "sig",
+    });
+    const proposal = makeProposal({
+      target_path: targetPath,
+      alternatives: [{ id: "a1", label: "", diff_or_content: after, tradeoff: "" }],
+    });
+    const summary = await engine.renderProposalSummary(proposal);
+    // Bounded well under a full-file dump (~50KB here) so it fits a chat message.
+    expect(summary.diff_preview.length).toBeLessThanOrEqual(2100);
+    expect(summary.diff_preview).toContain("[diff truncated]");
+  });
+
   it('handles "create new file" case (target_path does not exist yet)', async () => {
     const sub = new FakeSubject("fake");
     registry.registerSubject(sub);
