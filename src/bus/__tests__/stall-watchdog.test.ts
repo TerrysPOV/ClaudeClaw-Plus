@@ -33,18 +33,32 @@ function stateWith(tools: Array<{ id: string; name: string; startedAt: number }>
 /* ── classifyTool / ceilingFor ─────────────────────────────────────────── */
 
 describe("classifyTool", () => {
-  it("maps Bash → bash, fast tools → fast, MCP/unknown → default", () => {
+  it("maps Bash → bash, fast tools → fast", () => {
     expect(classifyTool("Bash")).toBe("bash");
     for (const t of ["Read", "Edit", "Grep", "Glob", "Write", "LS", "MultiEdit", "NotebookEdit"]) {
       expect(classifyTool(t)).toBe("fast");
     }
-    expect(classifyTool("mcp__playwright__navigate")).toBe("default");
+  });
+  it("maps agent-dispatch → task (generous, sub-agents run long)", () => {
+    expect(classifyTool("Task")).toBe("task");
+    expect(classifyTool("Agent")).toBe("task");
+  });
+  it("maps mcp__… → mcp, other unknown → default", () => {
+    expect(classifyTool("mcp__playwright__navigate")).toBe("mcp");
+    expect(classifyTool("mcp__deep-research__run")).toBe("mcp");
     expect(classifyTool("WebFetch")).toBe("default");
+    expect(classifyTool("SomethingNew")).toBe("default");
   });
   it("ceilingFor returns the class ceiling", () => {
     expect(ceilingFor("Bash", C)).toEqual(C.bash);
     expect(ceilingFor("Read", C)).toEqual(C.fast);
-    expect(ceilingFor("mcp__x__y", C)).toEqual(C.default);
+    expect(ceilingFor("Task", C)).toEqual(C.task);
+    expect(ceilingFor("mcp__x__y", C)).toEqual(C.mcp);
+    expect(ceilingFor("WebFetch", C)).toEqual(C.default);
+  });
+  it("task ceiling is more generous than bash/default (no false-positive kill of long sub-agents)", () => {
+    expect(C.task.killSeconds).toBeGreaterThan(C.bash.killSeconds);
+    expect(C.task.killSeconds).toBeGreaterThan(C.default.killSeconds);
   });
 });
 
@@ -234,5 +248,28 @@ describe("StallWatchdog kill orchestration", () => {
       rec.notify.some((n) => n.level === "critical" && /FAILED to restart/.test(n.message)),
     ).toBe(true);
     expect(rec.recordKill).toBe(0); // classification skipped when restart failed
+  });
+
+  it("after a failed restart, backs off — no re-kill/re-notify within the cooldown", async () => {
+    const { deps, rec } = recordingDeps({ restartThrows: true });
+    const wd = new StallWatchdog(DEFAULT_STALL_CONFIG, deps);
+    wd.ingest(evt("response.tool_use", 0, { id: "b1", name: "Bash" }));
+    await wd.sweep(950_000); // first kill attempt → restart throws, stamps cooldown
+    // Second sweep 60s later — still inside the 300s cooldown → suppressed.
+    await wd.sweep(1_010_000);
+    expect(rec.restart).toHaveLength(1); // NOT retried
+    const crit = rec.notify.filter(
+      (n) => n.level === "critical" && /FAILED to restart/.test(n.message),
+    );
+    expect(crit).toHaveLength(1); // NOT re-alerted (no storm)
+  });
+
+  it("retries the kill once the cooldown elapses", async () => {
+    const { deps, rec } = recordingDeps({ restartThrows: true });
+    const wd = new StallWatchdog(DEFAULT_STALL_CONFIG, deps);
+    wd.ingest(evt("response.tool_use", 0, { id: "b1", name: "Bash" }));
+    await wd.sweep(950_000); // fail → cooldown from t=950_000
+    await wd.sweep(1_300_000); // +350s > 300s cooldown → retried
+    expect(rec.restart).toHaveLength(2);
   });
 });
