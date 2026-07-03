@@ -9,8 +9,21 @@
  *
  *   log path:   $CLAUDECLAW_SKILL_ACCESS_LOG  (default ~/.config/tuner/skill_accesses.jsonl)
  *   skills dir: $CLAUDECLAW_SKILLS_DIR         (default ~/.claude/skills)
+ *
+ * OPT-IN — ships DISABLED. A PostToolUse(Read) matcher is tool-name only (it can't
+ * pre-filter to skill paths), so registering it always-on would fork a node process
+ * on EVERY Read just to return null — standing per-read latency on a lightweight
+ * daemon, feeding a stream nothing consumes until the #286 host-telemetry consumer
+ * is live. So hooks/hooks.json ships with no PostToolUse entry. Enable it once the
+ * consumer lands by adding this to your hooks config:
+ *
+ *   "PostToolUse": [
+ *     { "matcher": "Read", "hooks": [
+ *       { "type": "command", "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/log-skill-access.mjs\"" }
+ *     ] }
+ *   ]
  */
-import { appendFileSync, mkdirSync, realpathSync } from "node:fs";
+import { appendFileSync, mkdirSync, realpathSync, renameSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname, sep, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -18,6 +31,19 @@ import { pathToFileURL } from "node:url";
 /** The consumer's contract paths (must match SkillAccessTelemetryProducer). */
 export const DEFAULT_SKILLS_DIR = join(homedir(), ".claude", "skills");
 export const DEFAULT_LOG_PATH = join(homedir(), ".config", "tuner", "skill_accesses.jsonl");
+/** The producer owns its own trim: rotate the append-only log to `<path>.1` once
+ *  it passes this size so it can't grow unbounded (one prior segment retained). */
+export const MAX_LOG_BYTES = 5 * 1024 * 1024;
+
+/** Rotate the log to `<path>.1` if it has grown past MAX_LOG_BYTES. Best-effort:
+ *  a stat/rename failure must never block the write (the log is telemetry). */
+export function rotateIfNeeded(log, maxBytes = MAX_LOG_BYTES) {
+  try {
+    if (statSync(log).size >= maxBytes) renameSync(log, `${log}.1`);
+  } catch {
+    /* first write (no file yet) or a race — nothing to rotate */
+  }
+}
 
 /**
  * Pure: the log entry for a PostToolUse payload, or null if it is not a SUCCESSFUL
@@ -58,6 +84,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       if (!entry) return;
       const log = process.env.CLAUDECLAW_SKILL_ACCESS_LOG || DEFAULT_LOG_PATH;
       mkdirSync(dirname(log), { recursive: true });
+      rotateIfNeeded(log);
       appendFileSync(log, JSON.stringify(entry) + "\n");
     } catch {
       /* never block or fail the tool on a logging error */

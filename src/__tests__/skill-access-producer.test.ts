@@ -13,6 +13,7 @@ import { tmpdir, homedir } from "node:os";
 import { join } from "node:path";
 import {
   skillAccessEntry,
+  rotateIfNeeded,
   DEFAULT_LOG_PATH,
   DEFAULT_SKILLS_DIR,
 } from "../../hooks/log-skill-access.mjs";
@@ -144,5 +145,29 @@ describe("skill_access producer — hook integration", () => {
     const r = run("not json at all" as unknown);
     expect(r.status).toBe(0);
     expect(existsSync(log)).toBe(false);
+  });
+});
+
+describe("skill_access producer — log rotation (producer owns the trim)", () => {
+  let dir: string, log: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "skacc-rot-"));
+    log = join(dir, "access.jsonl");
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("rotates to <path>.1 once the log passes the cap", () => {
+    writeFileSync(log, "x".repeat(200));
+    rotateIfNeeded(log, 100); // cap below current size → rotate
+    expect(existsSync(`${log}.1`)).toBe(true);
+    expect(existsSync(log)).toBe(false); // next append recreates a fresh file
+  });
+
+  it("does not rotate below the cap, and is a no-op when the file is absent", () => {
+    writeFileSync(log, "x".repeat(50));
+    rotateIfNeeded(log, 100);
+    expect(existsSync(`${log}.1`)).toBe(false);
+    // absent file: must not throw
+    expect(() => rotateIfNeeded(join(dir, "nope.jsonl"), 100)).not.toThrow();
   });
 });
