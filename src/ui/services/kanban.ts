@@ -75,3 +75,29 @@ export async function moveCard(
     await writeKanban(board);
   }
 }
+
+export const DEFAULT_MAX_DONE_CARDS = 50;
+
+/**
+ * Cap the `done` column to the newest `max` cards, in place. Cards are unshifted
+ * newest-first, so keeping the head (`slice(0, max)`) keeps the most recent.
+ * Pure — mutates + returns the given board, no I/O. Used to bound the board file
+ * so a long-lived daemon's finished-subagent cards can't grow without limit.
+ */
+export function capDoneColumn(
+  board: KanbanBoard,
+  max: number = DEFAULT_MAX_DONE_CARDS,
+): KanbanBoard {
+  if (max >= 0 && board.columns.done.length > max) {
+    board.columns.done = board.columns.done.slice(0, max);
+  }
+  return board;
+}
+
+/** read → {@link capDoneColumn} → write convenience. No-op write when already under `max`. */
+export async function capDoneCards(max: number = DEFAULT_MAX_DONE_CARDS): Promise<void> {
+  const board = await readKanban();
+  if (board.columns.done.length <= max) return;
+  capDoneColumn(board, max);
+  await writeKanban(board);
+}
