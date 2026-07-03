@@ -157,7 +157,10 @@ export const WisecronSettingsSchema = z.object({
     .record(
       z.string(),
       z.object({
-        enabled: z.boolean(),
+        // Not required: the reader treats a missing `enabled` as enabled
+        // (`subjects?.[name]?.enabled !== false`), so default it to match rather
+        // than force every listed subject to spell it out (schema/reader parity).
+        enabled: z.boolean().default(true),
         /** Per-subject scope override. Falls back to the global `scope` when omitted. */
         scope: z.enum(SCOPES).optional(),
         /**

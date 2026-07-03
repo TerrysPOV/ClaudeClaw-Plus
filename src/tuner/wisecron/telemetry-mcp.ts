@@ -254,11 +254,17 @@ export class McpTelemetryProvider implements TelemetryProvider {
         ...(filters ? { filters } : {}),
       })) as QueryResult | undefined;
       if (!res || !Array.isArray(res.samples)) return [];
-      return res.samples.map((s) => ({
-        ts: new Date(s.ts),
-        value: s.value,
-        ...(s.labels ? { labels: s.labels } : {}),
-      }));
+      // The wire payload is untrusted (a remote host / transport-unwrap). Drop
+      // samples with a malformed timestamp (→ Invalid Date) or a non-finite value
+      // (NaN/Infinity) rather than propagating them into fitness math.
+      const out: MetricSample[] = [];
+      for (const s of res.samples) {
+        const ts = new Date(s.ts);
+        if (Number.isNaN(ts.getTime())) continue;
+        if (typeof s.value !== "number" || !Number.isFinite(s.value)) continue;
+        out.push({ ts, value: s.value, ...(s.labels ? { labels: s.labels } : {}) });
+      }
+      return out;
     } catch {
       return [];
     }

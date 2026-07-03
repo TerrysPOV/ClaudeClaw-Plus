@@ -92,13 +92,13 @@ describe("registerHostTelemetryTools + bridgeToolCaller (in-process)", () => {
 
     const samples = await provider.query("cron_run", RANGE);
     expect(samples).toHaveLength(1);
-    expect(samples[0]!.value).toBe(0);
-    expect(samples[0]!.ts.toISOString()).toBe(IN.toISOString());
-    expect(samples[0]!.labels).toEqual({ unit: "wisecron-a.service", status: "success" });
+    expect(samples[0]?.value).toBe(0);
+    expect(samples[0]?.ts.toISOString()).toBe(IN.toISOString());
+    expect(samples[0]?.labels).toEqual({ unit: "wisecron-a.service", status: "success" });
 
     // The host actually received the query over the boundary.
     expect(host.queries).toHaveLength(1);
-    expect(host.queries[0]!.stream).toBe("cron_run");
+    expect(host.queries[0]?.stream).toBe("cron_run");
   });
 
   it("re-registration replaces the prior tools (idempotent surface)", () => {
@@ -145,6 +145,26 @@ describe("McpTelemetryProvider — degrade gracefully", () => {
     expect(conn.ok).toBe(false);
     expect(provider.capabilities()).toEqual([]);
   });
+
+  it("drops query samples with an invalid timestamp or non-finite value", async () => {
+    const wire: TelemetryMcpClient = {
+      async callTool() {
+        return {
+          samples: [
+            { ts: RANGE.start.toISOString(), value: 1 }, // valid
+            { ts: "not-a-date", value: 2 }, // bad ts → dropped
+            { ts: RANGE.end.toISOString(), value: Number.NaN }, // NaN → dropped
+            { ts: RANGE.end.toISOString(), value: "x" }, // non-number → dropped
+            { ts: RANGE.end.toISOString(), value: 3 }, // valid
+          ],
+        };
+      },
+    };
+    const provider = new McpTelemetryProvider(wire);
+    const out = await provider.query("cron_run", RANGE);
+    expect(out.map((s) => s.value)).toEqual([1, 3]);
+    expect(out.every((s) => !Number.isNaN(s.ts.getTime()))).toBe(true);
+  });
 });
 
 describe("telemetry_query audit provenance", () => {
@@ -160,14 +180,14 @@ describe("telemetry_query audit provenance", () => {
 
     const records = audit.all().filter((r) => r.event === "telemetry_query");
     expect(records).toHaveLength(2);
-    expect(records[0]!.detail).toMatchObject({
+    expect(records[0]?.detail).toMatchObject({
       stream: "cron_run",
       window_start: RANGE.start.toISOString(),
       window_end: RANGE.end.toISOString(),
       sample_count: 1,
       contract_version: TELEMETRY_CONTRACT_VERSION,
     });
-    expect(records[1]!.detail).toMatchObject({ stream: "hook_exec", sample_count: 0 });
+    expect(records[1]?.detail).toMatchObject({ stream: "hook_exec", sample_count: 0 });
     expect(audit.verifyChain().ok).toBe(true);
 
     // Tamper with an earlier record → chain breaks.

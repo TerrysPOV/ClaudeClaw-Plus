@@ -22,6 +22,7 @@ import {
   type TelemetryStream,
 } from "../skills-tuner/core/telemetry.js";
 import { MCP_TOOL_CALL_STREAM } from "./tool-call.js";
+import { DEFAULT_TOOL_CALL_LOG } from "./tool-call-sink.js";
 
 interface ToolCallRecord {
   event?: string;
@@ -34,7 +35,10 @@ export class McpToolCallTelemetryProducer implements TelemetryProvider {
   private readonly path: string;
 
   constructor(opts: { logPath?: string } = {}) {
-    this.path = (opts.logPath ?? "").replace(/^~/, homedir());
+    // Default to the same log ToolCallSink writes, so the producer is available
+    // out of the box (matching the sink) instead of permanently returning [] when
+    // a caller forgets to pass a path.
+    this.path = (opts.logPath ?? DEFAULT_TOOL_CALL_LOG).replace(/^~/, homedir());
   }
 
   contractVersion(): string {
