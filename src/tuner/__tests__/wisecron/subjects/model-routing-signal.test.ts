@@ -21,6 +21,15 @@ function makeCostDb(path: string, rows: Array<[string, number]>): void {
   db.close();
 }
 
+// readDailyCost filters `date >= date('now','-30 days')`, so seed dates must be
+// generated RELATIVE to today or the fixtures fall out of the window over time
+// and the tests go stale/flaky (Copilot review on #292).
+function daysAgo(n: number): string {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() - n);
+  return d.toISOString().slice(0, 10);
+}
+
 describe("model-routing-signal — graceful on a bad cost DB (no loop stall)", () => {
   let dir: string;
   beforeEach(() => {
@@ -52,7 +61,7 @@ describe("model-routing-signal — absolute-cost path needs >=4 days", () => {
 
   it("a single outlier day over the cap does NOT set degraded", () => {
     const db = join(dir, "costs.db");
-    makeCostDb(db, [["2026-06-30", 30]]); // one day, $30, cap 25
+    makeCostDb(db, [[daysAgo(0), 30]]); // one day, $30, cap 25
     const sig = costSignal(db, 25);
     expect(sig.days).toBe(1);
     expect(sig.degraded).toBe(false); // pre-fix this was true
@@ -61,10 +70,10 @@ describe("model-routing-signal — absolute-cost path needs >=4 days", () => {
   it("recent-over-cap DOES degrade once >=4 days are present", () => {
     const db = join(dir, "costs.db");
     makeCostDb(db, [
-      ["2026-06-27", 2],
-      ["2026-06-28", 2],
-      ["2026-06-29", 2],
-      ["2026-06-30", 30], // recent day well over cap, with enough history
+      [daysAgo(3), 2],
+      [daysAgo(2), 2],
+      [daysAgo(1), 2],
+      [daysAgo(0), 30], // recent day well over cap, with enough history
     ]);
     const sig = costSignal(db, 25);
     expect(sig.days).toBe(4);

@@ -13,6 +13,15 @@ function makeCostDb(path: string, rows: Array<[string, number]>): void {
     db.run("INSERT INTO session_costs (date, cost_usd) VALUES (?1, ?2)", [date, c]);
   db.close();
 }
+
+// Seed dates RELATIVE to today: readDailyCost filters `date >= date('now','-30
+// days')`, so hard-coded fixtures would drift out of the window over time and
+// make these tests flaky (Copilot review on #292).
+function daysAgo(n: number): string {
+  const d = new Date();
+  d.setUTCDate(d.getUTCDate() - n);
+  return d.toISOString().slice(0, 10);
+}
 const ev = (o: Partial<StructuredEvidence> = {}): StructuredEvidence => ({
   technique: "cost-aware-routing",
   independentSources: 5,
@@ -48,14 +57,14 @@ describe("ModelRoutingSubject — EvidenceDrivenSubject (proactive)", () => {
 
   it("localSignal: RISING cost trend → degraded", async () => {
     makeCostDb(dbPath, [
-      ["2026-06-20", 1],
-      ["2026-06-21", 1],
-      ["2026-06-22", 1],
-      ["2026-06-23", 1],
-      ["2026-06-27", 5],
-      ["2026-06-28", 6],
-      ["2026-06-29", 7],
-      ["2026-06-30", 8],
+      [daysAgo(7), 1],
+      [daysAgo(6), 1],
+      [daysAgo(5), 1],
+      [daysAgo(4), 1],
+      [daysAgo(3), 5],
+      [daysAgo(2), 6],
+      [daysAgo(1), 7],
+      [daysAgo(0), 8],
     ]);
     const sig = await subj().localSignal();
     expect(sig.metric).toBe("session_cost_usd");
@@ -65,12 +74,12 @@ describe("ModelRoutingSubject — EvidenceDrivenSubject (proactive)", () => {
 
   it("localSignal: FLAT cost → not degraded", async () => {
     makeCostDb(dbPath, [
-      ["2026-06-20", 2],
-      ["2026-06-21", 2],
-      ["2026-06-22", 2],
-      ["2026-06-23", 2],
-      ["2026-06-27", 2],
-      ["2026-06-28", 2],
+      [daysAgo(5), 2],
+      [daysAgo(4), 2],
+      [daysAgo(3), 2],
+      [daysAgo(2), 2],
+      [daysAgo(1), 2],
+      [daysAgo(0), 2],
     ]);
     expect((await subj().localSignal()).degraded).toBe(false);
   });
@@ -97,8 +106,8 @@ describe("ModelRoutingSubject — EvidenceDrivenSubject (proactive)", () => {
   });
   it("confirm: cost improved (after < before) → true", async () => {
     makeCostDb(dbPath, [
-      ["2026-06-29", 1],
-      ["2026-06-30", 1],
+      [daysAgo(1), 1],
+      [daysAgo(0), 1],
     ]);
     expect(await subj().confirm({ ...degraded, value: 999 })).toBe(true);
   });
