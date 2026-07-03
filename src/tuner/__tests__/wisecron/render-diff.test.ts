@@ -61,6 +61,17 @@ describe("renderDiff — truncation", () => {
     const d = renderDiff("a\n", "b\n", { maxBytes: 2048 });
     expect(d).not.toContain("[diff truncated]");
   });
+
+  it("caps on real UTF-8 bytes, not UTF-16 length (multibyte content)", () => {
+    // Each 😀 is 1 JS string unit but 4 UTF-8 bytes. A char-based cap would let
+    // ~256 of them (~1KB) through; the byte cap must hold the real byte size.
+    const big = Array.from({ length: 500 }, () => "😀😀😀😀").join("\n");
+    const d = renderDiff("", big, { maxBytes: 256 });
+    expect(Buffer.byteLength(d, "utf8")).toBeLessThanOrEqual(256);
+    expect(d).toContain("[diff truncated]");
+    // And it never leaves a broken (replacement) character at the cut.
+    expect(d).not.toContain("�");
+  });
 });
 
 describe("renderDiff — reorder detection", () => {

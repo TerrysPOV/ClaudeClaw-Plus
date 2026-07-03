@@ -23,6 +23,21 @@ export interface RenderDiffOptions {
   toLabel?: string;
 }
 
+/** UTF-8 byte length of a string (what a chat/Block-Kit limit actually counts). */
+function byteLen(s: string): number {
+  return Buffer.byteLength(s, "utf8");
+}
+
+/** Truncate to at most `maxBytes` UTF-8 bytes without splitting a multibyte char. */
+function truncateToBytes(s: string, maxBytes: number): string {
+  const buf = Buffer.from(s, "utf8");
+  if (buf.length <= maxBytes) return s;
+  let end = Math.max(0, maxBytes);
+  // Back up out of the middle of a multibyte sequence (continuation byte = 10xxxxxx).
+  while (end > 0 && (buf[end]! & 0xc0) === 0x80) end--;
+  return buf.toString("utf8", 0, end);
+}
+
 export function renderDiff(
   original: string,
   modified: string,
@@ -87,10 +102,12 @@ export function renderDiff(
   for (const l of added) bodyLines.push(`+${l}`);
   let body = bodyLines.join("\n");
 
-  if (header.length + body.length > max) {
-    const trailer = "\n... [diff truncated]";
-    const room = Math.max(0, max - header.length - trailer.length);
-    body = body.slice(0, room) + trailer;
+  // Cap on real UTF-8 bytes, not UTF-16 code units: `.length` under-counts a
+  // multi-byte-heavy diff (emoji/CJK) and would blow past a byte-based chat limit.
+  const trailer = "\n... [diff truncated]";
+  if (byteLen(header) + byteLen(body) > max) {
+    const room = Math.max(0, max - byteLen(header) - byteLen(trailer));
+    body = truncateToBytes(body, room) + trailer;
   }
   return header + body;
 }
