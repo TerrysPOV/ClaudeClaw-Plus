@@ -112,9 +112,12 @@ describe("skill_access producer — hook integration", () => {
     mkdirSync(skillsDir, { recursive: true });
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
-  const run = (payload: unknown) =>
+  const run = (payload: unknown) => runRaw(JSON.stringify(payload));
+  // Sends the stdin bytes verbatim (no JSON.stringify) so we can feed genuinely
+  // malformed JSON, not a valid JSON string.
+  const runRaw = (input: string) =>
     spawnSync("node", [HOOK], {
-      input: JSON.stringify(payload),
+      input,
       env: { ...process.env, CLAUDECLAW_SKILL_ACCESS_LOG: log, CLAUDECLAW_SKILLS_DIR: skillsDir },
       encoding: "utf8",
     });
@@ -141,9 +144,13 @@ describe("skill_access producer — hook integration", () => {
     expect(existsSync(log)).toBe(false); // resolved target is outside skills → not logged
   });
 
-  it("never errors on malformed input (does not block the tool)", () => {
-    const r = run("not json at all" as unknown);
-    expect(r.status).toBe(0);
+  it("never errors on genuinely malformed JSON (does not block the tool)", () => {
+    // Raw bytes, NOT JSON.stringify'd — this actually breaks JSON.parse (a bare
+    // stringified value would have parsed fine and not exercised the catch).
+    for (const bad of ["{ broken", "not json at all", "", "{"]) {
+      const r = runRaw(bad);
+      expect(r.status).toBe(0);
+    }
     expect(existsSync(log)).toBe(false);
   });
 });

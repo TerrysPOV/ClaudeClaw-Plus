@@ -5,7 +5,10 @@
  *
  * This is the producer the `skill_access` telemetry stream consumes (see the
  * SkillAccessTelemetryProducer, host telemetry). Without it the stream is declared
- * but inert. Zero dependencies (Node only). Never blocks or fails the tool.
+ * but inert. Zero dependencies (Node only). Runs as a separate process off the
+ * agent's loop and never *fails* the tool: it swallows every error and does only a
+ * tiny synchronous local append (a rotate + one line), so its latency is bounded
+ * and it can't wedge the caller.
  *
  *   log path:   $CLAUDECLAW_SKILL_ACCESS_LOG  (default ~/.config/tuner/skill_accesses.jsonl)
  *   skills dir: $CLAUDECLAW_SKILLS_DIR         (default ~/.claude/skills)
@@ -65,7 +68,9 @@ export function skillAccessEntry(payload, skillsDir, nowIso) {
 
 // Run as a hook (stdin = the PostToolUse JSON). The guard uses pathToFileURL so it
 // is correct under percent-encoding (spaces) and on Windows — not a raw concat.
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// `resolve()` first: pathToFileURL requires an ABSOLUTE path, but argv[1] can be
+// relative (`node ./hooks/log-skill-access.mjs`), which would otherwise throw.
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   process.stdin.on("error", () => {}); // a stream error must never crash the hook
   let input = "";
   process.stdin.setEncoding("utf8");
