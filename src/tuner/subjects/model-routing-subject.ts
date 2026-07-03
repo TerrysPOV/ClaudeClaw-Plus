@@ -1,6 +1,13 @@
-import { existsSync, copyFileSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  copyFileSync,
+  readFileSync,
+  writeFileSync,
+  lstatSync,
+  realpathSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { BaseSubject } from "../../skills-tuner/subjects/base.js";
 import { sanitizeObservationContent } from "../../skills-tuner/core/security.js";
 import type { LLMClient } from "../../skills-tuner/core/llm.js";
@@ -239,8 +246,14 @@ export class ModelRoutingSubject extends BaseSubject implements RevertibleSubjec
     // Confinement: the only file this subject may write is its managed modes config.
     this.assertManagedTarget(proposal.target_path);
 
-    if (existsSync(proposal.target_path)) {
-      copyFileSync(proposal.target_path, `${proposal.target_path}.bak`);
+    // Never overwrite an existing .bak. On a double-apply (e.g. an operator
+    // re-applies after a crash between apply and the gate's status flip) the
+    // target already holds applied content — re-copying would destroy the
+    // pristine original backup and make a later revert restore applied-not-
+    // original. Keep the first .bak as the true pre-apply snapshot.
+    const bak = `${proposal.target_path}.bak`;
+    if (existsSync(proposal.target_path) && !existsSync(bak)) {
+      copyFileSync(proposal.target_path, bak);
     }
     writeFileSync(proposal.target_path, alt.diff_or_content, "utf8");
     return {
@@ -286,12 +299,18 @@ export class ModelRoutingSubject extends BaseSubject implements RevertibleSubjec
   }
 
   /**
-   * Observation-window health probe (MEDIUM risk). Runs AFTER apply: re-reads
-   * the just-applied modes config and re-runs validate() — the config must
-   * still parse as YAML and carry no duplicate keyword across modes (the exact
-   * collision that causes mis-routing). Failed on a parse error or a
-   * duplicate-keyword regression. Artifact-based + deterministic. A file gone
-   * from disk is not a break.
+   * Artifact health probe: re-reads the modes config and re-runs validate() —
+   * the config must still parse as YAML and carry no duplicate keyword across
+   * modes (the exact collision that causes mis-routing). Reports a parse error
+   * or a duplicate-keyword regression. Deterministic; a file gone from disk is
+   * not a break.
+   *
+   * NOTE: this subject is MEDIUM risk, and the ApplyPipeline only arms the
+   * post-apply observation-window auto-revert for HIGH/critical tiers. So this
+   * probe is NOT invoked automatically after apply — it is an explicit/operator
+   * check (and shares its logic with the validate() gate and the
+   * duplicate-keyword fitness signal). It is deliberately not wired to
+   * auto-revert; do not read the presence of this method as "medium auto-reverts".
    */
   async healthProbe(target: string): Promise<{ failed: boolean; errors: string[] }> {
     if (!existsSync(target)) return { failed: false, errors: [] };
@@ -316,9 +335,33 @@ export class ModelRoutingSubject extends BaseSubject implements RevertibleSubjec
     writeFileSync(inversePatch.target_path, inversePatch.applied_content, "utf8");
   }
 
-  /** The only writable file: the managed modes config. Anything else -> throw. */
+  /**
+   * The subject's declared managed surface — the ONLY path it may write. The
+   * wisecron gate reads this to reject an externally-injected proposal whose
+   * target_path falls outside it, so a self-signed research proposal cannot be
+   * driven to an arbitrary file write even if a subject forgot its own guard.
+   * Returned real-path-resolved (parent dir dereferenced) for a stable compare.
+   */
+  managedTargets(): string[] {
+    return [realResolvePath(this.modesConfigPath)];
+  }
+
+  /**
+   * The only writable file: the managed modes config. Anything else -> throw.
+   *
+   * Hardened against symlink redirection: `resolve()` normalises `../` but does
+   * NOT dereference symlinks, and writeFileSync/copyFileSync FOLLOW links — so a
+   * managed path that is (or sits behind) a symlink pointing at engine code
+   * would pass a naive compare yet write THROUGH the link. We (a) refuse a
+   * target that is itself a symlink (O_NOFOLLOW semantics) and (b) compare
+   * REAL paths (parent dir dereferenced via realpath) so a symlinked parent
+   * cannot smuggle the write outside the managed config.
+   */
   private assertManagedTarget(target: string): void {
-    if (resolve(target) !== resolve(this.modesConfigPath)) {
+    if (isSymlinkPath(target)) {
+      throw new Error(`target_path is a symlink — refusing to write through it: ${target}`);
+    }
+    if (realResolvePath(target) !== realResolvePath(this.modesConfigPath)) {
       throw new Error(`target_path is not the managed modes config: ${target}`);
     }
   }
@@ -468,6 +511,31 @@ export class ModelRoutingSubject extends BaseSubject implements RevertibleSubjec
 function expandHome(p: string): string {
   if (p.startsWith("~/")) return join(homedir(), p.slice(2));
   return p;
+}
+
+/**
+ * Resolve a path to its REAL location: dereference the (existing) parent
+ * directory via realpath, then re-attach the basename. This normalises `../`
+ * AND collapses symlinked parent dirs, without dereferencing a final-component
+ * symlink (that is refused separately). Falls back to a plain resolve() when
+ * the parent does not exist yet (a not-yet-created target).
+ */
+function realResolvePath(p: string): string {
+  const abs = resolve(expandHome(p));
+  try {
+    return join(realpathSync(dirname(abs)), basename(abs));
+  } catch {
+    return abs;
+  }
+}
+
+/** True when `p` exists and is a symbolic link (write would follow it). */
+function isSymlinkPath(p: string): boolean {
+  try {
+    return lstatSync(resolve(expandHome(p))).isSymbolicLink();
+  } catch {
+    return false;
+  }
 }
 
 function mk(

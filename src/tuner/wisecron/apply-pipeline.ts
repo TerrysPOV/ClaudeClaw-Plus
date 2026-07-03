@@ -1,6 +1,13 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  lstatSync,
+  realpathSync,
+} from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import type { Registry } from "../../skills-tuner/core/registry.js";
 import type { Patch, Proposal } from "../../skills-tuner/core/types.js";
@@ -167,15 +174,15 @@ export class ApplyPipeline {
 
         const forward_patch = await subject.apply(proposal, alternativeId);
 
-        // Git-commit the applied target (when it lives in a repo) for a clean,
-        // revertible trail alongside the .bak + inverse_patch.
-        const commit_sha = commitAppliedTarget(
-          forward_patch.target_path,
-          `[tuner] ${proposal.subject} proposal #${proposal.id} (alt ${alternativeId}) via ${appliedBy}`,
-        );
-
+        // Validate BEFORE committing or recording. subject.apply already wrote
+        // the new content to disk, so on a validation failure we must roll the
+        // on-disk state back to the pre-apply snapshot AND leave NO git commit
+        // and NO rollback_history row behind — otherwise a broken config (the
+        // very mistrigger these proposals fix) would be persisted + committed
+        // with no DB revision to revert it.
         const validation = await subject.validate(forward_patch);
         if (!validation.valid) {
+          await this.restoreInverse(subject, inverse_patch);
           this.audit("wisecron_validate_failed", {
             proposal_id: proposal.id,
             subject: proposal.subject,
@@ -183,6 +190,14 @@ export class ApplyPipeline {
           });
           throw new Error(`ApplyPipeline: forward_patch failed validation: ${validation.reason}`);
         }
+
+        // Only now that the change is known-valid: git-commit the applied target
+        // (when it lives in a repo) for a clean, revertible trail alongside the
+        // .bak + inverse_patch.
+        const commit_sha = commitAppliedTarget(
+          forward_patch.target_path,
+          `[tuner] ${proposal.subject} proposal #${proposal.id} (alt ${alternativeId}) via ${appliedBy}`,
+        );
 
         const id = this.db.recordApply({
           proposal_id: String(proposal.id),
@@ -271,7 +286,11 @@ export class ApplyPipeline {
       if (subjectWithRevert && typeof subjectWithRevert.revert === "function") {
         await subjectWithRevert.revert(inverse);
       } else {
-        // Generic fallback: overwrite target_path with inverse content.
+        // Generic fallback: overwrite target_path with inverse content. This
+        // path bypasses the subject's own revert()/assertManagedTarget guard,
+        // so confine it here — refuse to write through a symlink, and enforce
+        // the subject's declared managed surface when it exposes one.
+        assertRevertTargetConfined(subject, inverse.target_path);
         this.writeTarget(inverse.target_path, inverse.applied_content);
       }
 
@@ -389,6 +408,36 @@ export class ApplyPipeline {
   }
 
   /**
+   * Roll a just-written-but-invalid apply back to its pre-apply snapshot. Used
+   * on the validate-failure path so a rejected change is never left on disk.
+   * Routes through the subject's own `revert()` (which re-asserts confinement)
+   * when available, else the confined generic writeTarget. Best-effort: a
+   * failure here is audited but never masks the original validation error — the
+   * .bak the subject wrote remains on disk for manual recovery.
+   */
+  private async restoreInverse(subject: unknown, inversePatch: Patch): Promise<void> {
+    const inverse: Patch = {
+      target_path: inversePatch.target_path,
+      kind: inversePatch.kind,
+      applied_content: inversePatch.applied_content,
+    };
+    const subjectWithRevert = subject as unknown as Partial<RevertibleSubject> | undefined;
+    try {
+      if (subjectWithRevert && typeof subjectWithRevert.revert === "function") {
+        await subjectWithRevert.revert(inverse);
+      } else {
+        assertRevertTargetConfined(subject, inverse.target_path);
+        this.writeTarget(inverse.target_path, inverse.applied_content);
+      }
+    } catch (err) {
+      this.audit("wisecron_validate_restore_failed", {
+        target_path: inverse.target_path,
+        error: (err as Error).message.slice(0, 160),
+      });
+    }
+  }
+
+  /**
    * Serialize work touching the same target_path. Both apply() and revert()
    * go through this. The lock is keyed on target path; tests use it to
    * assert ordering guarantees.
@@ -425,6 +474,45 @@ export class ApplyPipeline {
         if (entry.waiters <= 0) this.locks.delete(targetPath);
       }
     }
+  }
+}
+
+// ── Confinement helpers (revert path) ──────────────────────────────────────
+
+/**
+ * Confine a generic (subject-less) revert write. The subject's own revert()
+ * enforces its managed surface; this fallback runs when the subject has none,
+ * so it enforces what it safely can: (a) never write THROUGH a symlink (a
+ * writeFileSync follows it, which could redirect the write into engine code),
+ * and (b) membership in the subject's declared `managedTargets()` when exposed.
+ */
+function assertRevertTargetConfined(subject: unknown, target: string): void {
+  if (isSymlinkPath(target)) {
+    throw new Error(`ApplyPipeline.revert: refusing to write through symlink target: ${target}`);
+  }
+  const s = subject as { managedTargets?: () => string[] } | undefined;
+  if (s && typeof s.managedTargets === "function") {
+    const managed = s.managedTargets().map(realResolvePath);
+    if (!managed.includes(realResolvePath(target))) {
+      throw new Error(`ApplyPipeline.revert: target outside managed surface: ${target}`);
+    }
+  }
+}
+
+function realResolvePath(p: string): string {
+  const abs = resolve(p);
+  try {
+    return join(realpathSync(dirname(abs)), basename(abs));
+  } catch {
+    return abs;
+  }
+}
+
+function isSymlinkPath(p: string): boolean {
+  try {
+    return lstatSync(resolve(p)).isSymbolicLink();
+  } catch {
+    return false;
   }
 }
 

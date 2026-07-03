@@ -129,7 +129,7 @@ describe("tuner__propose", () => {
 
     const pending = db.listProposals("pending");
     expect(pending).toHaveLength(1);
-    expect(pending[0]!.id).toBe("7");
+    expect(pending[0]?.id).toBe("7");
     expect(auditEvents.some((e) => e.event === "gate_propose")).toBe(true);
   });
 
@@ -159,7 +159,7 @@ describe("tuner__propose_external (research injection)", () => {
 
     const pending = db.listProposals("pending");
     expect(pending).toHaveLength(1);
-    expect(pending[0]!.proposal.pattern_signature.startsWith("research:")).toBe(true);
+    expect(pending[0]?.proposal.pattern_signature.startsWith("research:")).toBe(true);
     expect(
       auditEvents.some((e) => e.event === "gate_propose" && e.detail?.source === "research"),
     ).toBe(true);
@@ -184,6 +184,49 @@ describe("tuner__propose_external (research injection)", () => {
         alternatives: [{ id: "a", diff_or_content: "c" }],
       }),
     ).rejects.toThrow(/not registered/);
+  });
+
+  it("rejects a target_path OUTSIDE the subject's declared managed surface (gate scope guard)", async () => {
+    // A subject that declares its managed surface. The gate must reject an
+    // injected target_path outside it BEFORE persisting+signing — the self-sign
+    // means apply's signature check gives no protection here.
+    const managedPath = join(tmpDir, "agentic.yaml");
+    const registry = {
+      allSubjects: () => [{ name: "guarded" }],
+      getSubject: (n: string) =>
+        n === "guarded" ? { name: "guarded", managedTargets: () => [managedPath] } : undefined,
+    };
+    registerWisecronGateTools(bridge, makeBundle({ registry }));
+
+    await expect(
+      bridge.invokeTool(TUNER_PROPOSE_EXTERNAL_TOOL, {
+        subject: "guarded",
+        target_path: join(tmpDir, "engine.ts"),
+        pattern_signature: "malicious",
+        alternatives: [{ id: "a", diff_or_content: "PWNED", label: "", tradeoff: "" }],
+      }),
+    ).rejects.toThrow(/outside the managed surface/);
+    // Nothing persisted.
+    expect(db.listProposals("pending")).toHaveLength(0);
+  });
+
+  it("accepts a target_path INSIDE the declared managed surface", async () => {
+    const managedPath = join(tmpDir, "agentic.yaml");
+    const registry = {
+      allSubjects: () => [{ name: "guarded" }],
+      getSubject: (n: string) =>
+        n === "guarded" ? { name: "guarded", managedTargets: () => [managedPath] } : undefined,
+    };
+    registerWisecronGateTools(bridge, makeBundle({ registry }));
+
+    const res = (await bridge.invokeTool(TUNER_PROPOSE_EXTERNAL_TOOL, {
+      subject: "guarded",
+      target_path: managedPath,
+      pattern_signature: "legit",
+      alternatives: [{ id: "a", diff_or_content: "modes: {}\n", label: "", tradeoff: "" }],
+    })) as { deduped: boolean };
+    expect(res.deduped).toBe(false);
+    expect(db.listProposals("pending")).toHaveLength(1);
   });
 });
 
@@ -243,7 +286,7 @@ describe("tuner__apply", () => {
     };
     expect(res.revision_id).toBe(42);
     expect(res.alt).toBe("a1");
-    expect(db.getStoredProposal("5")!.status).toBe("applied");
+    expect(db.getStoredProposal("5")?.status).toBe("applied");
     expect(auditEvents.some((e) => e.event === "gate_apply")).toBe(true);
   });
 
@@ -276,6 +319,39 @@ describe("tuner__apply", () => {
     registerWisecronGateTools(bridge, makeBundle());
     await expect(bridge.invokeTool(TUNER_APPLY_TOOL, { id: "999" })).rejects.toThrow(/not found/);
   });
+
+  it("re-apply after a crash before the status flip RECONCILES, it does not re-apply", async () => {
+    // Proposal is still pending but a live revision already exists on disk (the
+    // apply persisted, the status flip did not). A naive re-apply would corrupt
+    // the .bak + inverse. The gate must reconcile to the existing revision.
+    seedPending(30);
+    const rev = db.recordApply({
+      proposal_id: "30",
+      subject: "fake",
+      forward_patch: { target_path: join(tmpDir, "t.txt"), kind: "patch", applied_content: "new" },
+      inverse_patch: { target_path: join(tmpDir, "t.txt"), kind: "patch", applied_content: "old" },
+      applied_by: "mcp",
+    });
+    let reapplied = false;
+    const pipeline = {
+      apply: async () => {
+        reapplied = true;
+        throw new Error("must not re-apply over a live revision");
+      },
+      revert: async () => {},
+    };
+    registerWisecronGateTools(bridge, makeBundle({ pipeline }));
+
+    const res = (await bridge.invokeTool(TUNER_APPLY_TOOL, { id: "30" })) as {
+      revision_id: number;
+    };
+    expect(reapplied).toBe(false);
+    expect(res.revision_id).toBe(rev);
+    expect(db.getStoredProposal("30")?.status).toBe("applied");
+    expect(auditEvents.some((e) => e.event === "gate_apply" && e.detail?.reconciled === true)).toBe(
+      true,
+    );
+  });
 });
 
 describe("tuner__refuse", () => {
@@ -284,7 +360,7 @@ describe("tuner__refuse", () => {
     registerWisecronGateTools(bridge, makeBundle());
     const res = (await bridge.invokeTool(TUNER_REFUSE_TOOL, { id: "8" })) as { status: string };
     expect(res.status).toBe("refused");
-    expect(db.getStoredProposal("8")!.status).toBe("refused");
+    expect(db.getStoredProposal("8")?.status).toBe("refused");
     expect(auditEvents.some((e) => e.event === "gate_refuse")).toBe(true);
   });
 });

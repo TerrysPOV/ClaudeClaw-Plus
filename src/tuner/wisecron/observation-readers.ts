@@ -166,10 +166,16 @@ export function hookExecReader(dir: string, since: Date): HookLogEntryShape[] {
         const tsRaw = o.ts as string | number | undefined;
         const ts = tsRaw ? new Date(tsRaw) : new Date();
         if (Number.isNaN(ts.getTime()) || ts < since) continue;
+        // Non-numeric duration/exit_code → NaN. Skip the row rather than emit a
+        // NaN metric value that poisons downstream aggregation.
+        const durationMs = Number(o.duration_ms ?? 0);
+        if (!Number.isFinite(durationMs)) continue;
+        const exitCodeRaw = Number(o.exit_code ?? 0);
+        const exitCode = Number.isFinite(exitCodeRaw) ? exitCodeRaw : 0;
         out.push({
           hook: (o.hook as string) ?? f.replace(/\.(jsonl|log)$/, ""),
-          exitCode: Number(o.exit_code ?? 0),
-          durationMs: Number(o.duration_ms ?? 0),
+          exitCode,
+          durationMs,
           eventType: (o.event as string) ?? "unknown",
           timestamp: ts,
         });

@@ -68,6 +68,22 @@ class ScriptedSubject extends TunableSubject {
   }
 }
 
+/** ScriptedSubject that also reports a fixed sample count per metric. */
+class CountingScriptedSubject extends ScriptedSubject {
+  constructor(
+    name: string,
+    risk_tier: RiskTier,
+    metrics: Metric[],
+    script: Array<Record<string, number>>,
+    private readonly counts: Record<string, number>,
+  ) {
+    super(name, risk_tier, metrics, script);
+  }
+  async measureFitnessCounts(): Promise<Record<string, number>> {
+    return this.counts;
+  }
+}
+
 function proposal(id: number, subject: string): Proposal {
   return {
     id,
@@ -172,7 +188,7 @@ describe("OutcomeRecorder — baseline → maturation → verdict", () => {
       },
     });
     expect(results).toHaveLength(1);
-    expect(results[0]!.verdict).toBe("improved");
+    expect(results[0]?.verdict).toBe("improved");
     expect(reverts).toEqual([]); // no revert on improvement
     expect(audit.all().some((r) => r.event === "verdict" && r.detail?.verdict === "improved")).toBe(
       true,
@@ -207,9 +223,9 @@ describe("OutcomeRecorder — baseline → maturation → verdict", () => {
         return tier === "low"; // low auto-reverts
       },
     });
-    expect(results[0]!.verdict).toBe("regressed");
+    expect(results[0]?.verdict).toBe("regressed");
     expect(routedTier).toBe("low");
-    expect(results[0]!.reverted).toBe(true);
+    expect(results[0]?.reverted).toBe(true);
   });
 
   it("verdict=regressed and HIGH-risk enqueues for human (no auto-revert)", async () => {
@@ -236,8 +252,8 @@ describe("OutcomeRecorder — baseline → maturation → verdict", () => {
     const results = await rec.runMaturation({
       revert: async (_id, tier) => tier === "low", // high → false (enqueued)
     });
-    expect(results[0]!.verdict).toBe("regressed");
-    expect(results[0]!.reverted).toBe(false);
+    expect(results[0]?.verdict).toBe("regressed");
+    expect(results[0]?.reverted).toBe(false);
     expect(
       audit.all().some((r) => r.event === "revert" && r.actor === "system:enqueued-for-human"),
     ).toBe(true);
@@ -269,7 +285,7 @@ describe("OutcomeRecorder — baseline → maturation → verdict", () => {
     await rec.snapshotBaseline(proposal(4, "cron"));
     t = new Date("2026-05-10T00:00:00Z");
     const results = await rec.runMaturation({});
-    expect(results[0]!.verdict).toBe("regressed");
+    expect(results[0]?.verdict).toBe("regressed");
   });
 
   it("does not mature rows before their window_end", async () => {
@@ -289,6 +305,171 @@ describe("OutcomeRecorder — baseline → maturation → verdict", () => {
     t = new Date("2026-05-03T00:00:00Z");
     const results = await rec.runMaturation({});
     expect(results).toEqual([]);
-    expect(db.getOutcomes("5")[0]!.verdict).toBeNull();
+    expect(db.getOutcomes("5")[0]?.verdict).toBeNull();
+  });
+
+  // ── fix 2: minimum-N guard threaded end-to-end ────────────────────────────
+  it("does not decide on N=1 even when the target improved (sample-size guard)", async () => {
+    const registry = new Registry();
+    const provider: TelemetryProvider = {
+      contractVersion: () => "1.0.0",
+      capabilities: () => [{ stream: "session_cost", schemaVersion: "1.0.0", available: true }],
+      query: async () => [],
+    };
+    const c: Metric = { ...cost, guardrails: [] };
+    // cost drops 100→50 (would be 'improved') but only 1 sample backs it.
+    const subj = new CountingScriptedSubject(
+      "cron",
+      "high",
+      [c],
+      [{ cron_cost: 100 }, { cron_cost: 50 }],
+      { cron_cost: 1 },
+    );
+    registry.registerSubject(subj);
+    let t = new Date("2026-05-01T00:00:00Z");
+    // minSamples defaults to 2.
+    const rec = new OutcomeRecorder(registry, db, provider, new AuditLog(), () => t);
+    await rec.snapshotBaseline(proposal(6, "cron"));
+    t = new Date("2026-05-10T00:00:00Z");
+    const results = await rec.runMaturation({});
+    expect(results[0]?.verdict).toBe("neutral");
+  });
+
+  // ── fix 3: un-measurable row finalizes after the grace period ─────────────
+  it("finalizes an un-measurable row to neutral after grace so it exits pending", async () => {
+    const registry = new Registry();
+    const provider: TelemetryProvider = {
+      contractVersion: () => "1.0.0",
+      capabilities: () => [{ stream: "session_cost", schemaVersion: "1.0.0", available: true }],
+      query: async () => [],
+    };
+    const c: Metric = { ...cost, guardrails: [] };
+    // baseline measures, but the post window yields NOTHING (telemetry gap).
+    const subj = new ScriptedSubject("cron", "high", [c], [{ cron_cost: 100 }, {}]);
+    registry.registerSubject(subj);
+    let t = new Date("2026-05-01T00:00:00Z");
+    // grace = 0 days → finalize as soon as window_end passes.
+    const rec = new OutcomeRecorder(
+      registry,
+      db,
+      provider,
+      new AuditLog(),
+      () => t,
+      undefined,
+      2,
+      0,
+    );
+    await rec.snapshotBaseline(proposal(7, "cron"));
+    t = new Date("2026-05-10T00:00:00Z");
+    const results = await rec.runMaturation({});
+    expect(results).toEqual([]); // no target to decide
+    expect(db.getOutcomes("7")[0]?.verdict).toBe("neutral"); // terminal, not NULL
+    expect(db.listMaturableOutcomes(t)).toHaveLength(0); // exited the pending set
+  });
+
+  it("keeps an un-measurable row pending while still inside the grace period", async () => {
+    const registry = new Registry();
+    const provider: TelemetryProvider = {
+      contractVersion: () => "1.0.0",
+      capabilities: () => [{ stream: "session_cost", schemaVersion: "1.0.0", available: true }],
+      query: async () => [],
+    };
+    const c: Metric = { ...cost, guardrails: [] };
+    const subj = new ScriptedSubject("cron", "high", [c], [{ cron_cost: 100 }, {}]);
+    registry.registerSubject(subj);
+    let t = new Date("2026-05-01T00:00:00Z");
+    // grace = 30 days.
+    const rec = new OutcomeRecorder(
+      registry,
+      db,
+      provider,
+      new AuditLog(),
+      () => t,
+      undefined,
+      2,
+      30,
+    );
+    await rec.snapshotBaseline(proposal(8, "cron"));
+    // window_end = 05-08; asOf = 05-10 is past it but well within 30d grace.
+    t = new Date("2026-05-10T00:00:00Z");
+    const results = await rec.runMaturation({});
+    expect(results).toEqual([]);
+    expect(db.getOutcomes("8")[0]?.verdict).toBeNull(); // still pending
+    expect(db.listMaturableOutcomes(t)).toHaveLength(1);
+  });
+
+  // ── fix 4: explicit target selection, not declaration order ───────────────
+  it("selects the target by guardrail relationship, not declaration order", async () => {
+    const registry = new Registry();
+    const provider: TelemetryProvider = {
+      contractVersion: () => "1.0.0",
+      capabilities: () => [
+        { stream: "session_cost", schemaVersion: "1.0.0", available: true },
+        { stream: "cron_run", schemaVersion: "1.0.0", available: true },
+      ],
+      query: async () => [],
+    };
+    // Guardrail metric declared FIRST — under declaration order it would wrongly
+    // be treated as the target. `cost` declares guardrails → it is the target.
+    const subj = new ScriptedSubject(
+      "cron",
+      "high",
+      [guardrail, cost],
+      [
+        { cron_cost: 100, critical_fire_success: 1.0 },
+        { cron_cost: 70, critical_fire_success: 1.0 },
+      ],
+    );
+    registry.registerSubject(subj);
+    let t = new Date("2026-05-01T00:00:00Z");
+    const rec = new OutcomeRecorder(registry, db, provider, new AuditLog(), () => t);
+    await rec.snapshotBaseline(proposal(9, "cron"));
+    t = new Date("2026-05-10T00:00:00Z");
+    const results = await rec.runMaturation({});
+    expect(results[0]?.target_metric).toBe("cron_cost");
+    expect(results[0]?.verdict).toBe("improved");
+  });
+
+  it("honors an explicit isTarget flag over declaration order", async () => {
+    const registry = new Registry();
+    const provider: TelemetryProvider = {
+      contractVersion: () => "1.0.0",
+      capabilities: () => [{ stream: "session_cost", schemaVersion: "1.0.0", available: true }],
+      query: async () => [],
+    };
+    // Two bare metrics, neither declares/uses guardrails. `alpha` is declared
+    // first but `beta` carries isTarget → beta must be the decided metric.
+    const alpha: Metric = {
+      name: "alpha",
+      source: "session_cost",
+      kind: "verifiable",
+      direction: "lower_is_better",
+      windowDays: 7,
+    };
+    const beta: Metric & { isTarget?: boolean } = {
+      name: "beta",
+      source: "session_cost",
+      kind: "verifiable",
+      direction: "lower_is_better",
+      windowDays: 7,
+      isTarget: true,
+    };
+    const subj = new ScriptedSubject(
+      "cron",
+      "high",
+      [alpha, beta],
+      [
+        { alpha: 100, beta: 100 },
+        { alpha: 100, beta: 70 }, // alpha flat, beta improves
+      ],
+    );
+    registry.registerSubject(subj);
+    let t = new Date("2026-05-01T00:00:00Z");
+    const rec = new OutcomeRecorder(registry, db, provider, new AuditLog(), () => t);
+    await rec.snapshotBaseline(proposal(10, "cron"));
+    t = new Date("2026-05-10T00:00:00Z");
+    const results = await rec.runMaturation({});
+    expect(results[0]?.target_metric).toBe("beta");
+    expect(results[0]?.verdict).toBe("improved");
   });
 });
