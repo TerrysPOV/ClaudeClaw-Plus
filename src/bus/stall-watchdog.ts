@@ -113,6 +113,58 @@ export function ceilingFor(name: string, ceilings: StallCeilings): ToolCeiling {
   return ceilings[classifyTool(name)];
 }
 
+/* ── Config parsing (mirror of `parseWatchdogConfig`) ────────────────────── */
+
+function posNum(v: unknown, fallback: number, min: number): number {
+  return typeof v === "number" && Number.isFinite(v) && v >= min ? v : fallback;
+}
+
+function parseCeiling(raw: unknown, d: ToolCeiling): ToolCeiling {
+  const r = (raw ?? {}) as Record<string, unknown>;
+  const killSeconds = posNum(r.killSeconds, d.killSeconds, 1);
+  // Clamp warn to kill: a warn set ABOVE its kill is dead (kill fires first), so
+  // a `warn > kill` misconfig is pinned to the kill line rather than silently
+  // never warning.
+  const warnSeconds = Math.min(posNum(r.warnSeconds, d.warnSeconds, 1), killSeconds);
+  return { warnSeconds, killSeconds };
+}
+
+/**
+ * Validate a raw settings value into a `StallWatchdogConfig`. Unknown keys are
+ * ignored; each invalid/missing field falls back to `DEFAULT_STALL_CONFIG`.
+ */
+export function parseStallWatchdogConfig(raw: unknown): StallWatchdogConfig {
+  const d = DEFAULT_STALL_CONFIG;
+  if (!raw || typeof raw !== "object") return structuredClone(d);
+  const r = raw as Record<string, unknown>;
+  const rc = (r.ceilings ?? {}) as Record<string, unknown>;
+  const ad = (r.autoDiscovery ?? {}) as Record<string, unknown>;
+  const sweepIntervalMs = posNum(r.sweepIntervalMs, d.sweepIntervalMs, 1000);
+  return {
+    enabled: typeof r.enabled === "boolean" ? r.enabled : d.enabled,
+    sweepIntervalMs,
+    ceilings: {
+      fast: parseCeiling(rc.fast, d.ceilings.fast),
+      bash: parseCeiling(rc.bash, d.ceilings.bash),
+      task: parseCeiling(rc.task, d.ceilings.task),
+      mcp: parseCeiling(rc.mcp, d.ceilings.mcp),
+      default: parseCeiling(rc.default, d.ceilings.default),
+    },
+    action: r.action === "warn" || r.action === "restart" ? r.action : d.action,
+    autoDiscovery: {
+      enabled: typeof ad.enabled === "boolean" ? ad.enabled : d.autoDiscovery.enabled,
+      cpuProbeMs: posNum(ad.cpuProbeMs, d.autoDiscovery.cpuProbeMs, 100),
+    },
+    // Floor the cooldown at one sweep: below that it would re-kill + re-alert
+    // every sweep — exactly the storm the cooldown exists to prevent.
+    restartFailureCooldownMs: posNum(
+      r.restartFailureCooldownMs,
+      d.restartFailureCooldownMs,
+      sweepIntervalMs,
+    ),
+  };
+}
+
 /* ── Per-session state + decision ────────────────────────────────────────── */
 
 interface OutstandingTool {
@@ -230,6 +282,12 @@ export class StallWatchdog {
   private unsubscribe: (() => void) | null = null;
   /** Sessions with a kill in flight — never double-restart the same one. */
   private readonly killing = new Set<string>();
+  /** Set once stop() begins, so no NEW kill starts a restart during teardown. */
+  private stopped = false;
+  /** In-flight handleKill promises so stop() can await them before it returns,
+   *  preventing a mid-flight restart from respawning a session the daemon has
+   *  already torn down (Codex P2 on #300). */
+  private readonly inFlight = new Set<Promise<void>>();
 
   constructor(
     private readonly config: StallWatchdogConfig,
@@ -325,7 +383,12 @@ export class StallWatchdog {
         continue;
       }
       this.killing.add(k);
-      kills.push(this.handleKill(s, decision, now).finally(() => this.killing.delete(k)));
+      const p = this.handleKill(s, decision, now).finally(() => {
+        this.killing.delete(k);
+        this.inFlight.delete(p);
+      });
+      this.inFlight.add(p);
+      kills.push(p);
     }
     // Await in-flight kills so sweeps never overlap on the same session and
     // tests observe the full capture→restart→classify sequence.
@@ -346,6 +409,12 @@ export class StallWatchdog {
         /* forensic is best-effort — never block recovery */
       }
     }
+
+    // If teardown began while we were capturing the forensic snapshot, abort
+    // before restarting — a restart here would respawn a session the daemon is
+    // tearing down (Codex P2 on #300). A kill already past this point is awaited
+    // by stop() so its respawn is torn down in order rather than orphaned.
+    if (this.stopped) return;
 
     try {
       await this.deps.restart(s.agentId, {
@@ -413,11 +482,16 @@ export class StallWatchdog {
     (this.timer as { unref?: () => void }).unref?.();
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
+    // Set first so any sweep already inside handleKill won't start a new restart.
+    this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     this.unsubscribe?.();
     this.unsubscribe = null;
+    // Await any kill already past its stopped-check: its restart completes, then
+    // the caller's teardown stops the respawned session in order (no orphan).
+    await Promise.allSettled([...this.inFlight]);
     this.sessions.clear();
   }
 }

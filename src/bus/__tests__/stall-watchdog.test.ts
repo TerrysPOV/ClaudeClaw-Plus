@@ -7,6 +7,7 @@ import {
   newSessionState,
   StallWatchdog,
   DEFAULT_STALL_CONFIG,
+  parseStallWatchdogConfig,
   type StallWatchdogDeps,
   type ForensicSnapshot,
   type StallKillOutcome,
@@ -271,5 +272,163 @@ describe("StallWatchdog kill orchestration", () => {
     await wd.sweep(950_000); // fail → cooldown from t=950_000
     await wd.sweep(1_300_000); // +350s > 300s cooldown → retried
     expect(rec.restart).toHaveLength(2);
+  });
+});
+
+/* ── parseStallWatchdogConfig ──────────────────────────────────────────── */
+
+describe("parseStallWatchdogConfig", () => {
+  it("returns defaults for missing/invalid input", () => {
+    expect(parseStallWatchdogConfig(undefined)).toEqual(DEFAULT_STALL_CONFIG);
+    expect(parseStallWatchdogConfig(null)).toEqual(DEFAULT_STALL_CONFIG);
+    expect(parseStallWatchdogConfig("nope")).toEqual(DEFAULT_STALL_CONFIG);
+  });
+
+  it("applies valid overrides and falls back per-field on garbage", () => {
+    const c = parseStallWatchdogConfig({
+      enabled: false,
+      sweepIntervalMs: 5000,
+      action: "warn",
+      ceilings: { bash: { warnSeconds: 120, killSeconds: 600 }, fast: { killSeconds: "bad" } },
+      autoDiscovery: { enabled: false, cpuProbeMs: 2000 },
+      restartFailureCooldownMs: 60_000,
+    });
+    expect(c.enabled).toBe(false);
+    expect(c.sweepIntervalMs).toBe(5000);
+    expect(c.action).toBe("warn");
+    expect(c.ceilings.bash).toEqual({ warnSeconds: 120, killSeconds: 600 });
+    // fast.killSeconds was garbage → whole field falls back to the default ceiling.
+    expect(c.ceilings.fast).toEqual(DEFAULT_STALL_CONFIG.ceilings.fast);
+    expect(c.autoDiscovery).toEqual({ enabled: false, cpuProbeMs: 2000 });
+    expect(c.restartFailureCooldownMs).toBe(60_000);
+  });
+
+  it("rejects out-of-range / wrong-type scalars", () => {
+    const c = parseStallWatchdogConfig({
+      sweepIntervalMs: 10, // below the 1000ms floor → default
+      action: "explode", // invalid enum → default
+      autoDiscovery: { cpuProbeMs: 5 }, // below the 100ms floor → default
+    });
+    expect(c.sweepIntervalMs).toBe(DEFAULT_STALL_CONFIG.sweepIntervalMs);
+    expect(c.action).toBe(DEFAULT_STALL_CONFIG.action);
+    expect(c.autoDiscovery.cpuProbeMs).toBe(DEFAULT_STALL_CONFIG.autoDiscovery.cpuProbeMs);
+  });
+
+  it("clamps a per-tool warnSeconds above its killSeconds down to kill", () => {
+    // warn > kill would be a dead warn (kill fires first) — pin it to the kill line.
+    const c = parseStallWatchdogConfig({
+      ceilings: { bash: { warnSeconds: 5000, killSeconds: 900 } },
+    });
+    expect(c.ceilings.bash).toEqual({ warnSeconds: 900, killSeconds: 900 });
+  });
+
+  it("floors restartFailureCooldownMs at sweepIntervalMs (no per-sweep alert storm)", () => {
+    const c = parseStallWatchdogConfig({ sweepIntervalMs: 30_000, restartFailureCooldownMs: 500 });
+    // 500ms < one sweep → rejected → default (which is ≥ one sweep).
+    expect(c.restartFailureCooldownMs).toBe(DEFAULT_STALL_CONFIG.restartFailureCooldownMs);
+    // A cooldown ≥ the sweep is kept as-is.
+    expect(
+      parseStallWatchdogConfig({ sweepIntervalMs: 30_000, restartFailureCooldownMs: 45_000 })
+        .restartFailureCooldownMs,
+    ).toBe(45_000);
+  });
+});
+
+/* ── restartFailedAt reset invariant (#297 review follow-up) ───────────── */
+
+describe("restartFailedAt does not leak across a failed→succeeded restart cycle", () => {
+  it("a re-observed session kills cleanly after an earlier failed restart recovered", async () => {
+    const calls: string[] = [];
+    let failNext = true;
+    const deps: StallWatchdogDeps = {
+      subscribe: () => () => {},
+      restart: async () => {
+        calls.push("restart");
+        if (failNext) {
+          failNext = false;
+          throw new Error("rate-limited");
+        }
+      },
+      captureForensic: async () => ({ cpuAdvancing: false, outputRecencyMs: 9_000_000 }),
+      recordKill: async () => ({ classification: "genuine_wedge" }),
+      notify: () => {},
+      now: () => 0,
+    };
+    const cfg = { ...DEFAULT_STALL_CONFIG, restartFailureCooldownMs: 10_000 };
+    const wd = new StallWatchdog(cfg, deps);
+
+    // t=950s: Bash stalled → kill → restart THROWS → cooldown armed, session kept.
+    wd.ingest(evt("response.tool_use", 0, { id: "b1", name: "Bash" }));
+    await wd.sweep(950_000);
+    expect(calls).toHaveLength(1);
+
+    // within cooldown (Δ5s < 10s) → suppressed.
+    await wd.sweep(955_000);
+    expect(calls).toHaveLength(1);
+
+    // after cooldown (Δ15s > 10s) → retry succeeds → session dropped.
+    await wd.sweep(965_000);
+    expect(calls).toHaveLength(2);
+
+    // Re-observe the SAME session id with a fresh stalled tool. It must rebuild a
+    // clean state (no leftover restartFailedAt/cooldown) and kill normally.
+    wd.ingest(evt("response.tool_use", 970_000, { id: "b2", name: "Bash" }));
+    await wd.sweep(970_000 + 950_000);
+    expect(calls).toHaveLength(3);
+  });
+});
+
+/* ── stop() during an in-flight kill (Codex P2 on #300) ────────────────── */
+
+describe("stop() while a kill is mid-flight", () => {
+  it("does not restart after stop() resolves, and stop() awaits the in-flight kill", async () => {
+    let releaseForensic!: () => void;
+    const forensicGate = new Promise<void>((r) => {
+      releaseForensic = r;
+    });
+    const calls = { restart: 0, forensic: 0, recordKill: 0 };
+    const deps: StallWatchdogDeps = {
+      subscribe: () => () => {},
+      restart: async () => {
+        calls.restart++;
+      },
+      captureForensic: async () => {
+        calls.forensic++;
+        await forensicGate; // block the kill mid-flight, at the forensic snapshot
+        return { cpuAdvancing: false, outputRecencyMs: 9_000_000 };
+      },
+      recordKill: async () => {
+        calls.recordKill++;
+        return { classification: "genuine_wedge" };
+      },
+      notify: () => {},
+      now: () => 0,
+    };
+    const wd = new StallWatchdog(DEFAULT_STALL_CONFIG, deps);
+    wd.ingest(evt("response.tool_use", 0, { id: "b1", name: "Bash" }));
+
+    // Fire a sweep that enters handleKill and blocks at captureForensic.
+    const sweepP = wd.sweep(950_000);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(calls.forensic).toBe(1); // kill is in flight
+    expect(calls.restart).toBe(0);
+
+    // Begin teardown while the kill is blocked; stop() must await the in-flight kill.
+    const stopP = wd.stop();
+    let stopResolved = false;
+    void stopP.then(() => {
+      stopResolved = true;
+    });
+    await Promise.resolve();
+    expect(stopResolved).toBe(false); // stop() is waiting on the in-flight kill
+
+    // Release the snapshot: handleKill resumes and must bail at the stopped-check.
+    releaseForensic();
+    await stopP;
+    await sweepP;
+
+    expect(calls.restart).toBe(0); // no restart started after stop() began
+    expect(calls.recordKill).toBe(0); // and the kill aborted before recording
   });
 });

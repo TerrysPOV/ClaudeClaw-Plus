@@ -43,6 +43,8 @@ import { createPromptStreamHandler } from "./receipt-wiring";
 import { peekSession } from "../sessions";
 import { generateSummary } from "../rotation";
 import { getSettings } from "../config";
+import { StallWatchdog, DEFAULT_STALL_CONFIG, type StallWatchdogConfig } from "./stall-watchdog";
+import { probeProcessTreeCpu, classifyKill, appendStallKillAudit } from "./stall-forensics";
 
 export interface BusRuntimeHandle {
   /** The mounted BusCore. Adapters / tests subscribe via this. */
@@ -454,6 +456,72 @@ export async function mountBusRuntime(
         : `adapters=[${adapters.map((a) => a.name).join(", ")}]`;
     logger.info(`[bus-runtime] mounted; socket=${socketPath}; ${spawnedLabel}; ${adaptersLabel}`);
 
+    // #296 PR#1 — Stall watchdog. Detect a bus PTY session wedged mid-tool-call
+    // (a `tool_use` with no `tool_result` past its per-tool ceiling) and
+    // kill+respawn it so a single hung tool can never take the daemon offline
+    // (the #295 outage). Recovery reuses `restart()` (inherits the restart
+    // rate-limiter); every kill is audited by the auto-discovery forensic
+    // (`stall-forensics`). Started here — after a successful mount — so a failed
+    // mount never leaves a dangling sweep timer; torn down in `stop()`.
+    let stallConfig: StallWatchdogConfig;
+    try {
+      stallConfig = getSettings().stallWatchdog;
+    } catch {
+      stallConfig = DEFAULT_STALL_CONFIG; // settings not loaded (early boot / tests)
+    }
+    const stallWatchdog = new StallWatchdog(stallConfig, {
+      subscribe: (handler) => {
+        const sub = bus.subscribe(
+          {
+            topics: [
+              "response.tool_use",
+              "tool_result",
+              "response.turn_end",
+              "session.init",
+              "session.end",
+            ],
+          },
+          handler,
+        );
+        return () => sub.close();
+      },
+      restart: async (agentId, o) => {
+        await sessionManager.restart(agentId, { reason: o.reason });
+      },
+      captureForensic: async (agentId) => {
+        const proc = sessionManager.getAgent(agentId);
+        if (!proc) return { cpuAdvancing: null, outputRecencyMs: null };
+        const cpuAdvancing = await probeProcessTreeCpu(
+          proc.pid,
+          stallConfig.autoDiscovery.cpuProbeMs,
+        );
+        const outputRecencyMs = proc.lastDataAt === null ? null : Date.now() - proc.lastDataAt;
+        return { cpuAdvancing, outputRecencyMs };
+      },
+      recordKill: async (input) => {
+        const outcome = classifyKill(input.snapshot, input.outstandingMs, input.ceiling);
+        await appendStallKillAudit({
+          ts: new Date().toISOString(),
+          agentId: input.agentId,
+          sessionId: input.sessionId,
+          tool: input.tool,
+          outstandingMs: input.outstandingMs,
+          killSeconds: input.ceiling.killSeconds,
+          classification: outcome.classification,
+          cpuAdvancing: input.snapshot.cpuAdvancing,
+          outputRecencyMs: input.snapshot.outputRecencyMs,
+          suggestedKillSeconds: outcome.suggestedKillSeconds,
+        });
+        return outcome;
+      },
+      notify: (level, message) => {
+        if (level === "critical") logger.error("[stall-watchdog]", message);
+        else logger.warn("[stall-watchdog]", message);
+      },
+      now: () => Date.now(),
+    });
+    stallWatchdog.start();
+
     return {
       bus,
       sessionManager,
@@ -512,6 +580,9 @@ export async function mountBusRuntime(
       async stop() {
         if (stopped) return;
         stopped = true;
+        // Stall watchdog first: cancel its sweep timer + bus subscription and
+        // await any in-flight kill so it can't respawn a session mid-teardown.
+        await stallWatchdog.stop();
         // Adapters first: stop inbound traffic so nothing new hits the
         // bus while we're tearing down agents. Sprint 5.2b.
         await stopBusAdapters(adapters, logger);

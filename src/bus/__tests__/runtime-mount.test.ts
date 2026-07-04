@@ -315,8 +315,9 @@ describe("mountBusRuntime — real UDS path", () => {
     try {
       expect(handle.bus).toBeDefined();
       expect(handle.sessionManager).toBeInstanceOf(SessionManager);
-      // BusCore.state() works post-mount.
-      expect(handle.bus.state().subscriberCount).toBe(0);
+      // BusCore.state() works post-mount. The one subscriber is the stall
+      // watchdog's session-event subscription, started by mountBusRuntime (#296).
+      expect(handle.bus.state().subscriberCount).toBe(1);
     } finally {
       await handle.stop();
     }
