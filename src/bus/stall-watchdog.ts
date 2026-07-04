@@ -121,10 +121,12 @@ function posNum(v: unknown, fallback: number, min: number): number {
 
 function parseCeiling(raw: unknown, d: ToolCeiling): ToolCeiling {
   const r = (raw ?? {}) as Record<string, unknown>;
-  return {
-    warnSeconds: posNum(r.warnSeconds, d.warnSeconds, 1),
-    killSeconds: posNum(r.killSeconds, d.killSeconds, 1),
-  };
+  const killSeconds = posNum(r.killSeconds, d.killSeconds, 1);
+  // Clamp warn to kill: a warn set ABOVE its kill is dead (kill fires first), so
+  // a `warn > kill` misconfig is pinned to the kill line rather than silently
+  // never warning.
+  const warnSeconds = Math.min(posNum(r.warnSeconds, d.warnSeconds, 1), killSeconds);
+  return { warnSeconds, killSeconds };
 }
 
 /**
@@ -137,9 +139,10 @@ export function parseStallWatchdogConfig(raw: unknown): StallWatchdogConfig {
   const r = raw as Record<string, unknown>;
   const rc = (r.ceilings ?? {}) as Record<string, unknown>;
   const ad = (r.autoDiscovery ?? {}) as Record<string, unknown>;
+  const sweepIntervalMs = posNum(r.sweepIntervalMs, d.sweepIntervalMs, 1000);
   return {
     enabled: typeof r.enabled === "boolean" ? r.enabled : d.enabled,
-    sweepIntervalMs: posNum(r.sweepIntervalMs, d.sweepIntervalMs, 1000),
+    sweepIntervalMs,
     ceilings: {
       fast: parseCeiling(rc.fast, d.ceilings.fast),
       bash: parseCeiling(rc.bash, d.ceilings.bash),
@@ -152,7 +155,13 @@ export function parseStallWatchdogConfig(raw: unknown): StallWatchdogConfig {
       enabled: typeof ad.enabled === "boolean" ? ad.enabled : d.autoDiscovery.enabled,
       cpuProbeMs: posNum(ad.cpuProbeMs, d.autoDiscovery.cpuProbeMs, 100),
     },
-    restartFailureCooldownMs: posNum(r.restartFailureCooldownMs, d.restartFailureCooldownMs, 0),
+    // Floor the cooldown at one sweep: below that it would re-kill + re-alert
+    // every sweep — exactly the storm the cooldown exists to prevent.
+    restartFailureCooldownMs: posNum(
+      r.restartFailureCooldownMs,
+      d.restartFailureCooldownMs,
+      sweepIntervalMs,
+    ),
   };
 }
 

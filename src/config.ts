@@ -231,7 +231,9 @@ const DEFAULT_SETTINGS: Settings = {
     },
   },
   watchdog: { maxConsecutiveTimeouts: null, maxRuntimeSeconds: null },
-  stallWatchdog: DEFAULT_STALL_CONFIG,
+  // Clone so a future in-place edit of settings.stallWatchdog can't mutate the
+  // shared exported default.
+  stallWatchdog: structuredClone(DEFAULT_STALL_CONFIG),
   governance: { watchdog: {} },
   session: { autoRotate: false, maxMessages: 50, maxAgeHours: 24, summaryPath: "" },
   // Default runtime: `bus` (Sprint 5.4 flip after Hetzner staging soak ended

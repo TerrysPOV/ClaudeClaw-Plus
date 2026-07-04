@@ -313,6 +313,25 @@ describe("parseStallWatchdogConfig", () => {
     expect(c.action).toBe(DEFAULT_STALL_CONFIG.action);
     expect(c.autoDiscovery.cpuProbeMs).toBe(DEFAULT_STALL_CONFIG.autoDiscovery.cpuProbeMs);
   });
+
+  it("clamps a per-tool warnSeconds above its killSeconds down to kill", () => {
+    // warn > kill would be a dead warn (kill fires first) — pin it to the kill line.
+    const c = parseStallWatchdogConfig({
+      ceilings: { bash: { warnSeconds: 5000, killSeconds: 900 } },
+    });
+    expect(c.ceilings.bash).toEqual({ warnSeconds: 900, killSeconds: 900 });
+  });
+
+  it("floors restartFailureCooldownMs at sweepIntervalMs (no per-sweep alert storm)", () => {
+    const c = parseStallWatchdogConfig({ sweepIntervalMs: 30_000, restartFailureCooldownMs: 500 });
+    // 500ms < one sweep → rejected → default (which is ≥ one sweep).
+    expect(c.restartFailureCooldownMs).toBe(DEFAULT_STALL_CONFIG.restartFailureCooldownMs);
+    // A cooldown ≥ the sweep is kept as-is.
+    expect(
+      parseStallWatchdogConfig({ sweepIntervalMs: 30_000, restartFailureCooldownMs: 45_000 })
+        .restartFailureCooldownMs,
+    ).toBe(45_000);
+  });
 });
 
 /* ── restartFailedAt reset invariant (#297 review follow-up) ───────────── */
