@@ -7,8 +7,9 @@
  * parsing line-by-line and skipping a malformed trailing partial write.
  *
  * `value` carries the call's `duration_ms`; everything else (plugin, tool,
- * status, agent_id, args_hash) rides in `labels` so a reader can reconstruct the
- * universal metrics without a second source.
+ * status, agent_id) rides in `labels` so a reader can reconstruct the universal
+ * metrics without a second source. Call args are never captured (not even a
+ * hash — see tool-call.ts), so there is nothing sensitive to surface here.
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -89,7 +90,6 @@ export class McpToolCallTelemetryProducer implements TelemetryProvider {
         tool: String(detail.tool ?? ""),
         status: String(detail.status ?? ""),
         agent_id: String(detail.agent_id ?? ""),
-        args_hash: String(detail.args_hash ?? ""),
       };
       if (filters && !Object.entries(filters).every(([k, v]) => labels[k] === v)) continue;
 

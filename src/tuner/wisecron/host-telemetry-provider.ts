@@ -47,6 +47,7 @@ import {
   type ViewManifestSource,
 } from "../../skills-tuner/core/telemetry.js";
 import { McpToolCallTelemetryProducer } from "../../observability/mcp-tool-call-producer.js";
+import { forEachLineSync } from "./line-reader.js";
 import { type TunerViewSources, TunerViewProvider } from "./tuner-view-provider.js";
 import { DEFAULT_MODE_DISPATCH_LOG } from "../../governance/mode-dispatch-journal.js";
 import { DEFAULT_TEMPLATE_FEEDBACK_LOG } from "../../skills-tuner/core/template-feedback.js";
@@ -80,6 +81,12 @@ export interface CronRunProducerConfig {
   /** Injected cron-config presence probe (feeds the unavailable reason). Default
    *  inspects `crontab -l` + `~/.config/cron`. Tests override for hermeticity. */
   cronConfigProbe?: () => CronConfigPresence;
+  /** TTL (ms) for the memoised source-kind. Default 60s. The probe spawns
+   *  journalctl (+ maybe crontab) — up to ~15s sync — so repeat `capabilities()`
+   *  / `query()` calls within the TTL reuse the resolved kind for free. */
+  kindCacheTtlMs?: number;
+  /** Injected clock (ms). Test seam for exercising the cache TTL. Default `Date.now`. */
+  now?: () => number;
 }
 
 interface CronRunEntry {
@@ -127,6 +134,10 @@ export class CronRunTelemetryProducer implements TelemetryProvider {
   private readonly journalRunner: (args: string[]) => string;
   private readonly costDbPath: string;
   private readonly cronConfigProbe: () => CronConfigPresence;
+  private readonly kindCacheTtlMs: number;
+  private readonly now: () => number;
+  /** Memoised source-kind + when it was resolved (see `detectKind`). */
+  private kindCache: { kind: CronSourceKind; at: number } | null = null;
 
   constructor(cfg: CronRunProducerConfig = {}) {
     this.journalUnitGlob = cfg.journalUnitGlob ?? "wisecron-*.service";
@@ -135,6 +146,8 @@ export class CronRunTelemetryProducer implements TelemetryProvider {
     this.journalRunner = cfg.journalRunner ?? defaultJournalRunner;
     this.costDbPath = expandHome(cfg.costDbPath ?? join(homedir(), "agent", "data", "costs.db"));
     this.cronConfigProbe = cfg.cronConfigProbe ?? defaultCronConfigProbe;
+    this.kindCacheTtlMs = cfg.kindCacheTtlMs ?? 60_000;
+    this.now = cfg.now ?? Date.now;
   }
 
   contractVersion(): string {
@@ -160,9 +173,27 @@ export class CronRunTelemetryProducer implements TelemetryProvider {
     return parseCronRunJournal(raw);
   }
 
-  /** Resolve the active source by probing each candidate in priority order. */
+  /**
+   * Resolve the active source, MEMOISED with a TTL. `detectKind` is called by
+   * both `capabilities()` and `query()` — and `telemetry__capabilities` is
+   * socket-exposed, so a client looping it would otherwise re-spawn journalctl
+   * (+ maybe crontab), up to ~15s SYNC each, and stall the daemon. First call in
+   * a TTL window probes + caches; repeats within the TTL cost nothing; after the
+   * TTL we re-probe so a newly-configured source is still picked up.
+   */
   private detectKind(): CronSourceKind {
-    if (this.readEntries(new Date(Date.now() - 7 * 86_400_000)).length > 0) return "systemd";
+    const now = this.now();
+    if (this.kindCache && now - this.kindCache.at < this.kindCacheTtlMs) {
+      return this.kindCache.kind;
+    }
+    const kind = this.probeKind();
+    this.kindCache = { kind, at: now };
+    return kind;
+  }
+
+  /** The actual (expensive) source probe, in priority order. */
+  private probeKind(): CronSourceKind {
+    if (this.readEntries(new Date(this.now() - 7 * 86_400_000)).length > 0) return "systemd";
     if (busSchedulerRowCount(this.costDbPath) > 0) return "bus_scheduler";
     return "none";
   }
@@ -607,22 +638,22 @@ export class JournalTelemetryProducer implements TelemetryProvider {
 
   private readAll(): Array<Record<string, unknown>> {
     if (!existsSync(this.journalPath)) return [];
-    let content: string;
+    const out: Array<Record<string, unknown>> = [];
+    // Stream line-by-line (bounded memory) rather than slurping the whole
+    // operations journal — it is append-only and can grow large on a busy host.
     try {
-      content = readFileSync(this.journalPath, "utf8");
+      forEachLineSync(this.journalPath, (line) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        try {
+          const obj = JSON.parse(trimmed);
+          if (typeof obj === "object" && obj !== null) out.push(obj as Record<string, unknown>);
+        } catch {
+          /* skip */
+        }
+      });
     } catch {
       return [];
-    }
-    const out: Array<Record<string, unknown>> = [];
-    for (const line of content.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        const obj = JSON.parse(trimmed);
-        if (typeof obj === "object" && obj !== null) out.push(obj as Record<string, unknown>);
-      } catch {
-        /* skip */
-      }
     }
     return out;
   }

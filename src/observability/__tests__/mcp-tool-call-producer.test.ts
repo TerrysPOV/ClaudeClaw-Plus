@@ -25,7 +25,6 @@ function ev(over: Partial<ToolCallEvent>): ToolCallEvent {
     agent_id: "pty-1",
     status: "ok",
     duration_ms: 10,
-    args_hash: "aaaa",
     ...over,
   };
 }
@@ -64,8 +63,9 @@ describe("McpToolCallTelemetryProducer", () => {
       tool: "echo",
       status: "ok",
       agent_id: "pty-1",
-      args_hash: "aaaa",
     });
+    // args_hash is intentionally NOT emitted — args are never captured.
+    expect(echo.labels).not.toHaveProperty("args_hash");
   });
 
   it("returns [] for a stream it does not own", async () => {

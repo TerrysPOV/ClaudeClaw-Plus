@@ -58,6 +58,9 @@ interface QueryResult {
   stream: TelemetryStream;
   contractVersion: string;
   samples: WireSample[];
+  /** True when the range was clamped and/or the sample array was capped (below).
+   *  Absent means the full requested window is represented. */
+  truncated?: boolean;
 }
 
 const QueryArgsSchema = z.object({
@@ -66,6 +69,19 @@ const QueryArgsSchema = z.object({
   end: z.string(),
   filters: z.record(z.string(), z.string()).optional(),
 });
+
+const DAY_MS = 86_400_000;
+/**
+ * Resource guards for the socket-exposed `telemetry__query`. Both are CLAMP,
+ * not reject, so a slightly-too-wide query still returns useful bounded data
+ * (flagged `truncated`) instead of erroring.
+ *  - MAX window: an unbounded [2020,2030) range would pull all history into one
+ *    in-memory MCP response. Cap it; keep the most recent window.
+ *  - MAX samples: cap the returned array regardless of window so a dense stream
+ *    can't blow the response size either.
+ */
+export const MAX_QUERY_WINDOW_DAYS = 90;
+export const MAX_QUERY_SAMPLES = 5_000;
 
 // ── HOST side ──────────────────────────────────────────────────────────────--
 
@@ -109,13 +125,30 @@ export function registerHostTelemetryTools(
       "optionally filtered by labels. start/end are ISO-8601 timestamps.",
     schema: QueryArgsSchema,
     handler: async (args: z.infer<typeof QueryArgsSchema>): Promise<QueryResult> => {
-      const range: DateRange = { start: new Date(args.start), end: new Date(args.end) };
-      if (Number.isNaN(range.start.getTime()) || Number.isNaN(range.end.getTime())) {
+      const start = new Date(args.start);
+      const end = new Date(args.end);
+      if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
         throw new Error(`invalid range: start=${args.start} end=${args.end}`);
       }
-      const samples = await provider.query(args.stream, range, args.filters);
-      // Provenance into the tamper-evident chain: which stream, which window,
-      // how many samples answered the measurement, at which schema version.
+      // Guard the window: clamp anything wider than MAX_QUERY_WINDOW_DAYS to the
+      // most-recent slice so a runaway [2020,2030) can't pull all history into
+      // one in-memory response.
+      let truncated = false;
+      let effectiveStart = start;
+      if (end.getTime() - start.getTime() > MAX_QUERY_WINDOW_DAYS * DAY_MS) {
+        effectiveStart = new Date(end.getTime() - MAX_QUERY_WINDOW_DAYS * DAY_MS);
+        truncated = true;
+      }
+      const range: DateRange = { start: effectiveStart, end };
+      let samples = await provider.query(args.stream, range, args.filters);
+      // Guard the response size: cap the array regardless of window.
+      if (samples.length > MAX_QUERY_SAMPLES) {
+        samples = samples.slice(0, MAX_QUERY_SAMPLES);
+        truncated = true;
+      }
+      // Provenance into the tamper-evident chain: which stream, which (clamped)
+      // window, how many samples answered the measurement, whether it was
+      // truncated, at which schema version.
       audit?.append({
         event: "telemetry_query",
         detail: {
@@ -124,6 +157,7 @@ export function registerHostTelemetryTools(
           window_end: range.end.toISOString(),
           ...(args.filters ? { filters: args.filters } : {}),
           sample_count: samples.length,
+          ...(truncated ? { truncated: true } : {}),
           contract_version: provider.contractVersion(),
         },
       });
@@ -135,6 +169,7 @@ export function registerHostTelemetryTools(
           value: s.value,
           ...(s.labels ? { labels: s.labels } : {}),
         })),
+        ...(truncated ? { truncated: true } : {}),
       };
     },
   });

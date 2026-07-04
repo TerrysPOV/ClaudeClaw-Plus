@@ -145,7 +145,6 @@ export class ToolCallSink {
       detail: {
         tool: intent.tool,
         agent_id: intent.agent_id,
-        args_hash: intent.args_hash,
         event_ts: intent.ts,
       },
     });
@@ -218,7 +217,6 @@ export class ToolCallSink {
             agent_id: e.agent_id,
             status: e.status,
             duration_ms: e.duration_ms,
-            args_hash: e.args_hash,
             event_ts: e.ts,
             ...(e.error !== undefined ? { error: ToolCallSink.clampError(e.error) } : {}),
           },

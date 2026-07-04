@@ -41,9 +41,10 @@
  * the projects dir is absent.
  */
 
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { forEachLineSync } from "./line-reader.js";
 import {
   type AssistantLine,
   type AssistantToolUseBlock,
@@ -77,6 +78,16 @@ const AGENT_DISPATCH_TOOLS = new Set(["Agent", "Task"]);
 
 /** A Read is a memory access when its path is a CLAUDE.md file or under a memory/learnings dir. */
 const MEMORY_PATH_RE = /(?:CLAUDE\.md$|\/memory\/|\/learnings\/|session-state\.md$)/;
+
+/**
+ * Cap the number of transcripts scanned per call. A busy host accumulates
+ * thousands of session files; reading every one on the cold `capabilities()`
+ * path is a synchronous event-loop stall / memory risk on a 4GB box. We scan the
+ * newest N by mtime (older files hold older events, already down-weighted by
+ * every metric's window) and `log()` when the cap truncates so the limit isn't
+ * silent.
+ */
+const MAX_FILES_PER_SCAN = 200;
 
 export interface SessionJsonlProducerConfig {
   /** Projects dir root. Default `~/.claude/projects`. Tests pass a temp dir. */
@@ -157,14 +168,33 @@ export class SessionJsonlTelemetryProducer implements TelemetryProvider {
     const acc = emptyCollected();
     const startMs = range.start.getTime();
 
+    // Gather in-window candidates with their mtime in one stat pass. A file last
+    // modified before the window starts cannot hold an in-range event (lines only
+    // append), so drop it up front without reading.
+    const candidates: Array<{ file: string; mtime: number }> = [];
     for (const file of this.sessionFiles(allowedDirPrefixes)) {
-      // A file last modified before the window starts cannot hold an in-range
-      // event (lines only append). Skip it without reading — bounds the scan.
       try {
-        if (statSync(file).mtime.getTime() < startMs) continue;
+        const mtime = statSync(file).mtime.getTime();
+        if (mtime < startMs) continue;
+        candidates.push({ file, mtime });
       } catch {
-        continue;
+        // unstattable file — skip
       }
+    }
+
+    // Bound the scan to the newest MAX_FILES_PER_SCAN by mtime so a host with
+    // thousands of sessions can't stall the sync path / exhaust memory.
+    candidates.sort((a, b) => b.mtime - a.mtime);
+    if (candidates.length > MAX_FILES_PER_SCAN) {
+      // Not silent: surface that the scan was capped.
+      console.warn(
+        `[session-jsonl] scan capped at ${MAX_FILES_PER_SCAN} of ${candidates.length} ` +
+          `in-window transcripts (newest by mtime) — older sessions skipped this call`,
+      );
+      candidates.length = MAX_FILES_PER_SCAN;
+    }
+
+    for (const { file } of candidates) {
       // Per-file tolerance mirrors the per-line JSON.parse skip: one unreadable
       // or malformed transcript must never take down the whole telemetry surface
       // (`capabilities()` is sync and feeds the activation gate).
@@ -182,42 +212,49 @@ export class SessionJsonlTelemetryProducer implements TelemetryProvider {
   }
 
   private scanFile(file: string, range: DateRange, acc: Collected): void {
-    let content: string;
-    try {
-      content = readFileSync(file, "utf8");
-    } catch {
-      return;
-    }
-
-    // First pass: map tool_use_id → is_error from tool_result blocks (which live
-    // in later user lines, not the assistant line that emitted the tool_use).
+    // Single streaming pass (bounded memory — never slurps the whole file):
+    //   - `errById` maps tool_use_id → is_error, populated from user
+    //     `tool_result` blocks (which live in later user lines than the
+    //     assistant `tool_use`), so the failure join needs the whole file first.
+    //   - `pending` holds a COMPACT record per emitted tool_use (ts + the few
+    //     fields that ride in labels), NOT the raw JSON line. Its size is the
+    //     output size — inherently O(samples) — not O(file bytes).
+    // After the stream we join `pending` against `errById` in encounter order,
+    // producing byte-for-byte the same samples the old two-pass slurp did.
     const errById = new Map<string, boolean>();
-    const lines: JsonlLine[] = [];
-    for (const raw of content.split("\n")) {
+    const pending: Array<{
+      ts: Date;
+      name: string;
+      id: string;
+      agent?: string;
+      memFile?: string;
+    }> = [];
+    const startMs = range.start.getTime();
+    const endMs = range.end.getTime();
+
+    forEachLineSync(file, (raw) => {
       const trimmed = raw.trim();
-      if (!trimmed) continue;
+      if (!trimmed) return;
       let line: JsonlLine;
       try {
         line = JSON.parse(trimmed) as JsonlLine;
       } catch {
-        continue;
+        return;
       }
-      lines.push(line);
+
       if (line.type === "user") {
         const results = extractToolResults((line as UserLine).message?.content);
         for (const r of results) {
           if (r.tool_use_id) errById.set(r.tool_use_id, r.is_error === true);
         }
+        return;
       }
-    }
+      if (line.type !== "assistant") return;
 
-    // Second pass: emit samples from assistant tool_use blocks.
-    for (const line of lines) {
-      if (line.type !== "assistant") continue;
       const a = line as AssistantLine;
       const ts = a.timestamp ? new Date(a.timestamp) : null;
-      if (!ts || Number.isNaN(ts.getTime())) continue;
-      if (ts.getTime() < range.start.getTime() || ts.getTime() >= range.end.getTime()) continue;
+      if (!ts || Number.isNaN(ts.getTime())) return;
+      if (ts.getTime() < startMs || ts.getTime() >= endMs) return;
 
       // `message.content` comes from an untrusted transcript; a non-array
       // (e.g. `{"message":{"content":{}}}`) would make `for...of` throw. Guard
@@ -227,34 +264,43 @@ export class SessionJsonlTelemetryProducer implements TelemetryProvider {
         if (!block || (block as { type?: string }).type !== "tool_use") continue;
         const tu = block as AssistantToolUseBlock;
         const name = tu.name ?? "";
-        const failed = tu.id ? errById.get(tu.id) === true : false;
-
-        // tool_call — every tool_use is one call; value carries failure.
-        acc.tool_call.push({
+        const rec: { ts: Date; name: string; id: string; agent?: string; memFile?: string } = {
           ts,
-          value: failed ? 1 : 0,
-          labels: { tool: name, server: serverOf(name), blocked: "false" },
-        });
+          name,
+          id: tu.id ?? "",
+        };
 
-        // agent_dispatch — Agent/Task invocations.
         if (AGENT_DISPATCH_TOOLS.has(name)) {
           const input = (tu.input ?? {}) as Record<string, unknown>;
-          const agent =
+          rec.agent =
             typeof input.subagent_type === "string" && input.subagent_type
               ? input.subagent_type
               : "default";
-          // value = 0: dispatch occurred; reclassification is not a transcript event.
-          acc.agent_dispatch.push({ ts, value: 0, labels: { agent } });
         }
-
-        // memory_access — Reads of CLAUDE.md / memory / learnings files.
         if (name === "Read") {
           const input = (tu.input ?? {}) as Record<string, unknown>;
           const fp = typeof input.file_path === "string" ? input.file_path : "";
-          if (fp && MEMORY_PATH_RE.test(fp)) {
-            acc.memory_access.push({ ts, value: 1, labels: { file: fp } });
-          }
+          if (fp && MEMORY_PATH_RE.test(fp)) rec.memFile = fp;
         }
+        pending.push(rec);
+      }
+    });
+
+    for (const p of pending) {
+      const failed = p.id ? errById.get(p.id) === true : false;
+      // tool_call — every tool_use is one call; value carries failure.
+      acc.tool_call.push({
+        ts: p.ts,
+        value: failed ? 1 : 0,
+        labels: { tool: p.name, server: serverOf(p.name), blocked: "false" },
+      });
+      // agent_dispatch — value = 0: dispatch occurred; reclassification is not a transcript event.
+      if (p.agent !== undefined) {
+        acc.agent_dispatch.push({ ts: p.ts, value: 0, labels: { agent: p.agent } });
+      }
+      // memory_access — Reads of CLAUDE.md / memory / learnings files.
+      if (p.memFile !== undefined) {
+        acc.memory_access.push({ ts: p.ts, value: 1, labels: { file: p.memFile } });
       }
     }
   }

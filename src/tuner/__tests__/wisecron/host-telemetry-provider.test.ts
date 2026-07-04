@@ -107,6 +107,34 @@ describe("CronRunTelemetryProducer", () => {
     expect(await p.query("hook_exec", RANGE)).toEqual([]);
   });
 
+  it("caches the resolved source-kind within the TTL (no re-spawn on repeat calls)", () => {
+    let probes = 0;
+    let clock = 1_000_000;
+    const p = new CronRunTelemetryProducer({
+      journalRunner: () => {
+        probes++;
+        return journalLine({ unit: "wisecron-a.service", ts: IN, exit: 0 });
+      },
+      costDbPath: "/nonexistent/costs.db",
+      kindCacheTtlMs: 60_000,
+      now: () => clock,
+    });
+
+    // First call resolves + caches (one journalctl spawn).
+    expect(p.capabilities()[0]!.available).toBe(true);
+    expect(probes).toBe(1);
+
+    // Repeat calls within the TTL reuse the cached kind — no new spawn.
+    p.capabilities();
+    p.capabilities();
+    expect(probes).toBe(1);
+
+    // Past the TTL, it re-probes.
+    clock += 61_000;
+    p.capabilities();
+    expect(probes).toBe(2);
+  });
+
   it("auto-detects the bus_scheduler source from costs.db when no systemd units", async () => {
     const dbDir = mkdtempSync(join(tmpdir(), "cron-costs-"));
     const dbPath = join(dbDir, "costs.db");
@@ -658,5 +686,58 @@ describe("SessionJsonlTelemetryProducer", () => {
     const p = new SessionJsonlTelemetryProducer({ projectsDir: root });
     expect(await p.query("cron_run", RANGE)).toEqual([]);
     expect(await p.query("session_cost", RANGE)).toEqual([]);
+  });
+
+  it("caps the scan at the newest 200 transcripts (bounded reads) and warns", async () => {
+    // 205 in-window sessions, each with one tool_use. The producer must scan at
+    // most 200 (newest by mtime) so a busy host can't stall / OOM the sync path.
+    const total = 205;
+    for (let i = 0; i < total; i++) {
+      writeSession(`s${i}.jsonl`, [
+        assistantToolUse(IN, [{ type: "tool_use", id: `t${i}`, name: "Bash", input: {} }]),
+      ]);
+    }
+    const warnings: string[] = [];
+    const orig = console.warn;
+    console.warn = (msg?: unknown) => {
+      warnings.push(String(msg));
+    };
+    try {
+      const p = new SessionJsonlTelemetryProducer({ projectsDir: root });
+      const samples = await p.query("tool_call", RANGE);
+      expect(samples).toHaveLength(200);
+      expect(warnings.some((w) => /scan capped at 200 of 205/.test(w))).toBe(true);
+    } finally {
+      console.warn = orig;
+    }
+  });
+
+  it("streams a transcript larger than the read chunk without slurping (all lines parsed)", async () => {
+    // >64KB single file spanning many read chunks: padding forces multi-chunk
+    // reads, and a multibyte path exercises the chunk-boundary decode. Every
+    // in-window tool_use must still be derived (behaviour identical to a slurp).
+    const lines: object[] = [];
+    const pad = "x".repeat(4096); // bloat each line so the file crosses 64KB
+    for (let i = 0; i < 40; i++) {
+      lines.push(
+        assistantToolUse(IN, [
+          { type: "tool_use", id: `b${i}`, name: "Bash", input: { note: pad } },
+          {
+            type: "tool_use",
+            id: `m${i}`,
+            name: "Read",
+            input: { file_path: `/home/x/mémoire/${i}/CLAUDE.md` },
+          },
+        ]),
+      );
+    }
+    writeSession("big.jsonl", lines);
+    const p = new SessionJsonlTelemetryProducer({ projectsDir: root });
+    const calls = await p.query("tool_call", RANGE);
+    expect(calls).toHaveLength(80); // 40 Bash + 40 Read
+    const mem = await p.query("memory_access", RANGE);
+    expect(mem).toHaveLength(40);
+    // Multibyte path survived the chunk-boundary decode intact.
+    expect(mem.every((s) => s.labels!.file.includes("mémoire"))).toBe(true);
   });
 });

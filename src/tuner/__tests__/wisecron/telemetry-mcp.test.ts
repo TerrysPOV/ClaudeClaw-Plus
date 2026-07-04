@@ -21,6 +21,8 @@ import {
 } from "../../../skills-tuner/core/telemetry.js";
 import {
   bridgeToolCaller,
+  MAX_QUERY_SAMPLES,
+  MAX_QUERY_WINDOW_DAYS,
   McpTelemetryProvider,
   registerHostTelemetryTools,
   TELEMETRY_CAPABILITIES_TOOL,
@@ -164,6 +166,74 @@ describe("McpTelemetryProvider — degrade gracefully", () => {
     const out = await provider.query("cron_run", RANGE);
     expect(out.map((s) => s.value)).toEqual([1, 3]);
     expect(out.every((s) => !Number.isNaN(s.ts.getTime()))).toBe(true);
+  });
+});
+
+describe("telemetry__query resource guards (range clamp + array cap)", () => {
+  const DAY_MS = 86_400_000;
+
+  /** Captures the range it was queried with, and returns a configurable count. */
+  class CapturingProvider implements TelemetryProvider {
+    lastRange: DateRange | null = null;
+    constructor(private readonly count: number) {}
+    contractVersion(): string {
+      return TELEMETRY_CONTRACT_VERSION;
+    }
+    capabilities(): TelemetryCapability[] {
+      return [{ stream: "cron_run", schemaVersion: TELEMETRY_CONTRACT_VERSION, available: true }];
+    }
+    async query(stream: TelemetryStream, range: DateRange): Promise<MetricSample[]> {
+      this.lastRange = range;
+      if (stream !== "cron_run") return [];
+      return Array.from({ length: this.count }, () => ({ ts: IN, value: 0 }));
+    }
+  }
+
+  it("clamps an over-wide window to the most-recent MAX_QUERY_WINDOW_DAYS and flags truncated", async () => {
+    const bridge = new PluginMcpBridge(join(tmpDir, "audit.jsonl"));
+    const host = new CapturingProvider(1);
+    registerHostTelemetryTools(bridge, { provider: host });
+
+    // A decade-wide request must reach the provider as a <=90d window ending at `end`.
+    const end = "2030-01-01T00:00:00.000Z";
+    const res = (await bridge.invokeTool(TELEMETRY_QUERY_TOOL, {
+      stream: "cron_run",
+      start: "2020-01-01T00:00:00.000Z",
+      end,
+    })) as { samples: unknown[]; truncated?: boolean };
+    expect(res.truncated).toBe(true);
+    const span = host.lastRange!.end.getTime() - host.lastRange!.start.getTime();
+    expect(span).toBeLessThanOrEqual(MAX_QUERY_WINDOW_DAYS * DAY_MS);
+    expect(host.lastRange!.end.toISOString()).toBe(end);
+  });
+
+  it("caps the returned sample array at MAX_QUERY_SAMPLES with truncated: true", async () => {
+    const bridge = new PluginMcpBridge(join(tmpDir, "audit.jsonl"));
+    registerHostTelemetryTools(bridge, { provider: new CapturingProvider(MAX_QUERY_SAMPLES + 25) });
+
+    // In-range window (well under the cap) but a dense stream → array is clipped.
+    const res = (await bridge.invokeTool(TELEMETRY_QUERY_TOOL, {
+      stream: "cron_run",
+      start: RANGE.start.toISOString(),
+      end: RANGE.end.toISOString(),
+    })) as { samples: unknown[]; truncated?: boolean };
+    expect(res.samples).toHaveLength(MAX_QUERY_SAMPLES);
+    expect(res.truncated).toBe(true);
+  });
+
+  it("leaves a normal query unclamped (no truncated flag)", async () => {
+    const bridge = new PluginMcpBridge(join(tmpDir, "audit.jsonl"));
+    const host = new CapturingProvider(3);
+    registerHostTelemetryTools(bridge, { provider: host });
+
+    const res = (await bridge.invokeTool(TELEMETRY_QUERY_TOOL, {
+      stream: "cron_run",
+      start: RANGE.start.toISOString(),
+      end: RANGE.end.toISOString(),
+    })) as { samples: unknown[]; truncated?: boolean };
+    expect(res.samples).toHaveLength(3);
+    expect(res.truncated).toBeUndefined();
+    expect(host.lastRange!.start.toISOString()).toBe(RANGE.start.toISOString());
   });
 });
 
