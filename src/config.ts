@@ -3,6 +3,11 @@ import { mkdir } from "fs/promises";
 import { existsSync } from "fs";
 import { normalizeTimezoneName, resolveTimezoneOffsetMinutes } from "./timezone";
 import { parseWatchdogConfig, type WatchdogConfig } from "./watchdog";
+import {
+  DEFAULT_STALL_CONFIG,
+  parseStallWatchdogConfig,
+  type StallWatchdogConfig,
+} from "./bus/stall-watchdog";
 import { parsePlugins, type PluginEntry } from "./plugins";
 import { parseMemorySearchSettings, type MemorySearchSettings } from "./memory";
 
@@ -226,6 +231,7 @@ const DEFAULT_SETTINGS: Settings = {
     },
   },
   watchdog: { maxConsecutiveTimeouts: null, maxRuntimeSeconds: null },
+  stallWatchdog: DEFAULT_STALL_CONFIG,
   governance: { watchdog: {} },
   session: { autoRotate: false, maxMessages: 50, maxAgeHours: 24, summaryPath: "" },
   // Default runtime: `bus` (Sprint 5.4 flip after Hetzner staging soak ended
@@ -680,6 +686,7 @@ export interface Settings {
   pty: PtyConfig;
   mcp: McpConfig;
   watchdog: WatchdogSettings;
+  stallWatchdog: StallWatchdogConfig;
   governance: GovernanceConfig;
   plugins: Record<string, PluginEntry>;
   session: SessionConfig;
@@ -1091,6 +1098,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
     agents: parseBusAgents(raw.agents),
     mcp: parseMcpConfig(raw.mcp, raw.web?.enabled),
     watchdog: parseWatchdogConfig(raw.watchdog),
+    stallWatchdog: parseStallWatchdogConfig(raw.stallWatchdog),
     governance: parseGovernanceConfig(raw.governance),
     plugins: parsePlugins(raw.plugins),
     memorySearch: parseMemorySearchSettings(raw.memorySearch),

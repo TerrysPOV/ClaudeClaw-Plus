@@ -49,6 +49,13 @@ export interface AgentProcess {
   readonly agent_id: string;
   readonly supervision: SupervisionMode;
   readonly pid: number;
+  /**
+   * Epoch ms of the most recent raw output chunk seen on the crash-signal
+   * channel, or `null` if none yet. Used by the stall watchdog's auto-discovery
+   * forensic as an "is this process emitting anything?" liveness signal — NOT
+   * parsed as model output.
+   */
+  readonly lastDataAt: number | null;
   /** Relay a slash command (e.g. `compact`, `clear`, `quit`). No leading slash. */
   send_slash(cmd: string): Promise<void>;
   /** Send a stream-json line. Only valid in `process-stream-json` mode. */
@@ -90,6 +97,10 @@ export class PtyAgentProcess implements AgentProcess {
   private readonly pty: PtyHandle;
   private readonly exitHandlers: ExitHandler[] = [];
   private readonly dataHandlers: DataHandler[] = [];
+  private _lastDataAt: number | null = null;
+  get lastDataAt(): number | null {
+    return this._lastDataAt;
+  }
   private _exited = false;
   /** Serializes the write/settle/CR sequence so concurrent prompts can't
    *  interleave in the PTY input buffer (review #141 P1). */
@@ -150,6 +161,7 @@ export class PtyAgentProcess implements AgentProcess {
       PtyAgentProcess.BOOT_DIALOG_MAX_MS,
     );
     pty.onData((chunk) => {
+      this._lastDataAt = Date.now();
       if (this.bootDialogActive) this.handleBootDialog(chunk);
       // Keep a small ANSI-stripped tail so send_prompt_stream can tell whether a
       // submit actually started a turn (the idle REPL footer disappears on turn
@@ -474,6 +486,10 @@ export class ChildAgentProcess implements AgentProcess {
   private readonly child: ChildProcess;
   private readonly exitHandlers: ExitHandler[] = [];
   private readonly dataHandlers: DataHandler[] = [];
+  private _lastDataAt: number | null = null;
+  get lastDataAt(): number | null {
+    return this._lastDataAt;
+  }
   private _exited = false;
 
   constructor(agent_id: string, supervision: SupervisionMode, child: ChildProcess) {
@@ -484,6 +500,7 @@ export class ChildAgentProcess implements AgentProcess {
     // Capture stdout/stderr for crash-diag observation. We do NOT parse output —
     // this is purely a crash-signal channel (spec §5.3).
     const forward = (chunk: Buffer | string): void => {
+      this._lastDataAt = Date.now();
       const s = typeof chunk === "string" ? chunk : chunk.toString("utf8");
       for (const h of this.dataHandlers) {
         try {

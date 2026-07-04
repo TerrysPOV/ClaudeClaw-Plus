@@ -113,6 +113,49 @@ export function ceilingFor(name: string, ceilings: StallCeilings): ToolCeiling {
   return ceilings[classifyTool(name)];
 }
 
+/* ── Config parsing (mirror of `parseWatchdogConfig`) ────────────────────── */
+
+function posNum(v: unknown, fallback: number, min: number): number {
+  return typeof v === "number" && Number.isFinite(v) && v >= min ? v : fallback;
+}
+
+function parseCeiling(raw: unknown, d: ToolCeiling): ToolCeiling {
+  const r = (raw ?? {}) as Record<string, unknown>;
+  return {
+    warnSeconds: posNum(r.warnSeconds, d.warnSeconds, 1),
+    killSeconds: posNum(r.killSeconds, d.killSeconds, 1),
+  };
+}
+
+/**
+ * Validate a raw settings value into a `StallWatchdogConfig`. Unknown keys are
+ * ignored; each invalid/missing field falls back to `DEFAULT_STALL_CONFIG`.
+ */
+export function parseStallWatchdogConfig(raw: unknown): StallWatchdogConfig {
+  const d = DEFAULT_STALL_CONFIG;
+  if (!raw || typeof raw !== "object") return structuredClone(d);
+  const r = raw as Record<string, unknown>;
+  const rc = (r.ceilings ?? {}) as Record<string, unknown>;
+  const ad = (r.autoDiscovery ?? {}) as Record<string, unknown>;
+  return {
+    enabled: typeof r.enabled === "boolean" ? r.enabled : d.enabled,
+    sweepIntervalMs: posNum(r.sweepIntervalMs, d.sweepIntervalMs, 1000),
+    ceilings: {
+      fast: parseCeiling(rc.fast, d.ceilings.fast),
+      bash: parseCeiling(rc.bash, d.ceilings.bash),
+      task: parseCeiling(rc.task, d.ceilings.task),
+      mcp: parseCeiling(rc.mcp, d.ceilings.mcp),
+      default: parseCeiling(rc.default, d.ceilings.default),
+    },
+    action: r.action === "warn" || r.action === "restart" ? r.action : d.action,
+    autoDiscovery: {
+      enabled: typeof ad.enabled === "boolean" ? ad.enabled : d.autoDiscovery.enabled,
+      cpuProbeMs: posNum(ad.cpuProbeMs, d.autoDiscovery.cpuProbeMs, 100),
+    },
+    restartFailureCooldownMs: posNum(r.restartFailureCooldownMs, d.restartFailureCooldownMs, 0),
+  };
+}
+
 /* ── Per-session state + decision ────────────────────────────────────────── */
 
 interface OutstandingTool {
