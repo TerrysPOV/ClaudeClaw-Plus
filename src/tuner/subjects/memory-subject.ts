@@ -348,7 +348,6 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
     const current = readFileSync(this.memoryIndex, "utf8");
     const dedupDead = applyStrategy(current, this.memoryIndex, "dedup-dead");
     const dedupReorder = applyStrategy(current, this.memoryIndex, "dedup-reorder");
-    const dedupGroup = applyStrategy(current, this.memoryIndex, "dedup-group");
     // Shrink: rewrite over-long entries to one line each (LLM, deterministic
     // fallback). Unknown-strategy id → apply() writes this content verbatim.
     const shrunk = await this.rewriteShort(current);
@@ -387,15 +386,6 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
             toLabel: "MEMORY.md (dedup-reorder)",
           }),
           tradeoff: "Easier visual scan; reorder churn in git blame.",
-        },
-        {
-          id: "dedup-group",
-          label: "Dedup + group by name prefix",
-          diff_or_content: renderDiff(current, dedupGroup, {
-            fromLabel: "MEMORY.md",
-            toLabel: "MEMORY.md (dedup-group)",
-          }),
-          tradeoff: "Groups feedback_/project_/user_ entries together; loses chronological order.",
         },
       ],
       pattern_signature: `memory:dedup:${parseEntries(current).length}`,

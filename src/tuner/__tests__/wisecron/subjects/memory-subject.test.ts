@@ -450,8 +450,10 @@ describe("MemorySubject — Pass B: proposeChange emits unified diff", () => {
       subjects_touched: ["memory"],
     };
     const proposal = await s.proposeChange(cluster);
-    // 3 dedup diffs (≤2KB each) + 1 full-content "shrink" alternative.
-    expect(proposal.alternatives).toHaveLength(4);
+    // 2 dedup diffs (≤2KB each) + 1 full-content "shrink" alternative = 3.
+    // Schema caps alternatives at 3 (adapter surfaces show 3 choices), so the
+    // subject must not exceed it — see UnsignedProposalSchema.alternatives.max(3).
+    expect(proposal.alternatives).toHaveLength(3);
     for (const alt of proposal.alternatives.filter((a) => a.id !== "shrink")) {
       expect(alt.diff_or_content.length).toBeLessThanOrEqual(2048);
     }
