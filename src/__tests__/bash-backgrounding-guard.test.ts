@@ -54,6 +54,28 @@ describe("isUnsafeBackground", () => {
   });
 });
 
+/* ── tightened safe-form exemptions (#302 review: Codex + Claude) ───────── */
+
+describe("isUnsafeBackground — safe-form exemptions are strict", () => {
+  it("setsid with only stdin (or stdin+2>&1) redirected is still unsafe", () => {
+    expect(isUnsafeBackground("setsid long-server </dev/null &")).toBe(true); // stdout/stderr leak
+    expect(isUnsafeBackground("setsid x </dev/null 2>&1 &")).toBe(true); // stdout still on the pipe
+  });
+  it("a `wait` that is not a real wait-on-the-job does not exempt", () => {
+    expect(isUnsafeBackground("echo wait; nohup server >log 2>&1 &")).toBe(true); // arg, before the bg
+    expect(isUnsafeBackground("wait; nohup server &")).toBe(true); // wait before the background
+  });
+  it("a quoted wait/setsid does not exempt", () => {
+    expect(isUnsafeBackground('nohup server >log 2>&1 & echo "please wait"')).toBe(true);
+    expect(isUnsafeBackground('echo "via setsid"; nohup bad &')).toBe(true);
+  });
+  it("the full-detach and real-wait forms are still allowed", () => {
+    expect(isUnsafeBackground("setsid x </dev/null >log 2>&1 &")).toBe(false);
+    expect(isUnsafeBackground("setsid x </dev/null &>log &")).toBe(false); // &>log = both fds
+    expect(isUnsafeBackground("a & b & wait")).toBe(false);
+  });
+});
+
 /* ── hook integration (stdin JSON → deny/allow) ────────────────────────── */
 
 describe("guard-bash-backgrounding hook", () => {
