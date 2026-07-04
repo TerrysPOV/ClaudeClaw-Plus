@@ -1,5 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, existsSync, mkdirSync } from "node:fs";
+import {
+  mkdtempSync,
+  writeFileSync,
+  readFileSync,
+  rmSync,
+  existsSync,
+  mkdirSync,
+  symlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { McpPluginSubject, type PluginInstaller } from "../../../subjects/mcp-plugin-subject.js";
@@ -112,6 +120,63 @@ describe("McpPluginSubject — real plugin install (confined + reversible)", () 
       /approved registry/,
     );
     expect(installerCalls).toHaveLength(0); // never reached the installer
+  });
+
+  it("SYMLINK: refuses to install when the managed plugins dir is a symlink out of the surface", async () => {
+    writeFileSync(settingsPath, JSON.stringify({ allowedTools: [] }));
+    // Plant a symlink AT the managed dir pointing outside the managed surface.
+    const outside = join(tmpRoot, "outside");
+    mkdirSync(outside, { recursive: true });
+    symlinkSync(outside, pluginsDir);
+    await expect(
+      subject(okInstaller).apply(installProposal(settingsPath), "install-plugin"),
+    ).rejects.toThrow(/symlink/);
+    // Nothing was written through the symlink, and the installer never ran.
+    expect(existsSync(join(outside, "mcp-server-qdrant"))).toBe(false);
+    expect(installerCalls).toHaveLength(0);
+  });
+
+  it("VERIFIED: an unverified registry entry is rejected at apply (belt-and-braces)", async () => {
+    writeFileSync(settingsPath, JSON.stringify({ allowedTools: [] }));
+    const spec = {
+      op: "install-plugin",
+      pluginId: "mcp-server-qdrant",
+      manager: "git",
+      source: "https://github.com/qdrant/mcp-server-qdrant",
+      server: { command: "uvx", args: ["mcp-server-qdrant"] },
+    };
+    // Registry entry matches the spec EXACTLY but is unverified.
+    writeFileSync(
+      registryPath,
+      JSON.stringify([
+        {
+          technique: "test",
+          capability: "test",
+          pluginId: spec.pluginId,
+          manager: spec.manager,
+          source: spec.source,
+          server: spec.server,
+          description: "unverified seed",
+          verified: false,
+        },
+      ]),
+    );
+    const proposal = {
+      id: 2,
+      cluster_id: "c",
+      subject: "mcp_plugin",
+      kind: "patch",
+      target_path: settingsPath,
+      alternatives: [
+        { id: "install-plugin", label: "x", diff_or_content: JSON.stringify(spec), tradeoff: "" },
+      ],
+      pattern_signature: "x",
+      created_at: new Date(),
+    } as unknown as Proposal;
+    await expect(subject(okInstaller).apply(proposal, "install-plugin")).rejects.toThrow(
+      /unverified/i,
+    );
+    expect(installerCalls).toHaveLength(0);
   });
 
   it("installs into the managed dir + registers the server in settings + records a manifest", async () => {

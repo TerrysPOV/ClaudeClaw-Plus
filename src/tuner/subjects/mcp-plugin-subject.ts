@@ -6,10 +6,11 @@ import {
   mkdirSync,
   rmSync,
   lstatSync,
+  realpathSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, dirname, basename } from "node:path";
 import { BaseSubject } from "../../skills-tuner/subjects/base.js";
 import { sanitizeObservationContent } from "../../skills-tuner/core/security.js";
 import type { LLMClient } from "../../skills-tuner/core/llm.js";
@@ -487,9 +488,20 @@ export class McpPluginSubject extends BaseSubject implements RevertibleSubject {
     // Apply-time approved-list gate: the propose-time `verified` check is not
     // enough — an externally-ingested proposal could carry an off-registry
     // source behind a benign label. Require an EXACT match to a curated entry.
-    if (!matchRegistryEntry(spec, { registryPath: this.registryPath })) {
+    const registryEntry = matchRegistryEntry(spec, { registryPath: this.registryPath });
+    if (!registryEntry) {
       throw new Error(
         `mcp-plugin-subject.applyInstall: spec for '${spec.pluginId}' matches no approved registry entry — refusing install`,
+      );
+    }
+    // Belt-and-braces with the human gate: even a spec that matches a registry
+    // entry must match a VERIFIED one. Built-in seeds ship `verified: false` by
+    // design (they are recommendations the operator must vet at the gate), so an
+    // unverified seed can never be installed even if a proposal reaches apply()
+    // carrying its exact spec.
+    if (!registryEntry.verified) {
+      throw new Error(
+        `mcp-plugin-subject.applyInstall: spec for '${spec.pluginId}' matches only an UNVERIFIED registry entry — refusing install`,
       );
     }
     const destDir = this.pluginDir(spec.pluginId);
@@ -514,6 +526,13 @@ export class McpPluginSubject extends BaseSubject implements RevertibleSubject {
     });
 
     // Clean any stale dir from a previous failed attempt, then install.
+    // Symlink guard BEFORE any fs mutation: a planted symlink at the managed
+    // plugins dir or at the specific install dir would make rmSync/mkdir/clone
+    // follow it OUT of the managed surface. assertInsidePlugins(destDir) above
+    // already realpath-resolves the whole chain; these lstat checks are the
+    // direct belt-and-braces the settings-file path uses.
+    assertNotSymlink(this.managedPluginsDir);
+    assertNotSymlink(destDir);
     if (existsSync(destDir)) rmSync(destDir, { recursive: true, force: true });
     mkdirSync(destDir, { recursive: true });
     const res = this.installer({ manager: spec.manager, source: spec.source, destDir });
@@ -628,12 +647,34 @@ export class McpPluginSubject extends BaseSubject implements RevertibleSubject {
     }
   }
 
-  /** Installs may only ever land inside the managed plugins dir. */
+  /**
+   * Installs may only ever land inside the managed plugins dir — enforced on TWO
+   * axes so neither a `..` nor a symlink can escape:
+   *   1. Lexical: `resolve()` (no fs touch) rejects `..` traversal.
+   *   2. Symlink: resolve symlinks on the existing part of the chain and require
+   *      the REAL target to stay under a root canonicalised the same way. The
+   *      target (e.g. `<managed>/<plugin>`) does not exist yet, so we realpath the
+   *      nearest EXISTING ancestor and re-append the not-yet-created suffix —
+   *      catching a planted symlink AT the managed dir or any component of the
+   *      install path, while tolerating benign symlinks ABOVE it (e.g. /tmp).
+   */
   private assertInsidePlugins(target: string): void {
-    const root = resolve(this.managedPluginsDir);
-    const resolved = resolve(target);
-    if (resolved !== root && !resolved.startsWith(`${root}/`)) {
+    const lexicalRoot = resolve(this.managedPluginsDir);
+    const lexicalTarget = resolve(target);
+    // 1. Lexical confinement — a `..` can never point the install outside.
+    if (lexicalTarget !== lexicalRoot && !lexicalTarget.startsWith(`${lexicalRoot}/`)) {
       throw new Error(`install path outside managedPluginsDir: ${target}`);
+    }
+    // 2. Symlink confinement — canonicalise ONLY the ancestry above the managed
+    //    dir, then keep the managed dir's own name lexical, so a symlink planted
+    //    AT the managed dir (or below) diverges the real target and is refused.
+    const canonicalRoot = join(
+      realpathNearestExisting(dirname(lexicalRoot)),
+      basename(lexicalRoot),
+    );
+    const realTarget = realpathNearestExisting(lexicalTarget);
+    if (realTarget !== canonicalRoot && !realTarget.startsWith(`${canonicalRoot}/`)) {
+      throw new Error(`install path escapes managedPluginsDir via symlink: ${target}`);
     }
   }
 
@@ -648,6 +689,9 @@ export class McpPluginSubject extends BaseSubject implements RevertibleSubject {
   }
 
   private writeManifest(entries: ManifestEntry[]): void {
+    // Never mkdir/write the manifest through a symlinked managed dir.
+    assertNotSymlink(this.managedPluginsDir);
+    this.assertInsidePlugins(this.managedPluginsDir);
     mkdirSync(this.managedPluginsDir, { recursive: true });
     writeFileSync(this.manifestPath, stableJson(entries), "utf8");
   }
@@ -864,8 +908,30 @@ function assertNotSymlink(target: string): void {
   }
 }
 
+/**
+ * realpath the longest EXISTING prefix of `p`, then re-append the not-yet-created
+ * suffix lexically. An install leaf (`<managed>/<plugin>`) doesn't exist yet, so
+ * we can't realpath it directly — this canonicalises symlinks on the real part of
+ * the chain while keeping the pending components literal. Benign symlinks above
+ * the managed dir (e.g. `/tmp` → `/private/tmp`) resolve consistently for both
+ * the root and the target, so they don't trip confinement; a symlink planted AT
+ * or below the managed dir diverges the target and is caught.
+ */
+function realpathNearestExisting(p: string): string {
+  let existing = resolve(p);
+  const suffix: string[] = [];
+  while (!existsSync(existing)) {
+    const parent = dirname(existing);
+    if (parent === existing) return existing; // reached filesystem root
+    suffix.unshift(basename(existing));
+    existing = parent;
+  }
+  const realBase = realpathSync(existing);
+  return suffix.length ? join(realBase, ...suffix) : realBase;
+}
+
 /** https git URL only — blocks file://, ssh, shell metachars, SSRF-ish hosts. */
-function isSafeGitUrl(url: string): boolean {
+export function isSafeGitUrl(url: string): boolean {
   let u: URL;
   try {
     u = new URL(url);
@@ -884,7 +950,7 @@ function isSafeGitUrl(url: string): boolean {
 }
 
 /** npm spec: package name (optionally @scope) + optional @version. No shell metachars/paths. */
-function isSafeNpmSpec(spec: string): boolean {
+export function isSafeNpmSpec(spec: string): boolean {
   // Leading char classes exclude '-' so a spec can never begin with a flag
   // (belt-and-suspenders with the `--` end-of-options separator at the call site).
   return /^(@[a-z0-9~][a-z0-9-._~]*\/)?[a-z0-9~][a-z0-9-._~]*(@[\w.\-^~*x>=<| ]+)?$/i.test(spec);
@@ -976,7 +1042,7 @@ function sortReplacer(_key: string, value: unknown): unknown {
   return value;
 }
 
-function defaultAuditReader(path: string, since: Date): Array<Record<string, unknown>> {
+export function defaultAuditReader(path: string, since: Date): Array<Record<string, unknown>> {
   if (!existsSync(path)) return [];
   const events: Array<Record<string, unknown>> = [];
   let content: string;
@@ -991,11 +1057,13 @@ function defaultAuditReader(path: string, since: Date): Array<Record<string, unk
     try {
       const obj = JSON.parse(trimmed);
       if (typeof obj !== "object" || obj === null) continue;
+      // A line with no (or an unparseable) timestamp can never age out of the
+      // `since` window — it would accumulate on every read and inflate the
+      // dead-tool counts. Treat a missing/invalid ts as pre-window and skip it.
       const ts = (obj as Record<string, unknown>).ts;
-      if (ts) {
-        const tsDate = new Date(ts as string | number);
-        if (tsDate < since) continue;
-      }
+      if (!ts) continue;
+      const tsDate = new Date(ts as string | number);
+      if (Number.isNaN(tsDate.getTime()) || tsDate < since) continue;
       events.push(obj as Record<string, unknown>);
     } catch {}
   }
