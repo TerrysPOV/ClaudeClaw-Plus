@@ -7,11 +7,11 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { tmpdir } from "node:os";
+import { tmpdir, hostname } from "node:os";
 import { join } from "node:path";
-import { ApplyPipeline } from "../../wisecron/apply-pipeline.js";
+import { ApplyPipeline, lockPathFor } from "../../wisecron/apply-pipeline.js";
 import { WisecronStateDB } from "../../wisecron/state-db.js";
 import { Registry } from "../../../skills-tuner/core/registry.js";
 import { TunableSubject } from "../../../skills-tuner/core/interfaces.js";
@@ -146,5 +146,99 @@ describe("ApplyPipeline — validate before commit/record (fix #1)", () => {
     expect(git("log", "-1", "--pretty=%s").stdout).toContain("[tuner]");
     expect(outcome.revision.id).toBeGreaterThan(0);
     expect(db.getActiveRevisionByProposal("101")).not.toBeNull();
+  });
+});
+
+/**
+ * Cross-process apply lock (fix #2): the in-process queue only serializes
+ * callers inside one process. A second PROCESS (daemon vs CLI, overlapping
+ * restart) must be blocked by the O_EXCL lockfile next to the target — and a
+ * holder that crashed mid-apply must not deadlock forever (stale recovery).
+ */
+describe("ApplyPipeline — cross-process apply lock (fix #2)", () => {
+  it("a live lock held by another process makes a concurrent apply fail cleanly, then recover", async () => {
+    const lockPath = lockPathFor(configPath);
+    // Simulate another LIVE process holding the lock (our own pid = alive).
+    writeFileSync(
+      lockPath,
+      JSON.stringify({ pid: process.pid, host: hostname(), time: Date.now() }),
+    );
+    // A separate instance = a separate in-process queue; only the file lock
+    // can serialize it against the (simulated) holder.
+    const other = new ApplyPipeline(registry, db, {
+      verify: () => true,
+      fileLockMaxWaitMs: 150,
+      fileLockPollMs: 20,
+      fileLockStaleMs: 60_000, // large: the live holder must NOT be seen as stale
+    });
+
+    await expect(
+      other.apply(proposal("modes:\n  a:\n    keywords: [blocked]\n"), "a", "cli"),
+    ).rejects.toThrow(/could not acquire apply lock/);
+    // The blocked apply never touched the target.
+    expect(readFileSync(configPath, "utf8")).not.toContain("blocked");
+    expect(db.listRevisionsBySubject("file_subject")).toHaveLength(0);
+
+    // Holder releases → a retry now succeeds and cleans up its own lock.
+    rmSync(lockPath, { force: true });
+    const out = await other.apply(
+      proposal("modes:\n  a:\n    keywords: [after]\n"),
+      "a",
+      "cli",
+    );
+    expect(out.revision.id).toBeGreaterThan(0);
+    expect(readFileSync(configPath, "utf8")).toContain("after");
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("breaks a stale lock left by a crashed (dead-pid) holder and applies", async () => {
+    // A process that has already exited → its pid is dead.
+    const dead = spawnSync(process.execPath, ["-e", "process.exit(0)"]);
+    const deadPid = dead.pid ?? 0x7ffffffe;
+    const lockPath = lockPathFor(configPath);
+    // Fresh mtime, but the recorded holder is dead → must be broken as stale.
+    writeFileSync(
+      lockPath,
+      JSON.stringify({ pid: deadPid, host: hostname(), time: Date.now() }),
+    );
+
+    // Small wait budget so a (very unlikely) pid reuse fails fast instead of
+    // hanging; large stale-mtime so ONLY the dead-pid path can break the lock.
+    const p = new ApplyPipeline(registry, db, {
+      verify: () => true,
+      fileLockMaxWaitMs: 500,
+      fileLockPollMs: 20,
+      fileLockStaleMs: 60_000,
+    });
+    const out = await p.apply(proposal("modes:\n  a:\n    keywords: [recovered]\n"), "a", "cli");
+
+    expect(out.revision.id).toBeGreaterThan(0);
+    expect(readFileSync(configPath, "utf8")).toContain("recovered");
+    // Lock released in the finally after a successful apply.
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it("two overlapping applies from separate instances serialize without corruption", async () => {
+    // Separate instances = independent in-process queues; the file lock is the
+    // only thing serializing them against each other.
+    const a = new ApplyPipeline(registry, db, { verify: () => true, fileLockPollMs: 10 });
+    const b = new ApplyPipeline(registry, db, { verify: () => true, fileLockPollMs: 10 });
+
+    const [ra, rb] = await Promise.all([
+      a.apply(proposal("modes:\n  a:\n    keywords: [one]\n"), "a", "cli"),
+      b.apply(proposal("modes:\n  a:\n    keywords: [two]\n"), "a", "cli"),
+    ]);
+
+    // Both applied (serialized, not corrupted) → two distinct revisions.
+    expect(ra.revision.id).toBeGreaterThan(0);
+    expect(rb.revision.id).toBeGreaterThan(0);
+    expect(ra.revision.id).not.toBe(rb.revision.id);
+    expect(db.listRevisionsBySubject("file_subject")).toHaveLength(2);
+    // Final content is exactly one of the two writes (a clean last-writer state,
+    // never an interleaved mix).
+    const final = readFileSync(configPath, "utf8");
+    expect(["one", "two"].some((k) => final.includes(k))).toBe(true);
+    // No lockfile leaked.
+    expect(existsSync(lockPathFor(configPath))).toBe(false);
   });
 });

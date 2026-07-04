@@ -51,6 +51,13 @@ class ScriptedSubject extends TunableSubject {
     this.measureCalls += 1;
     return v;
   }
+  // Report a plausible N per declared metric by default so pipeline tests
+  // exercise verdict *direction*, not the underpowered gate (an untracked metric
+  // — undefined count — is now treated as underpowered). Tests that target the
+  // gate itself use a no-count subject or a direct decideVerdict unit test.
+  async measureFitnessCounts(): Promise<Record<string, number>> {
+    return Object.fromEntries(this.metrics.map((m) => [m.name, 2]));
+  }
   async collectObservations(): Promise<Observation[]> {
     return [];
   }

@@ -6,6 +6,12 @@
  *  6. maturation pass             — `runMaturation()`  (post, delta, verdict)
  *  7. defensive revert by tier    — wired into `runMaturation` via `revert` cb
  *
+ * The maturation pass and its defensive revert run only when `runMaturation()`
+ * is explicitly invoked (the `tuner__mature` gate tool, or the CLI) — there is
+ * NO autonomous timer/tick driving it in this phase. So auto-revert is a wired,
+ * operator/cycle-triggered capability, not a self-driving one: "observation-only"
+ * means nothing reverts unless something calls `runMaturation`.
+ *
  * Verifiable metrics only (Tier 1 streams the host advertises + Tier 1b
  * artifact). No judge, no generative change to proposal generation. Every
  * step writes an audit record.
@@ -53,7 +59,8 @@ export type FitnessMetric = Metric & { isTarget?: boolean };
  * A subject that can OPTIONALLY report the sample count behind each fitness
  * value (so the maturation pass can gate on minimum-N and not decide on a single
  * session). Detected structurally — subjects that don't implement it degrade to
- * `count: undefined` (no gate), preserving Phase-1 behaviour.
+ * `count: undefined`, which the verdict treats as underpowered (conservative:
+ * an untracked metric can't force a verdict or a revert).
  */
 type CountingSubject = TunableSubject & {
   measureFitnessCounts?: (

@@ -37,7 +37,8 @@ export interface MetricDelta {
   absoluteNoise?: number;
   /**
    * Number of samples the aggregate was computed from. `undefined` = unknown
-   * (not gated, backward-compatible); `0` = empty window (no data). Used by
+   * (treated as underpowered — the safe default, so an untracked metric can't
+   * force a verdict/revert); `0` = empty window (no data). Used by
    * `decideVerdict`'s minimum-N guard so a single lucky session can't decide.
    */
   count?: number;
@@ -78,19 +79,22 @@ function classifyMove(d: MetricDelta): "up" | "down" | "flat" {
 export interface VerdictOptions {
   /**
    * Minimum sample count required to emit `improved`/`regressed`. A delta whose
-   * `count` is known and below this (including 0 = empty window) falls back to
-   * neutral/inconclusive; an unknown (`undefined`) count is NOT gated. Default 1
-   * — so an empty window (count 0) is still treated as "no data → neutral", but
-   * callers that can supply real N should raise it (e.g. 2) so one lucky/fast
-   * session can't clear the noise floor and decide on N=1.
+   * `count` is below this (including 0 = empty window) OR unknown (`undefined`)
+   * falls back to neutral/inconclusive — unknown is treated as underpowered, the
+   * safe default. Default 1 — so an empty window (count 0) is "no data →
+   * neutral", but callers that can supply real N should raise it (e.g. 2) so one
+   * lucky/fast session can't clear the noise floor and decide on N=1.
    */
   minSamples?: number;
 }
 
-/** A delta whose sample count is KNOWN and below the floor (or 0 = empty
- *  window): too little data to make a call. Unknown count → not underpowered. */
+/** A delta we can't trust as evidence: an unknown (`undefined`) count, or a
+ *  known count below the floor (including 0 = empty window). Unknown count is
+ *  treated as underpowered — the safe default — so a metric with no sample
+ *  tracking can't force a verdict (and, as a guardrail, a revert) off one
+ *  unlucky sample. Metrics that supply a real `count` gate on it as before. */
 function underpowered(d: MetricDelta, minSamples: number): boolean {
-  return d.count !== undefined && d.count < minSamples;
+  return d.count === undefined || d.count < minSamples;
 }
 
 /**

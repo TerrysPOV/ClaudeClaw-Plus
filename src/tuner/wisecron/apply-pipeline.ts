@@ -5,10 +5,15 @@ import {
   mkdirSync,
   lstatSync,
   realpathSync,
+  openSync,
+  writeSync,
+  closeSync,
+  statSync,
+  rmSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { basename, dirname, join, resolve } from "node:path";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import type { Registry } from "../../skills-tuner/core/registry.js";
 import type { Patch, Proposal } from "../../skills-tuner/core/types.js";
 import type { RiskTier, TunableSubject } from "../../skills-tuner/core/interfaces.js";
@@ -98,6 +103,15 @@ export class ApplyPipeline {
   // is removed once the last waiter drains so the map cannot grow unbounded
   // across distinct target paths over a long-running process.
   private readonly locks = new Map<string, { tail: Promise<unknown>; waiters: number }>();
+  // Cross-process apply lock tuning. The in-process `locks` map above only
+  // serializes callers inside THIS process; two PROCESSES (the daemon plus a
+  // CLI `apply`, or an overlapping restart) hitting the same target are guarded
+  // by an O_EXCL lockfile next to the target (see withFileLock). A holder that
+  // crashes mid-apply is recovered by stale-lock breaking (dead pid or mtime
+  // older than fileLockStaleMs) so the lock can never deadlock forever.
+  private readonly fileLockMaxWaitMs: number;
+  private readonly fileLockPollMs: number;
+  private readonly fileLockStaleMs: number;
 
   constructor(
     registry: Registry,
@@ -116,6 +130,12 @@ export class ApplyPipeline {
       waitForObservationWindow?: boolean;
       /** OutcomeLoop: when supplied, snapshot baseline fitness after apply. */
       outcomeRecorder?: OutcomeRecorderHook;
+      /** Max time to wait for a cross-process apply lock before failing cleanly. */
+      fileLockMaxWaitMs?: number;
+      /** Poll interval while waiting on a contended cross-process apply lock. */
+      fileLockPollMs?: number;
+      /** Age after which a held lockfile is treated as stale and broken. */
+      fileLockStaleMs?: number;
     } = {},
   ) {
     this.registry = registry;
@@ -141,6 +161,9 @@ export class ApplyPipeline {
     this.writeTarget = opts.writeTarget ?? defaultWriteTarget;
     this.waitForWindow = opts.waitForObservationWindow ?? false;
     this.outcomeRecorder = opts.outcomeRecorder;
+    this.fileLockMaxWaitMs = opts.fileLockMaxWaitMs ?? 30_000;
+    this.fileLockPollMs = opts.fileLockPollMs ?? 50;
+    this.fileLockStaleMs = opts.fileLockStaleMs ?? 60_000;
   }
 
   /**
@@ -465,7 +488,10 @@ export class ApplyPipeline {
     }
     await prev;
     try {
-      return await fn();
+      // The in-process gate is held; now take the cross-process file lock so a
+      // separate process (daemon vs CLI, overlapping restart) cannot run the
+      // read→apply→commit→record sequence for the same target concurrently.
+      return await this.withFileLock(targetPath, fn);
     } finally {
       release?.();
       const entry = this.locks.get(targetPath);
@@ -475,6 +501,146 @@ export class ApplyPipeline {
       }
     }
   }
+
+  /**
+   * Cross-process guard around `fn`, keyed on the target path via an O_EXCL
+   * lockfile next to the target. Complements the in-process `withTargetLock`
+   * gate (which only serializes callers inside this process): here two distinct
+   * PROCESSES touching the same target serialize — the second waits (bounded by
+   * fileLockMaxWaitMs) and then fails cleanly rather than corrupting the target.
+   *
+   * Robustness:
+   *   - A holder that crashed mid-apply is recovered by breakIfStale (dead pid
+   *     or lockfile older than fileLockStaleMs) so we never deadlock forever.
+   *   - Best-effort: if the target's directory can't host a lockfile (a
+   *     synthetic/read-only path), we degrade to the in-process lock only and
+   *     audit it, rather than failing the apply.
+   */
+  private async withFileLock<T>(targetPath: string, fn: () => Promise<T>): Promise<T> {
+    const lockPath = lockPathFor(targetPath);
+    const acquired = await this.acquireFileLock(lockPath);
+    try {
+      return await fn();
+    } finally {
+      if (acquired) {
+        try {
+          rmSync(lockPath, { force: true });
+        } catch {
+          // Lock already gone (e.g. broken as stale by a peer): nothing to do.
+        }
+      }
+    }
+  }
+
+  /**
+   * Acquire the O_EXCL lockfile at `lockPath`, waiting (polling) up to
+   * fileLockMaxWaitMs for a live holder to release it and breaking a stale
+   * holder on the way. Returns true when the lock is held by us, or false when
+   * the filesystem cannot host a lockfile (degrade to in-process lock only).
+   * Throws a clear error if a live peer holds the lock past the wait budget.
+   */
+  private async acquireFileLock(lockPath: string): Promise<boolean> {
+    const deadline = Date.now() + this.fileLockMaxWaitMs;
+    for (;;) {
+      try {
+        const fd = openSync(lockPath, "wx"); // O_CREAT | O_EXCL | O_WRONLY
+        try {
+          writeSync(
+            fd,
+            JSON.stringify({ pid: process.pid, host: hostname(), time: Date.now() }),
+          );
+        } finally {
+          closeSync(fd);
+        }
+        return true;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "EEXIST") {
+          // Contended. Break it if the holder is gone, else wait and retry.
+          if (this.breakIfStale(lockPath)) continue;
+          if (Date.now() >= deadline) {
+            throw new Error(
+              `ApplyPipeline: could not acquire apply lock ${lockPath} within ` +
+                `${this.fileLockMaxWaitMs}ms — held by another process`,
+            );
+          }
+          await sleep(this.fileLockPollMs);
+          continue;
+        }
+        // The directory can't host a lockfile (missing/read-only/synthetic
+        // path). Degrade to in-process locking only rather than failing apply.
+        this.audit("wisecron_apply_lock_unavailable", {
+          lock_path: lockPath,
+          error: (err as Error).message.slice(0, 160),
+        });
+        return false;
+      }
+    }
+  }
+
+  /**
+   * If the lockfile at `lockPath` is stale — its recorded holder pid is dead
+   * (same host) or the file is older than fileLockStaleMs — remove it and
+   * return true so the caller can retry the O_EXCL create. A corrupt/vanished
+   * lockfile is also treated as breakable. Returns false when a live holder
+   * legitimately owns it.
+   */
+  private breakIfStale(lockPath: string): boolean {
+    let info: { pid?: number; host?: string; time?: number };
+    let ageMs: number;
+    try {
+      info = JSON.parse(readFileSync(lockPath, "utf8")) as typeof info;
+      ageMs = Date.now() - statSync(lockPath).mtimeMs;
+    } catch {
+      // Unreadable or already removed by a peer → safe to (re)claim.
+      try {
+        rmSync(lockPath, { force: true });
+      } catch {
+        /* ignore */
+      }
+      return true;
+    }
+    const sameHost = !info.host || info.host === hostname();
+    let holderAlive = true;
+    if (sameHost && typeof info.pid === "number") {
+      try {
+        process.kill(info.pid, 0);
+        holderAlive = true;
+      } catch (e) {
+        // ESRCH → no such process (dead). EPERM → exists but not ours (alive).
+        holderAlive = (e as NodeJS.ErrnoException).code === "EPERM";
+      }
+    }
+    const stale = !holderAlive || ageMs > this.fileLockStaleMs;
+    if (!stale) return false;
+    try {
+      rmSync(lockPath, { force: true });
+    } catch {
+      /* ignore */
+    }
+    this.audit("wisecron_apply_lock_broken", {
+      lock_path: lockPath,
+      holder_pid: info.pid ?? null,
+      age_ms: Math.round(ageMs),
+      reason: holderAlive ? "stale-mtime" : "dead-holder",
+    });
+    return true;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Lockfile path next to a target: `<dir>/.<base>.tuner-apply.lock`. `~` is
+ * expanded and the path resolved so two processes referring to the same file
+ * by different spellings still contend on one lock.
+ */
+export function lockPathFor(targetPath: string): string {
+  const expanded = targetPath.startsWith("~") ? targetPath.replace(/^~/, homedir()) : targetPath;
+  const abs = resolve(expanded);
+  return join(dirname(abs), `.${basename(abs)}.tuner-apply.lock`);
 }
 
 // ── Confinement helpers (revert path) ──────────────────────────────────────
