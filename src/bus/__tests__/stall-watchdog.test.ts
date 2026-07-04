@@ -377,3 +377,58 @@ describe("restartFailedAt does not leak across a failed→succeeded restart cycl
     expect(calls).toHaveLength(3);
   });
 });
+
+/* ── stop() during an in-flight kill (Codex P2 on #300) ────────────────── */
+
+describe("stop() while a kill is mid-flight", () => {
+  it("does not restart after stop() resolves, and stop() awaits the in-flight kill", async () => {
+    let releaseForensic!: () => void;
+    const forensicGate = new Promise<void>((r) => {
+      releaseForensic = r;
+    });
+    const calls = { restart: 0, forensic: 0, recordKill: 0 };
+    const deps: StallWatchdogDeps = {
+      subscribe: () => () => {},
+      restart: async () => {
+        calls.restart++;
+      },
+      captureForensic: async () => {
+        calls.forensic++;
+        await forensicGate; // block the kill mid-flight, at the forensic snapshot
+        return { cpuAdvancing: false, outputRecencyMs: 9_000_000 };
+      },
+      recordKill: async () => {
+        calls.recordKill++;
+        return { classification: "genuine_wedge" };
+      },
+      notify: () => {},
+      now: () => 0,
+    };
+    const wd = new StallWatchdog(DEFAULT_STALL_CONFIG, deps);
+    wd.ingest(evt("response.tool_use", 0, { id: "b1", name: "Bash" }));
+
+    // Fire a sweep that enters handleKill and blocks at captureForensic.
+    const sweepP = wd.sweep(950_000);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(calls.forensic).toBe(1); // kill is in flight
+    expect(calls.restart).toBe(0);
+
+    // Begin teardown while the kill is blocked; stop() must await the in-flight kill.
+    const stopP = wd.stop();
+    let stopResolved = false;
+    void stopP.then(() => {
+      stopResolved = true;
+    });
+    await Promise.resolve();
+    expect(stopResolved).toBe(false); // stop() is waiting on the in-flight kill
+
+    // Release the snapshot: handleKill resumes and must bail at the stopped-check.
+    releaseForensic();
+    await stopP;
+    await sweepP;
+
+    expect(calls.restart).toBe(0); // no restart started after stop() began
+    expect(calls.recordKill).toBe(0); // and the kill aborted before recording
+  });
+});

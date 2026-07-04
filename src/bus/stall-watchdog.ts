@@ -282,6 +282,12 @@ export class StallWatchdog {
   private unsubscribe: (() => void) | null = null;
   /** Sessions with a kill in flight — never double-restart the same one. */
   private readonly killing = new Set<string>();
+  /** Set once stop() begins, so no NEW kill starts a restart during teardown. */
+  private stopped = false;
+  /** In-flight handleKill promises so stop() can await them before it returns,
+   *  preventing a mid-flight restart from respawning a session the daemon has
+   *  already torn down (Codex P2 on #300). */
+  private readonly inFlight = new Set<Promise<void>>();
 
   constructor(
     private readonly config: StallWatchdogConfig,
@@ -377,7 +383,12 @@ export class StallWatchdog {
         continue;
       }
       this.killing.add(k);
-      kills.push(this.handleKill(s, decision, now).finally(() => this.killing.delete(k)));
+      const p = this.handleKill(s, decision, now).finally(() => {
+        this.killing.delete(k);
+        this.inFlight.delete(p);
+      });
+      this.inFlight.add(p);
+      kills.push(p);
     }
     // Await in-flight kills so sweeps never overlap on the same session and
     // tests observe the full capture→restart→classify sequence.
@@ -398,6 +409,12 @@ export class StallWatchdog {
         /* forensic is best-effort — never block recovery */
       }
     }
+
+    // If teardown began while we were capturing the forensic snapshot, abort
+    // before restarting — a restart here would respawn a session the daemon is
+    // tearing down (Codex P2 on #300). A kill already past this point is awaited
+    // by stop() so its respawn is torn down in order rather than orphaned.
+    if (this.stopped) return;
 
     try {
       await this.deps.restart(s.agentId, {
@@ -465,11 +482,16 @@ export class StallWatchdog {
     (this.timer as { unref?: () => void }).unref?.();
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
+    // Set first so any sweep already inside handleKill won't start a new restart.
+    this.stopped = true;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     this.unsubscribe?.();
     this.unsubscribe = null;
+    // Await any kill already past its stopped-check: its restart completes, then
+    // the caller's teardown stops the respawned session in order (no orphan).
+    await Promise.allSettled([...this.inFlight]);
     this.sessions.clear();
   }
 }

@@ -580,9 +580,9 @@ export async function mountBusRuntime(
       async stop() {
         if (stopped) return;
         stopped = true;
-        // Stall watchdog first: cancel its sweep timer + bus subscription so it
-        // can't fire a restart against a session we're tearing down.
-        stallWatchdog.stop();
+        // Stall watchdog first: cancel its sweep timer + bus subscription and
+        // await any in-flight kill so it can't respawn a session mid-teardown.
+        await stallWatchdog.stop();
         // Adapters first: stop inbound traffic so nothing new hits the
         // bus while we're tearing down agents. Sprint 5.2b.
         await stopBusAdapters(adapters, logger);
