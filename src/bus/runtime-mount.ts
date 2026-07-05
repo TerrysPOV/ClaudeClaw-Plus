@@ -34,7 +34,12 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AgentConfig, BusOrigin } from "./types";
 import { BusCoreImpl, type BusCore } from "./core";
-import { AgentJobRunner, DEFAULT_AGENT_JOB_CONFIG, type AgentJobConfig } from "./agent-jobs";
+import {
+  AgentJobRunner,
+  DEFAULT_AGENT_JOB_CONFIG,
+  type AgentJobConfig,
+  type JobView,
+} from "./agent-jobs";
 import { runAgentJobHeadless } from "../runner";
 import { agentExists } from "../agents";
 import { SessionManager } from "./session-manager";
@@ -297,6 +302,69 @@ export function createRotateAgent(deps: RotateAgentDeps): (agentId: string) => P
 }
 
 /**
+ * Deliver a finished agent job back to its DISPATCHER (decision 1a) as a
+ * system-origin prompt, so it can act on / report the result — the loop the
+ * `/tmp` fire-scripts faked by tailing a log.
+ *
+ * Codex review (#296 PR 3): `bus.sendPrompt` overwrites the agent's single-slot
+ * prompt-origin bookkeeping. If we delivered while the dispatcher was mid-turn
+ * on a channel prompt (Discord/Web/…), its later `reply(final)` would be
+ * attributed to this `origin:"cron"` and misrouted/dropped. So we deliver
+ * immediately only when the dispatcher is idle; if it's mid-turn we defer to its
+ * next `response.turn_end`. Best-effort either way — the result is always
+ * queryable via `job_status`, so if the dispatcher never turns again we simply
+ * don't push (no clobber, no loss).
+ */
+export function deliverAgentJobResult(
+  bus: Pick<BusCore, "sendPrompt" | "isAgentTurnActive" | "subscribe">,
+  job: JobView,
+  logger: Pick<Console, "warn">,
+): void {
+  const detail = job.error ? `Error: ${job.error}` : (job.resultText ?? "(job produced no output)");
+  const send = (): void => {
+    void bus
+      .sendPrompt({
+        agent_id: job.dispatcher,
+        origin: "cron",
+        origin_id: `agent-job:${job.jobId}`,
+        user_id: "system",
+        text:
+          `Agent job ${job.jobId} (agent "${job.agent}") finished with status ` +
+          `"${job.status}".\n\n${detail}`,
+        metadata: {
+          kind: "agent_job_result",
+          job_id: job.jobId,
+          job_agent: job.agent,
+          job_status: job.status,
+        },
+      })
+      .catch((err) =>
+        logger.warn(`[bus-runtime] agent-job result delivery for ${job.jobId} failed`, err),
+      );
+  };
+
+  if (!bus.isAgentTurnActive(job.dispatcher)) {
+    send();
+    return;
+  }
+  // Mid-turn: defer to the dispatcher's next turn end so we never clobber the
+  // live prompt-origin. One-shot subscription.
+  let delivered = false;
+  const sub = bus.subscribe({ agent_id: job.dispatcher, topics: ["response.turn_end"] }, () => {
+    if (delivered) return;
+    delivered = true;
+    sub.close();
+    send();
+  });
+  // Race guard: the turn may have ended between the check and the subscribe.
+  if (!delivered && !bus.isAgentTurnActive(job.dispatcher)) {
+    delivered = true;
+    sub.close();
+    send();
+  }
+}
+
+/**
  * Mount the Bus runtime stack and return a teardown handle.
  *
  * Idempotency: each call returns a fresh handle. Callers must invoke
@@ -373,36 +441,7 @@ export async function mountBusRuntime(
     const jobRunner = new AgentJobRunner(agentJobConfig, {
       runAgentJob: (input) => runAgentJobHeadless(input),
       isKnownAgent: agentExists,
-      deliverResult: (job) => {
-        // Decision 1a: deliver the finished job back to the DISPATCHER as a
-        // system-origin prompt so it can act on / report the result — closing
-        // the loop the fire-scripts faked by tailing a log. `origin:"cron"`
-        // (a real, non-channel BusOrigin with `user_id:"system"`, mirroring the
-        // scheduler) keeps it off any user surface; the dispatcher decides how
-        // to surface it. Best-effort — the runner already guards this call.
-        const detail = job.error
-          ? `Error: ${job.error}`
-          : (job.resultText ?? "(job produced no output)");
-        void bus
-          .sendPrompt({
-            agent_id: job.dispatcher,
-            origin: "cron",
-            origin_id: `agent-job:${job.jobId}`,
-            user_id: "system",
-            text:
-              `Agent job ${job.jobId} (agent "${job.agent}") finished with status ` +
-              `"${job.status}".\n\n${detail}`,
-            metadata: {
-              kind: "agent_job_result",
-              job_id: job.jobId,
-              job_agent: job.agent,
-              job_status: job.status,
-            },
-          })
-          .catch((err) =>
-            logger.warn(`[bus-runtime] agent-job result delivery for ${job.jobId} failed`, err),
-          );
-      },
+      deliverResult: (job) => deliverAgentJobResult(bus, job, logger),
       now: Date.now,
       genId: () => randomUUID(),
     });

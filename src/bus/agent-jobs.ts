@@ -260,6 +260,12 @@ export class AgentJobRunner implements AgentJobHandler {
       controller.abort(); // running → the runAgentJob rejection/resolution flows into finish()
     } else if (!wasRunning) {
       // queued cancel: it never started, so finish() won't run — deliver + move on here.
+      // Remove it from the queue too (Codex review): maybeStart() only drains
+      // cancelled ids when a slot is free, so while all workers are busy a
+      // lingering cancelled id would inflate this.queue.length and make the
+      // maxQueued check phantom-reject new dispatches.
+      const qi = this.queue.indexOf(jobId);
+      if (qi >= 0) this.queue.splice(qi, 1);
       this.deliver(rec);
       this.maybeStart();
     }

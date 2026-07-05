@@ -53,7 +53,28 @@ import type {
   PermissionResponse,
 } from "./types";
 import { CHANNEL_DRIVEN_ORIGINS } from "./types";
-import type { AgentJobHandler } from "./agent-jobs";
+import type { AgentJobHandler, JobView } from "./agent-jobs";
+
+/**
+ * Map a `JobView` to the snake_case shape agents see over the tools (#296 PR 3
+ * Codex review). The `dispatch_job` contract and `job_status`/`list_jobs`/
+ * `cancel_job` all speak `job_id`, so the wire representation must too — the
+ * runner's internal camelCase (`jobId`, `createdAt`, …) never leaks to agents.
+ */
+function toWireJobView(v: JobView): Record<string, unknown> {
+  return {
+    job_id: v.jobId,
+    agent: v.agent,
+    dispatcher: v.dispatcher,
+    status: v.status,
+    created_at: v.createdAt,
+    ...(v.startedAt !== undefined ? { started_at: v.startedAt } : {}),
+    ...(v.endedAt !== undefined ? { ended_at: v.endedAt } : {}),
+    ...(v.exitCode !== undefined ? { exit_code: v.exitCode } : {}),
+    ...(v.resultText !== undefined ? { result_text: v.resultText } : {}),
+    ...(v.error !== undefined ? { error: v.error } : {}),
+  };
+}
 import { evaluate, type PolicyDecision, type ToolRequestContext } from "../policy/engine";
 
 /** Escape XML text content (`&`, `<`, `>`) so a `</channel>` in user text
@@ -1303,16 +1324,25 @@ export class BusCoreImpl implements BusCore {
             ...(typeof payload.model === "string" ? { model: payload.model } : {}),
             ...(typeof payload.timeoutMs === "number" ? { timeoutMs: payload.timeoutMs } : {}),
           });
-          this.sendJobResult(agentId, msg.req_id, { ok: true, result });
+          // Present the id as snake_case `job_id` to match the tool contract and
+          // the follow-up tools (Codex review); pass `{ error }` through as-is.
+          const wire = "jobId" in result ? { job_id: result.jobId, status: result.status } : result;
+          this.sendJobResult(agentId, msg.req_id, { ok: true, result: wire });
           return;
         }
         case "status": {
           const result = handler.status(typeof payload.job_id === "string" ? payload.job_id : "");
-          this.sendJobResult(agentId, msg.req_id, { ok: true, result });
+          this.sendJobResult(agentId, msg.req_id, {
+            ok: true,
+            result: result ? toWireJobView(result) : null,
+          });
           return;
         }
         case "list": {
-          this.sendJobResult(agentId, msg.req_id, { ok: true, result: handler.list() });
+          this.sendJobResult(agentId, msg.req_id, {
+            ok: true,
+            result: handler.list().map(toWireJobView),
+          });
           return;
         }
         case "cancel": {

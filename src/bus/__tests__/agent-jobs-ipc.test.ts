@@ -38,6 +38,16 @@ interface Deferred {
   aborted: () => boolean;
 }
 
+/** Snake_case shape the tools return to the agent (see toWireJobView in core.ts). */
+interface WireJob {
+  job_id: string;
+  agent: string;
+  dispatcher: string;
+  status: string;
+  result_text?: string;
+  error?: string;
+}
+
 interface Harness {
   bus: BusCore;
   mcp: BusMcpServer;
@@ -168,21 +178,22 @@ describe("Agent-job IPC round-trip — dispatch_job over UDS (#296 PR 3)", () =>
       prompt: "research the thing",
     });
     expect(isError).toBe(false);
-    const dispatch = parsed as { jobId: string; status: string };
-    expect(dispatch.jobId).toBe("job-1");
+    // Agent-facing responses are snake_case (job_id), matching the tool contract.
+    const dispatch = parsed as { job_id: string; status: string };
+    expect(dispatch.job_id).toBe("job-1");
     expect(dispatch.status).toBe("running");
     // Fire-and-return: the job is still running (its fake run hasn't resolved).
     expect(h.runs.has("job-1")).toBe(true);
 
-    const status = (await callTool(h.client, "job_status", { job_id: "job-1" })).parsed as JobView;
-    expect(status.jobId).toBe("job-1");
+    const status = (await callTool(h.client, "job_status", { job_id: "job-1" })).parsed as WireJob;
+    expect(status.job_id).toBe("job-1");
     expect(status.agent).toBe("reg");
     expect(status.dispatcher).toBe("dispatcher-agent"); // stamped from the socket, not the client
     expect(status.status).toBe("running");
 
-    const list = (await callTool(h.client, "list_jobs")).parsed as JobView[];
+    const list = (await callTool(h.client, "list_jobs")).parsed as WireJob[];
     expect(list).toHaveLength(1);
-    expect(list[0].jobId).toBe("job-1");
+    expect(list[0].job_id).toBe("job-1");
   });
 
   it("a finished job transitions to done and is delivered back to the dispatcher", async () => {
@@ -199,9 +210,9 @@ describe("Agent-job IPC round-trip — dispatch_job over UDS (#296 PR 3)", () =>
     expect(h.delivered[0].resultText).toBe("the answer is 42");
     expect(h.delivered[0].dispatcher).toBe("dispatcher-agent");
 
-    const status = (await callTool(h.client, "job_status", { job_id: "job-1" })).parsed as JobView;
+    const status = (await callTool(h.client, "job_status", { job_id: "job-1" })).parsed as WireJob;
     expect(status.status).toBe("done");
-    expect(status.resultText).toBe("the answer is 42");
+    expect(status.result_text).toBe("the answer is 42");
   });
 
   it("cancel_job aborts a running job and marks it cancelled", async () => {
@@ -215,7 +226,7 @@ describe("Agent-job IPC round-trip — dispatch_job over UDS (#296 PR 3)", () =>
     // The runner aborted the run's signal.
     expect(mustRun(h, "job-1").aborted()).toBe(true);
 
-    const status = (await callTool(h.client, "job_status", { job_id: "job-1" })).parsed as JobView;
+    const status = (await callTool(h.client, "job_status", { job_id: "job-1" })).parsed as WireJob;
     expect(status.status).toBe("cancelled");
   });
 

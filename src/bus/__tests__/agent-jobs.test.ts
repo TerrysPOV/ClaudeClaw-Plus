@@ -98,6 +98,22 @@ describe("AgentJobRunner.dispatch", () => {
     });
   });
 
+  it("cancelling a queued job frees a maxQueued slot while the worker stays busy (Codex review)", () => {
+    const { runner } = harness({ ...DEFAULT_AGENT_JOB_CONFIG, maxConcurrent: 1, maxQueued: 1 });
+    runner.dispatch({ agent: "reg", prompt: "a", dispatcher: "claw" }); // running (fills worker)
+    const q = jobIdOf(runner.dispatch({ agent: "reg", prompt: "b", dispatcher: "claw" })); // queued
+    // Queue is full → a third is rejected.
+    expect(runner.dispatch({ agent: "reg", prompt: "c", dispatcher: "claw" })).toEqual({
+      error: "job queue is full (max 1)",
+    });
+    // Cancelling the queued job must remove it from the queue so capacity frees
+    // up — even though the single worker is STILL running job "a".
+    expect(runner.cancel(q)).toEqual({ ok: true });
+    expect("jobId" in runner.dispatch({ agent: "reg", prompt: "c", dispatcher: "claw" })).toBe(
+      true,
+    );
+  });
+
   it("evicts oldest TERMINAL records past maxRetained (never a live one)", async () => {
     // maxConcurrent 1, maxRetained 2. Run 3 jobs to completion sequentially.
     const { runner, runs } = harness({
