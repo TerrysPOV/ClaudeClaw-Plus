@@ -213,6 +213,8 @@ export type IpcMessage =
   | IpcAskAnswer
   | IpcCancel
   | IpcRequestHuman
+  | IpcJobRequest
+  | IpcJobResult
   | IpcPermissionRequest
   | IpcPermissionResponse
   | IpcError;
@@ -286,6 +288,45 @@ export interface IpcRequestHuman {
    */
   ask_id: string;
   question: string;
+}
+
+/**
+ * Agent-job control request — Bus MCP server → Bus core (issue #296 PR 3).
+ *
+ * The `AgentJobRunner` lives in the DAEMON (only it can spawn/track the
+ * headless `claude -p` job processes), while the four job tools
+ * (`dispatch_job` / `job_status` / `list_jobs` / `cancel_job`) are invoked in
+ * the per-agent MCP SUBPROCESS. So the MCP server routes each call over the
+ * socket as this one generic envelope and awaits the correlated
+ * {@link IpcJobResult}. Mirrors the `request_human` round-trip.
+ *
+ * `agent_id` is the DISPATCHER — the agent whose socket carried the request;
+ * Bus core stamps it as the job's dispatcher (never trusting a client-supplied
+ * value) so results route back to the caller. `op` selects the runner method;
+ * `payload` carries the tool args (validated by the runner, not here).
+ */
+export interface IpcJobRequest {
+  type: "job_request";
+  agent_id: string;
+  /** Correlation id the matching `IpcJobResult` must echo. */
+  req_id: string;
+  op: "dispatch" | "status" | "list" | "cancel";
+  payload: Record<string, unknown>;
+}
+
+/**
+ * Agent-job control result — Bus core → Bus MCP server, correlated by `req_id`.
+ * `ok:false` carries `error`; `ok:true` carries the op-specific `result`
+ * (dispatch → `{jobId,status}|{error}`, status → `JobView|null`,
+ * list → `JobView[]`, cancel → `{ok,error?}`) which the MCP server serialises
+ * straight back to the calling agent as the tool result.
+ */
+export interface IpcJobResult {
+  type: "job_result";
+  req_id: string;
+  ok: boolean;
+  result?: unknown;
+  error?: string;
 }
 
 export interface IpcPermissionRequest {

@@ -31,8 +31,17 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import type { AgentConfig, BusOrigin } from "./types";
 import { BusCoreImpl, type BusCore } from "./core";
+import {
+  AgentJobRunner,
+  DEFAULT_AGENT_JOB_CONFIG,
+  type AgentJobConfig,
+  type JobView,
+} from "./agent-jobs";
+import { runAgentJobHeadless } from "../runner";
+import { agentExists } from "../agents";
 import { SessionManager } from "./session-manager";
 import { wireSlashCommands } from "./wiring";
 import { createMcpReconciler } from "./mcp-reconciler";
@@ -293,6 +302,69 @@ export function createRotateAgent(deps: RotateAgentDeps): (agentId: string) => P
 }
 
 /**
+ * Deliver a finished agent job back to its DISPATCHER (decision 1a) as a
+ * system-origin prompt, so it can act on / report the result — the loop the
+ * `/tmp` fire-scripts faked by tailing a log.
+ *
+ * Codex review (#296 PR 3): `bus.sendPrompt` overwrites the agent's single-slot
+ * prompt-origin bookkeeping. If we delivered while the dispatcher was mid-turn
+ * on a channel prompt (Discord/Web/…), its later `reply(final)` would be
+ * attributed to this `origin:"cron"` and misrouted/dropped. So we deliver
+ * immediately only when the dispatcher is idle; if it's mid-turn we defer to its
+ * next `response.turn_end`. Best-effort either way — the result is always
+ * queryable via `job_status`, so if the dispatcher never turns again we simply
+ * don't push (no clobber, no loss).
+ */
+export function deliverAgentJobResult(
+  bus: Pick<BusCore, "sendPrompt" | "isAgentTurnActive" | "subscribe">,
+  job: JobView,
+  logger: Pick<Console, "warn">,
+): void {
+  const detail = job.error ? `Error: ${job.error}` : (job.resultText ?? "(job produced no output)");
+  const send = (): void => {
+    void bus
+      .sendPrompt({
+        agent_id: job.dispatcher,
+        origin: "cron",
+        origin_id: `agent-job:${job.jobId}`,
+        user_id: "system",
+        text:
+          `Agent job ${job.jobId} (agent "${job.agent}") finished with status ` +
+          `"${job.status}".\n\n${detail}`,
+        metadata: {
+          kind: "agent_job_result",
+          job_id: job.jobId,
+          job_agent: job.agent,
+          job_status: job.status,
+        },
+      })
+      .catch((err) =>
+        logger.warn(`[bus-runtime] agent-job result delivery for ${job.jobId} failed`, err),
+      );
+  };
+
+  if (!bus.isAgentTurnActive(job.dispatcher)) {
+    send();
+    return;
+  }
+  // Mid-turn: defer to the dispatcher's next turn end so we never clobber the
+  // live prompt-origin. One-shot subscription.
+  let delivered = false;
+  const sub = bus.subscribe({ agent_id: job.dispatcher, topics: ["response.turn_end"] }, () => {
+    if (delivered) return;
+    delivered = true;
+    sub.close();
+    send();
+  });
+  // Race guard: the turn may have ended between the check and the subscribe.
+  if (!delivered && !bus.isAgentTurnActive(job.dispatcher)) {
+    delivered = true;
+    sub.close();
+    send();
+  }
+}
+
+/**
  * Mount the Bus runtime stack and return a teardown handle.
  *
  * Idempotency: each call returns a fresh handle. Callers must invoke
@@ -351,6 +423,29 @@ export async function mountBusRuntime(
         log: (msg, fields) => logger.error("[mcp-reconcile]", msg, fields),
       }),
     );
+
+    // #296 PR 3 — agent-job primitive. Gives agents a supported `dispatch_job`
+    // instead of hand-rolling `/tmp` fire-scripts + `claude -p` + `nohup … &`
+    // (the shape that wedged the daemon for ~11h in #295). The runner lives
+    // HERE in the daemon (only it can spawn/track processes); `dispatch_job`
+    // etc. route over IPC to `handleJobRequest`. Fire-and-return, capped
+    // concurrency, hard timeout cap, dispatcher-validated agent — a job can
+    // never block the caller's turn or spawn an unknown agent. Wired BEFORE
+    // agent spawn so a just-spawned agent's first dispatch is never dropped.
+    let agentJobConfig: AgentJobConfig;
+    try {
+      agentJobConfig = getSettings().agentJobs;
+    } catch {
+      agentJobConfig = DEFAULT_AGENT_JOB_CONFIG; // settings not loaded (early boot / tests)
+    }
+    const jobRunner = new AgentJobRunner(agentJobConfig, {
+      runAgentJob: (input) => runAgentJobHeadless(input),
+      isKnownAgent: agentExists,
+      deliverResult: (job) => deliverAgentJobResult(bus, job, logger),
+      now: Date.now,
+      genId: () => randomUUID(),
+    });
+    bus.setJobHandler(jobRunner);
 
     // #227 restart-based session rotation. The bus PTY is spawned once at boot
     // and kept alive, so the session JSONL grows unbounded and per-prompt
@@ -580,7 +675,16 @@ export async function mountBusRuntime(
       async stop() {
         if (stopped) return;
         stopped = true;
-        // Stall watchdog first: cancel its sweep timer + bus subscription and
+        // Agent-job runner: cancel in-flight jobs + clear the queue so no
+        // headless `claude -p` outlives the daemon, and detach the handler so
+        // a late `job_request` gets a clean "not enabled" error (#296 PR 3).
+        try {
+          jobRunner.stop();
+          bus.setJobHandler(null);
+        } catch (err) {
+          logger.error("[bus-runtime] jobRunner.stop() failed", err);
+        }
+        // Stall watchdog next: cancel its sweep timer + bus subscription and
         // await any in-flight kill so it can't respawn a session mid-teardown.
         await stallWatchdog.stop();
         // Adapters first: stop inbound traffic so nothing new hits the

@@ -45,12 +45,36 @@ import type {
   BusEvent,
   BusEventTopic,
   BusOrigin,
+  IpcJobRequest,
+  IpcJobResult,
   IpcMessage,
   IpcPrompt,
   PermissionRequest,
   PermissionResponse,
 } from "./types";
 import { CHANNEL_DRIVEN_ORIGINS } from "./types";
+import type { AgentJobHandler, JobView } from "./agent-jobs";
+
+/**
+ * Map a `JobView` to the snake_case shape agents see over the tools (#296 PR 3
+ * Codex review). The `dispatch_job` contract and `job_status`/`list_jobs`/
+ * `cancel_job` all speak `job_id`, so the wire representation must too — the
+ * runner's internal camelCase (`jobId`, `createdAt`, …) never leaks to agents.
+ */
+function toWireJobView(v: JobView): Record<string, unknown> {
+  return {
+    job_id: v.jobId,
+    agent: v.agent,
+    dispatcher: v.dispatcher,
+    status: v.status,
+    created_at: v.createdAt,
+    ...(v.startedAt !== undefined ? { started_at: v.startedAt } : {}),
+    ...(v.endedAt !== undefined ? { ended_at: v.endedAt } : {}),
+    ...(v.exitCode !== undefined ? { exit_code: v.exitCode } : {}),
+    ...(v.resultText !== undefined ? { result_text: v.resultText } : {}),
+    ...(v.error !== undefined ? { error: v.error } : {}),
+  };
+}
 import { evaluate, type PolicyDecision, type ToolRequestContext } from "../policy/engine";
 
 /** Escape XML text content (`&`, `<`, `>`) so a `</channel>` in user text
@@ -160,6 +184,16 @@ export interface BusCoreOptions {
    * usable without the wiring (and in tests).
    */
   onMcpSendFailed?: (agentId: string, ctx: { reason: string }) => void;
+  /**
+   * Agent-job handler (issue #296 PR 3). Set by the daemon so inbound
+   * `job_request` IPC (from an agent's `dispatch_job`/`job_status`/`list_jobs`/
+   * `cancel_job` tool) routes to the daemon-resident `AgentJobRunner`. Omitted
+   * in tests / when agent jobs are disabled — a `job_request` then gets a clean
+   * "not enabled" error rather than a hang. Also settable post-hoc via
+   * `setJobHandler` (the runner needs `sendPrompt`, so it's constructed AFTER
+   * the bus — same late-binding pattern as `slashCommandHandler`).
+   */
+  jobHandler?: AgentJobHandler;
 }
 
 /* ───────────────────────────────────────────────────────────────────── */
@@ -178,6 +212,14 @@ export interface BusCore {
    */
   setSlashCommandHandler(handler: SlashCommandHandler | null): void;
   setStreamPromptHandler(handler: StreamPromptHandler | null): void;
+  /**
+   * Install or replace the agent-job handler (#296 PR 3). The daemon wires
+   * this once the `AgentJobRunner` is constructed (which needs `sendPrompt`,
+   * so it can't be a constructor-only option). Pass `null` to detach on
+   * teardown. When unset, inbound `job_request` IPC is answered with a clean
+   * "agent jobs not enabled" error.
+   */
+  setJobHandler(handler: AgentJobHandler | null): void;
   /**
    * Install or replace the #222 reconciliation signal handler. Wired by the
    * bus runtime once the Session Manager is available. Pass `null` to detach
@@ -212,6 +254,10 @@ export class BusCoreImpl implements BusCore {
   private readonly eventLogAppend: EventLogAppendFn;
   private slashCommandHandler: SlashCommandHandler | null;
   private streamPromptHandler: StreamPromptHandler | null;
+  // Settable post-hoc (like streamPromptHandler): the AgentJobRunner needs
+  // `sendPrompt` for result delivery, so the daemon constructs it after the
+  // bus and wires it via setJobHandler (#296 PR 3).
+  private jobHandler: AgentJobHandler | null;
   private readonly onError: (err: unknown, ctx?: Record<string, unknown>) => void;
   private readonly evaluatePolicy: (ctx: ToolRequestContext) => PolicyDecision;
   // Settable post-hoc (like streamPromptHandler): the bus is constructed
@@ -385,6 +431,7 @@ export class BusCoreImpl implements BusCore {
     this.eventLogAppend = opts.eventLogAppend ?? eventLogAppend;
     this.slashCommandHandler = opts.slashCommandHandler ?? null;
     this.streamPromptHandler = opts.streamPromptHandler ?? null;
+    this.jobHandler = opts.jobHandler ?? null;
     this.onError = opts.onError ?? ((err, ctx) => console.error("[bus]", err, ctx));
     this.evaluatePolicy = opts.evaluatePolicy ?? evaluate;
     if (opts.onMcpSendFailed) this.onMcpSendFailed = opts.onMcpSendFailed;
@@ -873,6 +920,10 @@ export class BusCoreImpl implements BusCore {
     this.streamPromptHandler = handler;
   }
 
+  setJobHandler(handler: AgentJobHandler | null): void {
+    this.jobHandler = handler;
+  }
+
   setMcpSendFailedHandler(
     handler: ((agentId: string, ctx: { reason: string }) => void) | null,
   ): void {
@@ -1240,9 +1291,102 @@ export class BusCoreImpl implements BusCore {
   }
 
   /**
+   * Handle an inbound agent-job control request (#296 PR 3). `agentId` is the
+   * DISPATCHER — the agent whose socket carried the request; we stamp it as the
+   * job's dispatcher rather than trusting any client-supplied value, so results
+   * route back to the caller and one agent can't dispatch as another. Always
+   * sends exactly one `job_result` (a missing handler / bad op / thrown error
+   * becomes `ok:false` — never a silent drop that would hang the caller).
+   */
+  private handleJobRequest(agentId: string, msg: IpcJobRequest): void {
+    const handler = this.jobHandler;
+    if (!handler) {
+      this.sendJobResult(agentId, msg.req_id, {
+        ok: false,
+        error: "agent jobs are not enabled on this daemon",
+      });
+      return;
+    }
+    const payload = (msg.payload ?? {}) as {
+      agent?: unknown;
+      prompt?: unknown;
+      model?: unknown;
+      timeoutMs?: unknown;
+      job_id?: unknown;
+    };
+    try {
+      switch (msg.op) {
+        case "dispatch": {
+          const result = handler.dispatch({
+            agent: typeof payload.agent === "string" ? payload.agent : "",
+            prompt: typeof payload.prompt === "string" ? payload.prompt : "",
+            dispatcher: agentId,
+            ...(typeof payload.model === "string" ? { model: payload.model } : {}),
+            ...(typeof payload.timeoutMs === "number" ? { timeoutMs: payload.timeoutMs } : {}),
+          });
+          // Present the id as snake_case `job_id` to match the tool contract and
+          // the follow-up tools (Codex review); pass `{ error }` through as-is.
+          const wire = "jobId" in result ? { job_id: result.jobId, status: result.status } : result;
+          this.sendJobResult(agentId, msg.req_id, { ok: true, result: wire });
+          return;
+        }
+        case "status": {
+          const result = handler.status(typeof payload.job_id === "string" ? payload.job_id : "");
+          this.sendJobResult(agentId, msg.req_id, {
+            ok: true,
+            result: result ? toWireJobView(result) : null,
+          });
+          return;
+        }
+        case "list": {
+          this.sendJobResult(agentId, msg.req_id, {
+            ok: true,
+            result: handler.list().map(toWireJobView),
+          });
+          return;
+        }
+        case "cancel": {
+          const result = handler.cancel(typeof payload.job_id === "string" ? payload.job_id : "");
+          this.sendJobResult(agentId, msg.req_id, { ok: true, result });
+          return;
+        }
+        default:
+          this.sendJobResult(agentId, msg.req_id, {
+            ok: false,
+            error: `unknown job op: ${String(msg.op)}`,
+          });
+          return;
+      }
+    } catch (err) {
+      this.onError(err, { ctx: "job_request", op: msg.op, agent_id: agentId });
+      this.sendJobResult(agentId, msg.req_id, {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /** Send a correlated `job_result` back to the dispatching agent (#296 PR 3). */
+  private sendJobResult(
+    agentId: string,
+    reqId: string,
+    r: { ok: boolean; result?: unknown; error?: string },
+  ): void {
+    if (!this.ipcServer) return;
+    const msg: IpcJobResult = {
+      type: "job_result",
+      req_id: reqId,
+      ok: r.ok,
+      ...(r.result !== undefined ? { result: r.result } : {}),
+      ...(r.error !== undefined ? { error: r.error } : {}),
+    };
+    this.ipcServer.send(agentId, msg);
+  }
+
+  /**
    * Route messages received from the Bus MCP into the right ingest path.
    * Per spec §5.4, the Bus core handles `reply`, `ask`, `cancel`,
-   * `request_human`, and `permission_request` inbound from MCP.
+   * `request_human`, `job_request`, and `permission_request` inbound from MCP.
    */
   private handleIpcMessage(agentId: string, msg: IpcMessage): void {
     switch (msg.type) {
@@ -1324,6 +1468,13 @@ export class BusCoreImpl implements BusCore {
         });
         break;
       }
+      case "job_request":
+        // #296 PR 3: an agent's dispatch_job/job_status/list_jobs/cancel_job
+        // tool routes here over IPC. The AgentJobRunner lives in the daemon
+        // (only it spawns/tracks the headless `claude -p` job processes); we
+        // run the op and send back a correlated `job_result`.
+        this.handleJobRequest(agentId, msg);
+        break;
       case "permission_request": {
         // Same origin-propagation fix as request_human above: the
         // request_id-bearing payload now also carries the originating

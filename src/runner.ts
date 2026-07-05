@@ -66,6 +66,7 @@ import {
   indexSessionsBackground,
 } from "./memory";
 import { loadAgent } from "./agents";
+import { validateModelString } from "./jobs";
 import { selectModel } from "./model-router";
 import { recordResult, abortReason, clearSession, startSession } from "./watchdog";
 import { getPluginManager, type EventContext } from "./plugins";
@@ -744,6 +745,7 @@ export async function runClaudeOnce(
   baseEnv: Record<string, string>,
   timeoutMs: number = DEFAULT_SESSION_TIMEOUT_MS,
   cwd?: string,
+  signal?: AbortSignal,
 ): Promise<{ rawStdout: string; stderr: string; exitCode: number }> {
   const args = [...baseArgs];
   const normalizedModel = model.trim().toLowerCase();
@@ -765,6 +767,13 @@ export async function runClaudeOnce(
       timeoutMs,
     );
   });
+  // Cancellation (e.g. a job cancelled via the AgentJobRunner): abort like a
+  // timeout so the catch below kills the process and returns.
+  const abortPromise = new Promise<never>((_, reject) => {
+    if (!signal) return;
+    if (signal.aborted) reject(new Error("aborted"));
+    else signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+  });
 
   try {
     const [rawStdout, stderr] = (await Promise.race([
@@ -773,6 +782,7 @@ export async function runClaudeOnce(
         collectStream(proc.stderr as ReadableStream<Uint8Array>, MAX_OUTPUT_BYTES),
       ]),
       timeoutPromise,
+      abortPromise,
     ])) as [string, string];
 
     if (timeoutId) clearTimeout(timeoutId);
@@ -806,6 +816,44 @@ export async function runClaudeOnce(
       exitCode: 124,
     };
   }
+}
+
+/**
+ * Run a named agent as a one-shot headless job (for the bus AgentJobRunner). Loads
+ * the agent's persona (IDENTITY/SOUL/CLAUDE.md), runs `claude -p <prompt>` in the
+ * agent's dir with plain-text output, and returns the final text. Honours the
+ * AbortSignal (cancel → kill) and the timeout via `runClaudeOnce`. This is the
+ * supported replacement for the hand-rolled `/tmp` fire-scripts that caused #295.
+ */
+export async function runAgentJobHeadless(input: {
+  agent: string;
+  prompt: string;
+  model?: string;
+  timeoutMs: number;
+  signal: AbortSignal;
+}): Promise<{ exitCode: number; resultText?: string; error?: string; timedOut?: boolean }> {
+  const settings = getSettings();
+  // Security review (#296 PR 3): validate the caller-supplied model against the
+  // allow-list before spawning — reject an attacker-picked tier rather than
+  // silently falling back. Throws → the job is marked failed (never spawns).
+  validateModelString(input.model, "agent job");
+  const ctx = await loadAgent(input.agent);
+  const persona = await loadAgentPrompts(input.agent);
+  const args = [CLAUDE_EXECUTABLE, "-p", input.prompt, ...buildSecurityArgs(settings.security)];
+  if (persona) args.push("--append-system-prompt", persona);
+  const model = input.model?.trim() || settings.model;
+  const { rawStdout, stderr, exitCode } = await runClaudeOnce(
+    args,
+    model,
+    settings.api,
+    cleanSpawnEnv(),
+    input.timeoutMs,
+    ctx.dir,
+    input.signal,
+  );
+  if (exitCode === 124) return { exitCode, timedOut: true, error: stderr || "timed out" };
+  if (exitCode !== 0) return { exitCode, error: stderr || `claude exited ${exitCode}` };
+  return { exitCode, resultText: rawStdout.trim() };
 }
 
 // Runs claude with --output-format stream-json --verbose, reading NDJSON events as they

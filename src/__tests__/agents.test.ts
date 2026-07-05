@@ -13,6 +13,7 @@ import {
   loadAgent,
   listAgents,
   validateAgentName,
+  agentExists,
   parseScheduleToCron,
   validateJobLabel,
   addJob,
@@ -92,6 +93,27 @@ describe("validateAgentName", () => {
     const result = validateAgentName(name);
     expect(result.valid).toBe(false);
     expect(result.error).toBeDefined();
+  });
+});
+
+describe("agentExists — path-traversal guard (#296 PR 3 security review)", () => {
+  it("rejects traversal / separator names WITHOUT touching the filesystem", () => {
+    // The NAME_RE guard short-circuits before existsSync, so these return false
+    // even though the resolved paths (e.g. the repo root, /etc) plainly exist.
+    // Without the guard, the agent-job dispatch path could spawn `claude -p`
+    // with cwd set to an arbitrary directory outside agents/.
+    for (const bad of ["..", "../..", "../../etc", "a/b", "/etc", "foo/../bar", ".", "UPPER"]) {
+      expect(agentExists(bad)).toBe(false);
+    }
+    // Non-strings / empty are also rejected.
+    expect(agentExists("")).toBe(false);
+    expect(agentExists(undefined as unknown as string)).toBe(false);
+  });
+
+  it("still returns true for a real kebab-case agent dir", async () => {
+    const name = uniq("real");
+    await mkdir(join(AGENTS_DIR, name), { recursive: true });
+    expect(agentExists(name)).toBe(true);
   });
 });
 
