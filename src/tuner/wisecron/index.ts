@@ -6,7 +6,7 @@
  *
  * Not standalone, not MCP. See SPEC at ~/agent/plugin-specs/wisecron/SPEC.md.
  *
- * Phase 1 — fork Nibbler1250, opt-in via wisecron.enabled in config.yaml.
+ * Phase 1 — opt-in via wisecron.enabled in config.yaml.
  */
 
 import type { Registry } from "../../skills-tuner/core/registry.js";
@@ -163,7 +163,7 @@ export function registerWisecronSubjects(
  * Boot-time log of each subject's producer presence. Five subjects (cron,
  * hook, mcp_plugin, model_routing, prompt_template) silently emit zero
  * observations when their telemetry source is absent; this surfaces the
- * gap so operators can spot a misconfigured ProDesk-style deployment
+ * gap so operators can spot a misconfigured self-hosted deployment
  * (~/.claude/* vs ~/agent/*).
  *
  * High/medium-risk subjects with `producer_found=false` escalate to

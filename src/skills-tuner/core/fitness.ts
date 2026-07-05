@@ -152,7 +152,7 @@ export function activateFitness(
 /**
  * FOLD: bridge the legacy per-subject `healthCheck()` producer-probes into the
  * single `TelemetryProvider.capabilities()` surface. A reference host (e.g.
- * Simon's ProDesk) that has not yet implemented native stream emitters can
+ * a self-hosted agent) that has not yet implemented native stream emitters can
  * still advertise capabilities derived from what each subject's healthCheck
  * found — `producer_found=false` → `available=false` with the probe's reason.
  *

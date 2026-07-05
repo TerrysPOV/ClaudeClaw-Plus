@@ -2,7 +2,7 @@
  * Outlier-robust aggregation for fitness windows.
  *
  * Cost and latency telemetry is spiky and skewed by atypical debug/migration
- * sessions (validated on Simon's ProDesk fixture). A raw sum or mean lets one
+ * sessions (validated on a self-hosted agent fixture). A raw sum or mean lets one
  * outlier session dominate a verdict — so fitness aggregation MUST use a
  * median or trimmed mean, never a raw sum.
  */
