@@ -38,6 +38,10 @@ describe("McpPluginSubject — collectObservations", () => {
       auditLog: auditPath,
       settingsPath,
       auditReader: () => events,
+      // Stub the capability-gap detector so the test is hermetic: the default
+      // scans real ~/.claude/projects transcripts, which is slow (times out on
+      // a dev box) and non-deterministic (real gaps would inflate obs count).
+      gapDetector: () => [],
     });
     const obs = await s.collectObservations(new Date(0));
     expect(obs.length).toBe(1);
@@ -55,6 +59,7 @@ describe("McpPluginSubject — collectObservations", () => {
       auditLog: auditPath,
       settingsPath,
       auditReader: () => events,
+      gapDetector: () => [],
     });
     const obs = await s.collectObservations(new Date(0));
     expect(obs[0]?.metadata.calls).toBe(3);
@@ -63,7 +68,12 @@ describe("McpPluginSubject — collectObservations", () => {
   });
 
   it("returns empty when no audit events", async () => {
-    const s = new McpPluginSubject({ auditLog: auditPath, settingsPath, auditReader: () => [] });
+    const s = new McpPluginSubject({
+      auditLog: auditPath,
+      settingsPath,
+      auditReader: () => [],
+      gapDetector: () => [],
+    });
     expect(await s.collectObservations(new Date(0))).toEqual([]);
   });
 });
