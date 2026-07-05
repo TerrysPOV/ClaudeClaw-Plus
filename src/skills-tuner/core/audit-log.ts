@@ -191,22 +191,46 @@ export class AuditLog {
       return;
     }
     const lines = text.split("\n");
-    for (let i = lines.length - 1; i >= 0; i--) {
+    // Collect the on-disk tail and its immediate predecessor so we can verify
+    // the final link before trusting the tail as our new chain head.
+    let tail: AuditRecord | undefined;
+    let prev: AuditRecord | undefined;
+    for (let i = lines.length - 1; i >= 0 && prev === undefined; i--) {
       const trimmed = lines[i].trim();
       if (!trimmed) continue;
+      let rec: AuditRecord;
       try {
-        const rec = JSON.parse(trimmed) as AuditRecord;
-        if (typeof rec.seq === "number" && typeof rec.hash === "string") {
-          if (rec.seq >= this.seq) {
-            this.seq = rec.seq;
-            this.lastHash = rec.hash;
-          }
-          return;
-        }
+        rec = JSON.parse(trimmed) as AuditRecord;
       } catch {
-        // Torn final line — try the previous one.
+        // Only the very last line can be torn by a concurrent append; skip it
+        // to find the tail, but an earlier torn line ends the walk safely.
+        if (tail === undefined) continue;
+        break;
       }
+      if (typeof rec.seq !== "number" || typeof rec.hash !== "string") {
+        if (tail === undefined) continue;
+        break;
+      }
+      if (tail === undefined) tail = rec;
+      else prev = rec;
     }
+    if (!tail || tail.seq < this.seq) return;
+    // Verify the last link before adopting, so a forged tail record can't become
+    // our chain head. Two checks: (a) the tail's stored hash matches a recompute
+    // over its own content (self-consistent), and (b) its prev_hash chains from
+    // the real predecessor — or GENESIS if it's the first record. If either
+    // fails we keep our own state rather than trust a fabricated head.
+    const selfConsistent =
+      typeof tail.ts === "string" &&
+      typeof tail.prev_hash === "string" &&
+      hashRecord(tail.seq, tail.ts, tail.prev_hash, tail) === tail.hash;
+    const expectedPrevHash =
+      prev?.seq === tail.seq - 1 ? prev.hash : tail.seq === 1 ? GENESIS_HASH : undefined;
+    if (!selfConsistent || expectedPrevHash === undefined || tail.prev_hash !== expectedPrevHash) {
+      return;
+    }
+    this.seq = tail.seq;
+    this.lastHash = tail.hash;
   }
 
   /** Rotate the active file to `<path>.1` once it grows past `rotateBytes`. The

@@ -69,6 +69,43 @@ describe("AuditLog — torn-line tolerance (CRITICAL: gateway must not wedge)", 
   });
 });
 
+describe("AuditLog — resyncFromDisk verifies the last link before adopting a tail", () => {
+  it("refuses a forged tail that doesn't chain, keeping the genuine head", () => {
+    const alog = new AuditLog(logPath());
+    const r1 = alog.append({ event: "proposal", subject: "p" });
+    // Another writer forges a higher-seq tail whose prev_hash doesn't link to r1
+    // and whose hash isn't self-consistent — a fabricated chain head.
+    appendFileSync(
+      logPath(),
+      `${JSON.stringify({
+        seq: 2,
+        ts: "2020-01-01T00:00:00.000Z",
+        prev_hash: "0".repeat(64),
+        hash: "f".repeat(64),
+        event: "verdict",
+        actor: "attacker",
+      })}\n`,
+    );
+    // Our next append must chain off the REAL r1, not the forgery.
+    const r2 = alog.append({ event: "verdict", subject: "p" });
+    expect(r2.prev_hash).toBe(r1.hash);
+    expect(r2.seq).toBe(2); // did not jump to seq 3 off the forged tail
+  });
+
+  it("still adopts a genuine cross-writer append (multi-writer chain intact)", () => {
+    const a = new AuditLog(logPath());
+    const r1 = a.append({ event: "proposal", subject: "p" });
+    // A second instance (another process) resyncs onto r1 and appends legitimately.
+    const b = new AuditLog(logPath());
+    const r2 = b.append({ event: "verdict", subject: "p" });
+    expect(r2.prev_hash).toBe(r1.hash);
+    // Back in `a`: it must adopt b's genuine record and chain off it.
+    const r3 = a.append({ event: "revert", subject: "p" });
+    expect(r3.prev_hash).toBe(r2.hash);
+    expect(r3.seq).toBe(3);
+  });
+});
+
 describe("AuditLog — maxRecords bounds memory without breaking the chain", () => {
   it("retains only the last N in memory but keeps seq/hash monotonic on disk", () => {
     const cap = 10;
