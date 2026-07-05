@@ -545,10 +545,7 @@ export class ApplyPipeline {
       try {
         const fd = openSync(lockPath, "wx"); // O_CREAT | O_EXCL | O_WRONLY
         try {
-          writeSync(
-            fd,
-            JSON.stringify({ pid: process.pid, host: hostname(), time: Date.now() }),
-          );
+          writeSync(fd, JSON.stringify({ pid: process.pid, host: hostname(), time: Date.now() }));
         } finally {
           closeSync(fd);
         }

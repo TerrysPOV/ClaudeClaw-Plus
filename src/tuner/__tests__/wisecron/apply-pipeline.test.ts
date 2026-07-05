@@ -181,11 +181,7 @@ describe("ApplyPipeline — cross-process apply lock (fix #2)", () => {
 
     // Holder releases → a retry now succeeds and cleans up its own lock.
     rmSync(lockPath, { force: true });
-    const out = await other.apply(
-      proposal("modes:\n  a:\n    keywords: [after]\n"),
-      "a",
-      "cli",
-    );
+    const out = await other.apply(proposal("modes:\n  a:\n    keywords: [after]\n"), "a", "cli");
     expect(out.revision.id).toBeGreaterThan(0);
     expect(readFileSync(configPath, "utf8")).toContain("after");
     expect(existsSync(lockPath)).toBe(false);
@@ -197,10 +193,7 @@ describe("ApplyPipeline — cross-process apply lock (fix #2)", () => {
     const deadPid = dead.pid ?? 0x7ffffffe;
     const lockPath = lockPathFor(configPath);
     // Fresh mtime, but the recorded holder is dead → must be broken as stale.
-    writeFileSync(
-      lockPath,
-      JSON.stringify({ pid: deadPid, host: hostname(), time: Date.now() }),
-    );
+    writeFileSync(lockPath, JSON.stringify({ pid: deadPid, host: hostname(), time: Date.now() }));
 
     // Small wait budget so a (very unlikely) pid reuse fails fast instead of
     // hanging; large stale-mtime so ONLY the dead-pid path can break the lock.
