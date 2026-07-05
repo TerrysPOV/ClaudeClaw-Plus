@@ -282,9 +282,11 @@ const RequestHumanArgsSchema = z.object({
 });
 
 const DispatchJobArgsSchema = z.object({
-  agent: z.string(),
-  prompt: z.string(),
-  model: z.string().optional(),
+  // Bounds are early client-side feedback; Bus core's AgentJobRunner re-enforces
+  // the configured caps authoritatively (security review #296 PR 3).
+  agent: z.string().max(128),
+  prompt: z.string().max(100_000),
+  model: z.string().max(64).optional(),
   timeoutMs: z.number().optional(),
 });
 

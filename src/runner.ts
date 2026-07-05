@@ -66,6 +66,7 @@ import {
   indexSessionsBackground,
 } from "./memory";
 import { loadAgent } from "./agents";
+import { validateModelString } from "./jobs";
 import { selectModel } from "./model-router";
 import { recordResult, abortReason, clearSession, startSession } from "./watchdog";
 import { getPluginManager, type EventContext } from "./plugins";
@@ -832,6 +833,10 @@ export async function runAgentJobHeadless(input: {
   signal: AbortSignal;
 }): Promise<{ exitCode: number; resultText?: string; error?: string; timedOut?: boolean }> {
   const settings = getSettings();
+  // Security review (#296 PR 3): validate the caller-supplied model against the
+  // allow-list before spawning — reject an attacker-picked tier rather than
+  // silently falling back. Throws → the job is marked failed (never spawns).
+  validateModelString(input.model, "agent job");
   const ctx = await loadAgent(input.agent);
   const persona = await loadAgentPrompts(input.agent);
   const args = [CLAUDE_EXECUTABLE, "-p", input.prompt, ...buildSecurityArgs(settings.security)];

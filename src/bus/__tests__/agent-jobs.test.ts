@@ -61,10 +61,11 @@ describe("AgentJobRunner.dispatch", () => {
     expect(runs).toHaveLength(1); // started synchronously, not awaited
   });
 
-  it("rejects unknown agent and empty agent/prompt", () => {
+  it("rejects unknown agent and empty agent/prompt/dispatcher", () => {
     const { runner } = harness();
+    // Security review #296 PR 3: the error must NOT echo the raw caller input.
     expect(runner.dispatch({ agent: "nope", prompt: "x", dispatcher: "claw" })).toEqual({
-      error: "unknown agent: nope",
+      error: "unknown agent",
     });
     expect(runner.dispatch({ agent: "", prompt: "x", dispatcher: "claw" })).toEqual({
       error: "agent is required",
@@ -72,6 +73,48 @@ describe("AgentJobRunner.dispatch", () => {
     expect(runner.dispatch({ agent: "reg", prompt: "  ", dispatcher: "claw" })).toEqual({
       error: "prompt is required",
     });
+    expect(runner.dispatch({ agent: "reg", prompt: "x", dispatcher: "  " })).toEqual({
+      error: "dispatcher is required",
+    });
+  });
+
+  it("rejects a prompt over maxPromptChars (DoS bound)", () => {
+    const { runner } = harness({ ...DEFAULT_AGENT_JOB_CONFIG, maxPromptChars: 10 });
+    const r = runner.dispatch({ agent: "reg", prompt: "x".repeat(11), dispatcher: "claw" });
+    expect(r).toEqual({ error: "prompt exceeds 10-char limit" });
+  });
+
+  it("rejects dispatch once the queue is full (maxQueued)", () => {
+    // maxConcurrent 1 → 1 running; maxQueued 1 → 1 waiting; the 3rd is rejected.
+    const { runner } = harness({ ...DEFAULT_AGENT_JOB_CONFIG, maxConcurrent: 1, maxQueued: 1 });
+    expect("jobId" in runner.dispatch({ agent: "reg", prompt: "a", dispatcher: "claw" })).toBe(
+      true,
+    );
+    expect("jobId" in runner.dispatch({ agent: "reg", prompt: "b", dispatcher: "claw" })).toBe(
+      true,
+    );
+    expect(runner.dispatch({ agent: "reg", prompt: "c", dispatcher: "claw" })).toEqual({
+      error: "job queue is full (max 1)",
+    });
+  });
+
+  it("evicts oldest TERMINAL records past maxRetained (never a live one)", async () => {
+    // maxConcurrent 1, maxRetained 2. Run 3 jobs to completion sequentially.
+    const { runner, runs } = harness({
+      ...DEFAULT_AGENT_JOB_CONFIG,
+      maxConcurrent: 1,
+      maxRetained: 2,
+    });
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      ids.push(jobIdOf(runner.dispatch({ agent: "reg", prompt: `p${i}`, dispatcher: "claw" })));
+      at(runs, i).resolve({ exitCode: 0, resultText: `r${i}` });
+      await flush();
+    }
+    // Registry bounded to 2; the oldest (job-1) was evicted, newest two remain.
+    expect(runner.list()).toHaveLength(2);
+    expect(runner.status(ids[0])).toBeNull();
+    expect(runner.status(ids[2])?.status).toBe("done");
   });
 });
 

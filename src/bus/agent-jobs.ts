@@ -57,12 +57,29 @@ export interface AgentJobConfig {
   defaultTimeoutMs: number;
   /** Hard cap on any job's wall-clock, even if the caller asks for more. */
   maxTimeoutMs: number;
+  /**
+   * Max jobs allowed to sit in the queue at once. A dispatch past this is
+   * rejected rather than queued (security review #296 PR 3: an agent looping
+   * `dispatch_job` must not grow the queue unbounded → OOM).
+   */
+  maxQueued: number;
+  /**
+   * Max total job RECORDS retained in the registry. Terminal jobs are evicted
+   * oldest-first past this cap so completed records (which hold prompt +
+   * resultText) can't accumulate for the daemon's lifetime.
+   */
+  maxRetained: number;
+  /** Max characters in a job prompt; a longer dispatch is rejected. */
+  maxPromptChars: number;
 }
 
 export const DEFAULT_AGENT_JOB_CONFIG: AgentJobConfig = {
   maxConcurrent: 3,
   defaultTimeoutMs: 30 * 60_000, // 30 min
   maxTimeoutMs: 60 * 60_000, // 60 min hard cap
+  maxQueued: 50,
+  maxRetained: 200,
+  maxPromptChars: 100_000,
 };
 
 /**
@@ -83,7 +100,12 @@ export function parseAgentJobConfig(raw: unknown): AgentJobConfig {
     num(r.defaultTimeoutMs, DEFAULT_AGENT_JOB_CONFIG.defaultTimeoutMs, 1_000),
     maxTimeoutMs,
   );
-  return { maxConcurrent, defaultTimeoutMs, maxTimeoutMs };
+  const maxQueued = Math.floor(num(r.maxQueued, DEFAULT_AGENT_JOB_CONFIG.maxQueued, 1));
+  const maxRetained = Math.floor(num(r.maxRetained, DEFAULT_AGENT_JOB_CONFIG.maxRetained, 1));
+  const maxPromptChars = Math.floor(
+    num(r.maxPromptChars, DEFAULT_AGENT_JOB_CONFIG.maxPromptChars, 1),
+  );
+  return { maxConcurrent, defaultTimeoutMs, maxTimeoutMs, maxQueued, maxRetained, maxPromptChars };
 }
 
 /**
@@ -158,11 +180,22 @@ export class AgentJobRunner implements AgentJobHandler {
     timeoutMs?: number;
   }): { jobId: string; status: JobStatus } | { error: string } {
     if (this.stopped) return { error: "job runner is stopped" };
+    const dispatcher = (input.dispatcher ?? "").trim();
     const agent = (input.agent ?? "").trim();
     const prompt = (input.prompt ?? "").trim();
+    if (!dispatcher) return { error: "dispatcher is required" };
     if (!agent) return { error: "agent is required" };
     if (!prompt) return { error: "prompt is required" };
-    if (!this.deps.isKnownAgent(agent)) return { error: `unknown agent: ${agent}` };
+    if (prompt.length > this.config.maxPromptChars) {
+      return { error: `prompt exceeds ${this.config.maxPromptChars}-char limit` };
+    }
+    if (!this.deps.isKnownAgent(agent)) return { error: "unknown agent" };
+    // Bound the queue so a caller looping dispatch can't grow it unbounded
+    // (security review #296 PR 3). Running jobs are capped separately by
+    // maxConcurrent; this caps the WAITING backlog.
+    if (this.queue.length >= this.config.maxQueued) {
+      return { error: `job queue is full (max ${this.config.maxQueued})` };
+    }
 
     const timeoutMs = Math.min(
       Math.max(input.timeoutMs ?? this.config.defaultTimeoutMs, 1_000),
@@ -172,7 +205,7 @@ export class AgentJobRunner implements AgentJobHandler {
     this.jobs.set(jobId, {
       jobId,
       agent,
-      dispatcher: input.dispatcher,
+      dispatcher,
       prompt,
       model: input.model,
       timeoutMs,
@@ -180,8 +213,28 @@ export class AgentJobRunner implements AgentJobHandler {
       createdAt: this.deps.now(),
     });
     this.queue.push(jobId);
+    this.evictOldTerminal();
     this.maybeStart();
     return { jobId, status: this.jobs.get(jobId)?.status ?? "queued" };
+  }
+
+  /**
+   * Bound registry memory: when total records exceed `maxRetained`, drop the
+   * OLDEST terminal records (never a queued/running one — those are live).
+   * Terminal records hold prompt + resultText, so without this they'd
+   * accumulate for the daemon's lifetime (security review #296 PR 3).
+   */
+  private evictOldTerminal(): void {
+    let overBy = this.jobs.size - this.config.maxRetained;
+    if (overBy <= 0) return;
+    // Map preserves insertion order → iterating yields oldest-first.
+    for (const [id, rec] of this.jobs) {
+      if (overBy <= 0) break;
+      if (TERMINAL.has(rec.status)) {
+        this.jobs.delete(id);
+        overBy--;
+      }
+    }
   }
 
   status(jobId: string): JobView | null {
@@ -273,6 +326,7 @@ export class AgentJobRunner implements AgentJobHandler {
     if (rec.endedAt === undefined) rec.endedAt = this.deps.now();
     this.runningCount = Math.max(0, this.runningCount - 1);
     this.deliver(rec);
+    this.evictOldTerminal();
     this.maybeStart();
   }
 

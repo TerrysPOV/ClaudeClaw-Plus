@@ -726,9 +726,24 @@ export async function createAgent(opts: AgentCreateOpts): Promise<AgentContext> 
   };
 }
 
-/** Cheap existence check for a named agent (its config dir is present). */
+/**
+ * Cheap existence check for a named agent (its config dir is present).
+ *
+ * The `NAME_RE` guard is a SECURITY boundary, not just cosmetics: without it a
+ * name like `../../etc` passes `existsSync(join(agentsDir(), name))` and lets a
+ * caller (e.g. the agent-job dispatch path) escape the `agents/` sandbox and run
+ * `claude -p` with cwd set to an arbitrary existing directory. Restricting to the
+ * kebab-case charset categorically rejects `..`, path separators, and absolute
+ * paths. Every legitimately-created agent already matches `NAME_RE`
+ * (`validateAgentName` is the creation gate), so this never rejects a real agent.
+ */
 export function agentExists(name: string): boolean {
-  return typeof name === "string" && name.length > 0 && existsSync(join(agentsDir(), name));
+  return (
+    typeof name === "string" &&
+    name.length > 0 &&
+    NAME_RE.test(name) &&
+    existsSync(join(agentsDir(), name))
+  );
 }
 
 export async function loadAgent(name: string): Promise<AgentContext> {
