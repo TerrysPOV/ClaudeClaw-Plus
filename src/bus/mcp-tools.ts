@@ -82,4 +82,53 @@ export const BUS_MCP_TOOLS = [
       required: ["question"],
     },
   },
+  {
+    name: "dispatch_job",
+    description:
+      "Dispatch a background job to another agent (e.g. run `reg`/`suzy` on a long " +
+      "research/draft task). Fire-and-return: returns a `job_id` IMMEDIATELY and the " +
+      "job runs headless in its own process — never blocks your turn. The result is " +
+      "delivered back to you when it finishes, and is queryable via `job_status`. Use " +
+      "this instead of shelling out to `claude -p` yourself.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        agent: { type: "string", description: "Name of the agent to run the job." },
+        prompt: { type: "string", description: "The task for that agent." },
+        model: { type: "string", description: "Optional model override." },
+        timeoutMs: { type: "number", description: "Optional per-job wall-clock (capped)." },
+      },
+      required: ["agent", "prompt"],
+    },
+  },
+  {
+    name: "job_status",
+    description: "Get the status + result of a dispatched job by its `job_id`.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        job_id: { type: "string" },
+      },
+      required: ["job_id"],
+    },
+  },
+  {
+    name: "list_jobs",
+    description: "List all agent jobs and their statuses (queued/running/done/failed/…).",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
+  {
+    name: "cancel_job",
+    description: "Cancel a queued or running job by its `job_id` (kills the process).",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        job_id: { type: "string" },
+      },
+      required: ["job_id"],
+    },
+  },
 ] as const;

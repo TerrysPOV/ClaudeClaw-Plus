@@ -726,6 +726,11 @@ export async function createAgent(opts: AgentCreateOpts): Promise<AgentContext> 
   };
 }
 
+/** Cheap existence check for a named agent (its config dir is present). */
+export function agentExists(name: string): boolean {
+  return typeof name === "string" && name.length > 0 && existsSync(join(agentsDir(), name));
+}
+
 export async function loadAgent(name: string): Promise<AgentContext> {
   const dir = join(agentsDir(), name);
   if (!existsSync(dir)) {
