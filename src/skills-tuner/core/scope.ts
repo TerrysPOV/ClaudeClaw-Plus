@@ -88,8 +88,8 @@ export interface AgentSurface {
 
 /**
  * Claude Code encodes a project cwd into a `~/.claude/projects` dir name by
- * replacing path separators and dots with `-` (e.g. `/home/simon/agent` →
- * `-home-simon-agent`). We match dir-name PREFIXES with this, so a deeper agent
+ * replacing path separators and dots with `-` (e.g. `/home/user/agent` →
+ * `-home-user-agent`). We match dir-name PREFIXES with this, so a deeper agent
  * cwd still resolves under its root.
  */
 export function encodeProjectDir(absPath: string): string {
@@ -98,11 +98,11 @@ export function encodeProjectDir(absPath: string): string {
 
 /**
  * Default agent surface for a host whose agent lives under `~/agent` (the
- * ProDesk layout in this repo: `~/agent/skills`, `~/agent/agents`, cron jobs the
+ * The agent layout in this repo: `~/agent/skills`, `~/agent/agents`, cron jobs the
  * agent schedules via the bus-scheduler).
  *
  * FLAGGED AMBIGUITY — agent sessions: the autonomous agent and interactive Claude
- * Code sessions can both run with cwd `~` (project dir `-home-simon`), which would
+ * Code sessions can both run with cwd `~` (project dir `-home-user`), which would
  * make the two indistinguishable by directory. We therefore bound agent sessions
  * to project dirs encoding a path UNDER `~/agent` (a strict subset). If the agent
  * actually runs from `~`, this UNDER-includes its sessions — the conservative
@@ -169,7 +169,7 @@ export const SOURCE_SCOPED_STREAMS: ReadonlySet<TelemetryStream> = new Set<Telem
 ]);
 
 /** True when `file` lives at or under one of `roots` on a path-SEGMENT boundary
- * (so root `/home/simon/agent` does NOT match `/home/simon/agent-backup/...`). */
+ * (so root `/home/user/agent` does NOT match `/home/user/agent-backup/...`). */
 function fileUnderRoot(file: string, roots: readonly string[]): boolean {
   if (file === "") return false;
   return roots.some((r) => {

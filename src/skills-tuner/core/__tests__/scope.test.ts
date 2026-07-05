@@ -25,8 +25,8 @@ const RANGE: DateRange = {
   end: new Date("2026-05-31T00:00:00.000Z"),
 };
 
-/** Fixed agent surface rooted at /home/simon/agent (matches defaultAgentSurface). */
-const SURFACE: AgentSurface = defaultAgentSurface("/home/simon");
+/** Fixed agent surface rooted at /home/user/agent (matches defaultAgentSurface). */
+const SURFACE: AgentSurface = defaultAgentSurface("/home/user");
 
 function s(labels: Record<string, string>, value = 1): MetricSample {
   return { ts: new Date("2026-05-10T00:00:00.000Z"), value, labels };
@@ -65,7 +65,7 @@ describe("defaultAgentSurface", () => {
     // A generic cron tag would attribute the whole cron/cost stream to the agent.
     expect(SURFACE.jobMarkers).not.toContain('source="cron"');
     // Only agent-specific markers remain.
-    expect(SURFACE.jobMarkers).toEqual(["bus-scheduler", "/home/simon/agent"]);
+    expect(SURFACE.jobMarkers).toEqual(["bus-scheduler", "/home/user/agent"]);
   });
 });
 
@@ -83,7 +83,7 @@ describe("sampleInAgentScope — cron/cost attribution (fix #1)", () => {
     });
 
     it(`${stream}: a unit anchored under the agent root IS attributed`, () => {
-      const byUnit = s({ unit: "/home/simon/agent/jobs/nightly.service" });
+      const byUnit = s({ unit: "/home/user/agent/jobs/nightly.service" });
       expect(sampleInAgentScope(stream, byUnit, SURFACE)).toBe(true);
     });
 
@@ -97,22 +97,22 @@ describe("sampleInAgentScope — cron/cost attribution (fix #1)", () => {
 describe("sampleInAgentScope — memory_access root boundary (fix #3)", () => {
   it("keeps a file under the agent root", () => {
     expect(
-      sampleInAgentScope("memory_access", s({ file: "/home/simon/agent/memory/x.md" }), SURFACE),
+      sampleInAgentScope("memory_access", s({ file: "/home/user/agent/memory/x.md" }), SURFACE),
     ).toBe(true);
   });
 
   it("keeps the root path itself", () => {
-    expect(sampleInAgentScope("memory_access", s({ file: "/home/simon/agent" }), SURFACE)).toBe(
+    expect(sampleInAgentScope("memory_access", s({ file: "/home/user/agent" }), SURFACE)).toBe(
       true,
     );
   });
 
   it("does NOT match the agent-backup sibling directory", () => {
-    // /home/simon/agent must not prefix-match /home/simon/agent-backup/...
+    // /home/user/agent must not prefix-match /home/user/agent-backup/...
     expect(
       sampleInAgentScope(
         "memory_access",
-        s({ file: "/home/simon/agent-backup/secrets.md" }),
+        s({ file: "/home/user/agent-backup/secrets.md" }),
         SURFACE,
       ),
     ).toBe(false);
