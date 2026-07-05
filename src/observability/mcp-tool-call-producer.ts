@@ -12,8 +12,9 @@
  * hash — see tool-call.ts), so there is nothing sensitive to surface here.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
+import { forEachLineSync } from "../tuner/wisecron/line-reader.js";
 import {
   type DateRange,
   type MetricSample,
@@ -66,35 +67,54 @@ export class McpToolCallTelemetryProducer implements TelemetryProvider {
     if (stream !== MCP_TOOL_CALL_STREAM) return [];
     if (this.path === "" || !existsSync(this.path)) return [];
 
-    const text = readFileSync(this.path, "utf8");
+    // Stream the append-only audit log line-by-line with a per-file byte cap
+    // rather than slurping the whole file into one string. The log grows
+    // unbounded on a long-running daemon, so a `readFileSync` here could OOM
+    // before the MCP-layer sample cap can act. Same treatment the session /
+    // journal readers already use (see line-reader.ts). Wrapped in try/catch to
+    // tolerate a mid-read failure on one bad file.
     const out: MetricSample[] = [];
-    for (const line of text.split("\n")) {
-      const l = line.trim();
-      if (!l) continue;
-      let rec: ToolCallRecord;
-      try {
-        rec = JSON.parse(l) as ToolCallRecord;
-      } catch {
-        continue; // skip a partial trailing write or a corrupt line
-      }
-      if (rec.event !== MCP_TOOL_CALL_STREAM) continue;
-      const detail = rec.detail ?? {};
-      const tsStr = typeof detail.event_ts === "string" ? detail.event_ts : rec.ts;
-      if (!tsStr) continue;
-      const ts = new Date(tsStr);
-      if (Number.isNaN(ts.getTime())) continue;
-      if (ts < range.start || ts >= range.end) continue;
+    try {
+      forEachLineSync(
+        this.path,
+        (line) => {
+          const l = line.trim();
+          if (!l) return;
+          let rec: ToolCallRecord;
+          try {
+            rec = JSON.parse(l) as ToolCallRecord;
+          } catch {
+            return; // skip a partial trailing write or a corrupt line
+          }
+          if (rec.event !== MCP_TOOL_CALL_STREAM) return;
+          const detail = rec.detail ?? {};
+          const tsStr = typeof detail.event_ts === "string" ? detail.event_ts : rec.ts;
+          if (!tsStr) return;
+          const ts = new Date(tsStr);
+          if (Number.isNaN(ts.getTime())) return;
+          if (ts < range.start || ts >= range.end) return;
 
-      const labels: Record<string, string> = {
-        plugin: String(rec.subject ?? ""),
-        tool: String(detail.tool ?? ""),
-        status: String(detail.status ?? ""),
-        agent_id: String(detail.agent_id ?? ""),
-      };
-      if (filters && !Object.entries(filters).every(([k, v]) => labels[k] === v)) continue;
+          const labels: Record<string, string> = {
+            plugin: String(rec.subject ?? ""),
+            tool: String(detail.tool ?? ""),
+            status: String(detail.status ?? ""),
+            agent_id: String(detail.agent_id ?? ""),
+          };
+          if (filters && !Object.entries(filters).every(([k, v]) => labels[k] === v)) return;
 
-      const duration = Number(detail.duration_ms ?? 0);
-      out.push({ ts, value: Number.isFinite(duration) ? duration : 0, labels });
+          const duration = Number(detail.duration_ms ?? 0);
+          out.push({ ts, value: Number.isFinite(duration) ? duration : 0, labels });
+        },
+        {
+          onTruncate: (bytes) =>
+            console.warn(
+              `[mcp-tool-call] audit log read hit the ${bytes}-byte cap — query result is truncated`,
+            ),
+        },
+      );
+    } catch {
+      // A read failure mid-scan returns whatever was parsed so far, matching the
+      // "tolerate one bad file" contract of the other producers.
     }
     return out;
   }
