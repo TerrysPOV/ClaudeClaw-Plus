@@ -1,0 +1,34 @@
+name: Test
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    name: Bun test (module suites)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Scoped to the suites that pass cleanly. `bun test` treats these as path
+      # patterns, so each must point at a dir that actually holds *.test.ts:
+      # the module dirs (src/bus, src/tuner, src/observability, src/skills-tuner)
+      # plus the governance tests — which live under src/__tests__/governance,
+      # NOT src/governance (that dir has no tests). The rest of the root
+      # `src/__tests__/` suite is intentionally excluded for now: ~41 pre-existing
+      # failures, a mix of cross-test pollution (pass in isolation, fail in the
+      # shared process) and infra-dependent tests (DB/queue CI doesn't provide).
+      # Folding those in would make CI permanently red. Tracked for cleanup — see
+      # the issue linked in the PR — after which these paths widen toward full.
+      - name: Run tests (clean suites)
+        run: bun test src/bus src/tuner src/observability src/skills-tuner src/__tests__/governance
