@@ -8,6 +8,11 @@ import {
   parseStallWatchdogConfig,
   type StallWatchdogConfig,
 } from "./bus/stall-watchdog";
+import {
+  DEFAULT_AGENT_JOB_CONFIG,
+  parseAgentJobConfig,
+  type AgentJobConfig,
+} from "./bus/agent-jobs";
 import { parsePlugins, type PluginEntry } from "./plugins";
 import { parseMemorySearchSettings, type MemorySearchSettings } from "./memory";
 
@@ -234,6 +239,7 @@ const DEFAULT_SETTINGS: Settings = {
   // Clone so a future in-place edit of settings.stallWatchdog can't mutate the
   // shared exported default.
   stallWatchdog: structuredClone(DEFAULT_STALL_CONFIG),
+  agentJobs: structuredClone(DEFAULT_AGENT_JOB_CONFIG),
   governance: { watchdog: {} },
   session: { autoRotate: false, maxMessages: 50, maxAgeHours: 24, summaryPath: "" },
   // Default runtime: `bus` (Sprint 5.4 flip after Hetzner staging soak ended
@@ -689,6 +695,8 @@ export interface Settings {
   mcp: McpConfig;
   watchdog: WatchdogSettings;
   stallWatchdog: StallWatchdogConfig;
+  /** Agent-job primitive config (#296 PR 3): concurrency cap + per-job timeouts. */
+  agentJobs: AgentJobConfig;
   governance: GovernanceConfig;
   plugins: Record<string, PluginEntry>;
   session: SessionConfig;
@@ -1101,6 +1109,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
     mcp: parseMcpConfig(raw.mcp, raw.web?.enabled),
     watchdog: parseWatchdogConfig(raw.watchdog),
     stallWatchdog: parseStallWatchdogConfig(raw.stallWatchdog),
+    agentJobs: parseAgentJobConfig(raw.agentJobs),
     governance: parseGovernanceConfig(raw.governance),
     plugins: parsePlugins(raw.plugins),
     memorySearch: parseMemorySearchSettings(raw.memorySearch),

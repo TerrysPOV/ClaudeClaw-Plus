@@ -65,6 +65,46 @@ export const DEFAULT_AGENT_JOB_CONFIG: AgentJobConfig = {
   maxTimeoutMs: 60 * 60_000, // 60 min hard cap
 };
 
+/**
+ * Parse `settings.agentJobs` from raw JSON, clamping to sane bounds and
+ * falling back to {@link DEFAULT_AGENT_JOB_CONFIG} for any missing/invalid
+ * field. Mirrors `parseStallWatchdogConfig` — the bus module owns its config
+ * shape so `config.ts` just imports this. `defaultTimeoutMs` is never allowed
+ * to exceed `maxTimeoutMs` (an operator raising only the default shouldn't
+ * silently blow past the hard cap).
+ */
+export function parseAgentJobConfig(raw: unknown): AgentJobConfig {
+  const r = (raw ?? {}) as Partial<Record<keyof AgentJobConfig, unknown>>;
+  const num = (v: unknown, fallback: number, min: number): number =>
+    typeof v === "number" && Number.isFinite(v) && v >= min ? v : fallback;
+  const maxConcurrent = Math.floor(num(r.maxConcurrent, DEFAULT_AGENT_JOB_CONFIG.maxConcurrent, 1));
+  const maxTimeoutMs = num(r.maxTimeoutMs, DEFAULT_AGENT_JOB_CONFIG.maxTimeoutMs, 1_000);
+  const defaultTimeoutMs = Math.min(
+    num(r.defaultTimeoutMs, DEFAULT_AGENT_JOB_CONFIG.defaultTimeoutMs, 1_000),
+    maxTimeoutMs,
+  );
+  return { maxConcurrent, defaultTimeoutMs, maxTimeoutMs };
+}
+
+/**
+ * The daemon-facing surface of the job runner — the four operations Bus core
+ * routes an `IpcJobRequest` to. {@link AgentJobRunner} implements it; Bus core
+ * depends only on this interface so it stays decoupled from the runner's
+ * process-spawning internals (and tests can inject a fake).
+ */
+export interface AgentJobHandler {
+  dispatch(input: {
+    agent: string;
+    prompt: string;
+    dispatcher: string;
+    model?: string;
+    timeoutMs?: number;
+  }): { jobId: string; status: JobStatus } | { error: string };
+  status(jobId: string): JobView | null;
+  list(): JobView[];
+  cancel(jobId: string): { ok: boolean; error?: string };
+}
+
 export interface JobRunResult {
   exitCode: number;
   resultText?: string;
@@ -94,7 +134,7 @@ export interface AgentJobDeps {
   genId(): string;
 }
 
-export class AgentJobRunner {
+export class AgentJobRunner implements AgentJobHandler {
   private readonly jobs = new Map<string, JobRecord>();
   private readonly controllers = new Map<string, AbortController>();
   private readonly queue: string[] = [];

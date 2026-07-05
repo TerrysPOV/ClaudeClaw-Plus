@@ -83,6 +83,9 @@ function createFakeBus(opts: FakeBusOptions = {}): FakeBus {
     // care about ordering observe via the `events` buffer in
     // setSlashCommandHandler.
     setStreamPromptHandler() {},
+    // #296 PR 3 contract — runtime-mount installs the agent-job handler on
+    // start and detaches it on stop. No-op fake.
+    setJobHandler() {},
     // #222 reconciliation contract — runtime-mount installs the reconciler
     // signal handler on start. No-op fake.
     setMcpSendFailedHandler(h) {

@@ -51,6 +51,8 @@ import {
   type IpcAskAnswer,
   type IpcCancel,
   type IpcHello,
+  type IpcJobRequest,
+  type IpcJobResult,
   type IpcMessage,
   type IpcPermissionRequest,
   type IpcPermissionResponse,
@@ -279,6 +281,26 @@ const RequestHumanArgsSchema = z.object({
   question: z.string(),
 });
 
+const DispatchJobArgsSchema = z.object({
+  agent: z.string(),
+  prompt: z.string(),
+  model: z.string().optional(),
+  timeoutMs: z.number().optional(),
+});
+
+const JobIdArgsSchema = z.object({
+  job_id: z.string(),
+});
+
+/**
+ * Bound on how long a job-control call waits for Bus core's `IpcJobResult`.
+ * All four ops resolve SYNCHRONOUSLY in the daemon runner, so a reply is
+ * effectively immediate; this only fires if the daemon died or dropped the
+ * frame. Bounded (not open-ended like `request_human`) precisely because the
+ * whole point of the primitive is that a job call can NEVER wedge the turn.
+ */
+const JOB_REQUEST_TIMEOUT_MS = 30_000;
+
 /* ───────────────────────────────────────────────────────────────────── */
 /* BusMcpServer — wiring logic, transport-agnostic                       */
 /* ───────────────────────────────────────────────────────────────────── */
@@ -385,6 +407,14 @@ export class BusMcpServer {
 
   private readonly pendingAnswers = new Map<string, PendingAnswer>();
 
+  /**
+   * Pending job-control calls keyed by `req_id`. Each of the four job tools
+   * mints a `req_id`, registers its resolver here, sends an `IpcJobRequest`,
+   * and awaits — the correlated `IpcJobResult` from Bus core resolves it.
+   * Mirrors {@link pendingAnswers} for the `request_human` round-trip.
+   */
+  private readonly pendingJobRequests = new Map<string, (result: IpcJobResult) => void>();
+
   constructor(opts: BusMcpServerOptions) {
     this.agentId = opts.agentId;
     this.ipc = opts.ipc;
@@ -440,6 +470,14 @@ export class BusMcpServer {
           return this.handleCancel(rawArgs);
         case "request_human":
           return this.handleRequestHuman(rawArgs);
+        case "dispatch_job":
+          return this.handleDispatchJob(rawArgs);
+        case "job_status":
+          return this.handleJobStatus(rawArgs);
+        case "list_jobs":
+          return this.handleListJobs();
+        case "cancel_job":
+          return this.handleCancelJob(rawArgs);
         default:
           return {
             content: [{ type: "text", text: `Unknown tool: ${name}` }],
@@ -522,6 +560,9 @@ export class BusMcpServer {
         case "permission_response":
           this.deliverPermissionResponse(msg);
           return;
+        case "job_result":
+          this.deliverJobResult(msg);
+          return;
         // Bus core never sends these to the plugin in normal operation;
         // log and ignore for forward-compat.
         default:
@@ -598,6 +639,13 @@ export class BusMcpServer {
       .catch((err: unknown) => {
         process.stderr.write(`Bus MCP: permission notification failed: ${String(err)}\n`);
       });
+  }
+
+  private deliverJobResult(msg: IpcJobResult): void {
+    const resolve = this.pendingJobRequests.get(msg.req_id);
+    if (!resolve) return; // unknown / already-settled (timeout raced) — drop.
+    this.pendingJobRequests.delete(msg.req_id);
+    resolve(msg);
   }
 
   /* ── Tool handlers ──────────────────────────────────────────────── */
@@ -689,6 +737,90 @@ export class BusMcpServer {
     return {
       content: [{ type: "text", text: answer }],
     };
+  }
+
+  /* ── Agent-job tool handlers (issue #296 PR 3) ──────────────────── */
+
+  /**
+   * Route one job-control op to Bus core and await the correlated result.
+   * The `AgentJobRunner` lives in the daemon, so these tools can't touch it
+   * directly — they mint a `req_id`, register a resolver, send the
+   * `IpcJobRequest`, and await the matching `IpcJobResult`. A timeout guards
+   * against a dead daemon so a job call can never wedge the caller's turn.
+   */
+  private jobRequest(
+    op: IpcJobRequest["op"],
+    payload: Record<string, unknown>,
+  ): Promise<IpcJobResult> {
+    const reqId = randomUUID();
+    return new Promise<IpcJobResult>((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingJobRequests.delete(reqId);
+        resolve({
+          type: "job_result",
+          req_id: reqId,
+          ok: false,
+          error: "job request timed out — no response from Bus core",
+        });
+      }, JOB_REQUEST_TIMEOUT_MS);
+      // Don't let a stray timer keep the process alive if everything else is done.
+      timer.unref?.();
+      this.pendingJobRequests.set(reqId, (result) => {
+        clearTimeout(timer);
+        resolve(result);
+      });
+      const ipcMsg: IpcJobRequest = {
+        type: "job_request",
+        agent_id: this.agentId,
+        req_id: reqId,
+        op,
+        payload,
+      };
+      this.ipc.send(ipcMsg);
+    });
+  }
+
+  /** Serialise an `IpcJobResult` back to the calling agent as the tool result. */
+  private jobResultContent(res: IpcJobResult) {
+    if (!res.ok) {
+      return {
+        content: [
+          { type: "text", text: JSON.stringify({ error: res.error ?? "job request failed" }) },
+        ],
+        isError: true,
+      };
+    }
+    return {
+      content: [{ type: "text", text: JSON.stringify(res.result ?? null) }],
+    };
+  }
+
+  private async handleDispatchJob(raw: unknown) {
+    const args = DispatchJobArgsSchema.parse(raw ?? {});
+    const res = await this.jobRequest("dispatch", {
+      agent: args.agent,
+      prompt: args.prompt,
+      ...(args.model !== undefined ? { model: args.model } : {}),
+      ...(args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {}),
+    });
+    return this.jobResultContent(res);
+  }
+
+  private async handleJobStatus(raw: unknown) {
+    const args = JobIdArgsSchema.parse(raw ?? {});
+    const res = await this.jobRequest("status", { job_id: args.job_id });
+    return this.jobResultContent(res);
+  }
+
+  private async handleListJobs() {
+    const res = await this.jobRequest("list", {});
+    return this.jobResultContent(res);
+  }
+
+  private async handleCancelJob(raw: unknown) {
+    const args = JobIdArgsSchema.parse(raw ?? {});
+    const res = await this.jobRequest("cancel", { job_id: args.job_id });
+    return this.jobResultContent(res);
   }
 }
 

@@ -31,8 +31,12 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import type { AgentConfig, BusOrigin } from "./types";
 import { BusCoreImpl, type BusCore } from "./core";
+import { AgentJobRunner, DEFAULT_AGENT_JOB_CONFIG, type AgentJobConfig } from "./agent-jobs";
+import { runAgentJobHeadless } from "../runner";
+import { agentExists } from "../agents";
 import { SessionManager } from "./session-manager";
 import { wireSlashCommands } from "./wiring";
 import { createMcpReconciler } from "./mcp-reconciler";
@@ -352,6 +356,58 @@ export async function mountBusRuntime(
       }),
     );
 
+    // #296 PR 3 — agent-job primitive. Gives agents a supported `dispatch_job`
+    // instead of hand-rolling `/tmp` fire-scripts + `claude -p` + `nohup … &`
+    // (the shape that wedged the daemon for ~11h in #295). The runner lives
+    // HERE in the daemon (only it can spawn/track processes); `dispatch_job`
+    // etc. route over IPC to `handleJobRequest`. Fire-and-return, capped
+    // concurrency, hard timeout cap, dispatcher-validated agent — a job can
+    // never block the caller's turn or spawn an unknown agent. Wired BEFORE
+    // agent spawn so a just-spawned agent's first dispatch is never dropped.
+    let agentJobConfig: AgentJobConfig;
+    try {
+      agentJobConfig = getSettings().agentJobs;
+    } catch {
+      agentJobConfig = DEFAULT_AGENT_JOB_CONFIG; // settings not loaded (early boot / tests)
+    }
+    const jobRunner = new AgentJobRunner(agentJobConfig, {
+      runAgentJob: (input) => runAgentJobHeadless(input),
+      isKnownAgent: agentExists,
+      deliverResult: (job) => {
+        // Decision 1a: deliver the finished job back to the DISPATCHER as a
+        // system-origin prompt so it can act on / report the result — closing
+        // the loop the fire-scripts faked by tailing a log. `origin:"cron"`
+        // (a real, non-channel BusOrigin with `user_id:"system"`, mirroring the
+        // scheduler) keeps it off any user surface; the dispatcher decides how
+        // to surface it. Best-effort — the runner already guards this call.
+        const detail = job.error
+          ? `Error: ${job.error}`
+          : (job.resultText ?? "(job produced no output)");
+        void bus
+          .sendPrompt({
+            agent_id: job.dispatcher,
+            origin: "cron",
+            origin_id: `agent-job:${job.jobId}`,
+            user_id: "system",
+            text:
+              `Agent job ${job.jobId} (agent "${job.agent}") finished with status ` +
+              `"${job.status}".\n\n${detail}`,
+            metadata: {
+              kind: "agent_job_result",
+              job_id: job.jobId,
+              job_agent: job.agent,
+              job_status: job.status,
+            },
+          })
+          .catch((err) =>
+            logger.warn(`[bus-runtime] agent-job result delivery for ${job.jobId} failed`, err),
+          );
+      },
+      now: Date.now,
+      genId: () => randomUUID(),
+    });
+    bus.setJobHandler(jobRunner);
+
     // #227 restart-based session rotation. The bus PTY is spawned once at boot
     // and kept alive, so the session JSONL grows unbounded and per-prompt
     // latency creeps up (#213). When the per-agent message/age threshold trips,
@@ -580,7 +636,16 @@ export async function mountBusRuntime(
       async stop() {
         if (stopped) return;
         stopped = true;
-        // Stall watchdog first: cancel its sweep timer + bus subscription and
+        // Agent-job runner: cancel in-flight jobs + clear the queue so no
+        // headless `claude -p` outlives the daemon, and detach the handler so
+        // a late `job_request` gets a clean "not enabled" error (#296 PR 3).
+        try {
+          jobRunner.stop();
+          bus.setJobHandler(null);
+        } catch (err) {
+          logger.error("[bus-runtime] jobRunner.stop() failed", err);
+        }
+        // Stall watchdog next: cancel its sweep timer + bus subscription and
         // await any in-flight kill so it can't respawn a session mid-teardown.
         await stallWatchdog.stop();
         // Adapters first: stop inbound traffic so nothing new hits the
