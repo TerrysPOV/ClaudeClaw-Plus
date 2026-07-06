@@ -1,0 +1,143 @@
+import { describe, it, expect } from "bun:test";
+import type { ModelBenchmark } from "../../../subjects/model-routing-benchmarks.js";
+import { evaluateReroute } from "../../../subjects/model-routing-quality.js";
+
+function bench(p: Partial<ModelBenchmark>): ModelBenchmark {
+  return {
+    model_id: "x",
+    name: "X",
+    intelligence_index: 60,
+    coding_index: null,
+    agentic_index: null,
+    price_in_usd_per_mtok: 3,
+    price_out_usd_per_mtok: 15,
+    price_cache_hit_usd_per_mtok: null,
+    source: "t",
+    fetched_at: "t",
+    ...p,
+  };
+}
+
+describe("model-routing-quality — evaluateReroute (quality is the veto)", () => {
+  it("proposes a strict quality win that is also cheaper", () => {
+    const cur = bench({
+      intelligence_index: 60,
+      price_in_usd_per_mtok: 3,
+      price_out_usd_per_mtok: 15,
+    });
+    const cand = bench({
+      intelligence_index: 65,
+      price_in_usd_per_mtok: 1,
+      price_out_usd_per_mtok: 5,
+    });
+    const v = evaluateReroute(cur, cand);
+    expect(v.propose).toBe(true);
+    expect(v.code).toBe("quality_win");
+    expect(v.quality_delta).toBe(5);
+    expect(v.projected_savings_usd_per_mtok).toBeGreaterThan(0);
+  });
+
+  it("VETOES a cheaper candidate that regresses quality", () => {
+    const cur = bench({ intelligence_index: 60 });
+    const cand = bench({
+      intelligence_index: 50,
+      price_in_usd_per_mtok: 0.5,
+      price_out_usd_per_mtok: 2,
+    });
+    const v = evaluateReroute(cur, cand);
+    expect(v.propose).toBe(false);
+    expect(v.code).toBe("quality_regression");
+    // savings are real but irrelevant — quality wins
+    expect(v.projected_savings_usd_per_mtok).toBeGreaterThan(0);
+  });
+
+  it("does NOT propose when quality holds but there is no cost win", () => {
+    const cur = bench({
+      intelligence_index: 60,
+      price_in_usd_per_mtok: 3,
+      price_out_usd_per_mtok: 15,
+    });
+    const cand = bench({
+      intelligence_index: 62,
+      price_in_usd_per_mtok: 4,
+      price_out_usd_per_mtok: 20,
+    });
+    const v = evaluateReroute(cur, cand);
+    expect(v.propose).toBe(false);
+    expect(v.code).toBe("not_cheaper");
+  });
+
+  it("allows a within-tolerance quality dip when it buys a cost win", () => {
+    const cur = bench({
+      intelligence_index: 60,
+      price_in_usd_per_mtok: 3,
+      price_out_usd_per_mtok: 15,
+    });
+    const cand = bench({
+      intelligence_index: 58,
+      price_in_usd_per_mtok: 1,
+      price_out_usd_per_mtok: 5,
+    });
+    const v = evaluateReroute(cur, cand, { qualityTolerance: 3 });
+    expect(v.propose).toBe(true);
+    expect(v.code).toBe("cost_win_quality_held");
+    expect(v.quality_delta).toBe(-2);
+  });
+
+  it("with zero tolerance (default), even a tiny quality dip is vetoed", () => {
+    const cur = bench({ intelligence_index: 60 });
+    const cand = bench({
+      intelligence_index: 59.5,
+      price_in_usd_per_mtok: 0.1,
+      price_out_usd_per_mtok: 0.5,
+    });
+    const v = evaluateReroute(cur, cand);
+    expect(v.propose).toBe(false);
+    expect(v.code).toBe("quality_regression");
+  });
+
+  it("respects the minimum-savings floor", () => {
+    const cur = bench({
+      intelligence_index: 60,
+      price_in_usd_per_mtok: 3,
+      price_out_usd_per_mtok: 15,
+    });
+    const cand = bench({
+      intelligence_index: 61,
+      price_in_usd_per_mtok: 2.99,
+      price_out_usd_per_mtok: 14.9,
+    });
+    const v = evaluateReroute(cur, cand, { minSavingsUsdPerMtok: 1 });
+    expect(v.propose).toBe(false);
+    expect(v.code).toBe("not_cheaper");
+  });
+
+  it("cannot gate without both indices or pricing → insufficient_data", () => {
+    const cur = bench({ intelligence_index: null });
+    const cand = bench({ intelligence_index: 65 });
+    expect(evaluateReroute(cur, cand).code).toBe("insufficient_data");
+
+    const cur2 = bench({ price_in_usd_per_mtok: null });
+    const cand2 = bench({ intelligence_index: 65 });
+    const v2 = evaluateReroute(cur2, cand2);
+    expect(v2.propose).toBe(false);
+    expect(v2.code).toBe("insufficient_data");
+  });
+
+  it("computes blended savings with the input/output ratio", () => {
+    // ratio 3 → blended = (3*in + out)/4
+    const cur = bench({
+      intelligence_index: 60,
+      price_in_usd_per_mtok: 4,
+      price_out_usd_per_mtok: 4,
+    }); // blended 4
+    const cand = bench({
+      intelligence_index: 60,
+      price_in_usd_per_mtok: 2,
+      price_out_usd_per_mtok: 2,
+    }); // blended 2
+    const v = evaluateReroute(cur, cand, { inputOutputRatio: 3 });
+    expect(v.projected_savings_usd_per_mtok).toBe(2);
+    expect(v.propose).toBe(true);
+  });
+});
