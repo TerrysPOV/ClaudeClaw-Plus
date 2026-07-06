@@ -1483,6 +1483,33 @@ describe("BusCore IPC", () => {
       expect(replies.length).toBe(1);
       expect(replies[0].text).toBe("the answer");
     });
+
+    it("synthesizes immediately when the reply nudge reaches no transport (deaf agent) (#261)", async () => {
+      // replyNudge is on by default, but makeBus() wires neither an IPC server
+      // nor a streamPromptHandler, so the nudge reaches nobody. Pre-fix this
+      // stranded the user until the reconciler respawned the agent (one full
+      // cycle of hang); now the bus must fall through and synthesize at once.
+      const b = makeBus();
+      const replies = captureReplies(b, "alpha");
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "webui",
+        origin_id: "deaf-1",
+        user_id: "u1",
+        text: "hi",
+      });
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: "alpha",
+        session_id: "",
+        topic: "response.turn_end",
+        payload: { stop_reason: "end_turn", text: "recovered answer" },
+      });
+      // Delivered synchronously via synthesis — no waiting for a nudged turn.
+      expect(replies.length).toBe(1);
+      expect(replies[0].text).toBe("recovered answer");
+      expect(replies[0].synthesized).toBe(true);
+    });
   });
 });
 

@@ -565,6 +565,8 @@ export class BusCoreImpl implements BusCore {
     this.agentTurnActive.clear();
     this.originAmbiguous.clear();
     this.pendingRedelivery.clear();
+    this.replyNudged.clear();
+    this.pendingNudgeText.clear();
   }
 
   /* ─────────────────────────────── prompts ─────────────────────────────── */
@@ -1156,8 +1158,14 @@ export class BusCoreImpl implements BusCore {
       );
       this.replyNudged.set(agentId, true);
       this.pendingNudgeText.set(agentId, deliverText);
-      this.nudgeForReply(agentId, origin);
-      return;
+      if (this.nudgeForReply(agentId, origin)) return;
+      // #261/#222: neither IPC nor PTY received the nudge (deaf agent) — don't
+      // strand the user waiting for a turn that will never start. Fall through to
+      // synthesize immediately (zero-delay, exactly as the pre-#215 path did).
+      console.warn(
+        `[bus] reply nudge undeliverable for agent=${agentId} (no IPC/PTY transport) — ` +
+          `synthesizing immediately instead of waiting. See #261/#222.`,
+      );
     }
     // FALLBACK (#217/#240): the nudge is disabled or already spent and the turn
     // STILL ended without a reply — synthesize a labeled delivery so the user
@@ -1200,7 +1208,10 @@ export class BusCoreImpl implements BusCore {
    * per-turn delivered/published flags: a real reply then lands cleanly, and if
    * it doesn't, the next `response.turn_end` falls through to the fallback.
    */
-  private nudgeForReply(agentId: string, origin: { origin: BusOrigin; origin_id: string }): void {
+  private nudgeForReply(
+    agentId: string,
+    origin: { origin: BusOrigin; origin_id: string },
+  ): boolean {
     const text =
       "You ended your turn without calling the `reply` tool, so the user received " +
       "nothing — your transcript text does not reach them. Call `reply` now with " +
@@ -1208,18 +1219,25 @@ export class BusCoreImpl implements BusCore {
     this.currentTurnReplied.set(agentId, false);
     this.currentTurnFinalPublished.set(agentId, false);
     // IPC path (best-effort, no reconciler): reach an MCP-connected agent.
-    this.ipcServer?.send(agentId, {
-      type: "prompt",
-      agent_id: agentId,
-      origin: origin.origin,
-      origin_id: origin.origin_id,
-      user_id: "system",
-      text,
-      metadata: { nudge: "reply-tool" },
-    });
-    // PTY-stdin path for headless agents. A <system-reminder> wrap signals this
-    // is bus-injected guidance, not a user message from a surface.
+    const ipcDelivered =
+      this.ipcServer?.send(agentId, {
+        type: "prompt",
+        agent_id: agentId,
+        origin: origin.origin,
+        origin_id: origin.origin_id,
+        user_id: "system",
+        text,
+        metadata: { nudge: "reply-tool" },
+      }) === true;
+    // PTY-stdin path for headless agents. A <system-reminder> wrap signals this is
+    // bus-injected guidance, not a user message. deliverOrQueuePrompt no-ops when no
+    // streamPromptHandler is wired, so that is the PTY-availability signal.
+    const ptyAvailable = this.streamPromptHandler !== null;
     this.deliverOrQueuePrompt(agentId, `<system-reminder>${escapeXmlText(text)}</system-reminder>`);
+    // #261/#222: report whether ANY transport actually received the nudge, so a
+    // deaf agent (neither IPC nor PTY) does not leave the caller waiting for a
+    // turn that never starts.
+    return ipcDelivered || ptyAvailable;
   }
 
   ingestSessionEvent(e: BusEvent): void {
