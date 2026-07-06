@@ -22,6 +22,7 @@ import {
   type BusOrigin,
   type PermissionRequest,
   isTailerOriginEvent,
+  withSynthesizedNotice,
 } from "../../bus/types";
 import { createSlackApi } from "./api";
 import { buildPermissionBlocks } from "./blocks";
@@ -626,8 +627,11 @@ export class SlackAdapter {
       this.logger.warn(`[slack-adapter] no channels for agent ${agentId}; dropping response.text`);
       return;
     }
+    // #240: label a silent-drop safety-net delivery so it is not mistaken for a
+    // curated reply (no-op for normal replies). Full text preserved.
+    const outText = withSynthesizedNotice(text, payload);
     for (const channelId of channels) {
-      await this.safePostMessage({ channel: channelId, text });
+      await this.safePostMessage({ channel: channelId, text: outText });
     }
   }
 

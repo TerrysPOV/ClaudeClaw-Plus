@@ -142,6 +142,28 @@ export function isTailerOriginEvent(event: BusEvent): boolean {
   return meta?.source === TAILER_EVENT_SOURCE;
 }
 
+/**
+ * Prefix shown on a silent-drop safety-net delivery (#240). The bus tags these
+ * `synthesized: true` (see `ingestReply`) because the agent ended its turn
+ * without calling the `reply` tool, so the text is raw, uncurated turn output
+ * rather than a message the agent chose to send. Surfaces prepend this so the
+ * user does not mistake it for a curated reply; the full text is preserved (the
+ * #217 safety net exists precisely because the user would otherwise get nothing).
+ */
+export const SYNTHESIZED_REPLY_NOTICE =
+  "⚠️ The agent ended its turn without sending a reply — raw output below:";
+
+/**
+ * Prepend {@link SYNTHESIZED_REPLY_NOTICE} when `payload.synthesized` is set
+ * (#240). No-op for curated replies and for empty text. Centralised so every
+ * channel adapter renders the same wording and gate, with no drift.
+ */
+export function withSynthesizedNotice(text: string, payload: unknown): string {
+  const synthesized = (payload as { synthesized?: boolean } | undefined)?.synthesized === true;
+  if (!synthesized || text.length === 0) return text;
+  return `${SYNTHESIZED_REPLY_NOTICE}\n\n${text}`;
+}
+
 /* ───────────────────────────────────────────────────────────────────── */
 /* Permission flow (§5.1 v2.2)                                           */
 /* ───────────────────────────────────────────────────────────────────── */

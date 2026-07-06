@@ -1078,25 +1078,45 @@ describe("BusCore IPC", () => {
   });
 
   describe("silent-drop safety net (issue #215)", () => {
-    function makeBus(): BusCore {
+    function makeBus(opts?: { replyNudge?: boolean; nudges?: string[] }): BusCore {
       return createBusCore({
         eventLogAppend: createMockEventLog().append,
+        replyNudge: opts?.replyNudge,
+        // Capture PTY-stdin deliveries so nudge tests can assert the reminder
+        // was injected (no real REPL in tests).
+        streamPromptHandler: opts?.nudges
+          ? async (_agentId: string, wrapped: string) => {
+              // sendPrompt also delivers <channel> prompts over this seam;
+              // capture only the bus-injected reply nudges.
+              if (wrapped.includes("<system-reminder>")) opts.nudges?.push(wrapped);
+            }
+          : undefined,
       });
     }
 
     function captureReplies(b: BusCore, agentId: string) {
-      const replies: { text: string; origin?: string }[] = [];
+      const replies: { text: string; origin?: string; synthesized?: boolean }[] = [];
       b.subscribe({ agent_id: agentId, topics: ["response.text"] }, (event) => {
-        const payload = event.payload as { text?: string; intent?: string; origin?: string };
+        const payload = event.payload as {
+          text?: string;
+          intent?: string;
+          origin?: string;
+          synthesized?: boolean;
+        };
         if (payload?.intent === "final") {
-          replies.push({ text: payload.text ?? "", origin: payload.origin });
+          replies.push({
+            text: payload.text ?? "",
+            origin: payload.origin,
+            synthesized: payload.synthesized,
+          });
         }
       });
       return replies;
     }
 
     it("synthesizes a final reply when turn_end fires without prior reply call", async () => {
-      const b = makeBus();
+      // replyNudge:false isolates the fallback synthesis path from the nudge.
+      const b = makeBus({ replyNudge: false });
       const replies = captureReplies(b, "alpha");
 
       await b.sendPrompt({
@@ -1119,6 +1139,123 @@ describe("BusCore IPC", () => {
       expect(replies.length).toBe(1);
       expect(replies[0].text).toBe("hi there, this is the silent-dropped text");
       expect(replies[0].origin).toBe("webui");
+    });
+
+    it("tags the synthesized delivery with synthesized:true so surfaces can label it (#240)", async () => {
+      // replyNudge:false to reach the synthesis path directly (not via a nudge).
+      const b = makeBus({ replyNudge: false });
+      const replies = captureReplies(b, "alpha");
+
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "webui",
+        origin_id: "test-240",
+        user_id: "u1",
+        text: "say hi",
+      });
+
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: "alpha",
+        session_id: "",
+        topic: "response.turn_end",
+        payload: { stop_reason: "end_turn", text: "uncurated working prose" },
+      });
+
+      expect(replies.length).toBe(1);
+      expect(replies[0].synthesized).toBe(true);
+    });
+
+    /* ───────── reply-tool enforcement: nudge-first (#215/#240) ───────── */
+
+    const turnEnd = (b: BusCore, agentId: string, text: string) =>
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: agentId,
+        session_id: "",
+        topic: "response.turn_end",
+        payload: { stop_reason: "end_turn", text },
+      });
+    const promptTg = (b: BusCore, agentId: string) =>
+      b.sendPrompt({
+        agent_id: agentId,
+        origin: "telegram",
+        origin_id: "tg-1",
+        user_id: "u1",
+        text: "hi",
+      });
+    const tick = () => new Promise((r) => setTimeout(r, 5));
+
+    it("nudges the agent to call reply instead of synthesizing on the first miss", async () => {
+      const nudges: string[] = [];
+      const b = makeBus({ nudges });
+      const replies = captureReplies(b, "alpha");
+
+      await promptTg(b, "alpha");
+      turnEnd(b, "alpha", "uncurated scratch");
+      await tick();
+
+      // No synthesized delivery — the agent got a reminder to call reply.
+      expect(replies.length).toBe(0);
+      expect(nudges.length).toBe(1);
+      expect(nudges[0]).toContain("<system-reminder>");
+      expect(nudges[0]).toContain("reply");
+    });
+
+    it("delivers the agent's real reply (not a synthesized dump) when the nudge works", async () => {
+      const nudges: string[] = [];
+      const b = makeBus({ nudges });
+      const replies = captureReplies(b, "alpha");
+
+      await promptTg(b, "alpha");
+      turnEnd(b, "alpha", "scratch"); // → nudge
+      await tick();
+      expect(replies.length).toBe(0);
+
+      // The agent obeys the nudge and calls reply with a curated answer.
+      b.ingestReply({ agent_id: "alpha", text: "Curated answer", intent: "final" });
+      expect(replies.length).toBe(1);
+      expect(replies[0].text).toBe("Curated answer");
+      expect(replies[0].synthesized).toBeUndefined(); // a REAL reply, not synthesized
+
+      // A trailing turn_end for the nudged turn must NOT double-deliver.
+      turnEnd(b, "alpha", "scratch");
+      await tick();
+      expect(replies.length).toBe(1);
+    });
+
+    it("falls back to a labeled synthesized delivery when the nudged turn ALSO skips reply", async () => {
+      const nudges: string[] = [];
+      const b = makeBus({ nudges });
+      const replies = captureReplies(b, "alpha");
+
+      await promptTg(b, "alpha");
+      turnEnd(b, "alpha", "original output"); // first miss → nudge
+      await tick();
+      expect(replies.length).toBe(0);
+      expect(nudges.length).toBe(1);
+
+      turnEnd(b, "alpha", "second output"); // nudged turn ALSO skips reply
+      await tick();
+      expect(replies.length).toBe(1);
+      expect(replies[0].synthesized).toBe(true);
+      expect(nudges.length).toBe(1); // bounded: exactly one nudge per turn
+    });
+
+    it("the fallback preserves the original turn text if the nudged turn produces none", async () => {
+      const nudges: string[] = [];
+      const b = makeBus({ nudges });
+      const replies = captureReplies(b, "alpha");
+
+      await promptTg(b, "alpha");
+      turnEnd(b, "alpha", "the original answer"); // → nudge (text stashed)
+      await tick();
+      turnEnd(b, "alpha", ""); // nudged turn ends empty, still no reply
+      await tick();
+
+      expect(replies.length).toBe(1);
+      expect(replies[0].text).toBe("the original answer");
+      expect(replies[0].synthesized).toBe(true);
     });
 
     it("does NOT synthesize when the agent already called reply with intent: final", async () => {
@@ -1152,6 +1289,8 @@ describe("BusCore IPC", () => {
       // Only the real reply, no duplicate from the safety net.
       expect(replies.length).toBe(1);
       expect(replies[0].text).toBe("hello — delivered properly via reply tool");
+      // A curated reply is NOT tagged synthesized (#240).
+      expect(replies[0].synthesized).toBeUndefined();
     });
 
     it("does NOT synthesize when turn_end text is empty", async () => {
@@ -1221,7 +1360,8 @@ describe("BusCore IPC", () => {
     });
 
     it("resets the per-turn flag on each new prompt (single-flight per prompt)", async () => {
-      const b = makeBus();
+      // replyNudge:false: asserts the synthesis path directly across prompts.
+      const b = makeBus({ replyNudge: false });
       const replies = captureReplies(b, "alpha");
 
       // Prompt 1: agent calls reply → no synthesis.
@@ -1342,6 +1482,33 @@ describe("BusCore IPC", () => {
       // Exactly one final delivered, not two.
       expect(replies.length).toBe(1);
       expect(replies[0].text).toBe("the answer");
+    });
+
+    it("synthesizes immediately when the reply nudge reaches no transport (deaf agent) (#261)", async () => {
+      // replyNudge is on by default, but makeBus() wires neither an IPC server
+      // nor a streamPromptHandler, so the nudge reaches nobody. Pre-fix this
+      // stranded the user until the reconciler respawned the agent (one full
+      // cycle of hang); now the bus must fall through and synthesize at once.
+      const b = makeBus();
+      const replies = captureReplies(b, "alpha");
+      await b.sendPrompt({
+        agent_id: "alpha",
+        origin: "webui",
+        origin_id: "deaf-1",
+        user_id: "u1",
+        text: "hi",
+      });
+      b.ingestSessionEvent({
+        ts: Date.now(),
+        agent_id: "alpha",
+        session_id: "",
+        topic: "response.turn_end",
+        payload: { stop_reason: "end_turn", text: "recovered answer" },
+      });
+      // Delivered synchronously via synthesis — no waiting for a nudged turn.
+      expect(replies.length).toBe(1);
+      expect(replies[0].text).toBe("recovered answer");
+      expect(replies[0].synthesized).toBe(true);
     });
   });
 });

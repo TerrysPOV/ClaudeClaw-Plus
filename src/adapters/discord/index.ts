@@ -42,6 +42,7 @@ import {
   type BusOrigin,
   type PermissionRequest,
   isTailerOriginEvent,
+  withSynthesizedNotice,
 } from "../../bus/types";
 import { createDiscordGateway } from "./gateway";
 import { join } from "node:path";
@@ -521,8 +522,11 @@ export class DiscordAdapter {
       const payload = event.payload as { text?: string };
       const text = typeof payload.text === "string" ? payload.text : "";
       if (!text) return;
+      // #240: label a silent-drop safety-net delivery so it is not mistaken for
+      // a curated reply (no-op for normal replies). Full text preserved.
+      const outText = withSynthesizedNotice(text, event.payload);
       for (const channelId of targetChannels) {
-        void this.safeSendMessage(channelId, text);
+        void this.safeSendMessage(channelId, outText);
       }
       return;
     }
