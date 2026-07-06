@@ -1751,7 +1751,9 @@ async function loadKanban() {
 
 async function saveKanban() {
   try {
-    await fetch("/api/kanban", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(kanbanData) });
+    // mutatingFetch (not raw fetch): POST /api/kanban is CSRF-guarded, so a
+    // plain fetch 403s and the write is silently dropped (this catch swallows it).
+    await mutatingFetch("/api/kanban", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(kanbanData) });
   } catch (_) {}
 }
 
