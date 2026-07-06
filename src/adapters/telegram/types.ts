@@ -131,12 +131,14 @@ export interface TelegramApi {
     text: string;
     message_thread_id?: number;
     reply_markup?: { inline_keyboard: TelegramInlineKeyboardButton[][] };
+    parse_mode?: "HTML";
   }): Promise<{ ok: boolean; result?: { message_id: number } }>;
   /** Edit the text of a message the bot previously sent. */
   editMessageText(params: {
     chat_id: number;
     message_id: number;
     text: string;
+    parse_mode?: "HTML";
   }): Promise<{ ok: boolean; result?: { message_id: number } | true }>;
   /** Show a chat action (e.g. typing) — expires after ~5s. */
   sendChatAction(params: { chat_id: number; action: "typing" }): Promise<{ ok: boolean }>;

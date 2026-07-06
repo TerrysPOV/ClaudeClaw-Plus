@@ -99,9 +99,16 @@ export function createTelegramApi(token: string, options: TelegramApiOptions = {
     });
     if (!res.ok) {
       let retryAfter = 0;
+      let description = "";
       try {
-        const errBody = (await res.json()) as { parameters?: { retry_after?: number } };
+        const errBody = (await res.json()) as {
+          description?: string;
+          parameters?: { retry_after?: number };
+        };
         retryAfter = errBody?.parameters?.retry_after ?? 0;
+        // Surface Telegram's reason (e.g. "Bad Request: can't parse entities …")
+        // so callers can tell a malformed-HTML 400 from a benign one.
+        description = errBody?.description ?? "";
       } catch {
         /* error body was not JSON — ignore */
       }
@@ -111,7 +118,7 @@ export function createTelegramApi(token: string, options: TelegramApiOptions = {
       throw new Error(
         `Telegram API ${method}: ${res.status} ${res.statusText}${
           retryAfter ? ` (retry_after ${retryAfter}s)` : ""
-        }`,
+        }${description ? `: ${description}` : ""}`,
       );
     }
     return (await res.json()) as T;

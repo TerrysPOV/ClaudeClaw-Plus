@@ -130,6 +130,7 @@ interface SendMessageCall {
   text: string;
   message_thread_id?: number;
   reply_markup?: { inline_keyboard: TelegramInlineKeyboardButton[][] };
+  parse_mode?: "HTML";
 }
 
 interface SetReactionCall {
@@ -151,7 +152,12 @@ interface AnswerCallbackCall {
  */
 class FakeTelegramApi implements TelegramApi {
   public readonly sendMessages: SendMessageCall[] = [];
-  public readonly editMessages: Array<{ chat_id: number; message_id: number; text: string }> = [];
+  public readonly editMessages: Array<{
+    chat_id: number;
+    message_id: number;
+    text: string;
+    parse_mode?: "HTML";
+  }> = [];
   public readonly reactions: SetReactionCall[] = [];
   public readonly callbackAcks: AnswerCallbackCall[] = [];
   /** #201: count inbound polls so send-only configs can assert zero. */
@@ -202,6 +208,7 @@ class FakeTelegramApi implements TelegramApi {
     chat_id: number;
     message_id: number;
     text: string;
+    parse_mode?: "HTML";
   }): Promise<{ ok: boolean; result?: { message_id: number } | true }> {
     this.editMessages.push(params);
     return { ok: true, result: true };
@@ -612,6 +619,55 @@ describe("TelegramAdapter — response.text outbound", () => {
     expect(sent).toBeDefined();
     expect(sent?.text).toBe("hi there");
     expect(sent?.chat_id).toBe(100);
+  });
+
+  it("renders markdown as Telegram HTML with parse_mode (raw-markdown bug)", async () => {
+    // Regression: the bus adapter sent agent replies as plain text with no
+    // parse_mode, so Claude's markdown arrived as literal `**bold**` etc.
+    // Replies now convert to Telegram HTML and set parse_mode: "HTML".
+    adapter = await startAdapter();
+    await feedInbound();
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: {
+        text: "**bold** and *italic* and `code` and [link](https://example.com)",
+      },
+    });
+    await waitFor(() => api.sendMessages.length > 0);
+    const sent = api.sendMessages[0];
+    expect(sent?.parse_mode).toBe("HTML");
+    expect(sent?.text).toBe(
+      '<b>bold</b> and <i>italic</i> and <code>code</code> and <a href="https://example.com">link</a>',
+    );
+  });
+
+  it("converts markdown on an in-place edit too (progress → final)", async () => {
+    adapter = await startAdapter();
+    await feedInbound();
+
+    // Progress opens a live turn (fresh send); final edits it in place.
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "working", intent: "progress" },
+    });
+    await waitFor(() => api.sendMessages.length === 1);
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "**done**", intent: "final" },
+    });
+    await waitFor(() => api.editMessages.some((e) => e.text === "<b>done</b>"));
+    const edit = api.editMessages.find((e) => e.text === "<b>done</b>");
+    expect(edit?.parse_mode).toBe("HTML");
   });
 
   it("IGNORES the JSONL tailer observability echo so replies are not double-posted (#217)", async () => {
