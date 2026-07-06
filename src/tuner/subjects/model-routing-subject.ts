@@ -565,16 +565,19 @@ function removeKeywordFromYaml(content: string, mode: string, keyword: string): 
   const lines = content.split("\n");
   const out: string[] = [];
   let inMode = false;
+  let modeIndent = "";
   for (const line of lines) {
-    if (
-      new RegExp(`^\\s{2,}${escapeRe(mode)}:\\s*$`).test(line) ||
-      new RegExp(`^${escapeRe(mode)}:\\s*$`).test(line)
-    ) {
+    const modeHeader = line.match(new RegExp(`^(\\s*)${escapeRe(mode)}:\\s*$`));
+    if (modeHeader) {
       inMode = true;
+      modeIndent = modeHeader[1] ?? "";
       out.push(line);
       continue;
     }
-    if (inMode && /^\S/.test(line)) inMode = false;
+    // Exit the target mode's block on the first non-blank line indented no deeper
+    // than the header (a sibling mode or a dedent) — NOT only at column 0, which
+    // let edits bleed into sibling modes in an indented `modes:` block (#306).
+    if (inMode && line.trim().length > 0 && !line.startsWith(`${modeIndent} `)) inMode = false;
     if (inMode && new RegExp(`^\\s*-\\s+["']?${escapeRe(keyword)}["']?\\s*$`).test(line)) continue;
     out.push(line);
   }
@@ -590,16 +593,19 @@ function renameKeywordInYaml(
   const lines = content.split("\n");
   const out: string[] = [];
   let inMode = false;
+  let modeIndent = "";
   for (const line of lines) {
-    if (
-      new RegExp(`^\\s{2,}${escapeRe(mode)}:\\s*$`).test(line) ||
-      new RegExp(`^${escapeRe(mode)}:\\s*$`).test(line)
-    ) {
+    const modeHeader = line.match(new RegExp(`^(\\s*)${escapeRe(mode)}:\\s*$`));
+    if (modeHeader) {
       inMode = true;
+      modeIndent = modeHeader[1] ?? "";
       out.push(line);
       continue;
     }
-    if (inMode && /^\S/.test(line)) inMode = false;
+    // Exit the target mode's block on the first non-blank line indented no deeper
+    // than the header (a sibling mode or a dedent) — NOT only at column 0, which
+    // let edits bleed into sibling modes in an indented `modes:` block (#306).
+    if (inMode && line.trim().length > 0 && !line.startsWith(`${modeIndent} `)) inMode = false;
     if (inMode) {
       const m = line.match(new RegExp(`^(\\s*-\\s+)["']?${escapeRe(keyword)}["']?\\s*$`));
       if (m) {
@@ -616,16 +622,19 @@ function swapModelInYaml(content: string, mode: string): string {
   const lines = content.split("\n");
   const out: string[] = [];
   let inMode = false;
+  let modeIndent = "";
   for (const line of lines) {
-    if (
-      new RegExp(`^\\s{2,}${escapeRe(mode)}:\\s*$`).test(line) ||
-      new RegExp(`^${escapeRe(mode)}:\\s*$`).test(line)
-    ) {
+    const modeHeader = line.match(new RegExp(`^(\\s*)${escapeRe(mode)}:\\s*$`));
+    if (modeHeader) {
       inMode = true;
+      modeIndent = modeHeader[1] ?? "";
       out.push(line);
       continue;
     }
-    if (inMode && /^\S/.test(line)) inMode = false;
+    // Exit the target mode's block on the first non-blank line indented no deeper
+    // than the header (a sibling mode or a dedent) — NOT only at column 0, which
+    // let edits bleed into sibling modes in an indented `modes:` block (#306).
+    if (inMode && line.trim().length > 0 && !line.startsWith(`${modeIndent} `)) inMode = false;
     if (inMode && /^\s*model:\s*/.test(line)) {
       out.push(line.replace(/sonnet/g, "haiku").replace(/opus/g, "sonnet"));
       continue;

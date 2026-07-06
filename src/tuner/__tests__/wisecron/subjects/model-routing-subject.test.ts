@@ -463,3 +463,63 @@ describe("ModelRoutingSubject — healthProbe (post-apply artifact check)", () =
     expect(probe.failed).toBe(false);
   });
 });
+
+describe("ModelRoutingSubject — YAML editors don't corrupt sibling modes (#306)", () => {
+  it("proposeChange edits only the target mode in a multi-mode block", async () => {
+    const yaml = [
+      "modes:",
+      "  fast:",
+      "    model: claude-sonnet",
+      "    keywords:",
+      "      - quick",
+      "      - rapid",
+      "  slow:",
+      "    model: claude-opus",
+      "    keywords:",
+      "      - quick",
+      "      - deep",
+    ].join("\n");
+    writeFileSync(configPath, yaml, "utf8");
+    const s = new ModelRoutingSubject({ modesConfigPath: configPath });
+    const obs: Observation[] = [
+      {
+        session_id: "t",
+        observed_at: new Date(),
+        signal_type: "orphan",
+        verbatim: "{}",
+        metadata: {
+          subject: "model_routing",
+          mode: "fast",
+          keyword: "quick",
+          triggers: 0,
+          reclassify_rate: 0,
+          expensive: false,
+          age_days: 200,
+        },
+      },
+    ];
+    const clusters = await s.detectProblems(obs);
+    const cluster = clusters.find((c) => c.id === "routing-dead-keyword");
+    expect(cluster).toBeDefined();
+    const proposal = await s.proposeChange(cluster!);
+    const alt = (id: string) =>
+      proposal.alternatives.find((a) => a.id === id)?.diff_or_content ?? "";
+
+    // swap-model: fast sonnet -> haiku; slow's opus MUST survive (the #306 repro:
+    // the bug left inMode set and swapped slow's model to sonnet too).
+    const swapped = alt("swap-model");
+    expect(swapped).toContain("model: claude-haiku");
+    expect(swapped).toContain("model: claude-opus");
+
+    // remove-keyword: fast's 'quick' removed; slow's 'quick' + 'deep' untouched.
+    const removed = alt("remove-keyword");
+    expect((removed.match(/^\s*- quick$/gm) ?? []).length).toBe(1);
+    expect(removed).toContain("- rapid");
+    expect(removed).toContain("- deep");
+
+    // narrow-keyword: fast's 'quick' renamed; slow's 'quick' left as-is.
+    const narrowed = alt("narrow-keyword");
+    expect(narrowed).toContain("- quick-specific");
+    expect((narrowed.match(/^\s*- quick$/gm) ?? []).length).toBe(1);
+  });
+});
