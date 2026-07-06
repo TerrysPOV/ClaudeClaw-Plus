@@ -2205,7 +2205,9 @@ async function execClaude(
     }
     await recordInvocationCompletion(invocationId, invocationUsage, invocationCost);
 
-    // Check watchdog limits
+    // Check watchdog limits. Both suspend AND kill route through
+    // handleTrigger, which dispatches by state (kill → audited terminate path).
+    // `kill` is now reachable (#280): checkLimits escalates past the hard ceiling.
     const watchdogDecision = await checkLimits({ invocationId, sessionId: invocationSessionId });
     if (watchdogDecision.state === "suspend" || watchdogDecision.state === "kill") {
       console.warn(
@@ -2214,6 +2216,7 @@ async function execClaude(
       await watchdogHandleTrigger(
         { invocationId, sessionId: invocationSessionId },
         watchdogDecision,
+        { terminate: killActive },
       );
       // Send escalation notification for watchdog triggers
       try {
@@ -2399,6 +2402,7 @@ async function execClaude(
             await watchdogHandleTrigger(
               { invocationId, sessionId: invocationSessionId },
               retryWatchdogDecision,
+              { terminate: killActive },
             );
           }
         }

@@ -14,7 +14,7 @@ import {
   getWatchdogConfig,
   resetWatchdog,
 } from "../../governance/watchdog";
-import { join } from "path";
+import { join } from "node:path";
 
 const WATCHDOG_DIR = join(process.cwd(), ".claude", "claudeclaw", "watchdog");
 
@@ -24,7 +24,7 @@ describe("Watchdog", () => {
 
     // Clear watchdog directory for test isolation
     try {
-      const { rm, readdir } = await import("fs/promises");
+      const { rm, readdir } = await import("node:fs/promises");
       const files = await readdir(WATCHDOG_DIR);
       for (const file of files) {
         if (file !== ".gitkeep") {
@@ -85,9 +85,9 @@ describe("Watchdog", () => {
 
     const metrics = await getActiveInvocation(invocationId);
     expect(metrics).not.toBeNull();
-    expect(metrics!.toolCallCount).toBe(5);
-    expect(metrics!.turnCount).toBe(2);
-    expect(metrics!.invocationId).toBe(invocationId);
+    expect(metrics?.toolCallCount).toBe(5);
+    expect(metrics?.turnCount).toBe(2);
+    expect(metrics?.invocationId).toBe(invocationId);
   });
 
   test("should increment tool call count", async () => {
@@ -98,8 +98,8 @@ describe("Watchdog", () => {
     await incrementToolCall(invocationId, "write_file", { path: "/tmp/output.txt" });
 
     const metrics = await getActiveInvocation(invocationId);
-    expect(metrics!.toolCallCount).toBe(3);
-    expect(metrics!.toolCalls.length).toBe(3);
+    expect(metrics?.toolCallCount).toBe(3);
+    expect(metrics?.toolCalls.length).toBe(3);
   });
 
   test("should increment turn count", async () => {
@@ -109,7 +109,7 @@ describe("Watchdog", () => {
     await incrementTurnCount(invocationId);
 
     const metrics = await getActiveInvocation(invocationId);
-    expect(metrics!.turnCount).toBe(2);
+    expect(metrics?.turnCount).toBe(2);
   });
 
   test("should return healthy when under limits", async () => {
@@ -220,6 +220,82 @@ describe("Watchdog", () => {
 
     expect(result.success).toBe(true);
     expect(["suspended", "paused"]).toContain(result.action);
+  });
+
+  // #280 — kill escalation. checkLimits used to cap at "suspend", leaving the
+  // runner's `=== "kill"` branch dead. It now escalates to "kill" past a hard
+  // ceiling (limit * killCeilingMultiplier, default 2).
+  describe("#280 kill escalation", () => {
+    test("escalates to kill past the hard ceiling (2× tool-call limit)", async () => {
+      const invocationId = "test-invocation-kill-esc";
+      await recordExecutionMetric({ invocationId }, { toolCallCount: 20 }); // 2×10
+      const decision = await checkLimits({ invocationId });
+      expect(decision.state).toBe("kill");
+      expect(decision.recommendedAction).toBe("terminate");
+      expect(decision.triggeredLimits.some((l) => l.includes("maxToolCalls_kill"))).toBe(true);
+    });
+
+    test("kill is now reachable end-to-end via handleTrigger (terminated)", async () => {
+      const invocationId = "test-invocation-kill-e2e";
+      await recordExecutionMetric({ invocationId }, { toolCallCount: 25 });
+      const decision = await checkLimits({ invocationId });
+      expect(decision.state).toBe("kill");
+      const result = await handleTrigger({ invocationId }, decision);
+      expect(result.success).toBe(true);
+      expect(result.action).toBe("terminated");
+    });
+
+    test("kill invokes the injected terminator (actually terminates) — #298", async () => {
+      const invocationId = "test-invocation-kill-terminate";
+      await recordExecutionMetric({ invocationId }, { toolCallCount: 25 });
+      const decision = await checkLimits({ invocationId });
+      expect(decision.state).toBe("kill");
+      let called = 0;
+      const result = await handleTrigger({ invocationId }, decision, {
+        terminate: () => {
+          called++;
+          return true;
+        },
+      });
+      expect(called).toBe(1);
+      expect(result.success).toBe(true);
+      expect(result.action).toBe("terminated");
+    });
+
+    test("kill reports success:false when the terminator finds nothing to kill — #298", async () => {
+      const invocationId = "test-invocation-kill-noproc";
+      await recordExecutionMetric({ invocationId }, { toolCallCount: 25 });
+      const decision = await checkLimits({ invocationId });
+      const result = await handleTrigger({ invocationId }, decision, {
+        terminate: () => false,
+      });
+      expect(result.action).toBe("terminated");
+      expect(result.success).toBe(false);
+    });
+
+    test("just under the ceiling stays suspend, not kill", async () => {
+      const invocationId = "test-invocation-kill-boundary";
+      await recordExecutionMetric({ invocationId }, { toolCallCount: 19 }); // <2×10
+      const decision = await checkLimits({ invocationId });
+      expect(decision.state).toBe("suspend");
+    });
+
+    test("killCeilingMultiplier ≤ 1 disables the kill tier (suspend stays highest)", async () => {
+      configureWatchdog({
+        limits: {
+          maxToolCalls: 10,
+          maxTurns: 5,
+          maxRuntimeSeconds: 60,
+          maxRepeatedTools: 3,
+          killCeilingMultiplier: 1,
+        },
+        enabled: true,
+      });
+      const invocationId = "test-invocation-kill-optout";
+      await recordExecutionMetric({ invocationId }, { toolCallCount: 100 });
+      const decision = await checkLimits({ invocationId });
+      expect(decision.state).toBe("suspend");
+    });
   });
 
   test("should handle trigger for kill state", async () => {
@@ -357,14 +433,14 @@ describe("Watchdog", () => {
       );
       const record = await getActiveInvocation("leak-test-resume");
       expect(record).not.toBeNull();
-      expect(record!.toolCallCount).toBe(2);
+      expect(record?.toolCallCount).toBe(2);
     });
   });
 
   describe("#268 leak fix — startup eviction of stale records", () => {
     test("initWatchdog evicts records older than 24h on load", async () => {
       // Seed a stale record on disk by writing the index directly.
-      const { writeFile, mkdir } = await import("fs/promises");
+      const { writeFile, mkdir } = await import("node:fs/promises");
       await mkdir(WATCHDOG_DIR, { recursive: true });
       const indexPath = join(WATCHDOG_DIR, "watchdog-index.json");
       const stale = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
@@ -407,7 +483,7 @@ describe("Watchdog", () => {
     });
 
     test("evicts a malformed lastActivityAt and respects the 24h boundary", async () => {
-      const { writeFile, mkdir } = await import("fs/promises");
+      const { writeFile, mkdir } = await import("node:fs/promises");
       await mkdir(WATCHDOG_DIR, { recursive: true });
       const indexPath = join(WATCHDOG_DIR, "watchdog-index.json");
       const fresh = new Date().toISOString();
