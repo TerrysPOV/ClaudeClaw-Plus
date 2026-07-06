@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { ModelRoutingSubject } from "../../../subjects/model-routing-subject.js";
 import type { StructuredEvidence, LocalSignal } from "../../../wisecron/evidence-driven.js";
+import type { ModelBenchmark } from "../../../subjects/model-routing-benchmarks.js";
 
 function makeCostDb(path: string, rows: Array<[string, number]>): void {
   const db = new Database(path);
@@ -110,5 +111,69 @@ describe("ModelRoutingSubject — EvidenceDrivenSubject (proactive)", () => {
       [daysAgo(0), 1],
     ]);
     expect(await subj().confirm({ ...degraded, value: 999 })).toBe(true);
+  });
+});
+
+function bm(id: string, iq: number, pin: number, pout: number): ModelBenchmark {
+  return {
+    model_id: id,
+    name: id,
+    intelligence_index: iq,
+    coding_index: null,
+    agentic_index: null,
+    price_in_usd_per_mtok: pin,
+    price_out_usd_per_mtok: pout,
+    price_cache_hit_usd_per_mtok: null,
+    source: "t",
+    fetched_at: "t",
+  };
+}
+
+describe("ModelRoutingSubject — proposeEvidencePatch (benchmark reroute, #292)", () => {
+  let dir: string, cfgPath: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "mr-patch-"));
+    cfgPath = join(dir, "agentic.yaml");
+    writeFileSync(
+      cfgPath,
+      ["modes:", "  fast:", "    model: claude-opus", "  slow:", "    model: claude-haiku"].join(
+        "\n",
+      ),
+      "utf8",
+    );
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  const withBench = (rows: ModelBenchmark[]) =>
+    new ModelRoutingSubject({
+      modesConfigPath: cfgPath,
+      benchmarkProvider: async () => rows,
+      rerouteGate: { qualityTolerance: 6 },
+    });
+
+  it("proposes a quality-gated reroute patch for the degraded routing", async () => {
+    const s = withBench([
+      bm("claude-opus", 70, 15, 75),
+      bm("claude-sonnet", 66, 3, 15),
+      bm("claude-haiku", 55, 0.8, 4),
+    ]);
+    const patch = await s.proposeEvidencePatch(ev(), degraded);
+    expect(patch).not.toBeNull();
+    expect(patch!.target_path).toBe(cfgPath);
+    // fast (opus) → sonnet (best quality-safe cheaper); slow (haiku) has no safe swap.
+    const fast = patch!.alternatives.find((a) => a.id === "reroute-fast-to-claude-sonnet");
+    expect(fast).toBeDefined();
+    expect(fast!.diff_or_content).toContain("model: claude-sonnet");
+    expect(fast!.diff_or_content).toContain("model: claude-haiku"); // slow untouched
+  });
+
+  it("returns null when the cost signal is not degraded", async () => {
+    const s = withBench([bm("claude-opus", 70, 15, 75), bm("claude-sonnet", 66, 3, 15)]);
+    expect(await s.proposeEvidencePatch(ev(), { ...degraded, degraded: false })).toBeNull();
+  });
+
+  it("returns null when no benchmark data is available (no key / offline)", async () => {
+    const s = withBench([]);
+    expect(await s.proposeEvidencePatch(ev(), degraded)).toBeNull();
   });
 });

@@ -169,3 +169,90 @@ export function proposeBenchmarkReroute(
   }
   return proposals;
 }
+
+import type { EvidencePatch } from "../wisecron/evidence-driven.js";
+
+function escapeReQuality(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Extract `mode → model` assignments from an agentic.yaml `modes:` block. Tracks
+ * the (indented) mode header and pairs it with its `model:` line. Indent-aware so
+ * a comment or sibling never mis-binds (same discipline as the YAML editors).
+ */
+export function parseModelAssignments(content: string): Array<{ key: string; model: string }> {
+  const lines = content.split("\n");
+  const out: Array<{ key: string; model: string }> = [];
+  let mode: string | null = null;
+  let modeIndent = "";
+  for (const line of lines) {
+    const header = line.match(/^(\s*)([A-Za-z0-9_-]+):\s*$/);
+    if (header) {
+      mode = header[2] ?? null;
+      modeIndent = header[1] ?? "";
+      continue;
+    }
+    const m = line.match(/^(\s*)model:\s*["']?([A-Za-z0-9._-]+)["']?\s*$/);
+    if (m && mode && (m[1]?.length ?? 0) > modeIndent.length) {
+      out.push({ key: mode, model: m[2]! });
+      mode = null;
+    }
+  }
+  return out;
+}
+
+/**
+ * Set the `model:` for a specific mode block to `newModel`, preserving comments +
+ * ordering. Indent-aware block scope (exits on a sibling/dedent) so a reroute of
+ * one mode never rewrites another — the #306 hazard, avoided by construction.
+ */
+export function setModelInYaml(content: string, mode: string, newModel: string): string {
+  const lines = content.split("\n");
+  const out: string[] = [];
+  let inMode = false;
+  let modeIndent = "";
+  const header = new RegExp(`^(\\s*)${escapeReQuality(mode)}:\\s*$`);
+  for (const line of lines) {
+    const h = line.match(header);
+    if (h) {
+      inMode = true;
+      modeIndent = h[1] ?? "";
+      out.push(line);
+      continue;
+    }
+    if (inMode && line.trim().length > 0 && !line.startsWith(`${modeIndent} `)) inMode = false;
+    if (inMode) {
+      const m = line.match(/^(\s*model:\s*)["']?[A-Za-z0-9._-]+["']?\s*$/);
+      if (m) {
+        out.push(`${m[1]}${newModel}`);
+        inMode = false;
+        continue;
+      }
+    }
+    out.push(line);
+  }
+  return out.join("\n");
+}
+
+/**
+ * Turn quality-gated reroute proposals into an EvidencePatch the subject applies
+ * itself (a CONFIG patch, in its own modes file — never a plugin, never engine
+ * code). One alternative per proposal so the operator picks which mode to reroute.
+ */
+export function buildRerouteEvidencePatch(
+  content: string,
+  proposals: RerouteProposal[],
+  targetPath: string,
+): EvidencePatch | null {
+  if (proposals.length === 0) return null;
+  return {
+    target_path: targetPath,
+    alternatives: proposals.map((p) => ({
+      id: `reroute-${p.key}-to-${p.to_model}`,
+      label: `Route '${p.key}' ${p.from_model} → ${p.to_model}`,
+      diff_or_content: setModelInYaml(content, p.key, p.to_model),
+      tradeoff: p.verdict.reason,
+    })),
+  };
+}

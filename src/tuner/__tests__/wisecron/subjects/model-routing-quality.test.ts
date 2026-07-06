@@ -211,3 +211,73 @@ describe("model-routing-quality — proposeBenchmarkReroute (Tier-A pipeline)", 
     expect(props.map((p) => p.key).sort()).toEqual(["fast"]); // only 'fast' has a safe cheaper swap
   });
 });
+
+import {
+  parseModelAssignments,
+  setModelInYaml,
+  buildRerouteEvidencePatch,
+} from "../../../subjects/model-routing-quality.js";
+
+const CFG = [
+  "modes:",
+  "  fast:",
+  "    model: claude-sonnet",
+  "    keywords:",
+  "      - quick",
+  "  slow:",
+  "    model: claude-opus",
+].join("\n");
+
+describe("model-routing-quality — config helpers", () => {
+  it("parses mode → model assignments from the modes block", () => {
+    expect(parseModelAssignments(CFG)).toEqual([
+      { key: "fast", model: "claude-sonnet" },
+      { key: "slow", model: "claude-opus" },
+    ]);
+  });
+
+  it("setModelInYaml swaps only the target mode, leaving siblings intact (#306-safe)", () => {
+    const out = setModelInYaml(CFG, "fast", "claude-haiku");
+    expect(out).toContain("model: claude-haiku"); // fast changed
+    expect(out).toContain("model: claude-opus"); // slow untouched
+    expect(out).toContain("- quick"); // keywords preserved
+    expect(parseModelAssignments(out)).toEqual([
+      { key: "fast", model: "claude-haiku" },
+      { key: "slow", model: "claude-opus" },
+    ]);
+  });
+
+  it("buildRerouteEvidencePatch turns proposals into one alternative per mode", () => {
+    const proposals = proposeBenchmarkReroute(
+      [{ key: "fast", model: "opus" }],
+      [
+        bench({
+          model_id: "opus",
+          intelligence_index: 70,
+          price_in_usd_per_mtok: 15,
+          price_out_usd_per_mtok: 75,
+        }),
+        bench({
+          model_id: "sonnet",
+          intelligence_index: 66,
+          price_in_usd_per_mtok: 3,
+          price_out_usd_per_mtok: 15,
+        }),
+      ],
+      { qualityTolerance: 6 },
+    );
+    const patch = buildRerouteEvidencePatch(
+      "modes:\n  fast:\n    model: opus\n",
+      proposals,
+      "/tmp/agentic.yaml",
+    );
+    expect(patch).not.toBeNull();
+    expect(patch!.target_path).toBe("/tmp/agentic.yaml");
+    expect(patch!.alternatives[0]!.id).toBe("reroute-fast-to-sonnet");
+    expect(patch!.alternatives[0]!.diff_or_content).toContain("model: sonnet");
+  });
+
+  it("buildRerouteEvidencePatch returns null with no proposals", () => {
+    expect(buildRerouteEvidencePatch(CFG, [], "/x")).toBeNull();
+  });
+});

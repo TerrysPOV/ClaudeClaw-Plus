@@ -29,9 +29,17 @@ import {
   type LocalSignal,
   type StructuredEvidence,
   type EvidenceVerdict,
+  type EvidencePatch,
   meetsEvidenceBar,
 } from "../wisecron/evidence-driven.js";
 import { costSignal } from "./model-routing-signal.js";
+import { getModelBenchmarks, type ModelBenchmark } from "./model-routing-benchmarks.js";
+import {
+  buildRerouteEvidencePatch,
+  parseModelAssignments,
+  proposeBenchmarkReroute,
+  type RerouteGateOptions,
+} from "./model-routing-quality.js";
 
 /** Recent median session cost (USD) above which routing is "expensive" regardless of trend. */
 const MODEL_ROUTING_MAX_RECENT_USD = 25;
@@ -61,6 +69,10 @@ export interface ModelRoutingSubjectConfig {
   modesConfigPath?: string;
   /** Injected dispatch-event reader. */
   dispatchReader?: (since: Date) => Array<Record<string, unknown>>;
+  /** Injected published-benchmark provider (Artificial Analysis by default). */
+  benchmarkProvider?: (models: string[]) => Promise<ModelBenchmark[]>;
+  /** Quality/cost gate tuning for the benchmark reroute. */
+  rerouteGate?: RerouteGateOptions;
 }
 
 export class ModelRoutingSubject
@@ -77,6 +89,8 @@ export class ModelRoutingSubject
   private readonly dispatchReader: (since: Date) => Array<Record<string, unknown>>;
   private readonly dispatchReaderInjected: boolean;
   private readonly costDbPath: string;
+  private readonly benchmarkProvider: (models: string[]) => Promise<ModelBenchmark[]>;
+  private readonly rerouteGate: RerouteGateOptions;
 
   constructor(opts: ModelRoutingSubjectConfig = {}) {
     super();
@@ -87,6 +101,9 @@ export class ModelRoutingSubject
     this.dispatchReaderInjected = opts.dispatchReader !== undefined;
     this.dispatchReader = opts.dispatchReader ?? (() => []);
     this.costDbPath = expandHome(opts.costDbPath ?? join(homedir(), "agent", "data", "costs.db"));
+    this.benchmarkProvider =
+      opts.benchmarkProvider ?? ((models) => getModelBenchmarks({ models, nowMs: Date.now() }));
+    this.rerouteGate = opts.rerouteGate ?? {};
   }
 
   // ── Proactive face: EvidenceDrivenSubject (cost signal + faisceau de preuves) ──
@@ -141,6 +158,34 @@ export class ModelRoutingSubject
   async confirm(before: LocalSignal): Promise<boolean> {
     const after = await this.localSignal();
     return after.value < before.value;
+  }
+
+  /**
+   * Proactive benchmark reroute (kind:"patch"). When the local cost signal is
+   * degraded, read the operator's current model assignments, pull PUBLISHED
+   * quality+cost benchmarks (Tier A), and propose the best quality-gated reroute
+   * as a CONFIG patch the subject applies in its own modes file — quality is the
+   * veto (never a reroute that regresses quality). null when nothing is degraded,
+   * no benchmark data is available (no key/offline), or no safe reroute exists.
+   * A survivor is confirmed on the own-workload bench (#80) before apply.
+   */
+  async proposeEvidencePatch(
+    _evidence: StructuredEvidence,
+    signal: LocalSignal,
+  ): Promise<EvidencePatch | null> {
+    if (!signal.degraded) return null;
+    let content = "";
+    try {
+      content = readFileSync(this.modesConfigPath, "utf8");
+    } catch {
+      return null;
+    }
+    const assignments = parseModelAssignments(content);
+    if (assignments.length === 0) return null;
+    const benchmarks = await this.benchmarkProvider(assignments.map((a) => a.model));
+    if (benchmarks.length === 0) return null;
+    const proposals = proposeBenchmarkReroute(assignments, benchmarks, this.rerouteGate);
+    return buildRerouteEvidencePatch(content, proposals, this.modesConfigPath);
   }
 
   async collectObservations(since: Date): Promise<Observation[]> {
