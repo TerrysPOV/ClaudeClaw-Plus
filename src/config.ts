@@ -1,6 +1,6 @@
-import { join, isAbsolute } from "path";
-import { mkdir } from "fs/promises";
-import { existsSync } from "fs";
+import { join, isAbsolute } from "node:path";
+import { mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { normalizeTimezoneName, resolveTimezoneOffsetMinutes } from "./timezone";
 import { parseWatchdogConfig, type WatchdogConfig } from "./watchdog";
 import {
@@ -854,7 +854,7 @@ export async function initConfig(): Promise<void> {
   await mkdir(LOGS_DIR, { recursive: true });
 
   if (!existsSync(SETTINGS_FILE)) {
-    await Bun.write(SETTINGS_FILE, JSON.stringify(DEFAULT_SETTINGS, null, 2) + "\n");
+    await Bun.write(SETTINGS_FILE, `${JSON.stringify(DEFAULT_SETTINGS, null, 2)}\n`);
   }
 }
 
@@ -1545,7 +1545,7 @@ function parseMcpConfig(raw: any, webEnabled: unknown): McpConfig {
   // (SPEC-DELTA-2026-05-16 always-resume). Anything other than an
   // explicit `false` keeps the default — protects against typos like
   // `"false"` (string) silently disabling persistence.
-  const sessionPersistenceEnabled = raw?.sessionPersistenceEnabled === false ? false : true;
+  const sessionPersistenceEnabled = raw?.sessionPersistenceEnabled !== false;
 
   // Rule 6: sessionMaxAgeSeconds — positive integer, clamp to 60. Anything
   // sub-minute is operator error (TTL eviction would fire faster than a

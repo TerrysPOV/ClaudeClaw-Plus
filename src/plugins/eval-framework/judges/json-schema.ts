@@ -1,5 +1,3 @@
-import { z } from "zod";
-
 /**
  * JSON-schema judge: passes if actual output is valid JSON matching a zod schema
  * derived from the expected_output object definition.

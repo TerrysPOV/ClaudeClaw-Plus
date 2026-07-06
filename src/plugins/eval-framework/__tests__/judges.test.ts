@@ -104,34 +104,31 @@ describe("judge: json_schema", () => {
 
 describe("judge: llm_judge", () => {
   it("passes when LLM responds with PASS", async () => {
-    const result = await judgeLlm(
-      "input text",
-      "actual output",
-      "should be correct",
-      { model: "claude-opus-4-7", apiKey: "fake-key", provider: "anthropic" },
-    );
+    const result = await judgeLlm("input text", "actual output", "should be correct", {
+      model: "claude-opus-4-7",
+      apiKey: "fake-key",
+      provider: "anthropic",
+    });
     expect(result.pass).toBe(true);
     expect(result.latency_ms).toBeGreaterThan(0);
     expect(result.cost_usd).toBeGreaterThanOrEqual(0);
   });
 
   it("works with openai provider", async () => {
-    const result = await judgeLlm(
-      "input text",
-      "actual output",
-      "should be correct",
-      { model: "gpt-4", apiKey: "fake-key", provider: "openai" },
-    );
+    const result = await judgeLlm("input text", "actual output", "should be correct", {
+      model: "gpt-4",
+      apiKey: "fake-key",
+      provider: "openai",
+    });
     expect(result.pass).toBe(true);
   });
 
   it("works with array expected", async () => {
-    const result = await judgeLlm(
-      "input",
-      "output",
-      ["criteria 1", "criteria 2"],
-      { model: "claude-opus-4-7", apiKey: "fake-key", provider: "anthropic" },
-    );
+    const result = await judgeLlm("input", "output", ["criteria 1", "criteria 2"], {
+      model: "claude-opus-4-7",
+      apiKey: "fake-key",
+      provider: "anthropic",
+    });
     expect(typeof result.pass).toBe("boolean");
   });
 });
@@ -152,32 +149,28 @@ describe("judge: embedding_similarity", () => {
   });
 
   it("passes with simple overlap when no provider configured", async () => {
-    const result = await judgeEmbeddingSimilarity(
-      "hello world test",
-      "hello world test",
-      { threshold: 0.5 },
-    );
+    const result = await judgeEmbeddingSimilarity("hello world test", "hello world test", {
+      threshold: 0.5,
+    });
     expect(result.pass).toBe(true);
     expect(result.similarity).toBeGreaterThan(0.5);
     expect(result.cost_usd).toBe(0);
   });
 
   it("fails when texts are completely different (no overlap)", async () => {
-    const result = await judgeEmbeddingSimilarity(
-      "alpha beta gamma",
-      "one two three",
-      { threshold: 0.5 },
-    );
+    const result = await judgeEmbeddingSimilarity("alpha beta gamma", "one two three", {
+      threshold: 0.5,
+    });
     expect(result.pass).toBe(false);
     expect(result.similarity).toBe(0);
   });
 
   it("works with openai embedding provider", async () => {
-    const result = await judgeEmbeddingSimilarity(
-      "hello world",
-      "hello world",
-      { threshold: 0.5, provider: "openai", apiKey: "fake-key" },
-    );
+    const result = await judgeEmbeddingSimilarity("hello world", "hello world", {
+      threshold: 0.5,
+      provider: "openai",
+      apiKey: "fake-key",
+    });
     expect(result.pass).toBe(true);
     expect(result.cost_usd).toBeGreaterThanOrEqual(0);
   });

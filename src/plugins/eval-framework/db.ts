@@ -70,7 +70,9 @@ export class EvalDb {
 
   // ── Runs ──────────────────────────────────────────────────────────────────
 
-  createRun(run: Pick<RunRecord, "run_id" | "task_id" | "set_id" | "model" | "max_cost_usd">): void {
+  createRun(
+    run: Pick<RunRecord, "run_id" | "task_id" | "set_id" | "model" | "max_cost_usd">,
+  ): void {
     this.db.run(
       `INSERT INTO runs (run_id, task_id, set_id, model, max_cost_usd) VALUES (?, ?, ?, ?, ?)`,
       [run.run_id, run.task_id, run.set_id, run.model, run.max_cost_usd],
@@ -83,7 +85,16 @@ export class EvalDb {
         `UPDATE runs SET status=?, completed_at=strftime('%Y-%m-%dT%H:%M:%SZ', 'now'),
          pass_rate=?, p50_latency_ms=?, p95_latency_ms=?, p99_latency_ms=?, cost_usd=?, n_examples=?
          WHERE run_id=?`,
-        [status, metrics.pass_rate, metrics.p50_latency_ms, metrics.p95_latency_ms, metrics.p99_latency_ms, metrics.cost_usd, metrics.n_examples, runId],
+        [
+          status,
+          metrics.pass_rate,
+          metrics.p50_latency_ms,
+          metrics.p95_latency_ms,
+          metrics.p99_latency_ms,
+          metrics.cost_usd,
+          metrics.n_examples,
+          runId,
+        ],
       );
     } else {
       this.db.run(
@@ -98,7 +109,10 @@ export class EvalDb {
   }
 
   getRun(runId: string): RunRecord | null {
-    const row = this.db.query(`SELECT * FROM runs WHERE run_id=?`).get(runId) as Record<string, unknown> | null;
+    const row = this.db.query(`SELECT * FROM runs WHERE run_id=?`).get(runId) as Record<
+      string,
+      unknown
+    > | null;
     if (!row) return null;
     return {
       run_id: row.run_id as string,
@@ -110,22 +124,31 @@ export class EvalDb {
       completed_at: (row.completed_at as string) || undefined,
       max_cost_usd: row.max_cost_usd as number,
       cost_accumulated: row.cost_accumulated as number,
-      metrics: row.pass_rate != null ? {
-        pass_rate: row.pass_rate as number,
-        p50_latency_ms: row.p50_latency_ms as number,
-        p95_latency_ms: row.p95_latency_ms as number,
-        p99_latency_ms: row.p99_latency_ms as number,
-        cost_usd: row.cost_usd as number,
-        n_examples: row.n_examples as number,
-      } : undefined,
+      metrics:
+        row.pass_rate != null
+          ? {
+              pass_rate: row.pass_rate as number,
+              p50_latency_ms: row.p50_latency_ms as number,
+              p95_latency_ms: row.p95_latency_ms as number,
+              p99_latency_ms: row.p99_latency_ms as number,
+              cost_usd: row.cost_usd as number,
+              n_examples: row.n_examples as number,
+            }
+          : undefined,
     };
   }
 
   listRuns(taskId?: string, sinceIso?: string, limit = 50): RunRecord[] {
     let sql = "SELECT * FROM runs WHERE 1=1";
     const params: unknown[] = [];
-    if (taskId) { sql += " AND task_id=?"; params.push(taskId); }
-    if (sinceIso) { sql += " AND started_at>=?"; params.push(sinceIso); }
+    if (taskId) {
+      sql += " AND task_id=?";
+      params.push(taskId);
+    }
+    if (sinceIso) {
+      sql += " AND started_at>=?";
+      params.push(sinceIso);
+    }
     sql += " ORDER BY started_at DESC LIMIT ?";
     params.push(limit);
     const rows = this.db.query(sql).all(...(params as string[])) as Record<string, unknown>[];
@@ -148,12 +171,24 @@ export class EvalDb {
     this.db.run(
       `INSERT OR IGNORE INTO examples (run_id, example_id, input_hash, model, latency_ms, cost_usd, judge_verdict, judge_mode, error)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [result.run_id, result.example_id, result.input_hash, result.model, result.latency_ms, result.cost_usd, result.judge_verdict ? 1 : 0, result.judge_mode, result.error ?? null],
+      [
+        result.run_id,
+        result.example_id,
+        result.input_hash,
+        result.model,
+        result.latency_ms,
+        result.cost_usd,
+        result.judge_verdict ? 1 : 0,
+        result.judge_mode,
+        result.error ?? null,
+      ],
     );
   }
 
   getExamplesForRun(runId: string): ExampleResult[] {
-    const rows = this.db.query(`SELECT * FROM examples WHERE run_id=? ORDER BY id`).all(runId) as Record<string, unknown>[];
+    const rows = this.db
+      .query(`SELECT * FROM examples WHERE run_id=? ORDER BY id`)
+      .all(runId) as Record<string, unknown>[];
     return rows.map((r) => ({
       example_id: r.example_id as string,
       input_hash: r.input_hash as string,
@@ -167,7 +202,9 @@ export class EvalDb {
   }
 
   getCompletedExampleCount(runId: string): number {
-    const row = this.db.query(`SELECT COUNT(*) as cnt FROM examples WHERE run_id=?`).get(runId) as { cnt: number };
+    const row = this.db.query(`SELECT COUNT(*) as cnt FROM examples WHERE run_id=?`).get(runId) as {
+      cnt: number;
+    };
     return row.cnt;
   }
 
@@ -177,12 +214,20 @@ export class EvalDb {
     this.db.run(
       `INSERT OR REPLACE INTO recommendations (task_id, recommended_default_tier, escalation_rule, validated_at_iso, basis_run_id)
        VALUES (?, ?, ?, ?, ?)`,
-      [rec.task_id, rec.recommended_default_tier, rec.escalation_rule, rec.validated_at_iso, rec.basis_run_id],
+      [
+        rec.task_id,
+        rec.recommended_default_tier,
+        rec.escalation_rule,
+        rec.validated_at_iso,
+        rec.basis_run_id,
+      ],
     );
   }
 
   getRecommendation(taskId: string): Recommendation | null {
-    const row = this.db.query(`SELECT * FROM recommendations WHERE task_id=?`).get(taskId) as Record<string, unknown> | null;
+    const row = this.db
+      .query(`SELECT * FROM recommendations WHERE task_id=?`)
+      .get(taskId) as Record<string, unknown> | null;
     if (!row) return null;
     return {
       recommended_default_tier: row.recommended_default_tier as string,
@@ -195,7 +240,9 @@ export class EvalDb {
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
   getDbSizeBytes(): number {
-    const row = this.db.query("SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()").get() as { size: number };
+    const row = this.db
+      .query("SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()")
+      .get() as { size: number };
     return row.size;
   }
 

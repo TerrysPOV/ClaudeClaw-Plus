@@ -62,7 +62,7 @@ export async function judgeEmbeddingSimilarity(
   const similarity = cosineSimilarity(embA, embB);
   const latencyMs = performance.now() - startMs;
   // Approximate cost for embedding
-  const totalTokens = (response.usage?.total_tokens ?? 0);
+  const totalTokens = response.usage?.total_tokens ?? 0;
   const costUsd = (totalTokens * 0.00002) / 1000;
 
   return { pass: similarity >= threshold, similarity, latency_ms: latencyMs, cost_usd: costUsd };

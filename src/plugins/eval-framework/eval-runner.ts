@@ -1,12 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
 import { getMcpBridge } from "../mcp-bridge.js";
-import { EvalDb } from "./db.js";
-import type { EvalExample, EvalSet, ExampleResult, JudgeMode, RunMetrics, RunStatus } from "./types.js";
+import type { EvalDb } from "./db.js";
+import type { EvalExample, EvalSet, ExampleResult, RunMetrics, RunStatus } from "./types.js";
 import { judgeExactSet } from "./judges/exact-set.js";
 import { judgeRegex } from "./judges/regex.js";
 import { judgeJsonSchema } from "./judges/json-schema.js";
 import { judgeLlm, type LlmJudgeConfig } from "./judges/llm-judge.js";
-import { judgeEmbeddingSimilarity, type EmbeddingSimilarityConfig } from "./judges/embedding-similarity.js";
+import {
+  judgeEmbeddingSimilarity,
+  type EmbeddingSimilarityConfig,
+} from "./judges/embedding-similarity.js";
 
 export interface EvalRunnerConfig {
   db: EvalDb;
@@ -33,7 +36,9 @@ export class EvalRunner {
     this.config = config;
   }
 
-  async runEval(opts: RunEvalOpts): Promise<{ run_id: string; status: RunStatus; metrics: RunMetrics | null }> {
+  async runEval(
+    opts: RunEvalOpts,
+  ): Promise<{ run_id: string; status: RunStatus; metrics: RunMetrics | null }> {
     const runId = randomUUID();
     const maxCost = opts.maxCostUsd ?? this.config.defaultMaxCostUsd;
     const bridge = getMcpBridge();
@@ -48,7 +53,12 @@ export class EvalRunner {
       max_cost_usd: maxCost,
     });
 
-    bridge.audit("eval_run_started", { run_id: runId, task_id: opts.taskId, model: opts.modelId, set_id: opts.setId });
+    bridge.audit("eval_run_started", {
+      run_id: runId,
+      task_id: opts.taskId,
+      model: opts.modelId,
+      set_id: opts.setId,
+    });
 
     const results: ExampleResult[] = [];
     let costAccumulated = 0;
@@ -66,7 +76,11 @@ export class EvalRunner {
           const budgetResult = await this.config.checkBudget(this.config.budgetGuardScope);
           if (!budgetResult.allow) {
             finalStatus = "budget_denied";
-            bridge.audit("eval_run_cost_cap_hit", { run_id: runId, reason: "budget_guard_denied", cost_accumulated: costAccumulated });
+            bridge.audit("eval_run_cost_cap_hit", {
+              run_id: runId,
+              reason: "budget_guard_denied",
+              cost_accumulated: costAccumulated,
+            });
             break;
           }
         }
@@ -74,7 +88,12 @@ export class EvalRunner {
         // Cost ceiling check
         if (costAccumulated >= maxCost) {
           finalStatus = "cost_cap_hit";
-          bridge.audit("eval_run_cost_cap_hit", { run_id: runId, reason: "max_cost_exceeded", cost_accumulated: costAccumulated, max_cost_usd: maxCost });
+          bridge.audit("eval_run_cost_cap_hit", {
+            run_id: runId,
+            reason: "max_cost_exceeded",
+            cost_accumulated: costAccumulated,
+            max_cost_usd: maxCost,
+          });
           break;
         }
 
@@ -90,7 +109,11 @@ export class EvalRunner {
     }
 
     const metrics = this.computeMetrics(results);
-    this.config.db.updateRunStatus(runId, finalStatus, finalStatus === "completed" ? metrics : undefined);
+    this.config.db.updateRunStatus(
+      runId,
+      finalStatus,
+      finalStatus === "completed" ? metrics : undefined,
+    );
 
     if (finalStatus === "completed") {
       bridge.audit("eval_run_completed", { run_id: runId, metrics });
@@ -98,7 +121,11 @@ export class EvalRunner {
     }
 
     this.abortControllers.delete(runId);
-    return { run_id: runId, status: finalStatus, metrics: finalStatus === "completed" ? metrics : null };
+    return {
+      run_id: runId,
+      status: finalStatus,
+      metrics: finalStatus === "completed" ? metrics : null,
+    };
   }
 
   abortRun(runId: string): void {
@@ -106,7 +133,11 @@ export class EvalRunner {
     if (ac) ac.abort();
   }
 
-  private async evaluateExample(example: EvalExample, modelId: string, _runId: string): Promise<ExampleResult> {
+  private async evaluateExample(
+    example: EvalExample,
+    modelId: string,
+    _runId: string,
+  ): Promise<ExampleResult> {
     const exampleId = example.id ?? randomUUID();
     const inputHash = createHash("sha256").update(example.input).digest("hex").slice(0, 16);
     const startMs = performance.now();
@@ -148,7 +179,10 @@ export class EvalRunner {
     };
   }
 
-  private async callProvider(modelId: string, input: string): Promise<{ output: string; cost_usd: number }> {
+  private async callProvider(
+    modelId: string,
+    input: string,
+  ): Promise<{ output: string; cost_usd: number }> {
     // Determine provider from model ID pattern
     const provider = this.inferProvider(modelId);
     const apiKeyEnv = this.config.providerCredentials[provider];
@@ -188,32 +222,49 @@ export class EvalRunner {
     });
     const text = response.choices[0]?.message?.content ?? "";
     const usage = response.usage;
-    const cost = ((usage?.prompt_tokens ?? 0) * 0.005 + (usage?.completion_tokens ?? 0) * 0.015) / 1000;
+    const cost =
+      ((usage?.prompt_tokens ?? 0) * 0.005 + (usage?.completion_tokens ?? 0) * 0.015) / 1000;
     return { output: text, cost_usd: cost };
   }
 
   private inferProvider(modelId: string): string {
     if (modelId.startsWith("claude") || modelId.includes("anthropic")) return "anthropic";
-    if (modelId.startsWith("gpt") || modelId.startsWith("o1") || modelId.startsWith("o3")) return "openai";
-    if (modelId.startsWith("llama") || modelId.startsWith("mixtral") || modelId.includes("groq")) return "groq";
+    if (modelId.startsWith("gpt") || modelId.startsWith("o1") || modelId.startsWith("o3"))
+      return "openai";
+    if (modelId.startsWith("llama") || modelId.startsWith("mixtral") || modelId.includes("groq"))
+      return "groq";
     if (modelId.startsWith("deepseek")) return "deepseek";
     return "openai"; // default fallback
   }
 
-  private async judge(example: EvalExample, actualOutput: string): Promise<{ pass: boolean; cost_usd: number }> {
+  private async judge(
+    example: EvalExample,
+    actualOutput: string,
+  ): Promise<{ pass: boolean; cost_usd: number }> {
     const expected = example.expected_output;
 
     switch (example.judge_mode) {
       case "exact_set": {
-        const expectedVal = typeof expected === "string" ? expected : Array.isArray(expected) ? expected : JSON.stringify(expected);
+        const expectedVal =
+          typeof expected === "string"
+            ? expected
+            : Array.isArray(expected)
+              ? expected
+              : JSON.stringify(expected);
         return { pass: judgeExactSet(actualOutput, expectedVal as string | string[]), cost_usd: 0 };
       }
       case "regex": {
-        const pattern = typeof expected === "string" ? expected : Array.isArray(expected) ? expected : [JSON.stringify(expected)];
+        const pattern =
+          typeof expected === "string"
+            ? expected
+            : Array.isArray(expected)
+              ? expected
+              : [JSON.stringify(expected)];
         return { pass: judgeRegex(actualOutput, pattern as string | string[]), cost_usd: 0 };
       }
       case "json_schema": {
-        const schema = typeof expected === "string" ? expected : expected as Record<string, unknown>;
+        const schema =
+          typeof expected === "string" ? expected : (expected as Record<string, unknown>);
         return { pass: judgeJsonSchema(actualOutput, schema), cost_usd: 0 };
       }
       case "llm_judge": {
@@ -226,18 +277,37 @@ export class EvalRunner {
           apiKey,
           provider,
         };
-        const expectedStr = typeof expected === "string" ? expected : Array.isArray(expected) ? expected : [JSON.stringify(expected)];
-        const result = await judgeLlm(example.input, actualOutput, expectedStr as string | string[], config);
+        const expectedStr =
+          typeof expected === "string"
+            ? expected
+            : Array.isArray(expected)
+              ? expected
+              : [JSON.stringify(expected)];
+        const result = await judgeLlm(
+          example.input,
+          actualOutput,
+          expectedStr as string | string[],
+          config,
+        );
         return { pass: result.pass, cost_usd: result.cost_usd };
       }
       case "embedding_similarity": {
         const embConfig: EmbeddingSimilarityConfig = {
           threshold: (example.judge_config?.threshold as number) ?? 0.85,
           provider: (example.judge_config?.provider as "openai") ?? undefined,
-          apiKey: example.judge_config?.provider ? process.env[this.config.providerCredentials[example.judge_config.provider as string] ?? ""] : undefined,
+          apiKey: example.judge_config?.provider
+            ? process.env[
+                this.config.providerCredentials[example.judge_config.provider as string] ?? ""
+              ]
+            : undefined,
           model: example.judge_config?.model as string,
         };
-        const expectedStr = typeof expected === "string" ? expected : Array.isArray(expected) ? expected.join(" ") : JSON.stringify(expected);
+        const expectedStr =
+          typeof expected === "string"
+            ? expected
+            : Array.isArray(expected)
+              ? expected.join(" ")
+              : JSON.stringify(expected);
         const result = await judgeEmbeddingSimilarity(actualOutput, expectedStr, embConfig);
         return { pass: result.pass, cost_usd: result.cost_usd };
       }
@@ -248,7 +318,14 @@ export class EvalRunner {
 
   private computeMetrics(results: ExampleResult[]): RunMetrics {
     if (results.length === 0) {
-      return { pass_rate: 0, p50_latency_ms: 0, p95_latency_ms: 0, p99_latency_ms: 0, cost_usd: 0, n_examples: 0 };
+      return {
+        pass_rate: 0,
+        p50_latency_ms: 0,
+        p95_latency_ms: 0,
+        p99_latency_ms: 0,
+        cost_usd: 0,
+        n_examples: 0,
+      };
     }
 
     const passed = results.filter((r) => r.judge_verdict).length;
@@ -265,9 +342,16 @@ export class EvalRunner {
     };
   }
 
-  private async checkRegression(taskId: string, setId: string, currentRunId: string, currentMetrics: RunMetrics): Promise<void> {
+  private async checkRegression(
+    taskId: string,
+    setId: string,
+    currentRunId: string,
+    currentMetrics: RunMetrics,
+  ): Promise<void> {
     const runs = this.config.db.listRuns(taskId, undefined, 10);
-    const previousRun = runs.find((r) => r.run_id !== currentRunId && r.set_id === setId && r.status === "completed");
+    const previousRun = runs.find(
+      (r) => r.run_id !== currentRunId && r.set_id === setId && r.status === "completed",
+    );
     if (!previousRun) return;
 
     const prevRun = this.config.db.getRun(previousRun.run_id);
@@ -275,8 +359,12 @@ export class EvalRunner {
 
     const prev = prevRun.metrics;
     const passRateDrop = prev.pass_rate - currentMetrics.pass_rate;
-    const latencyIncrease = prev.p95_latency_ms > 0 ? (currentMetrics.p95_latency_ms - prev.p95_latency_ms) / prev.p95_latency_ms : 0;
-    const costIncrease = prev.cost_usd > 0 ? (currentMetrics.cost_usd - prev.cost_usd) / prev.cost_usd : 0;
+    const latencyIncrease =
+      prev.p95_latency_ms > 0
+        ? (currentMetrics.p95_latency_ms - prev.p95_latency_ms) / prev.p95_latency_ms
+        : 0;
+    const costIncrease =
+      prev.cost_usd > 0 ? (currentMetrics.cost_usd - prev.cost_usd) / prev.cost_usd : 0;
 
     if (passRateDrop > 0.03 || latencyIncrease > 0.3 || costIncrease > 0.1) {
       getMcpBridge().audit("eval_regression_detected", {

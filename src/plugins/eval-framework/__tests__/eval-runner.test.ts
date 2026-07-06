@@ -59,7 +59,10 @@ function makeDb(): EvalDb {
   return new EvalDb(`/tmp/eval-runner-test-${randomUUID()}.db`);
 }
 
-function makeRunner(db: EvalDb, opts: { checkBudget?: (s: string) => Promise<{ allow: boolean }> } = {}): EvalRunner {
+function makeRunner(
+  db: EvalDb,
+  opts: { checkBudget?: (s: string) => Promise<{ allow: boolean }> } = {},
+): EvalRunner {
   return new EvalRunner({
     db,
     defaultMaxCostUsd: 2.0,
@@ -108,8 +111,8 @@ describe("eval runner orchestration", () => {
     expect(result.run_id).toBeTruthy();
     expect(result.status).toBe("completed");
     expect(result.metrics).not.toBeNull();
-    expect(result.metrics!.n_examples).toBe(2);
-    expect(result.metrics!.pass_rate).toBeGreaterThanOrEqual(0);
+    expect(result.metrics?.n_examples).toBe(2);
+    expect(result.metrics?.pass_rate).toBeGreaterThanOrEqual(0);
   });
 
   it("emits eval_run_started and eval_run_completed", async () => {
@@ -134,9 +137,9 @@ describe("eval runner orchestration", () => {
     });
     const run = db.getRun(result.run_id);
     expect(run).not.toBeNull();
-    expect(run!.task_id).toBe("test-task");
-    expect(run!.model).toBe("claude-sonnet-4-6");
-    expect(run!.status).toBe("completed");
+    expect(run?.task_id).toBe("test-task");
+    expect(run?.model).toBe("claude-sonnet-4-6");
+    expect(run?.status).toBe("completed");
   });
 
   it("persists per-example results", async () => {
@@ -190,7 +193,7 @@ describe("cost ceiling enforcement", () => {
   });
 
   it("emits cost_cap_hit audit event when ceiling exceeded", async () => {
-    const runner = makeRunner(db);
+    const _runner = makeRunner(db);
     // Force budget check to deny
     const denyRunner = makeRunner(db, {
       checkBudget: async () => ({ allow: false }),
@@ -224,7 +227,13 @@ describe("regression detection", () => {
   it("detects regression when pass rate drops", async () => {
     // Seed a previous run with high pass rate
     const prevRunId = randomUUID();
-    db.createRun({ run_id: prevRunId, task_id: "reg-test", set_id: "basic", model: "claude-sonnet-4-6", max_cost_usd: 2.0 });
+    db.createRun({
+      run_id: prevRunId,
+      task_id: "reg-test",
+      set_id: "basic",
+      model: "claude-sonnet-4-6",
+      max_cost_usd: 2.0,
+    });
     db.updateRunStatus(prevRunId, "completed", {
       pass_rate: 1.0,
       p50_latency_ms: 100,

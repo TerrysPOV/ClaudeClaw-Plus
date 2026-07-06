@@ -3,7 +3,6 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { load as parseYaml } from "js-yaml";
 import { getMcpBridge } from "../mcp-bridge.js";
-import { getHttpGateway } from "../http-gateway.js";
 import { EvalDb } from "./db.js";
 import { EvalRunner } from "./eval-runner.js";
 import {
@@ -29,10 +28,10 @@ export interface EvalFrameworkPluginOpts {
   configOverride?: Partial<EvalFrameworkSettings>;
 }
 
-let singleton: EvalFrameworkPlugin | null = null;
+let _singleton: EvalFrameworkPlugin | null = null;
 
 export function _resetEvalFramework(): void {
-  singleton = null;
+  _singleton = null;
 }
 
 export class EvalFrameworkPlugin {
@@ -63,7 +62,7 @@ export class EvalFrameworkPlugin {
 
     this.startedAt = new Date();
     this.started = true;
-    singleton = this;
+    _singleton = this;
 
     getMcpBridge().audit("eval_framework_started", {
       evals_root: this.settings.evals_root,
@@ -107,8 +106,9 @@ export class EvalFrameworkPlugin {
       handler: async (args: unknown) => {
         const parsed = RunEvalArgsSchema.parse(args);
         const evalSet = this._loadEvalSet(parsed.task_id, parsed.set_id);
-        if (!evalSet) throw new Error(`Eval set not found: ${parsed.task_id}/${parsed.set_id ?? "default"}`);
-        return this.runner!.runEval({
+        if (!evalSet)
+          throw new Error(`Eval set not found: ${parsed.task_id}/${parsed.set_id ?? "default"}`);
+        return this.runner?.runEval({
           taskId: parsed.task_id,
           modelId: parsed.model_id,
           setId: parsed.set_id ?? "default",
@@ -125,12 +125,14 @@ export class EvalFrameworkPlugin {
       handler: async (args: unknown) => {
         const parsed = CompareModelsArgsSchema.parse(args);
         const evalSet = this._loadEvalSet(parsed.task_id, parsed.set_id);
-        if (!evalSet) throw new Error(`Eval set not found: ${parsed.task_id}/${parsed.set_id ?? "default"}`);
+        if (!evalSet)
+          throw new Error(`Eval set not found: ${parsed.task_id}/${parsed.set_id ?? "default"}`);
 
-        const maxCostPerModel = (parsed.max_cost_usd ?? this.settings.default_max_cost_usd) / parsed.model_ids.length;
+        const maxCostPerModel =
+          (parsed.max_cost_usd ?? this.settings.default_max_cost_usd) / parsed.model_ids.length;
         const runResults = await Promise.all(
           parsed.model_ids.map((modelId) =>
-            this.runner!.runEval({
+            this.runner?.runEval({
               taskId: parsed.task_id,
               modelId,
               setId: parsed.set_id ?? "default",
@@ -169,9 +171,14 @@ export class EvalFrameworkPlugin {
       schema: RecommendTierArgsSchema,
       handler: async (args: unknown) => {
         const parsed = RecommendTierArgsSchema.parse(args);
-        const rec = this.db!.getRecommendation(parsed.task_id);
+        const rec = this.db?.getRecommendation(parsed.task_id);
         if (!rec) {
-          return { recommended_default_tier: null, escalation_rule: null, validated_at_iso: null, basis_run_id: null };
+          return {
+            recommended_default_tier: null,
+            escalation_rule: null,
+            validated_at_iso: null,
+            basis_run_id: null,
+          };
         }
         return rec;
       },
@@ -183,7 +190,7 @@ export class EvalFrameworkPlugin {
       schema: ListRunsArgsSchema,
       handler: async (args: unknown) => {
         const parsed = ListRunsArgsSchema.parse(args);
-        return this.db!.listRuns(parsed.task_id, parsed.since_iso, parsed.limit);
+        return this.db?.listRuns(parsed.task_id, parsed.since_iso, parsed.limit);
       },
     });
 
@@ -193,9 +200,9 @@ export class EvalFrameworkPlugin {
       schema: GetRunReportArgsSchema,
       handler: async (args: unknown) => {
         const parsed = GetRunReportArgsSchema.parse(args);
-        const run = this.db!.getRun(parsed.run_id);
+        const run = this.db?.getRun(parsed.run_id);
         if (!run) throw new Error(`Run not found: ${parsed.run_id}`);
-        const examples = this.db!.getExamplesForRun(parsed.run_id);
+        const examples = this.db?.getExamplesForRun(parsed.run_id);
         const errors = examples.filter((e) => e.error).map((e) => `${e.example_id}: ${e.error}`);
         return {
           run_id: parsed.run_id,
@@ -218,12 +225,27 @@ export class EvalFrameworkPlugin {
           const raw = parseYaml(content);
           const result = EvalSetSchema.safeParse(raw);
           if (!result.success) {
-            return { valid: false, n_examples: 0, judge_modes_used: [], errors: result.error.issues.map((e: { message: string }) => e.message) };
+            return {
+              valid: false,
+              n_examples: 0,
+              judge_modes_used: [],
+              errors: result.error.issues.map((e: { message: string }) => e.message),
+            };
           }
           const modes = [...new Set(result.data.examples.map((e) => e.judge_mode))];
-          return { valid: true, n_examples: result.data.examples.length, judge_modes_used: modes, errors: [] };
+          return {
+            valid: true,
+            n_examples: result.data.examples.length,
+            judge_modes_used: modes,
+            errors: [],
+          };
         } catch (err) {
-          return { valid: false, n_examples: 0, judge_modes_used: [], errors: [(err as Error).message] };
+          return {
+            valid: false,
+            n_examples: 0,
+            judge_modes_used: [],
+            errors: [(err as Error).message],
+          };
         }
       },
     });
@@ -234,7 +256,9 @@ export class EvalFrameworkPlugin {
     // Returns undefined if budget-guard is not available
     try {
       const bridge = getMcpBridge();
-      const channel = (bridge as unknown as { runtime?: { channel?: Record<string, Record<string, Function>> } }).runtime?.channel;
+      const channel = (
+        bridge as unknown as { runtime?: { channel?: Record<string, Record<string, Function>> } }
+      ).runtime?.channel;
       if (channel?.["budget-guard"]?.check_budget) {
         return async (scope: string) => channel["budget-guard"].check_budget({ scope });
       }
@@ -264,7 +288,9 @@ export class EvalFrameworkPlugin {
       for (const taskDir of taskDirs) {
         const taskPath = join(evalsRoot, taskDir);
         if (!statSync(taskPath).isDirectory()) continue;
-        const files = readdirSync(taskPath).filter((f) => f.endsWith(".yaml") || f.endsWith(".yml"));
+        const files = readdirSync(taskPath).filter(
+          (f) => f.endsWith(".yaml") || f.endsWith(".yml"),
+        );
         for (const file of files) {
           sets.push(`${taskDir}/${file}`);
         }

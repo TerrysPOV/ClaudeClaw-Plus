@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, mock } from "bun:test";
+import { describe, it, expect, afterEach, mock } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
@@ -39,11 +39,14 @@ function makeTmpDirs() {
 function writeEvalSet(evalsRoot: string, taskId: string, setId: string, examples: unknown[]) {
   const dir = join(evalsRoot, taskId);
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, `${setId}.yaml`), yamlStringify({
-    task_id: taskId,
-    set_id: setId,
-    examples,
-  }));
+  writeFileSync(
+    join(dir, `${setId}.yaml`),
+    yamlStringify({
+      task_id: taskId,
+      set_id: setId,
+      examples,
+    }),
+  );
 }
 
 function makePlugin(overrides: Record<string, unknown> = {}) {
@@ -65,7 +68,9 @@ function makePlugin(overrides: Record<string, unknown> = {}) {
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 describe("lifecycle", () => {
-  afterEach(() => { _resetEvalFramework(); });
+  afterEach(() => {
+    _resetEvalFramework();
+  });
 
   it("start emits eval_framework_started audit event", async () => {
     auditEvents.length = 0;
@@ -110,7 +115,9 @@ describe("lifecycle", () => {
 // ── Health ────────────────────────────────────────────────────────────────────
 
 describe("health", () => {
-  afterEach(() => { _resetEvalFramework(); });
+  afterEach(() => {
+    _resetEvalFramework();
+  });
 
   it("returns status:up after start", async () => {
     const { plugin } = makePlugin();
@@ -131,7 +138,9 @@ describe("health", () => {
 // ── validate_eval_set ─���───────────────────────────────────────────────────────
 
 describe("validate_eval_set tool", () => {
-  afterEach(() => { _resetEvalFramework(); });
+  afterEach(() => {
+    _resetEvalFramework();
+  });
 
   it("validates a correct eval set", async () => {
     registeredTools.clear();
@@ -140,7 +149,7 @@ describe("validate_eval_set tool", () => {
       { input: "hello", expected_output: "world", judge_mode: "exact_set" },
     ]);
     await plugin.start();
-    const handler = registeredTools.get("validate_eval_set")!.handler;
+    const handler = registeredTools.get("validate_eval_set")?.handler;
     const result = await handler({ set_path: join(evalsRoot, "test-task", "basic.yaml") });
     expect(result.valid).toBe(true);
     expect(result.n_examples).toBe(1);
@@ -155,7 +164,7 @@ describe("validate_eval_set tool", () => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, "bad.yaml"), "not_valid: true\n");
     await plugin.start();
-    const handler = registeredTools.get("validate_eval_set")!.handler;
+    const handler = registeredTools.get("validate_eval_set")?.handler;
     const result = await handler({ set_path: join(dir, "bad.yaml") });
     expect(result.valid).toBe(false);
     expect(result.errors.length).toBeGreaterThan(0);
@@ -166,13 +175,15 @@ describe("validate_eval_set tool", () => {
 // ── list_runs ─────────────────────────────────────────────────────────────────
 
 describe("list_runs tool", () => {
-  afterEach(() => { _resetEvalFramework(); });
+  afterEach(() => {
+    _resetEvalFramework();
+  });
 
   it("returns empty array when no runs exist", async () => {
     registeredTools.clear();
     const { plugin } = makePlugin();
     await plugin.start();
-    const handler = registeredTools.get("list_runs")!.handler;
+    const handler = registeredTools.get("list_runs")?.handler;
     const result = await handler({});
     expect(Array.isArray(result)).toBe(true);
     expect(result.length).toBe(0);
@@ -183,13 +194,15 @@ describe("list_runs tool", () => {
 // ── recommend_tier ────────────────────────────────────────────────────────────
 
 describe("recommend_tier tool", () => {
-  afterEach(() => { _resetEvalFramework(); });
+  afterEach(() => {
+    _resetEvalFramework();
+  });
 
   it("returns null fields when no recommendation exists", async () => {
     registeredTools.clear();
     const { plugin } = makePlugin();
     await plugin.start();
-    const handler = registeredTools.get("recommend_tier")!.handler;
+    const handler = registeredTools.get("recommend_tier")?.handler;
     const result = await handler({ task_id: "nonexistent" });
     expect(result.recommended_default_tier).toBeNull();
     await plugin.stop();
@@ -199,7 +212,9 @@ describe("recommend_tier tool", () => {
 // ── Audit events ──��───────────────────────────────────────────────────────────
 
 describe("audit events", () => {
-  afterEach(() => { _resetEvalFramework(); });
+  afterEach(() => {
+    _resetEvalFramework();
+  });
 
   it("audit payloads never contain credentials", async () => {
     auditEvents.length = 0;
@@ -217,5 +232,7 @@ describe("audit events", () => {
 
 // Cleanup
 afterEach(() => {
-  try { rmSync(TMP_BASE, { recursive: true, force: true }); } catch {}
+  try {
+    rmSync(TMP_BASE, { recursive: true, force: true });
+  } catch {}
 });

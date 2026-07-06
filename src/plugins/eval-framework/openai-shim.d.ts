@@ -15,7 +15,11 @@ declare module "openai" {
     constructor(opts: { apiKey: string; baseURL?: string });
     chat: {
       completions: {
-        create(params: { model: string; max_tokens: number; messages: Array<{ role: string; content: string }> }): Promise<ChatCompletion>;
+        create(params: {
+          model: string;
+          max_tokens: number;
+          messages: Array<{ role: string; content: string }>;
+        }): Promise<ChatCompletion>;
       };
     };
     embeddings: {
