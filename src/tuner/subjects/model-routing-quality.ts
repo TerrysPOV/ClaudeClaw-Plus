@@ -121,3 +121,51 @@ export function evaluateReroute(
     projected_savings_usd_per_mtok: savings,
   };
 }
+
+/** A concrete, quality-gated reroute the proactive face can surface. */
+export interface RerouteProposal {
+  /** The config key / mode whose model would change. */
+  key: string;
+  from_model: string;
+  to_model: string;
+  verdict: RerouteVerdict;
+}
+
+/** Rank two accepted verdicts: more savings first, then higher quality delta. */
+function betterProposal(a: RerouteVerdict, b: RerouteVerdict): boolean {
+  const sa = a.projected_savings_usd_per_mtok ?? -Infinity;
+  const sb = b.projected_savings_usd_per_mtok ?? -Infinity;
+  if (sa !== sb) return sa > sb;
+  return (a.quality_delta ?? -Infinity) > (b.quality_delta ?? -Infinity);
+}
+
+/**
+ * The Tier-A pipeline: for each current model assignment, find the best
+ * quality-gated reroute among the published benchmarks. Returns at most one
+ * proposal per key (the best by savings, then quality). An assignment whose
+ * current model has no benchmark is skipped (can't gate → stay put). Pure:
+ * assignments + benchmarks in, proposals out — no I/O, no web, fully testable.
+ */
+export function proposeBenchmarkReroute(
+  assignments: Array<{ key: string; model: string }>,
+  benchmarks: ModelBenchmark[],
+  opts: RerouteGateOptions = {},
+): RerouteProposal[] {
+  const byId = new Map(benchmarks.map((b) => [b.model_id.toLowerCase(), b]));
+  const proposals: RerouteProposal[] = [];
+  for (const a of assignments) {
+    const current = byId.get(a.model.toLowerCase());
+    if (!current) continue;
+    let best: RerouteProposal | null = null;
+    for (const cand of benchmarks) {
+      if (cand.model_id.toLowerCase() === a.model.toLowerCase()) continue;
+      const verdict = evaluateReroute(current, cand, opts);
+      if (!verdict.propose) continue;
+      if (!best || betterProposal(verdict, best.verdict)) {
+        best = { key: a.key, from_model: a.model, to_model: cand.model_id, verdict };
+      }
+    }
+    if (best) proposals.push(best);
+  }
+  return proposals;
+}

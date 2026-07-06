@@ -141,3 +141,73 @@ describe("model-routing-quality — evaluateReroute (quality is the veto)", () =
     expect(v.propose).toBe(true);
   });
 });
+
+import { proposeBenchmarkReroute } from "../../../subjects/model-routing-quality.js";
+
+describe("model-routing-quality — proposeBenchmarkReroute (Tier-A pipeline)", () => {
+  const benches: ModelBenchmark[] = [
+    bench({
+      model_id: "opus",
+      intelligence_index: 70,
+      price_in_usd_per_mtok: 15,
+      price_out_usd_per_mtok: 75,
+    }),
+    bench({
+      model_id: "sonnet",
+      intelligence_index: 65,
+      price_in_usd_per_mtok: 3,
+      price_out_usd_per_mtok: 15,
+    }),
+    bench({
+      model_id: "haiku",
+      intelligence_index: 55,
+      price_in_usd_per_mtok: 0.8,
+      price_out_usd_per_mtok: 4,
+    }),
+  ];
+
+  it("proposes the best quality-gated reroute per assignment", () => {
+    // 'fast' is on opus (overkill+pricey). sonnet keeps most quality much cheaper;
+    // haiku is cheaper still but regresses quality more. With tolerance 6, sonnet
+    // (Δ-5) passes and haiku (Δ-15) is vetoed → sonnet wins.
+    const props = proposeBenchmarkReroute([{ key: "fast", model: "opus" }], benches, {
+      qualityTolerance: 6,
+    });
+    expect(props.length).toBe(1);
+    expect(props[0]!.to_model).toBe("sonnet");
+    expect(props[0]!.verdict.propose).toBe(true);
+  });
+
+  it("skips an assignment whose current model has no benchmark", () => {
+    const props = proposeBenchmarkReroute([{ key: "x", model: "unknown-model" }], benches);
+    expect(props).toEqual([]);
+  });
+
+  it("proposes nothing when the current model is already the quality leader and nothing is a safe cheaper swap", () => {
+    // opus is top quality; with strict tolerance 0 every cheaper model regresses.
+    const props = proposeBenchmarkReroute([{ key: "hard", model: "opus" }], benches, {
+      qualityTolerance: 0,
+    });
+    expect(props).toEqual([]);
+  });
+
+  it("upgrades toward higher quality when it is also not more expensive", () => {
+    // 'cheap' sits on haiku; a same-or-lower-price higher-quality model would win,
+    // but here everything better is pricier → no proposal (quality can't be bought
+    // with a cost regression). Confirms cost-safety on the upgrade direction.
+    const props = proposeBenchmarkReroute([{ key: "cheap", model: "haiku" }], benches);
+    expect(props).toEqual([]);
+  });
+
+  it("handles several assignments independently", () => {
+    const props = proposeBenchmarkReroute(
+      [
+        { key: "fast", model: "opus" },
+        { key: "cheap", model: "haiku" },
+      ],
+      benches,
+      { qualityTolerance: 6 },
+    );
+    expect(props.map((p) => p.key).sort()).toEqual(["fast"]); // only 'fast' has a safe cheaper swap
+  });
+});
