@@ -2216,6 +2216,7 @@ async function execClaude(
       await watchdogHandleTrigger(
         { invocationId, sessionId: invocationSessionId },
         watchdogDecision,
+        { terminate: killActive },
       );
       // Send escalation notification for watchdog triggers
       try {
@@ -2401,6 +2402,7 @@ async function execClaude(
             await watchdogHandleTrigger(
               { invocationId, sessionId: invocationSessionId },
               retryWatchdogDecision,
+              { terminate: killActive },
             );
           }
         }

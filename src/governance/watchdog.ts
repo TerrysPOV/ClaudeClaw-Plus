@@ -577,6 +577,11 @@ export async function handleTrigger(
     sessionId?: string;
   },
   decision: WatchdogDecision,
+  options?: {
+    // Injected by the runner (killActive) so governance stays decoupled from the
+    // runtime — no governance→runner import cycle. Absent for audit-only callers.
+    terminate?: () => boolean | Promise<boolean>;
+  },
 ): Promise<{ action: string; success: boolean }> {
   await initWatchdog();
 
@@ -586,6 +591,20 @@ export async function handleTrigger(
     case "kill": {
       // Record kill in usage tracker for audit
       await recordInvocationKilled(context.invocationId, `Watchdog kill: ${decision.reason}`);
+
+      // Actually terminate the runaway. The terminator is injected by the runner
+      // (killActive) rather than imported, keeping governance decoupled from the
+      // runtime. With no terminator (audit-only callers / tests) the kill is
+      // recorded but no live process is signalled.
+      let terminated: boolean | null = null;
+      if (options?.terminate) {
+        try {
+          terminated = await options.terminate();
+        } catch (err) {
+          terminated = false;
+          console.error("[watchdog] terminate() threw during kill escalation:", err);
+        }
+      }
 
       // Remove from active invocations
       delete watchdogIndex!.activeInvocations[context.invocationId];
@@ -597,14 +616,16 @@ export async function handleTrigger(
         invocationId: context.invocationId,
         sessionId: context.sessionId,
         decision,
-        executedAction: "killed",
+        executedAction: terminated === false ? "kill-failed" : "killed",
         timestamp: now,
       };
       await appendWatchdogEvent(killEvent);
 
       return {
         action: "terminated",
-        success: true,
+        // A terminator that ran and reported false (nothing killed) is an honest
+        // failure; audit-only callers (no terminator) stay success:true.
+        success: terminated ?? true,
       };
     }
 

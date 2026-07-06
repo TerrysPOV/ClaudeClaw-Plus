@@ -245,6 +245,34 @@ describe("Watchdog", () => {
       expect(result.action).toBe("terminated");
     });
 
+    test("kill invokes the injected terminator (actually terminates) — #298", async () => {
+      const invocationId = "test-invocation-kill-terminate";
+      await recordExecutionMetric({ invocationId }, { toolCallCount: 25 });
+      const decision = await checkLimits({ invocationId });
+      expect(decision.state).toBe("kill");
+      let called = 0;
+      const result = await handleTrigger({ invocationId }, decision, {
+        terminate: () => {
+          called++;
+          return true;
+        },
+      });
+      expect(called).toBe(1);
+      expect(result.success).toBe(true);
+      expect(result.action).toBe("terminated");
+    });
+
+    test("kill reports success:false when the terminator finds nothing to kill — #298", async () => {
+      const invocationId = "test-invocation-kill-noproc";
+      await recordExecutionMetric({ invocationId }, { toolCallCount: 25 });
+      const decision = await checkLimits({ invocationId });
+      const result = await handleTrigger({ invocationId }, decision, {
+        terminate: () => false,
+      });
+      expect(result.action).toBe("terminated");
+      expect(result.success).toBe(false);
+    });
+
     test("just under the ceiling stays suspend, not kill", async () => {
       const invocationId = "test-invocation-kill-boundary";
       await recordExecutionMetric({ invocationId }, { toolCallCount: 19 }); // <2×10
