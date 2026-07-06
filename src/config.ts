@@ -703,6 +703,16 @@ export interface Settings {
   memorySearch: MemorySearchSettings;
   llmRouter: LlmRouterConfig;
   jobsDir?: string;
+  /**
+   * Live Kanban board of subagent activity (#294). Optional; when absent the
+   * tracker defaults ON. Set `{ enabled: false }` to disable the bus-driven
+   * board feed (the manual `/api/kanban` "+ Add task" path is unaffected).
+   */
+  kanban?: KanbanSettings;
+}
+
+export interface KanbanSettings {
+  enabled: boolean;
 }
 
 /**
@@ -1125,6 +1135,11 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
       typeof raw.apiToken === "string" && raw.apiToken.trim() ? raw.apiToken.trim() : undefined,
     ...(typeof raw.jobsDir === "string" && raw.jobsDir.trim()
       ? { jobsDir: raw.jobsDir.trim() }
+      : {}),
+    // #294: live Kanban board of subagent activity. Present-but-not-false ⇒
+    // enabled; absent block leaves `kanban` undefined (tracker treats as ON).
+    ...(raw.kanban && typeof raw.kanban === "object"
+      ? { kanban: { enabled: (raw.kanban as { enabled?: unknown }).enabled !== false } }
       : {}),
   };
 }

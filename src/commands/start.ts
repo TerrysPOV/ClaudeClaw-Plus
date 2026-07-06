@@ -474,6 +474,10 @@ export async function start(args: string[] = []) {
   // trigger routes (jobs/fire, inject, chat) instead of spawning a
   // sidecar PTY claude that would race the bus's own session.
   let busCoreForWebUi: import("../bus/core").BusCore | null = null;
+  // #294: live Kanban board of subagent activity — a global bus subscriber that
+  // turns Task/Agent tool_use → tool_result into board cards. Instantiated in the
+  // deferred-spawn block once the bus + agents are up; stopped on teardown.
+  let kanbanTracker: import("../bus/kanban-tracker").KanbanTracker | null = null;
 
   // Plugin system — initialize before gateway start
   const pluginManager = new PluginManager(process.cwd());
@@ -621,6 +625,15 @@ export async function start(args: string[] = []) {
     if (discordStopGateway) discordStopGateway();
     if (slackStopFn) slackStopFn();
     if (web) web.stop();
+    // #294: unsubscribe the kanban tracker before the bus stops.
+    if (kanbanTracker) {
+      try {
+        kanbanTracker.stop();
+      } catch (err) {
+        console.error("[kanban-tracker] shutdown failed", err);
+      }
+      kanbanTracker = null;
+    }
     if (busRuntimeHandle) {
       try {
         await busRuntimeHandle.stop();
@@ -954,6 +967,48 @@ export async function start(args: string[] = []) {
       });
       busRuntimeHandle.attachScheduler(schedulerHandle);
 
+      // #294: mount the live Kanban tracker now that the bus + agents are up.
+      // A pure global bus subscriber — maps subagent (Task/Agent) tool_use →
+      // tool_result onto the Web UI board via the (previously unwired) kanban
+      // mutators. Gated ON by default (`settings.kanban.enabled`). Stopped in
+      // shutdown() and in the deferred-spawn rollback below.
+      if (currentSettings.kanban?.enabled !== false) {
+        try {
+          const { KanbanTracker } = await import("../bus/kanban-tracker");
+          const kanbanSvc = await import("../ui/services/kanban");
+          const bus = busRuntimeHandle.bus;
+          kanbanTracker = new KanbanTracker(
+            { enabled: true, maxDoneCards: kanbanSvc.DEFAULT_MAX_DONE_CARDS },
+            {
+              subscribe: (handler) => {
+                const sub = bus.subscribe(
+                  {
+                    topics: [
+                      "response.tool_use",
+                      "tool_result",
+                      "session.end",
+                      "session.init",
+                      "session.agent_name",
+                    ],
+                  },
+                  handler,
+                );
+                return () => sub.close();
+              },
+              addCard: kanbanSvc.addCardToColumn,
+              moveCard: kanbanSvc.moveCard,
+              capDone: kanbanSvc.capDoneCards,
+              now: () => Date.now(),
+              log: (msg, err) => console.warn(`[${ts()}] kanban-tracker: ${msg}`, err),
+            },
+          );
+          kanbanTracker.start();
+        } catch (kbErr) {
+          console.warn(`[${ts()}] kanban tracker mount failed (non-fatal):`, kbErr);
+          kanbanTracker = null;
+        }
+      }
+
       // Issue #166: write the architecture doc only after the bus booted
       // end-to-end (spawn + scheduler), so a doc on disk always reflects a
       // genuinely-running bus. Best-effort — a missing doc degrades agent
@@ -979,6 +1034,17 @@ export async function start(args: string[] = []) {
         `[${ts()}] Bus runtime: deferred agent spawn failed — tearing down and falling back to legacy command surfaces`,
         spawnErr,
       );
+      // #294: tear down the kanban subscriber alongside the bus on rollback.
+      // Inside this catch, `kanbanTracker` narrows to `never` purely as a tsc
+      // error-recovery artifact cascading from the pre-existing type errors
+      // upstream in this fn (~L832); the value is correct at runtime, so cast
+      // through the real shape to keep the teardown typechecking.
+      try {
+        (kanbanTracker as { stop(): void } | null)?.stop();
+      } catch {
+        /* best-effort */
+      }
+      kanbanTracker = null;
       try {
         await busRuntimeHandle.stop();
       } catch (stopErr) {
