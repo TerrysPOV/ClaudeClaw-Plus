@@ -1219,16 +1219,24 @@ export class BusCoreImpl implements BusCore {
     this.currentTurnReplied.set(agentId, false);
     this.currentTurnFinalPublished.set(agentId, false);
     // IPC path (best-effort, no reconciler): reach an MCP-connected agent.
-    const ipcDelivered =
-      this.ipcServer?.send(agentId, {
-        type: "prompt",
-        agent_id: agentId,
-        origin: origin.origin,
-        origin_id: origin.origin_id,
-        user_id: "system",
-        text,
-        metadata: { nudge: "reply-tool" },
-      }) === true;
+    // Wrapped so a synchronous send() throw can't skip the PTY path below or
+    // propagate to the turn-end handler — the send is best-effort, mirroring
+    // sendPrompt's IPC guard.
+    let ipcDelivered = false;
+    try {
+      ipcDelivered =
+        this.ipcServer?.send(agentId, {
+          type: "prompt",
+          agent_id: agentId,
+          origin: origin.origin,
+          origin_id: origin.origin_id,
+          user_id: "system",
+          text,
+          metadata: { nudge: "reply-tool" },
+        }) === true;
+    } catch {
+      /* best-effort: the PTY path + synthesize fallback still cover delivery */
+    }
     // PTY-stdin path for headless agents. A <system-reminder> wrap signals this is
     // bus-injected guidance, not a user message. deliverOrQueuePrompt no-ops when no
     // streamPromptHandler is wired, so that is the PTY-availability signal.
