@@ -69,12 +69,21 @@ export function parseArtificialAnalysis(raw: unknown, fetchedAtIso: string): Mod
     const slug = typeof r.slug === "string" ? r.slug : typeof r.id === "string" ? r.id : null;
     if (!slug) continue;
     const pricing = (r.pricing ?? {}) as Record<string, unknown>;
+    // Intelligence scores live under `evaluations` in the live v2 response
+    // (the flat top-level form is kept as a fallback for older snapshots).
+    const evals = (r.evaluations ?? {}) as Record<string, unknown>;
     out.push({
       model_id: slug,
       name: typeof r.name === "string" ? r.name : slug,
-      intelligence_index: num(r.artificial_analysis_intelligence_index),
-      coding_index: num(r.artificial_analysis_coding_index),
-      agentic_index: num(r.artificial_analysis_agentic_index),
+      intelligence_index: num(
+        evals.artificial_analysis_intelligence_index ?? r.artificial_analysis_intelligence_index,
+      ),
+      coding_index: num(
+        evals.artificial_analysis_coding_index ?? r.artificial_analysis_coding_index,
+      ),
+      agentic_index: num(
+        evals.artificial_analysis_agentic_index ?? r.artificial_analysis_agentic_index,
+      ),
       price_in_usd_per_mtok: num(pricing.price_1m_input_tokens),
       price_out_usd_per_mtok: num(pricing.price_1m_output_tokens),
       price_cache_hit_usd_per_mtok: num(pricing.price_1m_cache_hit_tokens),

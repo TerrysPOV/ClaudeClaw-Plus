@@ -24,9 +24,11 @@ function aaResponse() {
         id: "m1",
         name: "Claude Opus 4.8",
         slug: "claude-4-8-opus",
-        artificial_analysis_intelligence_index: 71.2,
-        artificial_analysis_coding_index: 68.0,
-        artificial_analysis_agentic_index: 55.4,
+        evaluations: {
+          artificial_analysis_intelligence_index: 71.2,
+          artificial_analysis_coding_index: 68.0,
+          artificial_analysis_agentic_index: 55.4,
+        },
         pricing: {
           price_1m_input_tokens: 15,
           price_1m_output_tokens: 75,
@@ -35,12 +37,12 @@ function aaResponse() {
       },
       {
         name: "No-slug model",
-        artificial_analysis_intelligence_index: 40,
+        evaluations: { artificial_analysis_intelligence_index: 40 },
       }, // dropped: no slug/id
       {
         slug: "haiku-cheap",
         name: "Haiku",
-        artificial_analysis_intelligence_index: 50,
+        evaluations: { artificial_analysis_intelligence_index: 50 },
         // no pricing, no coding/agentic → null, not throw
       },
     ],
