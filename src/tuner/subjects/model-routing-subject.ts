@@ -102,7 +102,15 @@ export class ModelRoutingSubject
     this.dispatchReader = opts.dispatchReader ?? (() => []);
     this.costDbPath = expandHome(opts.costDbPath ?? join(homedir(), "agent", "data", "costs.db"));
     this.benchmarkProvider =
-      opts.benchmarkProvider ?? ((models) => getModelBenchmarks({ models, nowMs: Date.now() }));
+      opts.benchmarkProvider ??
+      ((models) =>
+        getModelBenchmarks({
+          models,
+          nowMs: Date.now(),
+          // Cache the published benchmarks (24h TTL) so a proactive tick does not
+          // hit the Artificial Analysis API every run (free tier = 1000/day).
+          cachePath: join(homedir(), ".claude", "tuner-benchmarks.json"),
+        }));
     this.rerouteGate = opts.rerouteGate ?? {};
   }
 
@@ -182,7 +190,10 @@ export class ModelRoutingSubject
     }
     const assignments = parseModelAssignments(content);
     if (assignments.length === 0) return null;
-    const benchmarks = await this.benchmarkProvider(assignments.map((a) => a.model));
+    // Fetch the FULL benchmark set (empty filter) — we need CANDIDATES to reroute
+    // to, not just the models already in use. Filtering to the current models
+    // would leave nothing to switch to.
+    const benchmarks = await this.benchmarkProvider([]);
     if (benchmarks.length === 0) return null;
     const proposals = proposeBenchmarkReroute(assignments, benchmarks, this.rerouteGate);
     return buildRerouteEvidencePatch(content, proposals, this.modesConfigPath);
