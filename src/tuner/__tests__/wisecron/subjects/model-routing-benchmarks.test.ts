@@ -194,3 +194,33 @@ describe("model-routing-benchmarks — cache", () => {
     expect(rows.length).toBe(2);
   });
 });
+
+describe("model-routing-benchmarks — cache stores the FULL set (no poisoning)", () => {
+  it("filtered getModelBenchmarks does not shrink the cache for later readers", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "aa-poison-"));
+    const cachePath = join(dir, "b.json");
+    const { impl } = mockFetch(aaResponse());
+    // 1st call: filter to ONE model + cache
+    await getModelBenchmarks({
+      apiKey: "k",
+      fetchImpl: impl,
+      cachePath,
+      nowMs: NOW,
+      models: ["claude-4-8-opus"],
+    });
+    // 2nd call: SAME cache, no filter → must still see both models (cache holds full set)
+    const { impl: impl2, calls: calls2 } = mockFetch(aaResponse());
+    const all = await getModelBenchmarks({
+      apiKey: "k",
+      fetchImpl: impl2,
+      cachePath,
+      nowMs: NOW + 1000,
+    });
+    expect(all.length).toBe(2); // NOT 1 — cache was not poisoned
+    expect(calls2.length).toBe(0); // served from the (full) cache
+    rmSync(dir, { recursive: true, force: true });
+  });
+});

@@ -33,7 +33,7 @@ import {
   meetsEvidenceBar,
 } from "../wisecron/evidence-driven.js";
 import { costSignal } from "./model-routing-signal.js";
-import { getModelBenchmarks, type ModelBenchmark } from "./model-routing-benchmarks.js";
+import type { ModelBenchmark } from "./model-routing-benchmarks.js";
 import {
   buildRerouteEvidencePatch,
   parseModelAssignments,
@@ -110,16 +110,12 @@ export class ModelRoutingSubject
     this.dispatchReaderInjected = opts.dispatchReader !== undefined;
     this.dispatchReader = opts.dispatchReader ?? (() => []);
     this.costDbPath = expandHome(opts.costDbPath ?? join(homedir(), "agent", "data", "costs.db"));
-    this.benchmarkProvider =
-      opts.benchmarkProvider ??
-      ((models) =>
-        getModelBenchmarks({
-          models,
-          nowMs: Date.now(),
-          // Cache the published benchmarks (24h TTL) so a proactive tick does not
-          // hit the Artificial Analysis API every run (free tier = 1000/day).
-          cachePath: join(homedir(), ".claude", "tuner-benchmarks.json"),
-        }));
+    // Feeder-frontier (governance rule): the SUBJECT never fetches the web itself.
+    // A sandboxed feeder / the research scout fetches the published benchmarks and
+    // INJECTS them via benchmarkProvider; with none injected the subject simply has
+    // no external data and proposes nothing (safe). getModelBenchmarks lives here
+    // only as the mechanism the feeder/scout calls — not wired as the default.
+    this.benchmarkProvider = opts.benchmarkProvider ?? (async () => []);
     this.rerouteGate = opts.rerouteGate ?? {};
     this.settingsPath = opts.settingsPath ? expandHome(opts.settingsPath) : undefined;
   }

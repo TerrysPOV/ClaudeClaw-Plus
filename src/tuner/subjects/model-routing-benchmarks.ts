@@ -175,10 +175,13 @@ export async function getModelBenchmarks(
     const cached = readBenchmarkCache(opts.cachePath, ttlMs, nowMs);
     if (cached) return applyFilter(cached, opts.models);
   }
-  const fresh = await fetchModelBenchmarks(opts);
+  // Fetch the FULL set for the cache (never the caller's models filter — caching a
+  // filtered result would poison the cache for a later unfiltered read). Filter on
+  // the way out instead.
+  const fresh = await fetchModelBenchmarks({ ...opts, models: undefined });
   if (fresh.length > 0) {
     if (opts.cachePath) writeBenchmarkCache(opts.cachePath, fresh, nowMs);
-    return fresh;
+    return applyFilter(fresh, opts.models);
   }
   // Fetch yielded nothing — fall back to a stale cache (ignore TTL) if any.
   if (opts.cachePath && existsSync(opts.cachePath)) {

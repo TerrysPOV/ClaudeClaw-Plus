@@ -177,3 +177,23 @@ describe("ModelRoutingSubject — proposeEvidencePatch (benchmark reroute, #292)
     expect(await s.proposeEvidencePatch(ev(), degraded)).toBeNull();
   });
 });
+
+describe("ModelRoutingSubject — feeder frontier: no self-fetch (#292)", () => {
+  it("with NO injected benchmarkProvider, proposeEvidencePatch returns null (never fetches)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mr-nofetch-"));
+    const cfg = join(dir, "agentic.yaml");
+    writeFileSync(cfg, ["modes:", "  fast:", "    model: claude-opus"].join("\n"), "utf8");
+    // default provider must NOT hit the network; it yields no data → null.
+    const s = new ModelRoutingSubject({ modesConfigPath: cfg });
+    const deg = {
+      metric: "session_cost_usd",
+      value: 8,
+      unit: "usd",
+      degraded: true,
+      trend: "degrading" as const,
+      sampledAt: "t",
+    };
+    expect(await s.proposeEvidencePatch(ev(), deg)).toBeNull();
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
