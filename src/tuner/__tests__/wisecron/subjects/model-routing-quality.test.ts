@@ -174,8 +174,8 @@ describe("model-routing-quality — proposeBenchmarkReroute (Tier-A pipeline)", 
       qualityTolerance: 6,
     });
     expect(props.length).toBe(1);
-    expect(props[0]!.to_model).toBe("sonnet");
-    expect(props[0]!.verdict.propose).toBe(true);
+    expect(props[0]?.to_model).toBe("sonnet");
+    expect(props[0]?.verdict.propose).toBe(true);
   });
 
   it("skips an assignment whose current model has no benchmark", () => {
@@ -272,9 +272,9 @@ describe("model-routing-quality — config helpers", () => {
       "/tmp/agentic.yaml",
     );
     expect(patch).not.toBeNull();
-    expect(patch!.target_path).toBe("/tmp/agentic.yaml");
-    expect(patch!.alternatives[0]!.id).toBe("reroute-fast-to-sonnet");
-    expect(patch!.alternatives[0]!.diff_or_content).toContain("model: sonnet");
+    expect(patch?.target_path).toBe("/tmp/agentic.yaml");
+    expect(patch?.alternatives[0]?.id).toBe("reroute-fast-to-sonnet");
+    expect(patch?.alternatives[0]?.diff_or_content).toContain("model: sonnet");
   });
 
   it("buildRerouteEvidencePatch returns null with no proposals", () => {

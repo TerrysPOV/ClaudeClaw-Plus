@@ -159,12 +159,12 @@ describe("ModelRoutingSubject — proposeEvidencePatch (benchmark reroute, #292)
     ]);
     const patch = await s.proposeEvidencePatch(ev(), degraded);
     expect(patch).not.toBeNull();
-    expect(patch!.target_path).toBe(cfgPath);
+    expect(patch?.target_path).toBe(cfgPath);
     // fast (opus) → sonnet (best quality-safe cheaper); slow (haiku) has no safe swap.
-    const fast = patch!.alternatives.find((a) => a.id === "reroute-fast-to-claude-sonnet");
+    const fast = patch?.alternatives.find((a) => a.id === "reroute-fast-to-claude-sonnet");
     expect(fast).toBeDefined();
-    expect(fast!.diff_or_content).toContain("model: claude-sonnet");
-    expect(fast!.diff_or_content).toContain("model: claude-haiku"); // slow untouched
+    expect(fast?.diff_or_content).toContain("model: claude-sonnet");
+    expect(fast?.diff_or_content).toContain("model: claude-haiku"); // slow untouched
   });
 
   it("returns null when the cost signal is not degraded", async () => {

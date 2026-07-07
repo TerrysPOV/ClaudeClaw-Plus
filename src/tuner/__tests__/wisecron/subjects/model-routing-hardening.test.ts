@@ -68,7 +68,7 @@ describe("HARD parseArtificialAnalysis — hostile / messy input", () => {
     }));
     const rows = parseArtificialAnalysis({ data }, "t");
     expect(rows.length).toBe(1000);
-    expect(rows[0]!.price_in_usd_per_mtok).toBe(-1); // negative is a real (if odd) number
+    expect(rows[0]?.price_in_usd_per_mtok).toBe(-1); // negative is a real (if odd) number
   });
 });
 
@@ -162,7 +162,7 @@ describe("HARD parseModelAssignments — messy configs", () => {
     const cfg = ["modes:", "  fast:", "    model: sonnet"].join("\r\n");
     const asg = parseModelAssignments(cfg);
     expect(asg.length).toBe(1);
-    expect(asg[0]!.model).toBe("sonnet");
+    expect(asg[0]?.model).toBe("sonnet");
   });
 });
 
@@ -238,7 +238,7 @@ describe("HARD proposeBenchmarkReroute — scale + ties + all-vetoed", () => {
     });
     const props = proposeBenchmarkReroute([{ key: "k", model: "cur" }], [cur, ...cands]);
     expect(props.length).toBe(1);
-    expect(props[0]!.to_model).toBe("c199"); // cheapest quality-safe
+    expect(props[0]?.to_model).toBe("c199"); // cheapest quality-safe
   });
 
   it("returns [] when every candidate regresses quality (strict veto holds at scale)", () => {
@@ -306,7 +306,7 @@ describe("HARD gate corrections found by the Greg test (#292)", () => {
       { qualityMetric: "coding" },
     );
     expect(props.length).toBe(1);
-    expect(props[0]!.to_model).toBe("sonnet-5"); // NOT command-a-plus
+    expect(props[0]?.to_model).toBe("sonnet-5"); // NOT command-a-plus
   });
 
   it("a $0/$0 (missing-pricing) candidate never yields a bogus cost win", () => {
@@ -387,8 +387,8 @@ describe("HARD metric fallback (A) + Anthropic enrichment (B) — the opus-null 
       bm({ model_id: "some-other-model", coding_index: null }), // not in table → stays null
     ];
     const out = enrichWithAnthropicCoding(rows);
-    expect(out[0]!.coding_index).toBe(82.0); // filled from Anthropic
-    expect(out[1]!.coding_index).toBe(71.5); // AA value untouched
-    expect(out[2]!.coding_index).toBeNull(); // unknown → left null (fallback A covers it)
+    expect(out[0]?.coding_index).toBe(82.0); // filled from Anthropic
+    expect(out[1]?.coding_index).toBe(71.5); // AA value untouched
+    expect(out[2]?.coding_index).toBeNull(); // unknown → left null (fallback A covers it)
   });
 });
