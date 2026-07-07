@@ -181,9 +181,10 @@ function betterProposal(a: RerouteVerdict, b: RerouteVerdict): boolean {
 export function proposeBenchmarkReroute(
   assignments: Array<{ key: string; model: string }>,
   benchmarks: ModelBenchmark[],
-  opts: RerouteGateOptions = {},
+  opts: RerouteGateOptions & { candidateFilter?: (b: ModelBenchmark) => boolean } = {},
 ): RerouteProposal[] {
   const byId = new Map(benchmarks.map((b) => [b.model_id.toLowerCase(), b]));
+  const canUse = opts.candidateFilter ?? (() => true);
   const proposals: RerouteProposal[] = [];
   for (const a of assignments) {
     const current = byId.get(a.model.toLowerCase());
@@ -191,6 +192,7 @@ export function proposeBenchmarkReroute(
     let best: RerouteProposal | null = null;
     for (const cand of benchmarks) {
       if (cand.model_id.toLowerCase() === a.model.toLowerCase()) continue;
+      if (!canUse(cand)) continue;
       const verdict = evaluateReroute(current, cand, opts);
       if (!verdict.propose) continue;
       if (!best || betterProposal(verdict, best.verdict)) {

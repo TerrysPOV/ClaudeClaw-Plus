@@ -40,6 +40,7 @@ import {
   proposeBenchmarkReroute,
   type RerouteGateOptions,
 } from "./model-routing-quality.js";
+import { readAgenticModes, setAgenticModel, isRunnableModel } from "./agentic-config.js";
 
 /** Recent median session cost (USD) above which routing is "expensive" regardless of trend. */
 const MODEL_ROUTING_MAX_RECENT_USD = 25;
@@ -73,6 +74,12 @@ export interface ModelRoutingSubjectConfig {
   benchmarkProvider?: (models: string[]) => Promise<ModelBenchmark[]>;
   /** Quality/cost gate tuning for the benchmark reroute. */
   rerouteGate?: RerouteGateOptions;
+  /**
+   * settings.json path — when set, the benchmark reroute reads the REAL agentic
+   * modes (list format) from here and constrains candidates to runnable (Claude)
+   * models, instead of the standalone agentic.yaml. This is the reconciled path.
+   */
+  settingsPath?: string;
 }
 
 export class ModelRoutingSubject
@@ -91,6 +98,7 @@ export class ModelRoutingSubject
   private readonly costDbPath: string;
   private readonly benchmarkProvider: (models: string[]) => Promise<ModelBenchmark[]>;
   private readonly rerouteGate: RerouteGateOptions;
+  private readonly settingsPath?: string;
 
   constructor(opts: ModelRoutingSubjectConfig = {}) {
     super();
@@ -112,6 +120,7 @@ export class ModelRoutingSubject
           cachePath: join(homedir(), ".claude", "tuner-benchmarks.json"),
         }));
     this.rerouteGate = opts.rerouteGate ?? {};
+    this.settingsPath = opts.settingsPath ? expandHome(opts.settingsPath) : undefined;
   }
 
   // ── Proactive face: EvidenceDrivenSubject (cost signal + faisceau de preuves) ──
@@ -182,6 +191,41 @@ export class ModelRoutingSubject
     signal: LocalSignal,
   ): Promise<EvidencePatch | null> {
     if (!signal.degraded) return null;
+    // Fetch the FULL benchmark set (empty filter) — we need CANDIDATES to reroute
+    // to, not just the models already in use.
+    const benchmarks = await this.benchmarkProvider([]);
+    if (benchmarks.length === 0) return null;
+
+    // Reconciled path: read the REAL agentic modes from settings.json (list
+    // format), look models up by their AA slug, and constrain candidates to
+    // runnable (Claude) models — the only thing `claude --model` can launch.
+    if (this.settingsPath) {
+      let raw = "";
+      try {
+        raw = readFileSync(this.settingsPath, "utf8");
+      } catch {
+        return null;
+      }
+      const modes = readAgenticModes(raw);
+      if (modes.length === 0) return null;
+      const assignments = modes.map((m) => ({ key: m.mode, model: m.aaSlug }));
+      const proposals = proposeBenchmarkReroute(assignments, benchmarks, {
+        ...this.rerouteGate,
+        candidateFilter: isRunnableModel,
+      });
+      if (proposals.length === 0) return null;
+      return {
+        target_path: this.settingsPath,
+        alternatives: proposals.map((p) => ({
+          id: `reroute-${p.key}-to-${p.to_model}`,
+          label: `Route '${p.key}' ${p.from_model} → ${p.to_model}`,
+          diff_or_content: setAgenticModel(raw, p.key, p.to_model),
+          tradeoff: p.verdict.reason,
+        })),
+      };
+    }
+
+    // Legacy standalone agentic.yaml (nested-map format).
     let content = "";
     try {
       content = readFileSync(this.modesConfigPath, "utf8");
@@ -190,11 +234,6 @@ export class ModelRoutingSubject
     }
     const assignments = parseModelAssignments(content);
     if (assignments.length === 0) return null;
-    // Fetch the FULL benchmark set (empty filter) — we need CANDIDATES to reroute
-    // to, not just the models already in use. Filtering to the current models
-    // would leave nothing to switch to.
-    const benchmarks = await this.benchmarkProvider([]);
-    if (benchmarks.length === 0) return null;
     const proposals = proposeBenchmarkReroute(assignments, benchmarks, this.rerouteGate);
     return buildRerouteEvidencePatch(content, proposals, this.modesConfigPath);
   }
