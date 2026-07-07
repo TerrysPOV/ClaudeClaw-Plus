@@ -353,3 +353,42 @@ describe("HARD gate corrections found by the Greg test (#292)", () => {
     expect(evaluateReroute(cur, neg).code).toBe("insufficient_data");
   });
 });
+
+import { enrichWithAnthropicCoding } from "../../../subjects/anthropic-benchmarks.js";
+
+describe("HARD metric fallback (A) + Anthropic enrichment (B) — the opus-null fix", () => {
+  it("A: falls back to the intelligence composite when coding is null for a model", () => {
+    // opus has intelligence but NO coding (AA gap); candidate has both.
+    const opus = bm({ intelligence_index: 42.7, coding_index: null });
+    const cand = bm({
+      intelligence_index: 53.4,
+      coding_index: 71.5,
+      price_in_usd_per_mtok: 1,
+      price_out_usd_per_mtok: 5,
+    });
+    // coding requested, but opus lacks it → fallback to intelligence for BOTH → 42.7 vs 53.4 = win
+    const v = evaluateReroute(opus, cand, { qualityMetric: "coding" });
+    expect(v.propose).toBe(true);
+    expect(v.quality_delta).toBeCloseTo(53.4 - 42.7, 5); // compared on intelligence, not coding
+  });
+
+  it("A: metricFallback:false keeps the strict coding gate (opus → insufficient_data)", () => {
+    const opus = bm({ intelligence_index: 42.7, coding_index: null });
+    const cand = bm({ intelligence_index: 53.4, coding_index: 71.5 });
+    expect(
+      evaluateReroute(opus, cand, { qualityMetric: "coding", metricFallback: false }).code,
+    ).toBe("insufficient_data");
+  });
+
+  it("B: enrichment fills a null Claude coding_index from the Anthropic table, never overwrites AA", () => {
+    const rows = [
+      bm({ model_id: "claude-opus-4-7-non-reasoning", coding_index: null }),
+      bm({ model_id: "claude-sonnet-5", coding_index: 71.5 }), // AA already has it
+      bm({ model_id: "some-other-model", coding_index: null }), // not in table → stays null
+    ];
+    const out = enrichWithAnthropicCoding(rows);
+    expect(out[0]!.coding_index).toBe(82.0); // filled from Anthropic
+    expect(out[1]!.coding_index).toBe(71.5); // AA value untouched
+    expect(out[2]!.coding_index).toBeNull(); // unknown → left null (fallback A covers it)
+  });
+});

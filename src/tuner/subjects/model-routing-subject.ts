@@ -41,6 +41,7 @@ import {
   type RerouteGateOptions,
 } from "./model-routing-quality.js";
 import { readAgenticModes, setAgenticModel, isRunnableModel } from "./agentic-config.js";
+import { enrichWithAnthropicCoding } from "./anthropic-benchmarks.js";
 
 /** Recent median session cost (USD) above which routing is "expensive" regardless of trend. */
 const MODEL_ROUTING_MAX_RECENT_USD = 25;
@@ -193,7 +194,7 @@ export class ModelRoutingSubject
     if (!signal.degraded) return null;
     // Fetch the FULL benchmark set (empty filter) — we need CANDIDATES to reroute
     // to, not just the models already in use.
-    const benchmarks = await this.benchmarkProvider([]);
+    const benchmarks = enrichWithAnthropicCoding(await this.benchmarkProvider([]));
     if (benchmarks.length === 0) return null;
 
     // Reconciled path: read the REAL agentic modes from settings.json (list

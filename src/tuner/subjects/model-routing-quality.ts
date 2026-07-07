@@ -46,6 +46,12 @@ export interface RerouteGateOptions {
    * higher overall while it is actually WORSE at code. Default "intelligence".
    */
   qualityMetric?: "intelligence" | "coding" | "agentic";
+  /**
+   * When the requested metric is missing for a model (AA's free tier has no Opus
+   * coding/agentic), fall back to the intelligence COMPOSITE for both models.
+   * Default true. The composite already folds in coding-heavy benchmarks.
+   */
+  metricFallback?: boolean;
 }
 
 function blendedPrice(b: ModelBenchmark, ratio: number): number | null {
@@ -71,26 +77,36 @@ export function evaluateReroute(
   const ratio = opts.inputOutputRatio ?? 3;
   const minSavings = opts.minSavingsUsdPerMtok ?? 0;
 
-  const metricField = (
-    {
-      intelligence: "intelligence_index",
-      coding: "coding_index",
-      agentic: "agentic_index",
-    } as const
-  )[opts.qualityMetric ?? "intelligence"];
-  const qCur = current[metricField];
-  const qCand = candidate[metricField];
+  const FIELD = {
+    intelligence: "intelligence_index",
+    coding: "coding_index",
+    agentic: "agentic_index",
+  } as const;
+  const primaryMetric = opts.qualityMetric ?? "intelligence";
+  let usedMetric: "intelligence" | "coding" | "agentic" = primaryMetric;
+  let qCur = current[FIELD[primaryMetric]];
+  let qCand = candidate[FIELD[primaryMetric]];
+  // Metric fallback (#292): if the requested sub-score is missing for either
+  // model, fall back to the intelligence composite for BOTH — a fair (if coarser)
+  // comparison, since the composite already includes coding-heavy benchmarks.
+  if (
+    (qCur === null || qCand === null) &&
+    primaryMetric !== "intelligence" &&
+    (opts.metricFallback ?? true)
+  ) {
+    usedMetric = "intelligence";
+    qCur = current.intelligence_index;
+    qCand = candidate.intelligence_index;
+  }
   const pCur = blendedPrice(current, ratio);
   const pCand = blendedPrice(candidate, ratio);
-
-  const metric = opts.qualityMetric ?? "intelligence";
 
   // Quality gate needs both indices. Without them we cannot judge quality at all.
   if (qCur === null || qCand === null) {
     return {
       propose: false,
       code: "insufficient_data",
-      reason: `Missing ${metric} score for one of the models — cannot gate on quality, staying put.`,
+      reason: `Missing ${usedMetric} score for one of the models — cannot gate on quality, staying put.`,
       quality_delta: null,
       projected_savings_usd_per_mtok: pCur !== null && pCand !== null ? pCur - pCand : null,
     };
@@ -104,7 +120,7 @@ export function evaluateReroute(
     return {
       propose: false,
       code: "quality_regression",
-      reason: `Candidate ${metric} score ${qCand} is ${(-qualityDelta).toFixed(
+      reason: `Candidate ${usedMetric} score ${qCand} is ${(-qualityDelta).toFixed(
         1,
       )} below current ${qCur} (tolerance ${tol}). Quality is the veto.`,
       quality_delta: qualityDelta,
