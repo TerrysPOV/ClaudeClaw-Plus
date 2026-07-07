@@ -254,3 +254,102 @@ describe("HARD proposeBenchmarkReroute — scale + ties + all-vetoed", () => {
     expect(proposeBenchmarkReroute([{ key: "k", model: "top" }], [cur, ...cands])).toEqual([]);
   });
 });
+
+describe("HARD gate corrections found by the Greg test (#292)", () => {
+  it("qualityMetric='coding' can REJECT what 'intelligence' would accept (the Greg trap)", () => {
+    // command-a-plus: higher general IQ, LOWER coding, than the current model.
+    const cur = bm({
+      intelligence_index: 9.9,
+      coding_index: 30.2,
+      price_in_usd_per_mtok: 3,
+      price_out_usd_per_mtok: 15,
+    });
+    const cand = bm({
+      intelligence_index: 22.5,
+      coding_index: 27.8,
+      price_in_usd_per_mtok: 1,
+      price_out_usd_per_mtok: 5,
+    });
+    // general index → looks like a win
+    expect(evaluateReroute(cur, cand, { qualityMetric: "intelligence" }).propose).toBe(true);
+    // coding index → correctly VETOED (candidate is worse at code)
+    const coded = evaluateReroute(cur, cand, { qualityMetric: "coding" });
+    expect(coded.propose).toBe(false);
+    expect(coded.code).toBe("quality_regression");
+  });
+
+  it("gates on coding and prefers the real coding leader (sonnet-5 over command-a-plus)", () => {
+    const cur = bm({
+      model_id: "old-sonnet",
+      intelligence_index: 9.9,
+      coding_index: 30.2,
+      price_in_usd_per_mtok: 3,
+      price_out_usd_per_mtok: 15,
+    });
+    const commandA = bm({
+      model_id: "command-a-plus",
+      intelligence_index: 22.5,
+      coding_index: 27.8,
+      price_in_usd_per_mtok: 0,
+      price_out_usd_per_mtok: 0,
+    });
+    const sonnet5 = bm({
+      model_id: "sonnet-5",
+      intelligence_index: 53.4,
+      coding_index: 71.5,
+      price_in_usd_per_mtok: 2,
+      price_out_usd_per_mtok: 10,
+    });
+    const props = proposeBenchmarkReroute(
+      [{ key: "greg", model: "old-sonnet" }],
+      [cur, commandA, sonnet5],
+      { qualityMetric: "coding" },
+    );
+    expect(props.length).toBe(1);
+    expect(props[0]!.to_model).toBe("sonnet-5"); // NOT command-a-plus
+  });
+
+  it("a $0/$0 (missing-pricing) candidate never yields a bogus cost win", () => {
+    const cur = bm({
+      intelligence_index: 50,
+      price_in_usd_per_mtok: 3,
+      price_out_usd_per_mtok: 15,
+    });
+    const freebie = bm({
+      intelligence_index: 55,
+      price_in_usd_per_mtok: 0,
+      price_out_usd_per_mtok: 0,
+    });
+    const v = evaluateReroute(cur, freebie); // quality safe, but pricing is 0/0
+    expect(v.propose).toBe(false);
+    expect(v.code).toBe("insufficient_data");
+  });
+
+  it("quality veto still fires on a $0 candidate that is WORSE (veto before pricing)", () => {
+    const cur = bm({
+      intelligence_index: 60,
+      price_in_usd_per_mtok: 3,
+      price_out_usd_per_mtok: 15,
+    });
+    const worse = bm({
+      intelligence_index: 40,
+      price_in_usd_per_mtok: 0,
+      price_out_usd_per_mtok: 0,
+    });
+    expect(evaluateReroute(cur, worse).code).toBe("quality_regression");
+  });
+
+  it("negative prices are treated as missing (not a giant saving)", () => {
+    const cur = bm({
+      intelligence_index: 50,
+      price_in_usd_per_mtok: 3,
+      price_out_usd_per_mtok: 15,
+    });
+    const neg = bm({
+      intelligence_index: 55,
+      price_in_usd_per_mtok: -1,
+      price_out_usd_per_mtok: -1,
+    });
+    expect(evaluateReroute(cur, neg).code).toBe("insufficient_data");
+  });
+});

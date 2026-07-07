@@ -40,12 +40,20 @@ export interface RerouteGateOptions {
   inputOutputRatio?: number; // e.g. 3 → price ≈ (3*in + out) / 4
   /** Minimum blended $/Mtok saving to bother proposing. */
   minSavingsUsdPerMtok?: number;
+  /**
+   * Which published index to gate quality on. A CODING/ops agent (e.g. Greg)
+   * should use "coding" — the general "intelligence" composite can rank a model
+   * higher overall while it is actually WORSE at code. Default "intelligence".
+   */
+  qualityMetric?: "intelligence" | "coding" | "agentic";
 }
 
 function blendedPrice(b: ModelBenchmark, ratio: number): number | null {
   const pin = b.price_in_usd_per_mtok;
   const pout = b.price_out_usd_per_mtok;
-  if (pin === null || pout === null) return null;
+  // Non-positive prices mean MISSING data (AA returns 0/0 for unpriced models);
+  // a bogus "free" model must never manufacture a cost win. Treat as unknown.
+  if (pin === null || pout === null || pin <= 0 || pout <= 0) return null;
   return (ratio * pin + pout) / (ratio + 1);
 }
 
@@ -63,40 +71,64 @@ export function evaluateReroute(
   const ratio = opts.inputOutputRatio ?? 3;
   const minSavings = opts.minSavingsUsdPerMtok ?? 0;
 
-  const qCur = current.intelligence_index;
-  const qCand = candidate.intelligence_index;
+  const metricField = (
+    {
+      intelligence: "intelligence_index",
+      coding: "coding_index",
+      agentic: "agentic_index",
+    } as const
+  )[opts.qualityMetric ?? "intelligence"];
+  const qCur = current[metricField];
+  const qCand = candidate[metricField];
   const pCur = blendedPrice(current, ratio);
   const pCand = blendedPrice(candidate, ratio);
 
-  // Cannot gate on quality without both indices, nor on cost without pricing.
-  if (qCur === null || qCand === null || pCur === null || pCand === null) {
+  const metric = opts.qualityMetric ?? "intelligence";
+
+  // Quality gate needs both indices. Without them we cannot judge quality at all.
+  if (qCur === null || qCand === null) {
     return {
       propose: false,
       code: "insufficient_data",
-      reason:
-        "Missing Intelligence Index or pricing for one of the models — cannot gate on quality, staying put.",
-      quality_delta: qCur !== null && qCand !== null ? qCand - qCur : null,
+      reason: `Missing ${metric} score for one of the models — cannot gate on quality, staying put.`,
+      quality_delta: null,
       projected_savings_usd_per_mtok: pCur !== null && pCand !== null ? pCur - pCand : null,
     };
   }
 
   const qualityDelta = qCand - qCur;
-  const savings = pCur - pCand;
 
-  // VETO: quality regression beyond tolerance — reject even if cheaper.
+  // VETO: quality regression beyond tolerance — decided on QUALITY ALONE, so it
+  // fires even when pricing is missing (a cheaper-but-worse model is still out).
   if (qualityDelta < -tol) {
     return {
       propose: false,
       code: "quality_regression",
-      reason: `Candidate Intelligence Index ${qCand} is ${(-qualityDelta).toFixed(
+      reason: `Candidate ${metric} score ${qCand} is ${(-qualityDelta).toFixed(
         1,
-      )} below current ${qCur} (tolerance ${tol}). Quality is the veto — not proposed even though it saves $${savings.toFixed(2)}/Mtok.`,
+      )} below current ${qCur} (tolerance ${tol}). Quality is the veto.`,
       quality_delta: qualityDelta,
-      projected_savings_usd_per_mtok: savings,
+      projected_savings_usd_per_mtok: pCur !== null && pCand !== null ? pCur - pCand : null,
     };
   }
 
-  // Quality is safe. Now cost is the tiebreaker: require a real saving.
+  // Quality is safe. A cost decision needs real pricing on BOTH models — a 0/0
+  // "free" model was already nulled by blendedPrice, so it lands here, not as a
+  // bogus saving.
+  if (pCur === null || pCand === null) {
+    return {
+      propose: false,
+      code: "insufficient_data",
+      reason:
+        "Quality is safe but pricing is missing/zero for one of the models — no trustworthy cost signal, staying put.",
+      quality_delta: qualityDelta,
+      projected_savings_usd_per_mtok: null,
+    };
+  }
+
+  const savings = pCur - pCand;
+
+  // Cost is the tiebreaker: require a real saving.
   if (savings <= minSavings) {
     return {
       propose: false,
