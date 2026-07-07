@@ -221,7 +221,13 @@ export function setModelInYaml(content: string, mode: string, newModel: string):
       out.push(line);
       continue;
     }
-    if (inMode && line.trim().length > 0 && !line.startsWith(`${modeIndent} `)) inMode = false;
+    if (
+      inMode &&
+      line.trim().length > 0 &&
+      !line.trim().startsWith("#") &&
+      !line.startsWith(`${modeIndent} `)
+    )
+      inMode = false;
     if (inMode) {
       const m = line.match(/^(\s*model:\s*)["']?[A-Za-z0-9._-]+["']?\s*$/);
       if (m) {
