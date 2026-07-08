@@ -40,7 +40,12 @@ import {
   proposeBenchmarkReroute,
   type RerouteGateOptions,
 } from "./model-routing-quality.js";
-import { readAgenticModes, setAgenticModel, isRunnableModel } from "./agentic-config.js";
+import {
+  readAgenticModes,
+  setAgenticModel,
+  isRunnableModel,
+  toLaunchableModel,
+} from "./agentic-config.js";
 import { enrichWithAnthropicCoding } from "./anthropic-benchmarks.js";
 
 /** Recent median session cost (USD) above which routing is "expensive" regardless of trend. */
@@ -210,16 +215,23 @@ export class ModelRoutingSubject
         ...this.rerouteGate,
         candidateFilter: isRunnableModel,
       });
-      if (proposals.length === 0) return null;
-      return {
-        target_path: this.settingsPath,
-        alternatives: proposals.map((p) => ({
-          id: `reroute-${p.key}-to-${p.to_model}`,
-          label: `Route '${p.key}' ${p.from_model} → ${p.to_model}`,
-          diff_or_content: setAgenticModel(raw, p.key, p.to_model),
-          tradeoff: p.verdict.reason,
-        })),
-      };
+      // Write a LAUNCHABLE tier (opus/sonnet/haiku), NEVER the AA slug — an AA
+      // catalog slug is not a valid `--model` value and would break the mode.
+      // Skip a same-tier no-op (target tier == current tier).
+      const alternatives = proposals
+        .map((p) => {
+          const launchable = toLaunchableModel(p.to_model);
+          if (!launchable || launchable === toLaunchableModel(p.from_model)) return null;
+          return {
+            id: `reroute-${p.key}-to-${launchable}`,
+            label: `Route '${p.key}' → ${launchable}`,
+            diff_or_content: setAgenticModel(raw, p.key, launchable),
+            tradeoff: p.verdict.reason,
+          };
+        })
+        .filter((a): a is NonNullable<typeof a> => a !== null);
+      if (alternatives.length === 0) return null;
+      return { target_path: this.settingsPath, alternatives };
     }
 
     // Legacy standalone agentic.yaml (nested-map format).
@@ -509,7 +521,9 @@ export class ModelRoutingSubject
    * Returned real-path-resolved (parent dir dereferenced) for a stable compare.
    */
   managedTargets(): string[] {
-    return [realResolvePath(this.modesConfigPath)];
+    const targets = [realResolvePath(this.modesConfigPath)];
+    if (this.settingsPath) targets.push(realResolvePath(this.settingsPath));
+    return targets;
   }
 
   /**
@@ -528,8 +542,8 @@ export class ModelRoutingSubject
     if (isSymlinkPath(target)) {
       throw new Error(`target_path is a symlink — refusing to write through it: ${target}`);
     }
-    if (realResolvePath(target) !== realResolvePath(this.modesConfigPath)) {
-      throw new Error(`target_path is not the managed modes config: ${target}`);
+    if (!this.managedTargets().includes(realResolvePath(target))) {
+      throw new Error(`target_path is not a managed config: ${target}`);
     }
   }
 

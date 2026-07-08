@@ -197,3 +197,63 @@ describe("ModelRoutingSubject — feeder frontier: no self-fetch (#292)", () => 
     rmSync(dir, { recursive: true, force: true });
   });
 });
+
+import { toLaunchableModel } from "../../../subjects/agentic-config.js";
+
+describe("ModelRoutingSubject — settingsPath write-back is LAUNCHABLE (Terry #292)", () => {
+  it("writes a launchable tier (opus/sonnet/haiku), never an Artificial-Analysis slug", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "mr-launch-"));
+    const settings = join(dir, "settings.json");
+    writeFileSync(
+      settings,
+      JSON.stringify(
+        { agentic: { enabled: true, modes: [{ name: "impl", model: "claude-3-5-sonnet" }] } },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    // Realistic AA slugs as model_id — exactly what tripped the original bug.
+    const rows = [
+      bm2("claude-35-sonnet", 9.9, 3, 15), // current (claude-3-5-sonnet → this slug)
+      bm2("claude-opus-4-7-non-reasoning", 82, 2, 10), // AA catalog slug, better+cheaper
+    ];
+    const s = new ModelRoutingSubject({
+      settingsPath: settings,
+      benchmarkProvider: async () => rows,
+      rerouteGate: { qualityMetric: "intelligence" },
+    });
+    const deg = {
+      metric: "c",
+      value: 8,
+      unit: "usd",
+      degraded: true,
+      trend: "degrading" as const,
+      sampledAt: "t",
+    };
+    const patch = await s.proposeEvidencePatch(ev(), deg);
+    expect(patch).not.toBeNull();
+    const written = patch?.alternatives[0]?.diff_or_content;
+    const model = JSON.parse(written).agentic.modes[0].model;
+    // The written value MUST be a launchable tier, NOT the AA slug.
+    expect(model).toBe("opus");
+    expect(model).not.toContain("non-reasoning");
+    expect(toLaunchableModel(model)).not.toBeNull();
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+function bm2(id: string, iq: number, pin: number, pout: number) {
+  return {
+    model_id: id,
+    name: id,
+    intelligence_index: iq,
+    coding_index: null,
+    agentic_index: null,
+    price_in_usd_per_mtok: pin,
+    price_out_usd_per_mtok: pout,
+    price_cache_hit_usd_per_mtok: null,
+    source: "t",
+    fetched_at: "t",
+  };
+}

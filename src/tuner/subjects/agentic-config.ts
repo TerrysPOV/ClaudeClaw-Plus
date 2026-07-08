@@ -30,9 +30,25 @@ export function toAaSlug(model: string): string {
   return CLAUDE_SLUG_ALIASES[key] ?? key;
 }
 
-/** Is this benchmark a Claude model (the only thing ClaudeClaw can run today)? */
+/**
+ * Map an AA slug (or operator model name) to a LAUNCHABLE `--model` value. ClaudeClaw
+ * runs `claude --model <x>`; AA catalog slugs like "claude-opus-4-7-non-reasoning"
+ * are NOT valid --model values, but the tier short name ("opus"/"sonnet"/"haiku")
+ * always is — and is version-agnostic, so a reroute targets a TIER, never a stale
+ * pinned id that would break the mode. Returns null for anything not a launchable
+ * Claude tier (which is also what constrains reroute candidates).
+ */
+export function toLaunchableModel(model: string): "opus" | "sonnet" | "haiku" | null {
+  const s = model.toLowerCase();
+  if (s.includes("opus")) return "opus";
+  if (s.includes("sonnet")) return "sonnet";
+  if (s.includes("haiku")) return "haiku";
+  return null;
+}
+
+/** A benchmark is a runnable candidate only if it maps to a launchable Claude tier. */
 export function isRunnableModel(b: ModelBenchmark): boolean {
-  return b.model_id.toLowerCase().includes("claude");
+  return toLaunchableModel(b.model_id) !== null;
 }
 
 export interface AgenticAssignment {

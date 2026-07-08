@@ -32,9 +32,7 @@ describe("ModelRoutingSubject — apply/revert confinement", () => {
   it("apply refuses a target_path outside the managed modes config", async () => {
     const sub = new ModelRoutingSubject({ modesConfigPath: configPath });
     const foreign = join(tmpRoot, "engine.ts");
-    await expect(sub.apply(foreignProposal(foreign), "a")).rejects.toThrow(
-      /not the managed modes config/,
-    );
+    await expect(sub.apply(foreignProposal(foreign), "a")).rejects.toThrow(/not a managed config/);
   });
 
   it("revert refuses a foreign target_path", async () => {
@@ -44,7 +42,7 @@ describe("ModelRoutingSubject — apply/revert confinement", () => {
       kind: "patch_inverse",
       applied_content: "x",
     };
-    await expect(sub.revert(inverse)).rejects.toThrow(/not the managed modes config/);
+    await expect(sub.revert(inverse)).rejects.toThrow(/not a managed config/);
   });
 
   it("apply still works for the managed config", async () => {
