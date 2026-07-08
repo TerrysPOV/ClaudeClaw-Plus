@@ -12,24 +12,25 @@ mock.module("@anthropic-ai/sdk", () => ({
   },
 }));
 
-mock.module("openai", () => ({
-  default: class MockOpenAI {
-    chat = {
-      completions: {
-        create: async () => ({
-          choices: [{ message: { content: "PASS - matches" } }],
-          usage: { prompt_tokens: 50, completion_tokens: 10 },
-        }),
-      },
-    };
-    embeddings = {
-      create: async () => ({
-        data: [{ embedding: [0.9, 0.1, 0.0] }, { embedding: [0.9, 0.1, 0.0] }],
-        usage: { total_tokens: 20 },
-      }),
-    };
-  },
-}));
+// OpenAI-compatible providers now go over plain fetch (providers.ts) — tests
+// inject a stub fetch instead of mocking an SDK module.
+function stubFetch(payload: unknown): typeof fetch {
+  return (async () =>
+    new Response(JSON.stringify(payload), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    })) as typeof fetch;
+}
+
+const chatFetch = stubFetch({
+  choices: [{ message: { content: "PASS - matches" } }],
+  usage: { prompt_tokens: 50, completion_tokens: 10 },
+});
+
+const embeddingsFetch = stubFetch({
+  data: [{ embedding: [0.9, 0.1, 0.0] }, { embedding: [0.9, 0.1, 0.0] }],
+  usage: { total_tokens: 20 },
+});
 
 import { judgeExactSet } from "../judges/exact-set.js";
 import { judgeRegex } from "../judges/regex.js";
@@ -114,13 +115,26 @@ describe("judge: llm_judge", () => {
     expect(result.cost_usd).toBeGreaterThanOrEqual(0);
   });
 
-  it("works with openai provider", async () => {
+  it("works with openai provider (fetch-based)", async () => {
     const result = await judgeLlm("input text", "actual output", "should be correct", {
       model: "gpt-4",
       apiKey: "fake-key",
       provider: "openai",
+      fetchImpl: chatFetch,
     });
     expect(result.pass).toBe(true);
+  });
+
+  it("throws on provider HTTP error (caller handles per-example)", async () => {
+    const failFetch = (async () => new Response("rate limited", { status: 429 })) as typeof fetch;
+    await expect(
+      judgeLlm("input", "output", "criteria", {
+        model: "gpt-4",
+        apiKey: "fake-key",
+        provider: "openai",
+        fetchImpl: failFetch,
+      }),
+    ).rejects.toThrow(/HTTP 429/);
   });
 
   it("works with array expected", async () => {
@@ -165,11 +179,12 @@ describe("judge: embedding_similarity", () => {
     expect(result.similarity).toBe(0);
   });
 
-  it("works with openai embedding provider", async () => {
+  it("works with openai embedding provider (fetch-based)", async () => {
     const result = await judgeEmbeddingSimilarity("hello world", "hello world", {
       threshold: 0.5,
       provider: "openai",
       apiKey: "fake-key",
+      fetchImpl: embeddingsFetch,
     });
     expect(result.pass).toBe(true);
     expect(result.cost_usd).toBeGreaterThanOrEqual(0);

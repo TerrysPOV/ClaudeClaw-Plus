@@ -1,5 +1,17 @@
 import { z } from "zod";
 
+// ── Path-safe identifiers ─────────────────────────────────────────────────────
+// task_id/set_id are joined into filesystem paths under evals_root, and the
+// eval tools are invocable by the agent loop itself — so a prompt-injected
+// "../../../etc" must be rejected at the schema boundary. Mirrors the
+// allowlist approach of mcp-bridge._validatePluginId.
+
+export const SAFE_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
+
+export const SafeIdSchema = z
+  .string()
+  .regex(SAFE_ID_RE, "must be a plain identifier: [a-zA-Z0-9_-], max 64 chars, no path separators");
+
 // ── Judge modes ───────────────────────────────────────────────────────────────
 
 export const JudgeModeSchema = z.enum([
@@ -57,16 +69,24 @@ export type EvalFrameworkSettings = z.infer<typeof EvalFrameworkSettingsSchema>;
 // ── Tool args ─────────────────────────────────────────────────────────────────
 
 export const RunEvalArgsSchema = z.object({
-  task_id: z.string(),
+  task_id: SafeIdSchema,
   model_id: z.string(),
-  set_id: z.string().optional(),
+  set_id: SafeIdSchema.optional(),
   max_cost_usd: z.number().nonnegative().optional(),
 });
 
 export const CompareModelsArgsSchema = z.object({
-  task_id: z.string(),
+  task_id: SafeIdSchema,
   model_ids: z.array(z.string()).min(1),
-  set_id: z.string().optional(),
+  set_id: SafeIdSchema.optional(),
+  max_cost_usd: z.number().nonnegative().optional(),
+});
+
+export const RunCascadeArgsSchema = z.object({
+  task_id: SafeIdSchema,
+  cheap_model: z.string(),
+  escalation_model: z.string(),
+  set_id: SafeIdSchema.optional(),
   max_cost_usd: z.number().nonnegative().optional(),
 });
 
@@ -108,6 +128,22 @@ export interface ExampleResult {
   judge_verdict: boolean;
   judge_mode: JudgeMode;
   error?: string;
+}
+
+/**
+ * Cascade validation (SPEC "cheap → escalate on judge-fail"): per-tier cost
+ * split + effective pass rate, so an operator can see whether a cheap default
+ * with escalation beats a single-tier strategy on both quality and cost.
+ */
+export interface CascadeMetrics {
+  effective_pass_rate: number;
+  cheap_pass_rate: number;
+  escalation_rate: number;
+  n_examples: number;
+  n_escalated: number;
+  cost_usd_total: number;
+  cost_usd_cheap_tier: number;
+  cost_usd_escalation_tier: number;
 }
 
 export type RunStatus = "running" | "completed" | "failed" | "cost_cap_hit" | "budget_denied";

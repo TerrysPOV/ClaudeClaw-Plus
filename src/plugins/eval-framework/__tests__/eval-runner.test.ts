@@ -30,30 +30,28 @@ mock.module("@anthropic-ai/sdk", () => ({
   },
 }));
 
-mock.module("openai", () => ({
-  default: class MockOpenAI {
-    chat = {
-      completions: {
-        create: async () => ({
-          choices: [{ message: { content: "mocked response" } }],
-          usage: { prompt_tokens: 10, completion_tokens: 5 },
-        }),
-      },
-    };
-    embeddings = {
-      create: async () => ({
-        data: [{ embedding: [1, 0, 0] }, { embedding: [1, 0, 0] }],
-        usage: { total_tokens: 20 },
+// OpenAI-compatible providers go over plain fetch (providers.ts) — inject a
+// stub fetch that answers per-model, so cascade tests can make the cheap
+// model wrong and the escalation model right.
+function makeChatFetch(outputByModel: Record<string, string>, fallback = "mocked response") {
+  return (async (_url: RequestInfo | URL, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as { model?: string };
+    const content = outputByModel[body.model ?? ""] ?? fallback;
+    return new Response(
+      JSON.stringify({
+        choices: [{ message: { content } }],
+        usage: { prompt_tokens: 10, completion_tokens: 5 },
       }),
-    };
-  },
-}));
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }) as typeof fetch;
+}
 
 import { EvalRunner } from "../eval-runner.js";
 import { EvalDb } from "../db.js";
 import type { EvalSet } from "../types.js";
 
-// ── Helpers ──────────────��────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 function makeDb(): EvalDb {
   return new EvalDb(`/tmp/eval-runner-test-${randomUUID()}.db`);
@@ -61,7 +59,10 @@ function makeDb(): EvalDb {
 
 function makeRunner(
   db: EvalDb,
-  opts: { checkBudget?: (s: string) => Promise<{ allow: boolean }> } = {},
+  opts: {
+    checkBudget?: (s: string) => Promise<{ allow: boolean }>;
+    fetchImpl?: typeof fetch;
+  } = {},
 ): EvalRunner {
   return new EvalRunner({
     db,
@@ -73,6 +74,7 @@ function makeRunner(
     },
     budgetGuardScope: "eval-framework",
     checkBudget: opts.checkBudget,
+    fetchImpl: opts.fetchImpl ?? makeChatFetch({}),
   });
 }
 
@@ -261,5 +263,151 @@ describe("regression detection", () => {
 
     // Should detect regression (pass rate dropped from 1.0 to 0.0)
     expect(auditEvents.some((e) => e.event === "eval_regression_detected")).toBe(true);
+  });
+});
+
+// ── Judge exceptions are per-example, not run-fatal ───────────────────────────
+
+describe("judge exception isolation", () => {
+  let db: EvalDb;
+
+  beforeEach(() => {
+    auditEvents.length = 0;
+    process.env.ANTHROPIC_API_KEY = "test-key-not-real";
+    db = makeDb();
+  });
+  afterEach(() => {
+    db.close();
+    delete process.env.ANTHROPIC_API_KEY;
+  });
+
+  it("a judge throw fails only that example — run completes with metrics", async () => {
+    const runner = makeRunner(db);
+    const evalSet: EvalSet = {
+      task_id: "judge-throw",
+      set_id: "basic",
+      examples: [
+        // Malformed regex → judgeRegex's `new RegExp("[")` throws
+        { input: "q1", expected_output: "[", judge_mode: "regex" },
+        // Healthy example after the bad one — must still be evaluated
+        { input: "q2", expected_output: "mocked response", judge_mode: "exact_set" },
+      ],
+    };
+    const result = await runner.runEval({
+      taskId: "judge-throw",
+      modelId: "claude-sonnet-4-6",
+      setId: "basic",
+      evalSet,
+    });
+    // Whole run survives: completed status, metrics kept
+    expect(result.status).toBe("completed");
+    expect(result.metrics?.n_examples).toBe(2);
+    expect(result.metrics?.pass_rate).toBe(0.5);
+    // The failed example carries the judge error, verdict false
+    const rows = db.getExamplesForRun(result.run_id);
+    const failed = rows.find((r) => r.error);
+    expect(failed?.error).toMatch(/^judge:/);
+    expect(failed?.judge_verdict).toBe(false);
+    expect(auditEvents.some((e) => e.event === "eval_run_failed")).toBe(false);
+  });
+});
+
+// ── Cascade validation ────────────────────────────────────────────────────────
+
+describe("cascade validation", () => {
+  let db: EvalDb;
+
+  beforeEach(() => {
+    auditEvents.length = 0;
+    process.env.OPENAI_API_KEY = "test-key-not-real";
+    db = makeDb();
+  });
+  afterEach(() => {
+    db.close();
+    delete process.env.OPENAI_API_KEY;
+  });
+
+  const cascadeSet: EvalSet = {
+    task_id: "cascade-test",
+    set_id: "basic",
+    examples: [
+      { input: "easy one", expected_output: "right answer", judge_mode: "exact_set" },
+      { input: "hard one", expected_output: "hard answer", judge_mode: "exact_set" },
+    ],
+  };
+
+  it("escalates only judge-failed examples and splits cost by tier", async () => {
+    // Cheap model answers "right answer" always: passes ex1, fails ex2.
+    // Escalation model answers "hard answer" always: rescues ex2.
+    const fetchImpl = makeChatFetch({
+      "gpt-cheap": "right answer",
+      "gpt-premium": "hard answer",
+    });
+    const runner = makeRunner(db, { fetchImpl });
+    const result = await runner.runCascadeEval({
+      taskId: "cascade-test",
+      setId: "basic",
+      evalSet: cascadeSet,
+      cheapModel: "gpt-cheap",
+      escalationModel: "gpt-premium",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(result.cascade).not.toBeNull();
+    expect(result.cascade?.n_examples).toBe(2);
+    expect(result.cascade?.n_escalated).toBe(1);
+    expect(result.cascade?.cheap_pass_rate).toBe(0.5);
+    expect(result.cascade?.effective_pass_rate).toBe(1.0);
+    expect(result.cascade?.escalation_rate).toBe(0.5);
+    // Cost split: both tiers spent something, total = sum of tiers
+    expect(result.cascade?.cost_usd_cheap_tier).toBeGreaterThan(0);
+    expect(result.cascade?.cost_usd_escalation_tier).toBeGreaterThan(0);
+    expect(result.cascade?.cost_usd_total).toBeCloseTo(
+      (result.cascade?.cost_usd_cheap_tier ?? 0) + (result.cascade?.cost_usd_escalation_tier ?? 0),
+      10,
+    );
+    // Per-tier attempts are visible in the run report (3 rows: 2 cheap + 1 escalation)
+    expect(db.getExamplesForRun(result.run_id).length).toBe(3);
+    expect(auditEvents.some((e) => e.event === "eval_cascade_completed")).toBe(true);
+  });
+
+  it("does not escalate when the cheap model passes everything", async () => {
+    const fetchImpl = makeChatFetch(
+      {},
+      "right answer", // every model answers ex1 right, ex2 wrong… so restrict set
+    );
+    const runner = makeRunner(db, { fetchImpl });
+    const result = await runner.runCascadeEval({
+      taskId: "cascade-test",
+      setId: "all-pass",
+      evalSet: {
+        task_id: "cascade-test",
+        set_id: "all-pass",
+        examples: [{ input: "easy one", expected_output: "right answer", judge_mode: "exact_set" }],
+      },
+      cheapModel: "gpt-cheap",
+      escalationModel: "gpt-premium",
+    });
+    expect(result.cascade?.n_escalated).toBe(0);
+    expect(result.cascade?.escalation_rate).toBe(0);
+    expect(result.cascade?.cost_usd_escalation_tier).toBe(0);
+    expect(result.cascade?.effective_pass_rate).toBe(1.0);
+  });
+
+  it("stores the cascade run under a composite model name", async () => {
+    const runner = makeRunner(db, { fetchImpl: makeChatFetch({}, "right answer") });
+    const result = await runner.runCascadeEval({
+      taskId: "cascade-test",
+      setId: "basic",
+      evalSet: {
+        task_id: "cascade-test",
+        set_id: "basic",
+        examples: [{ input: "easy one", expected_output: "right answer", judge_mode: "exact_set" }],
+      },
+      cheapModel: "gpt-cheap",
+      escalationModel: "gpt-premium",
+    });
+    const run = db.getRun(result.run_id);
+    expect(run?.model).toBe("cascade(gpt-cheap->gpt-premium)");
   });
 });

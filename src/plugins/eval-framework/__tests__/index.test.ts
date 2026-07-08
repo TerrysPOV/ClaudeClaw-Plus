@@ -98,16 +98,84 @@ describe("lifecycle", () => {
     await plugin.stop();
   });
 
-  it("registers 6 tools with bridge", async () => {
+  it("registers 7 tools with bridge", async () => {
     registeredTools.clear();
     const { plugin } = makePlugin();
     await plugin.start();
     expect(registeredTools.has("run_eval")).toBe(true);
+    expect(registeredTools.has("run_cascade_eval")).toBe(true);
     expect(registeredTools.has("compare_models")).toBe(true);
     expect(registeredTools.has("recommend_tier")).toBe(true);
     expect(registeredTools.has("list_runs")).toBe(true);
     expect(registeredTools.has("get_run_report")).toBe(true);
     expect(registeredTools.has("validate_eval_set")).toBe(true);
+    await plugin.stop();
+  });
+
+  it("callTool dispatches like the bridge handlers (stdio server path)", async () => {
+    const { plugin } = makePlugin();
+    await plugin.start();
+    const result = (await plugin.callTool("list_runs", {})) as unknown[];
+    expect(Array.isArray(result)).toBe(true);
+    await expect(plugin.callTool("nope", {})).rejects.toThrow(/unknown tool/);
+    expect(plugin.toolDescriptors().map((t) => t.name)).toContain("run_cascade_eval");
+    await plugin.stop();
+  });
+});
+
+// ── Path traversal guard (task_id/set_id → filesystem paths) ──────────────────
+
+describe("path traversal guard", () => {
+  afterEach(() => {
+    _resetEvalFramework();
+  });
+
+  it("run_eval rejects traversal-shaped task_id at the schema boundary", async () => {
+    registeredTools.clear();
+    const { plugin } = makePlugin();
+    await plugin.start();
+    const handler = registeredTools.get("run_eval")?.handler;
+    for (const bad of ["../../../etc", "..", "a/b", "a\\b", ".hidden", ""]) {
+      await expect(handler({ task_id: bad, model_id: "claude-x" })).rejects.toThrow();
+    }
+    await plugin.stop();
+  });
+
+  it("run_eval rejects traversal-shaped set_id", async () => {
+    registeredTools.clear();
+    const { plugin, evalsRoot } = makePlugin();
+    writeEvalSet(evalsRoot, "task-a", "default", [
+      { input: "hello", expected_output: "world", judge_mode: "exact_set" },
+    ]);
+    await plugin.start();
+    const handler = registeredTools.get("run_eval")?.handler;
+    await expect(
+      handler({ task_id: "task-a", set_id: "../task-b/default", model_id: "claude-x" }),
+    ).rejects.toThrow();
+    await plugin.stop();
+  });
+
+  it("_loadEvalSet defense-in-depth refuses ids that escape evals_root", async () => {
+    const { plugin, evalsRoot } = makePlugin();
+    await plugin.start();
+    // A YAML file OUTSIDE evals_root that a traversal would have reached
+    const outside = join(evalsRoot, "..", `outside-${randomUUID()}`);
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(
+      join(outside, "default.yaml"),
+      yamlStringify({
+        task_id: "x",
+        set_id: "default",
+        examples: [{ input: "a", expected_output: "b", judge_mode: "exact_set" }],
+      }),
+    );
+    const loadEvalSet = (
+      plugin as unknown as {
+        _loadEvalSet: (t: string, s?: string) => unknown;
+      }
+    )._loadEvalSet.bind(plugin);
+    expect(loadEvalSet("../" + outside.split("/").pop())).toBeNull();
+    expect(loadEvalSet("..", "default")).toBeNull();
     await plugin.stop();
   });
 });

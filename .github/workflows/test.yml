@@ -31,4 +31,4 @@ jobs:
       # Folding those in would make CI permanently red. Tracked for cleanup — see
       # the issue linked in the PR — after which these paths widen toward full.
       - name: Run tests (clean suites)
-        run: bun test src/bus src/tuner src/observability src/skills-tuner src/__tests__/governance
+        run: bun test src/bus src/tuner src/observability src/skills-tuner src/plugins/eval-framework src/__tests__/governance

@@ -6,11 +6,15 @@
  * This skeleton provides the cosine math and a pluggable embedding interface.
  */
 
+import { OPENAI_COMPAT_BASE_URLS, openAiEmbeddings } from "../providers.js";
+
 export interface EmbeddingSimilarityConfig {
   threshold: number; // 0.0 - 1.0, default 0.85
   provider?: "openai"; // future: more providers
   apiKey?: string;
   model?: string;
+  /** Injectable for tests. */
+  fetchImpl?: typeof fetch;
 }
 
 export function cosineSimilarity(a: number[], b: number[]): number {
@@ -47,23 +51,20 @@ export async function judgeEmbeddingSimilarity(
     };
   }
 
-  // OpenAI embeddings path
-  const { default: OpenAI } = await import("openai");
-  const client = new OpenAI({ apiKey: config.apiKey });
+  // OpenAI embeddings over fetch — no SDK dependency (providers.ts)
   const model = config.model ?? "text-embedding-3-small";
-
-  const response = await client.embeddings.create({
+  const response = await openAiEmbeddings({
+    baseUrl: OPENAI_COMPAT_BASE_URLS.openai,
+    apiKey: config.apiKey,
     model,
     input: [actual, expectedStr],
+    fetchImpl: config.fetchImpl,
   });
 
-  const embA = response.data[0].embedding;
-  const embB = response.data[1].embedding;
-  const similarity = cosineSimilarity(embA, embB);
+  const similarity = cosineSimilarity(response.embeddings[0] ?? [], response.embeddings[1] ?? []);
   const latencyMs = performance.now() - startMs;
   // Approximate cost for embedding
-  const totalTokens = response.usage?.total_tokens ?? 0;
-  const costUsd = (totalTokens * 0.00002) / 1000;
+  const costUsd = (response.total_tokens * 0.00002) / 1000;
 
   return { pass: similarity >= threshold, similarity, latency_ms: latencyMs, cost_usd: costUsd };
 }

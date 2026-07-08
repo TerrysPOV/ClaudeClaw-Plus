@@ -267,21 +267,9 @@ const DEFAULT_SETTINGS: Settings = {
     tiers: { fast: [], balanced: [], reasoning: [] },
     openRouterBaseUrl: "https://openrouter.ai/api/v1",
   },
-  evalFramework: {
-    enabled: false,
-    evals_root: "~/agent/evals",
-    database_path: "~/agent/evals/runs.db",
-    reports_dir: "~/agent/evals/reports",
-    default_max_cost_usd: 2.0,
-    default_judge_model: "claude-opus-4-7",
-    provider_credentials_env: {
-      anthropic: "ANTHROPIC_API_KEY",
-      openai: "OPENAI_API_KEY",
-      groq: "GROQ_API_KEY",
-      deepseek: "DEEPSEEK_API_KEY",
-    },
-    budget_guard_scope: "eval-framework",
-  },
+  // eval-framework (#80) lives under `governance.evalFramework` (see
+  // GovernanceConfig) — its field defaults come from the plugin's own zod
+  // schema (src/plugins/eval-framework/types.ts), so nothing to seed here.
 };
 
 export interface HeartbeatExcludeWindow {
@@ -763,15 +751,18 @@ export interface GovernanceWatchdogConfig {
 
 export interface GovernanceConfig {
   watchdog: GovernanceWatchdogConfig;
+  // eval-framework (#80). All fields optional: the plugin's zod schema
+  // (EvalFrameworkSettingsSchema) fills defaults at construction, so an
+  // operator only writes the keys they change (plus enabled=true to opt in).
   evalFramework?: {
-    enabled: boolean;
-    evals_root: string;
-    database_path: string;
-    reports_dir: string;
-    default_max_cost_usd: number;
-    default_judge_model: string;
-    provider_credentials_env: Record<string, string>;
-    budget_guard_scope: string;
+    enabled?: boolean;
+    evals_root?: string;
+    database_path?: string;
+    reports_dir?: string;
+    default_max_cost_usd?: number;
+    default_judge_model?: string;
+    provider_credentials_env?: Record<string, string>;
+    budget_guard_scope?: string;
   };
 }
 
@@ -1306,31 +1297,38 @@ function parseBusAgents(raw: unknown): BusAgentSettings[] {
 }
 
 /**
- * Parse the `settings.governance` block. Today only `watchdog` is exposed —
- * fields are narrow and optional; unset values fall back to the in-memory
- * runtime defaults inside `src/governance/watchdog.ts:configureWatchdog`.
+ * Parse the `settings.governance` block: `watchdog` (narrow, optional fields
+ * falling back to runtime defaults in `src/governance/watchdog.ts`) and
+ * `evalFramework` (#80 — carried through as-is when present; the plugin's
+ * zod schema validates and fills defaults at construction).
  */
-function parseGovernanceConfig(raw: unknown): GovernanceConfig {
-  const empty: GovernanceConfig = { watchdog: {} };
-  if (!raw || typeof raw !== "object") return empty;
+export function parseGovernanceConfig(raw: unknown): GovernanceConfig {
+  const out: GovernanceConfig = { watchdog: {} };
+  if (!raw || typeof raw !== "object") return out;
   const r = raw as Record<string, unknown>;
-  const w = r.watchdog;
-  if (!w || typeof w !== "object") return empty;
-  const wr = w as Record<string, unknown>;
 
   const numIfFinitePositive = (v: unknown): number | undefined =>
     typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined;
 
-  return {
-    watchdog: {
+  const w = r.watchdog;
+  if (w && typeof w === "object") {
+    const wr = w as Record<string, unknown>;
+    out.watchdog = {
       enabled: typeof wr.enabled === "boolean" ? wr.enabled : undefined,
       maxToolCalls: numIfFinitePositive(wr.maxToolCalls),
       maxTurns: numIfFinitePositive(wr.maxTurns),
       maxRuntimeSeconds: numIfFinitePositive(wr.maxRuntimeSeconds),
       maxRepeatedTools: numIfFinitePositive(wr.maxRepeatedTools),
       repeatedToolThreshold: numIfFinitePositive(wr.repeatedToolThreshold),
-    },
-  };
+    };
+  }
+
+  const ef = r.evalFramework;
+  if (ef && typeof ef === "object") {
+    out.evalFramework = ef as GovernanceConfig["evalFramework"];
+  }
+
+  return out;
 }
 
 /**

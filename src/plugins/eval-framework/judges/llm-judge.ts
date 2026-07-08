@@ -2,14 +2,19 @@
  * LLM judge: uses a premium-tier model to evaluate whether actual output
  * meets the expected criteria. Returns pass/fail based on model verdict.
  *
- * Provider SDK calls are direct (Anthropic initially). Migrates to llm-router
- * once #70 lands.
+ * Anthropic goes through @anthropic-ai/sdk (already a repo dependency);
+ * OpenAI-compatible providers go through plain fetch (providers.ts) — no
+ * `openai` SDK dependency.
  */
+
+import { OPENAI_COMPAT_BASE_URLS, openAiCompatChat } from "../providers.js";
 
 export interface LlmJudgeConfig {
   model: string;
   apiKey: string;
   provider: "anthropic" | "openai" | "groq" | "deepseek";
+  /** Injectable for tests. */
+  fetchImpl?: typeof fetch;
 }
 
 export interface LlmJudgeResult {
@@ -48,38 +53,24 @@ export async function judgeLlm(
     const inTokens = response.usage?.input_tokens ?? 0;
     const outTokens = response.usage?.output_tokens ?? 0;
     costUsd = (inTokens * 0.015 + outTokens * 0.075) / 1000;
-  } else if (config.provider === "openai") {
-    const { default: OpenAI } = await import("openai");
-    const client = new OpenAI({ apiKey: config.apiKey });
-    const response = await client.chat.completions.create({
-      model: config.model,
-      max_tokens: 100,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-    });
-    responseText = response.choices[0]?.message?.content ?? "";
-    const usage = response.usage;
-    costUsd = ((usage?.prompt_tokens ?? 0) * 0.01 + (usage?.completion_tokens ?? 0) * 0.03) / 1000;
   } else {
-    // groq / deepseek — OpenAI-compatible SDK
-    const { default: OpenAI } = await import("openai");
-    const baseUrls: Record<string, string> = {
-      groq: "https://api.groq.com/openai/v1",
-      deepseek: "https://api.deepseek.com",
-    };
-    const client = new OpenAI({ apiKey: config.apiKey, baseURL: baseUrls[config.provider] });
-    const response = await client.chat.completions.create({
+    // openai / groq / deepseek — OpenAI-compatible wire format over fetch
+    const response = await openAiCompatChat({
+      baseUrl: OPENAI_COMPAT_BASE_URLS[config.provider],
+      apiKey: config.apiKey,
       model: config.model,
-      max_tokens: 100,
+      maxTokens: 100,
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userPrompt },
       ],
+      fetchImpl: config.fetchImpl,
     });
-    responseText = response.choices[0]?.message?.content ?? "";
-    costUsd = 0.001; // Approximate for groq/deepseek
+    responseText = response.text;
+    costUsd =
+      config.provider === "openai"
+        ? (response.prompt_tokens * 0.01 + response.completion_tokens * 0.03) / 1000
+        : 0.001; // Approximate for groq/deepseek
   }
 
   const latencyMs = performance.now() - startMs;

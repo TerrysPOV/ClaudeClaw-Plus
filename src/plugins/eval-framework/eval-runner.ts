@@ -1,7 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import { getMcpBridge } from "../mcp-bridge.js";
 import type { EvalDb } from "./db.js";
-import type { EvalExample, EvalSet, ExampleResult, RunMetrics, RunStatus } from "./types.js";
+import type {
+  CascadeMetrics,
+  EvalExample,
+  EvalSet,
+  ExampleResult,
+  RunMetrics,
+  RunStatus,
+} from "./types.js";
 import { judgeExactSet } from "./judges/exact-set.js";
 import { judgeRegex } from "./judges/regex.js";
 import { judgeJsonSchema } from "./judges/json-schema.js";
@@ -10,6 +17,7 @@ import {
   judgeEmbeddingSimilarity,
   type EmbeddingSimilarityConfig,
 } from "./judges/embedding-similarity.js";
+import { OPENAI_COMPAT_BASE_URLS, openAiCompatChat } from "./providers.js";
 
 export interface EvalRunnerConfig {
   db: EvalDb;
@@ -18,6 +26,8 @@ export interface EvalRunnerConfig {
   providerCredentials: Record<string, string>;
   budgetGuardScope: string;
   checkBudget?: (scope: string) => Promise<{ allow: boolean }>;
+  /** Injectable for tests (same convention as llm-router's OpenRouterDeps). */
+  fetchImpl?: typeof fetch;
 }
 
 export interface RunEvalOpts {
@@ -25,6 +35,15 @@ export interface RunEvalOpts {
   modelId: string;
   setId: string;
   evalSet: EvalSet;
+  maxCostUsd?: number;
+}
+
+export interface RunCascadeOpts {
+  taskId: string;
+  setId: string;
+  evalSet: EvalSet;
+  cheapModel: string;
+  escalationModel: string;
   maxCostUsd?: number;
 }
 
@@ -133,6 +152,129 @@ export class EvalRunner {
     if (ac) ac.abort();
   }
 
+  /**
+   * Cascade validation (SPEC): simulate "cheap model first, escalate to the
+   * premium model when the cheap answer fails its judge" and report the
+   * EFFECTIVE pass rate + cost split between tiers. Judge-fail covers the
+   * schema-invalid case (json_schema mode) as well as content misses.
+   *
+   * Persisted as one run (model = "cascade(cheap->escalation)"); each tier
+   * attempt is stored as its own example row so get_run_report shows which
+   * tier answered.
+   */
+  async runCascadeEval(opts: RunCascadeOpts): Promise<{
+    run_id: string;
+    status: RunStatus;
+    metrics: RunMetrics | null;
+    cascade: CascadeMetrics | null;
+  }> {
+    const runId = randomUUID();
+    const maxCost = opts.maxCostUsd ?? this.config.defaultMaxCostUsd;
+    const bridge = getMcpBridge();
+    const cascadeModel = `cascade(${opts.cheapModel}->${opts.escalationModel})`;
+
+    this.config.db.createRun({
+      run_id: runId,
+      task_id: opts.taskId,
+      set_id: opts.setId,
+      model: cascadeModel,
+      max_cost_usd: maxCost,
+    });
+    bridge.audit("eval_cascade_started", {
+      run_id: runId,
+      task_id: opts.taskId,
+      set_id: opts.setId,
+      cheap_model: opts.cheapModel,
+      escalation_model: opts.escalationModel,
+    });
+
+    const effective: ExampleResult[] = [];
+    let cheapPassed = 0;
+    let escalated = 0;
+    let costCheap = 0;
+    let costEscalation = 0;
+    let finalStatus: RunStatus = "completed";
+
+    try {
+      for (const example of opts.evalSet.examples) {
+        if (this.config.checkBudget) {
+          const budgetResult = await this.config.checkBudget(this.config.budgetGuardScope);
+          if (!budgetResult.allow) {
+            finalStatus = "budget_denied";
+            bridge.audit("eval_run_cost_cap_hit", {
+              run_id: runId,
+              reason: "budget_guard_denied",
+              cost_accumulated: costCheap + costEscalation,
+            });
+            break;
+          }
+        }
+        if (costCheap + costEscalation >= maxCost) {
+          finalStatus = "cost_cap_hit";
+          bridge.audit("eval_run_cost_cap_hit", {
+            run_id: runId,
+            reason: "max_cost_exceeded",
+            cost_accumulated: costCheap + costEscalation,
+            max_cost_usd: maxCost,
+          });
+          break;
+        }
+
+        const cheap = await this.evaluateExample(example, opts.cheapModel, runId);
+        costCheap += cheap.cost_usd;
+        this.config.db.insertExample({ ...cheap, run_id: runId });
+
+        let finalResult = cheap;
+        if (cheap.judge_verdict) {
+          cheapPassed++;
+        } else {
+          escalated++;
+          const premium = await this.evaluateExample(example, opts.escalationModel, runId);
+          costEscalation += premium.cost_usd;
+          this.config.db.insertExample({ ...premium, run_id: runId });
+          finalResult = {
+            ...premium,
+            // Effective latency = both tiers walked for this example
+            latency_ms: cheap.latency_ms + premium.latency_ms,
+            cost_usd: cheap.cost_usd + premium.cost_usd,
+          };
+        }
+        effective.push(finalResult);
+        this.config.db.updateRunCost(runId, costCheap + costEscalation);
+      }
+    } catch (err) {
+      finalStatus = "failed";
+      bridge.audit("eval_run_failed", { run_id: runId, error: (err as Error).message });
+    }
+
+    const metrics = this.computeMetrics(effective);
+    const cascade: CascadeMetrics = {
+      effective_pass_rate: metrics.pass_rate,
+      cheap_pass_rate: effective.length > 0 ? cheapPassed / effective.length : 0,
+      escalation_rate: effective.length > 0 ? escalated / effective.length : 0,
+      n_examples: effective.length,
+      n_escalated: escalated,
+      cost_usd_total: costCheap + costEscalation,
+      cost_usd_cheap_tier: costCheap,
+      cost_usd_escalation_tier: costEscalation,
+    };
+    this.config.db.updateRunStatus(
+      runId,
+      finalStatus,
+      finalStatus === "completed" ? metrics : undefined,
+    );
+    if (finalStatus === "completed") {
+      bridge.audit("eval_cascade_completed", { run_id: runId, metrics, cascade });
+    }
+
+    return {
+      run_id: runId,
+      status: finalStatus,
+      metrics: finalStatus === "completed" ? metrics : null,
+      cascade: finalStatus === "completed" ? cascade : null,
+    };
+  }
+
   private async evaluateExample(
     example: EvalExample,
     modelId: string,
@@ -164,8 +306,25 @@ export class EvalRunner {
       };
     }
 
-    // Judge the response
-    const judgeResult = await this.judge(example, actualOutput);
+    // Judge the response. A judge throw (missing API key, malformed regex,
+    // transient LLM-judge failure) is a PER-EXAMPLE failure — it must not
+    // propagate and mark the whole run "failed", discarding the metrics of
+    // every already-completed example in an expensive batch.
+    let judgeResult: { pass: boolean; cost_usd: number };
+    try {
+      judgeResult = await this.judge(example, actualOutput);
+    } catch (err) {
+      return {
+        example_id: exampleId,
+        input_hash: inputHash,
+        model: modelId,
+        latency_ms: performance.now() - startMs,
+        cost_usd: callCost,
+        judge_verdict: false,
+        judge_mode: example.judge_mode,
+        error: `judge: ${(err as Error).message}`,
+      };
+    }
     const latencyMs = performance.now() - startMs;
 
     return {
@@ -207,24 +366,18 @@ export class EvalRunner {
       return { output: text, cost_usd: cost };
     }
 
-    // OpenAI-compatible providers
-    const { default: OpenAI } = await import("openai");
-    const baseUrls: Record<string, string | undefined> = {
-      openai: undefined,
-      groq: "https://api.groq.com/openai/v1",
-      deepseek: "https://api.deepseek.com",
-    };
-    const client = new OpenAI({ apiKey, baseURL: baseUrls[provider] });
-    const response = await client.chat.completions.create({
+    // OpenAI-compatible providers — plain fetch, no SDK dependency (same
+    // convention as llm-router's openrouter.ts).
+    const response = await openAiCompatChat({
+      baseUrl: OPENAI_COMPAT_BASE_URLS[provider] ?? OPENAI_COMPAT_BASE_URLS.openai,
+      apiKey,
       model: modelId,
-      max_tokens: 1024,
+      maxTokens: 1024,
       messages: [{ role: "user", content: input }],
+      fetchImpl: this.config.fetchImpl,
     });
-    const text = response.choices[0]?.message?.content ?? "";
-    const usage = response.usage;
-    const cost =
-      ((usage?.prompt_tokens ?? 0) * 0.005 + (usage?.completion_tokens ?? 0) * 0.015) / 1000;
-    return { output: text, cost_usd: cost };
+    const cost = (response.prompt_tokens * 0.005 + response.completion_tokens * 0.015) / 1000;
+    return { output: response.text, cost_usd: cost };
   }
 
   private inferProvider(modelId: string): string {
@@ -276,6 +429,7 @@ export class EvalRunner {
           model: this.config.defaultJudgeModel,
           apiKey,
           provider,
+          fetchImpl: this.config.fetchImpl,
         };
         const expectedStr =
           typeof expected === "string"
@@ -301,6 +455,7 @@ export class EvalRunner {
               ]
             : undefined,
           model: example.judge_config?.model as string,
+          fetchImpl: this.config.fetchImpl,
         };
         const expectedStr =
           typeof expected === "string"
