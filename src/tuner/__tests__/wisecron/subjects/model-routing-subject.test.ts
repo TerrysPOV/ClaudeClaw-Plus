@@ -398,7 +398,7 @@ describe("ModelRoutingSubject — healthCheck", () => {
   it("returns producer_found=false when dispatchReader is not injected", async () => {
     // Default ctor: dispatchReader=() => [], i.e. not configured.
     const s = new ModelRoutingSubject({ modesConfigPath: configPath });
-    const h = await s.healthCheck!();
+    const h = await s.healthCheck?.();
     expect(h.producer_found).toBe(false);
     expect(h.reason).toMatch(/dispatchReader not configured/);
   });
@@ -408,7 +408,7 @@ describe("ModelRoutingSubject — healthCheck", () => {
       modesConfigPath: configPath,
       dispatchReader: () => [],
     });
-    const h = await s.healthCheck!();
+    const h = await s.healthCheck?.();
     expect(h.producer_found).toBe(true);
     expect(h.sample_event_match_rate).toBe(0);
     expect(h.reason).toMatch(/0 events/);
@@ -419,7 +419,7 @@ describe("ModelRoutingSubject — healthCheck", () => {
       modesConfigPath: configPath,
       dispatchReader: () => [{ type: "dispatch", mode: "code-fix" }, { type: "other" }],
     });
-    const h = await s.healthCheck!();
+    const h = await s.healthCheck?.();
     expect(h.producer_found).toBe(true);
     expect(h.sample_event_match_rate).toBeGreaterThan(0);
   });
@@ -433,7 +433,7 @@ describe("ModelRoutingSubject — healthProbe (post-apply artifact check)", () =
       "modes:\n  fast:\n    keywords: [quick, q]\n  deep:\n    keywords: [research]\n",
       "utf8",
     );
-    const probe = await s.healthProbe!(configPath);
+    const probe = await s.healthProbe?.(configPath);
     expect(probe.failed).toBe(false);
     expect(probe.errors).toEqual([]);
   });
@@ -445,7 +445,7 @@ describe("ModelRoutingSubject — healthProbe (post-apply artifact check)", () =
       "modes:\n  fast:\n    keywords: [quick]\n  deep:\n    keywords: [quick]\n",
       "utf8",
     );
-    const probe = await s.healthProbe!(configPath);
+    const probe = await s.healthProbe?.(configPath);
     expect(probe.failed).toBe(true);
     expect(probe.errors.join(" ")).toMatch(/duplicate keyword/);
   });
@@ -453,13 +453,13 @@ describe("ModelRoutingSubject — healthProbe (post-apply artifact check)", () =
   it("invalid YAML → failed:true", async () => {
     const s = new ModelRoutingSubject({ modesConfigPath: configPath });
     writeFileSync(configPath, "modes:\n  fast: [unclosed\n", "utf8");
-    const probe = await s.healthProbe!(configPath);
+    const probe = await s.healthProbe?.(configPath);
     expect(probe.failed).toBe(true);
   });
 
   it("config absent after apply → not a break", async () => {
     const s = new ModelRoutingSubject({ modesConfigPath: configPath });
-    const probe = await s.healthProbe!(configPath);
+    const probe = await s.healthProbe?.(configPath);
     expect(probe.failed).toBe(false);
   });
 });

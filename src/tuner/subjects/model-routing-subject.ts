@@ -23,6 +23,33 @@ import type { RevertibleSubject } from "../wisecron/types.js";
 import type { DateRange, Metric, TelemetryProvider } from "../../skills-tuner/core/telemetry.js";
 import { ARTIFACT_SOURCE } from "../../skills-tuner/core/telemetry.js";
 import { nonzeroRate } from "../../skills-tuner/core/aggregate.js";
+import {
+  type EvidenceDrivenSubject,
+  type ResearchSpec,
+  type LocalSignal,
+  type StructuredEvidence,
+  type EvidenceVerdict,
+  type EvidencePatch,
+  meetsEvidenceBar,
+} from "../wisecron/evidence-driven.js";
+import { costSignal } from "./model-routing-signal.js";
+import type { ModelBenchmark } from "./model-routing-benchmarks.js";
+import {
+  buildRerouteEvidencePatch,
+  parseModelAssignments,
+  proposeBenchmarkReroute,
+  type RerouteGateOptions,
+} from "./model-routing-quality.js";
+import {
+  readAgenticModes,
+  setAgenticModel,
+  isRunnableModel,
+  toLaunchableModel,
+} from "./agentic-config.js";
+import { enrichWithAnthropicCoding } from "./anthropic-benchmarks.js";
+
+/** Recent median session cost (USD) above which routing is "expensive" regardless of trend. */
+const MODEL_ROUTING_MAX_RECENT_USD = 25;
 
 const DEAD_DAYS = 90;
 const MISTRIGGER_RATE = 0.3;
@@ -43,13 +70,28 @@ interface RoutingStats {
  */
 export interface ModelRoutingSubjectConfig {
   llm?: LLMClient;
+  /** Path to the session-cost SQLite store (the proactive signal source). */
+  costDbPath?: string;
   /** Modes config path. Default: ~/.claude/agentic.yaml. */
   modesConfigPath?: string;
   /** Injected dispatch-event reader. */
   dispatchReader?: (since: Date) => Array<Record<string, unknown>>;
+  /** Injected published-benchmark provider (Artificial Analysis by default). */
+  benchmarkProvider?: (models: string[]) => Promise<ModelBenchmark[]>;
+  /** Quality/cost gate tuning for the benchmark reroute. */
+  rerouteGate?: RerouteGateOptions;
+  /**
+   * settings.json path — when set, the benchmark reroute reads the REAL agentic
+   * modes (list format) from here and constrains candidates to runnable (Claude)
+   * models, instead of the standalone agentic.yaml. This is the reconciled path.
+   */
+  settingsPath?: string;
 }
 
-export class ModelRoutingSubject extends BaseSubject implements RevertibleSubject {
+export class ModelRoutingSubject
+  extends BaseSubject
+  implements RevertibleSubject, EvidenceDrivenSubject
+{
   readonly name = "model_routing";
   readonly risk_tier = "medium" as const;
   readonly auto_merge_default = false;
@@ -59,6 +101,10 @@ export class ModelRoutingSubject extends BaseSubject implements RevertibleSubjec
   private readonly modesConfigPath: string;
   private readonly dispatchReader: (since: Date) => Array<Record<string, unknown>>;
   private readonly dispatchReaderInjected: boolean;
+  private readonly costDbPath: string;
+  private readonly benchmarkProvider: (models: string[]) => Promise<ModelBenchmark[]>;
+  private readonly rerouteGate: RerouteGateOptions;
+  private readonly settingsPath?: string;
 
   constructor(opts: ModelRoutingSubjectConfig = {}) {
     super();
@@ -68,6 +114,137 @@ export class ModelRoutingSubject extends BaseSubject implements RevertibleSubjec
     );
     this.dispatchReaderInjected = opts.dispatchReader !== undefined;
     this.dispatchReader = opts.dispatchReader ?? (() => []);
+    this.costDbPath = expandHome(opts.costDbPath ?? join(homedir(), "agent", "data", "costs.db"));
+    // Feeder-frontier (governance rule): the SUBJECT never fetches the web itself.
+    // A sandboxed feeder / the research scout fetches the published benchmarks and
+    // INJECTS them via benchmarkProvider; with none injected the subject simply has
+    // no external data and proposes nothing (safe). getModelBenchmarks lives here
+    // only as the mechanism the feeder/scout calls — not wired as the default.
+    this.benchmarkProvider = opts.benchmarkProvider ?? (async () => []);
+    this.rerouteGate = opts.rerouteGate ?? {};
+    this.settingsPath = opts.settingsPath ? expandHome(opts.settingsPath) : undefined;
+  }
+
+  // ── Proactive face: EvidenceDrivenSubject (cost signal + faisceau de preuves) ──
+
+  researchSpec(): ResearchSpec {
+    return {
+      subject: "model_routing",
+      query: "llm routing cost quality model cascade speculative decoding semantic router",
+      sourceTiers: ["enterprise", "authoritative", "papers"],
+      technique: "cost-aware-routing",
+    };
+  }
+
+  async localSignal(): Promise<LocalSignal> {
+    const c = costSignal(this.costDbPath, MODEL_ROUTING_MAX_RECENT_USD);
+    return {
+      metric: "session_cost_usd",
+      value: c.value,
+      unit: "usd",
+      degraded: c.degraded,
+      trend: c.trend,
+      sampledAt: new Date().toISOString(),
+    };
+  }
+
+  evaluate(evidence: StructuredEvidence, signal: LocalSignal): EvidenceVerdict {
+    if (!signal.degraded) {
+      return {
+        propose: false,
+        reason: `routing cost healthy (${signal.value}${signal.unit}, ${signal.trend})`,
+        kind: "recommendation",
+        confidence: 0,
+      };
+    }
+    if (!meetsEvidenceBar(evidence)) {
+      return {
+        propose: false,
+        reason: `evidence below bar for '${evidence.technique}' (${evidence.independentSources} independent, ${evidence.highTrustSources} high-trust)`,
+        kind: "recommendation",
+        confidence: 0.2,
+      };
+    }
+    const confidence = Math.round(Math.min(1, evidence.independentSources / 5) * 100) / 100;
+    return {
+      propose: true,
+      reason: `routing cost ${signal.trend} (${signal.value}${signal.unit}) + ${evidence.independentSources} independent sources for '${evidence.technique}'`,
+      kind: "recommendation",
+      confidence,
+    };
+  }
+
+  async confirm(before: LocalSignal): Promise<boolean> {
+    const after = await this.localSignal();
+    return after.value < before.value;
+  }
+
+  /**
+   * Proactive benchmark reroute (kind:"patch"). When the local cost signal is
+   * degraded, read the operator's current model assignments, pull PUBLISHED
+   * quality+cost benchmarks (Tier A), and propose the best quality-gated reroute
+   * as a CONFIG patch the subject applies in its own modes file — quality is the
+   * veto (never a reroute that regresses quality). null when nothing is degraded,
+   * no benchmark data is available (no key/offline), or no safe reroute exists.
+   * A survivor is confirmed on the own-workload bench (#80) before apply.
+   */
+  async proposeEvidencePatch(
+    _evidence: StructuredEvidence,
+    signal: LocalSignal,
+  ): Promise<EvidencePatch | null> {
+    if (!signal.degraded) return null;
+    // Fetch the FULL benchmark set (empty filter) — we need CANDIDATES to reroute
+    // to, not just the models already in use.
+    const benchmarks = enrichWithAnthropicCoding(await this.benchmarkProvider([]));
+    if (benchmarks.length === 0) return null;
+
+    // Reconciled path: read the REAL agentic modes from settings.json (list
+    // format), look models up by their AA slug, and constrain candidates to
+    // runnable (Claude) models — the only thing `claude --model` can launch.
+    if (this.settingsPath) {
+      let raw = "";
+      try {
+        raw = readFileSync(this.settingsPath, "utf8");
+      } catch {
+        return null;
+      }
+      const modes = readAgenticModes(raw);
+      if (modes.length === 0) return null;
+      const assignments = modes.map((m) => ({ key: m.mode, model: m.aaSlug }));
+      const proposals = proposeBenchmarkReroute(assignments, benchmarks, {
+        ...this.rerouteGate,
+        candidateFilter: isRunnableModel,
+      });
+      // Write a LAUNCHABLE tier (opus/sonnet/haiku), NEVER the AA slug — an AA
+      // catalog slug is not a valid `--model` value and would break the mode.
+      // Skip a same-tier no-op (target tier == current tier).
+      const alternatives = proposals
+        .map((p) => {
+          const launchable = toLaunchableModel(p.to_model);
+          if (!launchable || launchable === toLaunchableModel(p.from_model)) return null;
+          return {
+            id: `reroute-${p.key}-to-${launchable}`,
+            label: `Route '${p.key}' → ${launchable}`,
+            diff_or_content: setAgenticModel(raw, p.key, launchable),
+            tradeoff: p.verdict.reason,
+          };
+        })
+        .filter((a): a is NonNullable<typeof a> => a !== null);
+      if (alternatives.length === 0) return null;
+      return { target_path: this.settingsPath, alternatives };
+    }
+
+    // Legacy standalone agentic.yaml (nested-map format).
+    let content = "";
+    try {
+      content = readFileSync(this.modesConfigPath, "utf8");
+    } catch {
+      return null;
+    }
+    const assignments = parseModelAssignments(content);
+    if (assignments.length === 0) return null;
+    const proposals = proposeBenchmarkReroute(assignments, benchmarks, this.rerouteGate);
+    return buildRerouteEvidencePatch(content, proposals, this.modesConfigPath);
   }
 
   async collectObservations(since: Date): Promise<Observation[]> {
@@ -243,7 +420,8 @@ export class ModelRoutingSubject extends BaseSubject implements RevertibleSubjec
     const alt = proposal.alternatives.find((a) => a.id === alternativeId);
     if (!alt)
       throw new Error(`model-routing-subject.apply: alternative ${alternativeId} not found`);
-    // Confinement: the only file this subject may write is its managed modes config.
+    // Confinement: the only file this subject may write is its managed modes
+    // config — never engine code or anything outside it.
     this.assertManagedTarget(proposal.target_path);
 
     // Never overwrite an existing .bak. On a double-apply (e.g. an operator
@@ -343,7 +521,9 @@ export class ModelRoutingSubject extends BaseSubject implements RevertibleSubjec
    * Returned real-path-resolved (parent dir dereferenced) for a stable compare.
    */
   managedTargets(): string[] {
-    return [realResolvePath(this.modesConfigPath)];
+    const targets = [realResolvePath(this.modesConfigPath)];
+    if (this.settingsPath) targets.push(realResolvePath(this.settingsPath));
+    return targets;
   }
 
   /**
@@ -357,12 +537,13 @@ export class ModelRoutingSubject extends BaseSubject implements RevertibleSubjec
    * REAL paths (parent dir dereferenced via realpath) so a symlinked parent
    * cannot smuggle the write outside the managed config.
    */
+  /** The only writable file: the managed modes config. Anything else → throw. */
   private assertManagedTarget(target: string): void {
     if (isSymlinkPath(target)) {
       throw new Error(`target_path is a symlink — refusing to write through it: ${target}`);
     }
-    if (realResolvePath(target) !== realResolvePath(this.modesConfigPath)) {
-      throw new Error(`target_path is not the managed modes config: ${target}`);
+    if (!this.managedTargets().includes(realResolvePath(target))) {
+      throw new Error(`target_path is not a managed config: ${target}`);
     }
   }
 
