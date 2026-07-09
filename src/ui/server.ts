@@ -289,9 +289,13 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
         // #178: expose the daemon cgroup memory state so external monitors
         // can tell a memory-freeze (cgroup over MemoryHigh — kill the hog,
         // do NOT restart-loop the daemon) apart from a dead daemon. See
-        // docs/deploy-systemd-hardening.md.  stays true: the freeze
+        // docs/deploy-systemd-hardening.md. `ok` stays true: the freeze
         // discriminator must not trip naive ok-based restart loops.
+        // Health is deliberately pre-auth (monitors / load balancers), so
+        // the unauthenticated payload carries ONLY the boolean signal —
+        // byte counts and configured limits require the web token.
         const mem = readMemoryPressure();
+        const authed = checkToken(req, opts.token);
         return json({
           ok: true,
           now: Date.now(),
@@ -299,9 +303,13 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
             ? {
                 memory: {
                   overHigh: mem.overHigh,
-                  currentBytes: mem.currentBytes,
-                  highBytes: mem.highBytes,
-                  highEvents: mem.highEvents,
+                  ...(authed
+                    ? {
+                        currentBytes: mem.currentBytes,
+                        highBytes: mem.highBytes,
+                        highEvents: mem.highEvents,
+                      }
+                    : {}),
                 },
               }
             : {}),
