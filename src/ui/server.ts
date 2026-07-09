@@ -1,4 +1,5 @@
 import { timingSafeEqual, randomUUID } from "crypto";
+import { readMemoryPressure } from "../observability/memory-pressure.js";
 import { tmpdir } from "node:os";
 import { htmlPage } from "./page/html";
 import { clampInt, json } from "./http";
@@ -285,7 +286,26 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
       // Health check is intentionally pre-auth so monitors / load balancers
       // work unauthenticated.
       if (url.pathname === "/api/health") {
-        return json({ ok: true, now: Date.now() });
+        // #178: expose the daemon cgroup memory state so external monitors
+        // can tell a memory-freeze (cgroup over MemoryHigh — kill the hog,
+        // do NOT restart-loop the daemon) apart from a dead daemon. See
+        // docs/deploy-systemd-hardening.md.  stays true: the freeze
+        // discriminator must not trip naive ok-based restart loops.
+        const mem = readMemoryPressure();
+        return json({
+          ok: true,
+          now: Date.now(),
+          ...(mem.supported
+            ? {
+                memory: {
+                  overHigh: mem.overHigh,
+                  currentBytes: mem.currentBytes,
+                  highBytes: mem.highBytes,
+                  highEvents: mem.highEvents,
+                },
+              }
+            : {}),
+        });
       }
 
       // Issue #164 PR B: require the web token for every /api/* route.
