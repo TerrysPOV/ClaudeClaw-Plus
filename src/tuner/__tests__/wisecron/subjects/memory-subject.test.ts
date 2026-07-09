@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemorySubject } from "../../../subjects/memory-subject.js";
@@ -117,6 +117,125 @@ describe("MemorySubject — detectProblems", () => {
     // cluster; only a truly empty observation set yields no proposal.
     const clusters = await s.detectProblems([]);
     expect(clusters).toEqual([]);
+  });
+});
+
+describe("MemorySubject — relocate-then-shorten (shrink apply)", () => {
+  // A >200-char hook so the shrink path actually shortens the line.
+  const LONG_HOOK =
+    "vacances ON depuis le 2 juillet, attend la date de retour pour désarmer ; " +
+    "fix lumières-de-jour appliqué le 8 juillet avec gating crépuscule astral ; " +
+    "bug _original_setpoints chauffage jamais restauré après le mode, à fixer avant l'hiver sinon consigne froide";
+
+  function shrinkProposal(shrunkIndex: string): Proposal {
+    return {
+      id: 2,
+      cluster_id: "memory-index-cleanup",
+      subject: "memory",
+      kind: "patch",
+      target_path: indexPath,
+      pattern_signature: "sig",
+      created_at: new Date(),
+      signature: "sig",
+      alternatives: [{ id: "shrink", label: "lbl", tradeoff: "", diff_or_content: shrunkIndex }],
+    };
+  }
+
+  it("appends trimmed detail to the topic when it is not already there", async () => {
+    seed(`# Memory Index\n\n- [Vac](vac.md) — ${LONG_HOOK}\n`);
+    writeFileSync(join(tmpDir, "vac.md"), "# Vac\n\nDétail existant sans le hook.\n", "utf8");
+    const s = new MemorySubject({ memoryIndex: indexPath });
+    await s.apply(shrinkProposal("# Memory Index\n\n- [Vac](vac.md) — vacances ON…\n"), "shrink");
+
+    const index = readFileSync(indexPath, "utf8");
+    const entry = index.split("\n").find((l) => l.startsWith("- [Vac]")) ?? "";
+    expect(entry.length).toBeLessThanOrEqual(200);
+    const topic = readFileSync(join(tmpDir, "vac.md"), "utf8");
+    expect(topic).toContain("Index overflow (relocated by tuner)");
+    expect(topic).toContain("consigne froide"); // the trimmed tail landed in the topic
+  });
+
+  it("does not append when the detail already exists in the topic (whitespace-normalized)", async () => {
+    seed(`# Memory Index\n\n- [Vac](vac.md) — ${LONG_HOOK}\n`);
+    // Same content, different wrapping/whitespace.
+    writeFileSync(
+      join(tmpDir, "vac.md"),
+      `# Vac\n\n${LONG_HOOK.replace(/ ; /g, " ;\n")}\n`,
+      "utf8",
+    );
+    const s = new MemorySubject({ memoryIndex: indexPath });
+    const before = readFileSync(join(tmpDir, "vac.md"), "utf8");
+    await s.apply(shrinkProposal("# Memory Index\n\n- [Vac](vac.md) — vacances ON…\n"), "shrink");
+
+    expect(readFileSync(join(tmpDir, "vac.md"), "utf8")).toBe(before); // untouched
+    const entry =
+      readFileSync(indexPath, "utf8")
+        .split("\n")
+        .find((l) => l.startsWith("- [Vac]")) ?? "";
+    expect(entry.length).toBeLessThanOrEqual(200);
+  });
+
+  it("keeps the line LONG when the topic file is missing (no place to relocate)", async () => {
+    seed(`# Memory Index\n\n- [Ghost](ghost.md) — ${LONG_HOOK}\n`);
+    const s = new MemorySubject({ memoryIndex: indexPath });
+    await s.apply(
+      shrinkProposal("# Memory Index\n\n- [Ghost](ghost.md) — vacances ON…\n"),
+      "shrink",
+    );
+
+    const entry =
+      readFileSync(indexPath, "utf8")
+        .split("\n")
+        .find((l) => l.startsWith("- [Ghost]")) ?? "";
+    expect(entry).toContain("consigne froide"); // full hook preserved in the index
+    expect(existsSync(join(tmpDir, "ghost.md"))).toBe(false); // nothing created
+  });
+
+  it("refuses to relocate outside the memory dir (traversal pointer) — keeps the line long", async () => {
+    const outside = join(tmpDir, "..", `outside-${Date.now()}.md`);
+    writeFileSync(outside, "# outside\n", "utf8");
+    const rel = `../${outside.split("/").pop()}`;
+    seed(`# Memory Index\n\n- [Evil](${rel}) — ${LONG_HOOK}\n`);
+    const s = new MemorySubject({ memoryIndex: indexPath });
+    await s.apply(shrinkProposal(`# Memory Index\n\n- [Evil](${rel}) — vacances ON…\n`), "shrink");
+
+    const entry =
+      readFileSync(indexPath, "utf8")
+        .split("\n")
+        .find((l) => l.startsWith("- [Evil]")) ?? "";
+    expect(entry).toContain("consigne froide"); // kept long
+    expect(readFileSync(outside, "utf8")).toBe("# outside\n"); // never written
+    rmSync(outside, { force: true });
+  });
+
+  it("refuses a symlinked topic (append would leak outside) — keeps the line long", async () => {
+    const outside = join(tmpDir, "..", `slink-target-${Date.now()}.md`);
+    writeFileSync(outside, "# real target\n", "utf8");
+    symlinkSync(outside, join(tmpDir, "vac.md"));
+    seed(`# Memory Index\n\n- [Vac](vac.md) — ${LONG_HOOK}\n`);
+    const s = new MemorySubject({ memoryIndex: indexPath });
+    await s.apply(shrinkProposal("# Memory Index\n\n- [Vac](vac.md) — vacances ON…\n"), "shrink");
+
+    const entry =
+      readFileSync(indexPath, "utf8")
+        .split("\n")
+        .find((l) => l.startsWith("- [Vac]")) ?? "";
+    expect(entry).toContain("consigne froide"); // kept long
+    expect(readFileSync(outside, "utf8")).toBe("# real target\n"); // link target untouched
+    rmSync(outside, { force: true });
+  });
+
+  it("topic appends are additive: existing topic content is preserved", async () => {
+    seed(`# Memory Index\n\n- [Vac](vac.md) — ${LONG_HOOK}\n`);
+    writeFileSync(join(tmpDir, "vac.md"), "# Vac\n\nContenu original important.\n", "utf8");
+    const s = new MemorySubject({ memoryIndex: indexPath });
+    await s.apply(shrinkProposal("# Memory Index\n\n- [Vac](vac.md) — vacances ON…\n"), "shrink");
+
+    const topic = readFileSync(join(tmpDir, "vac.md"), "utf8");
+    expect(topic).toContain("Contenu original important.");
+    expect(topic.indexOf("Contenu original important.")).toBeLessThan(
+      topic.indexOf("Index overflow"),
+    );
   });
 });
 
