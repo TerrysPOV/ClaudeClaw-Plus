@@ -128,6 +128,25 @@ PreToolUse refusals.)*
     the UI. This is the operator's first stop for "X ne marche pas" — see
     which server stopped answering before touching anything.
 
+    **Interaction model (filter → drill → investigate):**
+    - *Filters* (composable, URL-addressable so a view can be shared/bookmarked):
+      server, tool, agent, status (ok/error), time window, free-text search
+      over error messages.
+    - *Click a call row* → detail sheet: the full audit record (ts, server,
+      tool, agent, duration, status, full error text), its hash-chain
+      position with a verify-chain ✓/✗ badge, and a "context strip" of the
+      N surrounding calls from the same agent — the seconds before and after
+      a failure usually tell the story.
+    - *Click a server* → server page: volume/error/latency time series,
+      per-tool table, proxy/multiplexer registration state, current health.
+    - *"Investigate" button* (on a call or a server) → reuses #288 §6's
+      discuss path: injects the selected record + surrounding context +
+      server stats into the agent's session, which runs the diagnosis and
+      answers in the chat page. The operator never copy-pastes logs.
+    - Honest limit: call args are never captured, so investigation works on
+      metadata + correlated events (watchdog, bus turns, audit) around the
+      same timestamps — not on payload content.
+
 13. 💬 **Discussion / Chat** — converse with the agent from the app: inject →
     agent session (the "discuss" pattern that keeps context), streamed
     replies. A **"Discuss" button** on a proposal routes to the agent WITH the
