@@ -119,6 +119,15 @@ PreToolUse refusals.)*
     cadence, reroute `qualityMetric`/tolerance, benchmark API key presence,
     gate auto-merge defaults. Writes to settings + `subject_state`
     (role-gated).
+13.5 🔌 **MCP traffic** — live + historical view of every MCP tool call
+    crossing the gateway, from the hash-chained `mcp.tool_call` audit stream
+    (#286): per-server (plugin) call volume, error rate, p50/p95 latency;
+    per-tool breakdown; last-N calls table (ts, agent, tool, status,
+    duration, error message); "server silent since X" staleness badges.
+    Args are never captured by design, so nothing sensitive can leak into
+    the UI. This is the operator's first stop for "X ne marche pas" — see
+    which server stopped answering before touching anything.
+
 13. 💬 **Discussion / Chat** — converse with the agent from the app: inject →
     agent session (the "discuss" pattern that keeps context), streamed
     replies. A **"Discuss" button** on a proposal routes to the agent WITH the
@@ -158,6 +167,8 @@ Beyond components, the reference dashboard has entire features that map 1:1:
 - `GET /tuner/watchdog/sessions` · `/forensics/:id` ← #297/#300/#298.
 - `GET /tuner/jobs` · `POST /tuner/jobs/:id/cancel` ← `dispatch_job` #303.
 - `GET /tuner/eval/sets` · `/runs` · `GET /tuner/eval/recommend/:task` ← #80.
+- `GET /tuner/mcp/traffic?server=&since=` ← `mcp.tool_call` stream: volumes,
+  error rates, latency percentiles, last-N calls per server/tool.
 - `GET /tuner/feed` (unified chronology) ← audit + outcomes + scouts +
   watchdog events.
 - **WS `tuner.events`** ← live (proposal / apply / revert / kill / job).
@@ -182,7 +193,8 @@ Beyond components, the reference dashboard has entire features that map 1:1:
 ## 5. PHASING (slots onto what is live)
 
 - **Phase 1 — read-only** (low risk): Dashboard summary + Observability (3) +
-  Outcomes (2) + Audit (6) + unified Feed. Every source already exists
+  Outcomes (2) + Audit (6) + unified Feed + MCP traffic (13.5 — read-only, high
+  operator value). Every source already exists
   (`telemetry__*`, engine DB, audit log). = Phase 1 of #285.
 - **Phase 2 — gate**: gate queue (1) approve/refuse + diff preview (already
   wired to a messenger — the app becomes the 2nd canonical surface).
