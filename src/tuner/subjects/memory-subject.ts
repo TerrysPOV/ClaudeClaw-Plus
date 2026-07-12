@@ -6,9 +6,10 @@ import {
   renameSync,
   statSync,
   lstatSync,
+  appendFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, resolve } from "node:path";
+import { basename, dirname, resolve, sep } from "node:path";
 import { BaseSubject } from "../../skills-tuner/subjects/base.js";
 import { sanitizeObservationContent } from "../../skills-tuner/core/security.js";
 import type { LLMClient } from "../../skills-tuner/core/llm.js";
@@ -118,6 +119,90 @@ function shortenIndexLine(line: string): string {
   if (budget <= 0) return `${line.slice(0, MAX_INDEX_LINE_CHARS - 1)}…`;
   const hook = (m[2] as string).slice(0, budget).replace(/\s+\S*$/, "");
   return `${head}${hook}…`;
+}
+
+const normalizeWs = (s: string): string => s.replace(/\s+/g, " ").trim();
+
+interface RelocationResult {
+  content: string;
+  /** absolute topic path → overflow blocks to append (additive-only). */
+  appends: Map<string, string[]>;
+  relocated: number;
+  keptLong: number;
+}
+
+/**
+ * Relocate-then-shorten: make the shrink label ("detail stays in topics") true
+ * BY CONSTRUCTION instead of by hope. For every index line the reconciled
+ * content shortens, verify the trimmed detail actually exists in the entry's
+ * topic file; when it does not, queue an additive append of the full original
+ * hook to the topic — only then is the shortened line accepted. An entry whose
+ * topic is missing, or whose pointer escapes the memory dir (traversal), has
+ * nowhere safe to hold the detail: its line is KEPT LONG (no information loss,
+ * ever) and left for dedup-dead / a human.
+ *
+ * Pairing is positional: reconcileToLive maps live lines 1:1 in order, so
+ * old/new lines at the same offset describe the same entry.
+ */
+function relocateOverflow(
+  oldContent: string,
+  newContent: string,
+  memDir: string,
+): RelocationResult {
+  const oldLines = oldContent.split("\n");
+  const newLines = newContent.split("\n");
+  const appends = new Map<string, string[]>();
+  let relocated = 0;
+  let keptLong = 0;
+  const resolvedDir = resolve(memDir);
+
+  const out = newLines.map((nl, i) => {
+    const ol = oldLines[i];
+    if (ol === undefined || ol === nl || !ol.startsWith("- [")) return nl;
+    if (nl.length >= ol.length) return nl; // not a shortening
+    const m = ol.match(ENTRY_RE);
+    if (!m) return nl;
+    const oldHook = (m[3] ?? "").trim();
+    if (oldHook.length === 0) return nl;
+
+    const topicPath = resolve(resolvedDir, m[2] as string);
+    // Confinement (traversal), existence, and M3-style symlink refusal:
+    // appendFileSync follows links, so a symlinked topic could leak the
+    // append outside the memory dir.
+    if (
+      !topicPath.startsWith(resolvedDir + sep) ||
+      !existsSync(topicPath) ||
+      lstatSync(topicPath).isSymbolicLink() ||
+      !lstatSync(topicPath).isFile()
+    ) {
+      keptLong++;
+      return ol;
+    }
+
+    const newHook = (nl.match(ENTRY_RE)?.[3] ?? "").replace(/…\s*$/u, "").trim();
+    // Non-prefix shortening (LLM paraphrase) → on relocalise le hook ENTIER :
+    // plus verbeux que strictement nécessaire, mais le seul choix qui garantit
+    // zéro perte sans diff sémantique. Tradeoff assumé (review #311 finding 3).
+    const lost = oldHook.startsWith(newHook) ? oldHook.slice(newHook.length).trim() : oldHook;
+    if (lost.length === 0) return nl;
+
+    // "Already there" doit couvrir le fichier ET les blocs déjà en file pour
+    // ce topic dans CETTE passe : deux lignes d'index pointant le même topic
+    // (slug dupliqué) ne doivent pas déposer deux fois le même overflow.
+    const queued = (appends.get(topicPath) ?? []).join(" ");
+    const topic = readFileSync(topicPath, "utf8");
+    if (normalizeWs(`${topic} ${queued}`).includes(normalizeWs(lost))) return nl;
+
+    const blocks = appends.get(topicPath) ?? [];
+    // Full original hook (not just the tail) so the relocated note reads
+    // standalone in the topic file.
+    blocks.push(`\n**Index overflow (relocated by tuner):** ${oldHook}\n`);
+    appends.set(topicPath, blocks);
+    relocated++;
+    return nl;
+  });
+
+  return { content: out.join("\n"), appends, relocated, keptLong };
 }
 // `- [Title](file.md) — hook` shape — em-dash or ASCII hyphen separator.
 const ENTRY_RE = /^- \[([^\]]+)\]\(([^)]+\.md)\)(?:\s+[—-]\s+(.+))?$/;
@@ -364,10 +449,12 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
       alternatives: [
         {
           id: "shrink",
-          label: "Shrink: rewrite over-long entries to one line (detail stays in topics)",
+          label:
+            "Shrink: rewrite over-long entries to one line (relocates trimmed detail into topics)",
           diff_or_content: shrunk,
           tradeoff:
-            "Cuts per-session context cost + long-line count toward 0; keeps every entry + link.",
+            "Cuts per-session context cost + long-line count toward 0; keeps every entry + link; " +
+            "detail trimmed from a line is appended to its topic file when not already there.",
         },
         {
           id: "dedup-dead",
@@ -408,6 +495,7 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
     // An UNKNOWN id -> an external/research proposal carrying the full new index in
     // diff_or_content. validate() gates the result either way.
     let newContent: string;
+    let relocationAppends: Map<string, string[]> | null = null;
     if (isKnownStrategy(alternativeId)) {
       newContent = applyStrategy(current, this.memoryIndex, alternativeId);
     } else {
@@ -432,6 +520,12 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
       // always succeeds on the current state and NEVER drops a live pointer.
       newContent = reconcileToLive(explicit, current);
       const memDir = dirname(this.memoryIndex);
+      // Relocate-then-shorten: trimmed detail must EXIST in the topic file
+      // before the shortened line is accepted; otherwise it is appended there
+      // (additive-only), or the line is kept long. See relocateOverflow.
+      const relocation = relocateOverflow(current, newContent, memDir);
+      newContent = relocation.content;
+      relocationAppends = relocation.appends;
       const liveBefore = [...current.matchAll(/\]\(([^)]+\.md)\)/g)]
         .map((m) => m[1] as string)
         .filter((file) => existsSync(resolve(memDir, file)));
@@ -455,6 +549,14 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
     }
     if (existsSync(this.memoryIndex)) {
       copyFileSync(this.memoryIndex, `${this.memoryIndex}.bak`);
+    }
+    // Topic appends FIRST, index write second: the appends are additive-only,
+    // so a failure between the two duplicates information (index still long)
+    // instead of losing it (index shortened, detail nowhere).
+    if (relocationAppends) {
+      for (const [topicPath, blocks] of relocationAppends) {
+        appendFileSync(topicPath, blocks.join(""), "utf8");
+      }
     }
     // Atomic: write a temp then rename so a mid-write failure can't truncate the index.
     const tmpPath = `${this.memoryIndex}.tmp`;
