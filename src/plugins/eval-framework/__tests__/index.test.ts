@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach, mock } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { dump as yamlStringify } from "js-yaml";
 
@@ -124,6 +124,66 @@ describe("lifecycle", () => {
 });
 
 // ── Path traversal guard (task_id/set_id → filesystem paths) ──────────────────
+
+describe("validate_eval_set path containment (review ask)", () => {
+  afterEach(() => {
+    _resetEvalFramework();
+  });
+
+  it("refuses an absolute path outside evals_root", async () => {
+    registeredTools.clear();
+    const { plugin } = makePlugin();
+    await plugin.start();
+    const handler = registeredTools.get("validate_eval_set")?.handler;
+    const result = await handler({ set_path: "/etc/passwd" });
+    expect(result.valid).toBe(false);
+    expect(result.errors[0]).toMatch(/escapes evals_root|set not found/);
+    await plugin.stop();
+  });
+
+  it("refuses ../ traversal out of evals_root", async () => {
+    registeredTools.clear();
+    const { plugin, evalsRoot } = makePlugin();
+    const outside = join(evalsRoot, "..", `secret-${randomUUID()}.yaml`);
+    writeFileSync(outside, "task_id: x\nset_id: default\nexamples: []\n", "utf8");
+    await plugin.start();
+    const handler = registeredTools.get("validate_eval_set")?.handler;
+    const result = await handler({ set_path: `../${outside.split("/").pop()}` });
+    expect(result.valid).toBe(false);
+    expect(result.errors[0]).toMatch(/escapes evals_root/);
+    rmSync(outside, { force: true });
+    await plugin.stop();
+  });
+
+  it("refuses a symlink under evals_root that points outside", async () => {
+    registeredTools.clear();
+    const { plugin, evalsRoot } = makePlugin();
+    const outside = join(evalsRoot, "..", `slink-${randomUUID()}.yaml`);
+    writeFileSync(outside, "task_id: x\nset_id: default\nexamples: []\n", "utf8");
+    symlinkSync(outside, join(evalsRoot, "evil.yaml"));
+    await plugin.start();
+    const handler = registeredTools.get("validate_eval_set")?.handler;
+    const result = await handler({ set_path: "evil.yaml" });
+    expect(result.valid).toBe(false);
+    expect(result.errors[0]).toMatch(/escapes evals_root/);
+    rmSync(outside, { force: true });
+    await plugin.stop();
+  });
+
+  it("still validates a legit set under evals_root (relative path)", async () => {
+    registeredTools.clear();
+    const { plugin, evalsRoot } = makePlugin();
+    writeEvalSet(evalsRoot, "task-ok", "basic", [
+      { input: "hello", expected_output: "world", judge_mode: "exact_set" },
+    ]);
+    await plugin.start();
+    const handler = registeredTools.get("validate_eval_set")?.handler;
+    const result = await handler({ set_path: "task-ok/basic.yaml" });
+    expect(result.valid).toBe(true);
+    expect(result.n_examples).toBe(1);
+    await plugin.stop();
+  });
+});
 
 describe("path traversal guard", () => {
   afterEach(() => {

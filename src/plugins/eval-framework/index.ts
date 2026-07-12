@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, realpathSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
 import { load as parseYaml } from "js-yaml";
@@ -254,7 +254,27 @@ export class EvalFrameworkPlugin {
         schema: ValidateEvalSetArgsSchema,
         handler: async (args: unknown) => {
           const parsed = ValidateEvalSetArgsSchema.parse(args);
-          const resolvedPath = resolvePath(parsed.set_path);
+          // Same class of guard as _loadEvalSet, but realpath-based: this tool
+          // reads an ARBITRARY caller-supplied path, and it's agent-invocable —
+          // a prompt-injected `/etc/passwd` or `../../…` (or a symlink planted
+          // under evals_root) must never be readable through it. realpathSync
+          // resolves symlinks BEFORE the containment check, so a link escaping
+          // the root fails startsWith even though its literal path is inside.
+          const evalsRoot = realpathSync(resolvePath(this.settings.evals_root));
+          let resolvedPath: string;
+          try {
+            resolvedPath = realpathSync(resolve(evalsRoot, resolvePath(parsed.set_path)));
+          } catch {
+            return { valid: false, n_examples: 0, judge_modes_used: [], errors: ["set not found"] };
+          }
+          if (!resolvedPath.startsWith(evalsRoot + sep)) {
+            return {
+              valid: false,
+              n_examples: 0,
+              judge_modes_used: [],
+              errors: [`set_path escapes evals_root (${this.settings.evals_root}) — refused`],
+            };
+          }
           try {
             const content = readFileSync(resolvedPath, "utf-8");
             const raw = parseYaml(content);

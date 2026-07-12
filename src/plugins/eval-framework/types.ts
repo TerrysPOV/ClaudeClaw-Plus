@@ -105,6 +105,8 @@ export const GetRunReportArgsSchema = z.object({
 });
 
 export const ValidateEvalSetArgsSchema = z.object({
+  // Relative to evals_root (absolute allowed only if it stays under it) —
+  // the handler realpath-contains the result under evals_root before reading.
   set_path: z.string(),
 });
 
