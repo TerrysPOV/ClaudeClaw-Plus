@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemorySubject } from "../../../subjects/memory-subject.js";
@@ -223,6 +223,36 @@ describe("MemorySubject — relocate-then-shorten (shrink apply)", () => {
     expect(entry).toContain("consigne froide"); // kept long
     expect(readFileSync(outside, "utf8")).toBe("# real target\n"); // link target untouched
     rmSync(outside, { force: true });
+  });
+
+  it("two long lines sharing one topic append the overflow only once (review #1)", async () => {
+    seed(`# Memory Index\n\n- [Vac](vac.md) — ${LONG_HOOK}\n- [Vac bis](vac.md) — ${LONG_HOOK}\n`);
+    writeFileSync(join(tmpDir, "vac.md"), "# Vac\n", "utf8");
+    const s = new MemorySubject({ memoryIndex: indexPath });
+    await s.apply(
+      shrinkProposal(
+        "# Memory Index\n\n- [Vac](vac.md) — vacances ON…\n- [Vac bis](vac.md) — vacances ON…\n",
+      ),
+      "shrink",
+    );
+    const topic = readFileSync(join(tmpDir, "vac.md"), "utf8");
+    const occurrences = topic.split("Index overflow (relocated by tuner)").length - 1;
+    expect(occurrences).toBe(1);
+  });
+
+  it("keeps the line long when the topic pointer is a DIRECTORY (review #2)", async () => {
+    mkdirSync(join(tmpDir, "weird.md"), { recursive: true });
+    seed(`# Memory Index\n\n- [Weird](weird.md) — ${LONG_HOOK}\n`);
+    const s = new MemorySubject({ memoryIndex: indexPath });
+    await s.apply(
+      shrinkProposal("# Memory Index\n\n- [Weird](weird.md) — vacances ON…\n"),
+      "shrink",
+    );
+    const entry =
+      readFileSync(indexPath, "utf8")
+        .split("\n")
+        .find((l) => l.startsWith("- [Weird]")) ?? "";
+    expect(entry).toContain("consigne froide"); // pas de crash EISDIR, ligne gardée longue
   });
 
   it("topic appends are additive: existing topic content is preserved", async () => {

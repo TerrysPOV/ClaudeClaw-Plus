@@ -172,18 +172,26 @@ function relocateOverflow(
     if (
       !topicPath.startsWith(resolvedDir + sep) ||
       !existsSync(topicPath) ||
-      lstatSync(topicPath).isSymbolicLink()
+      lstatSync(topicPath).isSymbolicLink() ||
+      !lstatSync(topicPath).isFile()
     ) {
       keptLong++;
       return ol;
     }
 
     const newHook = (nl.match(ENTRY_RE)?.[3] ?? "").replace(/…\s*$/u, "").trim();
+    // Non-prefix shortening (LLM paraphrase) → on relocalise le hook ENTIER :
+    // plus verbeux que strictement nécessaire, mais le seul choix qui garantit
+    // zéro perte sans diff sémantique. Tradeoff assumé (review #311 finding 3).
     const lost = oldHook.startsWith(newHook) ? oldHook.slice(newHook.length).trim() : oldHook;
     if (lost.length === 0) return nl;
 
+    // "Already there" doit couvrir le fichier ET les blocs déjà en file pour
+    // ce topic dans CETTE passe : deux lignes d'index pointant le même topic
+    // (slug dupliqué) ne doivent pas déposer deux fois le même overflow.
+    const queued = (appends.get(topicPath) ?? []).join(" ");
     const topic = readFileSync(topicPath, "utf8");
-    if (normalizeWs(topic).includes(normalizeWs(lost))) return nl; // already there
+    if (normalizeWs(`${topic} ${queued}`).includes(normalizeWs(lost))) return nl;
 
     const blocks = appends.get(topicPath) ?? [];
     // Full original hook (not just the tail) so the relocated note reads
