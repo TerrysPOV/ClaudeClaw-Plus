@@ -79,7 +79,7 @@ prompt_template / agent) + registry refresh (drift `⚠ DRIFT` / `✚ NEW`) feed
 
 ---
 
-## 2. PANELS (the 7 from #285 + 4 new from recent PRs + 2 new asks)
+## 2. PANELS (the 7 from #285 + 4 new from recent PRs + 3 new asks)
 
 **From #285 (kept):**
 
@@ -119,7 +119,7 @@ PreToolUse refusals.)*
     cadence, reroute `qualityMetric`/tolerance, benchmark API key presence,
     gate auto-merge defaults. Writes to settings + `subject_state`
     (role-gated).
-13.5 🔌 **MCP traffic** — live + historical view of every MCP tool call
+13. 🔌 **MCP traffic** — live + historical view of every MCP tool call
     crossing the gateway, from the hash-chained `mcp.tool_call` audit stream
     (#286): per-server (plugin) call volume, error rate, p50/p95 latency;
     per-tool breakdown; last-N calls table (ts, agent, tool, status,
@@ -147,7 +147,7 @@ PreToolUse refusals.)*
       metadata + correlated events (watchdog, bus turns, audit) around the
       same timestamps — not on payload content.
 
-13. 💬 **Discussion / Chat** — converse with the agent from the app: inject →
+14. 💬 **Discussion / Chat** — converse with the agent from the app: inject →
     agent session (the "discuss" pattern that keeps context), streamed
     replies. A **"Discuss" button** on a proposal routes to the agent WITH the
     diff/context — this is exactly #288 §6's discuss path, extended into a
@@ -186,8 +186,10 @@ Beyond components, the reference dashboard has entire features that map 1:1:
 - `GET /tuner/watchdog/sessions` · `/forensics/:id` ← #297/#300/#298.
 - `GET /tuner/jobs` · `POST /tuner/jobs/:id/cancel` ← `dispatch_job` #303.
 - `GET /tuner/eval/sets` · `/runs` · `GET /tuner/eval/recommend/:task` ← #80.
-- `GET /tuner/mcp/traffic?server=&since=` ← `mcp.tool_call` stream: volumes,
-  error rates, latency percentiles, last-N calls per server/tool.
+- `GET /tuner/mcp/traffic?server=&tool=&agent=&status=&since=&q=` ←
+  `mcp.tool_call` stream: volumes, error rates, latency percentiles, last-N
+  calls; filters match the panel's interaction model (q = free-text over
+  error messages).
 - `GET /tuner/feed` (unified chronology) ← audit + outcomes + scouts +
   watchdog events.
 - **WS `tuner.events`** ← live (proposal / apply / revert / kill / job).
@@ -212,7 +214,7 @@ Beyond components, the reference dashboard has entire features that map 1:1:
 ## 5. PHASING (slots onto what is live)
 
 - **Phase 1 — read-only** (low risk): Dashboard summary + Observability (3) +
-  Outcomes (2) + Audit (6) + unified Feed + MCP traffic (13.5 — read-only, high
+  Outcomes (2) + Audit (6) + unified Feed + MCP traffic (13 — read-only, high
   operator value). Every source already exists
   (`telemetry__*`, engine DB, audit log). = Phase 1 of #285.
 - **Phase 2 — gate**: gate queue (1) approve/refuse + diff preview (already
