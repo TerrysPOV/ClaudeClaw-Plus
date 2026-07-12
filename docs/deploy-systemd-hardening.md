@@ -87,6 +87,15 @@ systemctl show <unit> -p MemoryHigh -p MemoryMax -p MemorySwapMax -p TasksMax
 The daemon exposes its own cgroup state on `/api/health` (pre-auth, so
 monitors can read it):
 
+Unauthenticated (the pre-auth surface carries only the boolean signal):
+
+```json
+{ "ok": true, "now": 1751980000000, "memory": { "overHigh": false } }
+```
+
+With the web token (`Authorization: Bearer <token>` or `?token=`), the
+diagnostic detail appears:
+
 ```json
 { "ok": true, "now": 1751980000000,
   "memory": { "overHigh": false, "currentBytes": 474525696,

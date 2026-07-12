@@ -33,6 +33,9 @@ export interface MemoryPressure {
   /** null = "max" (no soft limit configured — no freeze zone possible). */
   highBytes: number | null;
   maxBytes: number | null;
+  // Swap fields are read for module consumers (the operator-side watchdog
+  // uses them directly) and deliberately NOT surfaced through /api/health —
+  // the HTTP surface carries only what an external monitor needs to act.
   swapCurrentBytes: number | null;
   swapMaxBytes: number | null;
   /** memory.events "high" counter: how many times the high boundary was crossed. */
