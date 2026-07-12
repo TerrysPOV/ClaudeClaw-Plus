@@ -54,6 +54,31 @@ describe("/api/* web token enforcement (issue #164 PR B)", () => {
     expect(res.headers.get("content-type") ?? "").toContain("text/html");
   });
 
+  it("health memory block (#178): boolean-only pre-auth, detail with token", async () => {
+    // The cgroup probe is Linux/cgroup-v2 only; on other hosts the memory
+    // block is absent entirely and both assertions reduce to that.
+    const anon = await (
+      await fetch(`${base}/api/health`, { headers: { Host: `127.0.0.1:${handle.port}` } })
+    ).json();
+    const authed = await (
+      await fetch(`${base}/api/health`, {
+        headers: { Host: `127.0.0.1:${handle.port}`, Authorization: `Bearer ${TOKEN}` },
+      })
+    ).json();
+
+    if (anon.memory === undefined) {
+      expect(authed.memory).toBeUndefined(); // unsupported host: nothing leaks anywhere
+      return;
+    }
+    // Unauthenticated: ONLY the boolean signal — no byte counts, no limits.
+    expect(Object.keys(anon.memory).sort()).toEqual(["overHigh"]);
+    expect(typeof anon.memory.overHigh).toBe("boolean");
+    // Authenticated: the diagnostic detail appears.
+    expect(Object.keys(authed.memory)).toContain("currentBytes");
+    expect(Object.keys(authed.memory)).toContain("highBytes");
+    expect(Object.keys(authed.memory)).toContain("highEvents");
+  });
+
   it("allows /api/health pre-auth", async () => {
     const res = await fetch(`${base}/api/health`, {
       headers: { Host: `127.0.0.1:${handle.port}` },
