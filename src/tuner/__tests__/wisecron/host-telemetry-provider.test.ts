@@ -741,3 +741,64 @@ describe("SessionJsonlTelemetryProducer", () => {
     expect(mem.every((s) => s.labels!.file.includes("mémoire"))).toBe(true);
   });
 });
+
+describe("buildHostTelemetryProvider — extraProducers (operator extension point)", () => {
+  // A minimal operator-supplied producer advertising its OWN (custom-namespaced)
+  // stream — the third-party instrumentation path this PR unlocks.
+  class CustomDemoProducer implements TelemetryProvider {
+    contractVersion(): string {
+      return "1.0.0";
+    }
+    capabilities() {
+      return [
+        { stream: "custom.demo" as TelemetryStream, schemaVersion: "1.0.0", available: true },
+      ];
+    }
+    async query(stream: TelemetryStream, _range: DateRange): Promise<MetricSample[]> {
+      if (stream !== "custom.demo") return [];
+      return [{ ts: new Date(NOW_MS), value: 42, labels: { source: "demo" } }];
+    }
+  }
+
+  it("composes an operator producer advertising a CUSTOM stream", async () => {
+    const provider = buildHostTelemetryProvider({ extraProducers: [new CustomDemoProducer()] });
+    const demo = provider.capabilities().find((c) => c.stream === "custom.demo");
+    expect(demo?.available).toBe(true);
+    const samples = await provider.query("custom.demo" as TelemetryStream, RANGE);
+    expect(samples).toHaveLength(1);
+    expect(samples[0]?.value).toBe(42);
+  });
+
+  it("still advertises every built-in stream (no regression)", () => {
+    const provider = buildHostTelemetryProvider({ extraProducers: [new CustomDemoProducer()] });
+    const streams = new Set(provider.capabilities().map((c) => c.stream));
+    for (const s of TELEMETRY_STREAMS) expect(streams.has(s)).toBe(true);
+  });
+
+  it("an available operator producer upgrades a built-in stream that shipped unavailable", async () => {
+    class UpgradeProducer implements TelemetryProvider {
+      contractVersion(): string {
+        return "1.0.0";
+      }
+      capabilities() {
+        return [
+          { stream: "memory_signal" as TelemetryStream, schemaVersion: "1.0.0", available: true },
+        ];
+      }
+      async query(): Promise<MetricSample[]> {
+        return [];
+      }
+    }
+    // Without `memorySignalHistoryPath` the built-in memory_signal ships unavailable;
+    // the operator producer (composed last) upgrades it via the available-wins merge.
+    const provider = buildHostTelemetryProvider({ extraProducers: [new UpgradeProducer()] });
+    const cap = provider.capabilities().find((c) => c.stream === "memory_signal");
+    expect(cap?.available).toBe(true);
+  });
+
+  it("omitting extraProducers is a no-op (back-compat)", () => {
+    const before = buildHostTelemetryProvider({}).capabilities().length;
+    const after = buildHostTelemetryProvider({ extraProducers: [] }).capabilities().length;
+    expect(after).toBe(before);
+  });
+});

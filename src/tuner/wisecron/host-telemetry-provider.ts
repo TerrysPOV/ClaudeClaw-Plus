@@ -1042,6 +1042,15 @@ export interface HostTelemetryConfig {
    * specialized page and falls back to the universal page like any plugin.
    */
   tunerView?: TunerViewSources;
+  /**
+   * Operator-supplied producers composed alongside the built-ins — the
+   * extension point for a host to add its own telemetry source (or a custom
+   * stream) without editing this function. Each is merged into the composite
+   * exactly like a built-in: its `capabilities()` win the per-stream merge
+   * when available, and its `query()` results are concatenated. Custom streams
+   * SHOULD be namespaced (`custom.<name>`).
+   */
+  extraProducers?: TelemetryProvider[];
 }
 
 /**
@@ -1094,5 +1103,8 @@ export function buildHostTelemetryProvider(
   if (cfg.tunerView) {
     providers.push(new TunerViewProvider(cfg.tunerView));
   }
+  // Operator-supplied producers last, so an explicit host source can upgrade
+  // a built-in stream that shipped unavailable (the merge is available-wins).
+  if (cfg.extraProducers?.length) providers.push(...cfg.extraProducers);
   return new CompositeTelemetryProvider(providers);
 }
