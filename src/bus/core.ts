@@ -242,6 +242,8 @@ export interface BusCore {
   /** True if the agent has a turn currently streaming (#222 reconciler reads
    *  this to skip restarting a deaf-but-mid-turn agent). */
   isAgentTurnActive(agentId: string): boolean;
+  /** #315: ids of all agents with an in-flight turn (aggregate of {@link isAgentTurnActive}). */
+  activeTurnAgents(): string[];
   ingestReply(req: IngestReplyRequest): void;
   ingestSessionEvent(e: BusEvent): void;
   ingestPermissionDecision(req: IngestPermissionDecisionRequest): void;
@@ -974,6 +976,14 @@ export class BusCoreImpl implements BusCore {
    *  the tailer, not the dead MCP socket. */
   isAgentTurnActive(agentId: string): boolean {
     return this.agentTurnActive.has(agentId);
+  }
+
+  /** #315: the ids of every agent with a turn currently in flight (prompt seen,
+   *  no `response.turn_end` yet). Exposed so an external restart/deploy guard can
+   *  drain-then-restart instead of killing a turn mid-flight. Aggregate sibling of
+   *  {@link isAgentTurnActive}. */
+  activeTurnAgents(): string[] {
+    return [...this.agentTurnActive];
   }
 
   /* ─────────────────────────────── subscriptions ─────────────────────────────── */

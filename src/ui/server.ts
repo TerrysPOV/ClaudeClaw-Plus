@@ -296,9 +296,22 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
         // byte counts and configured limits require the web token.
         const mem = readMemoryPressure();
         const authed = checkToken(req, opts.token);
+        // #315: pre-auth busy signal so an external restart guard can
+        // drain-then-restart instead of killing an in-flight turn. Follows the
+        // #178 rule: the unauthenticated payload carries ONLY the boolean; the
+        // agent count requires the web token. `ok` stays true — a busy agent is
+        // not unhealthy (busy is orthogonal to health, per IETF health+json /
+        // k8s readiness guidance). Absent bus (legacy mode) → field omitted.
+        const activeTurns = opts.bus?.activeTurnAgents();
         return json({
           ok: true,
           now: Date.now(),
+          ...(activeTurns
+            ? {
+                busy: activeTurns.length > 0,
+                ...(authed ? { activeTurns: activeTurns.length } : {}),
+              }
+            : {}),
           ...(mem.supported
             ? {
                 memory: {
