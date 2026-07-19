@@ -71,7 +71,10 @@ describe("pty-output-parser — sentinel flow (synthetic)", () => {
     // one of claude's spinner glyphs. Markers (`●`/`⏺`) are
     // deliberately NOT in the gate (Codex P1 on PR #124) because they
     // appear in the TUI status box + scrollback redraws.
-    feed(parser, new TextEncoder().encode("✻ a"), now);
+    // The response must also leave claude back at the idle REPL prompt — its
+    // footer's "to cycle" hint is what tells the parser the turn is genuinely
+    // done (issue #316); without it, quiet is correctly withheld.
+    feed(parser, new TextEncoder().encode("✻ a\nshift+tab to cycle"), now);
     expect(parser.sawByteSinceTurnStart).toBe(true);
 
     // Within the quiet window after that byte → still no quiet.
@@ -101,10 +104,11 @@ describe("pty-output-parser — sentinel flow (synthetic)", () => {
     expect(startEv).toEqual({ type: "turn-start", offset: parser.totalBytes });
     expect(parser.state).toBe("accumulating");
 
-    // Response trickles in — include `✻` (spinner) so the
-    // activity-indicator gate is satisfied alongside the byte-seen gate.
+    // Response trickles in — include `✻` (spinner) so the activity-indicator
+    // gate is satisfied, and the idle REPL footer ("to cycle") so the
+    // turn-done gate (issue #316) is satisfied alongside the byte-seen gate.
     now += 10;
-    expect(feed(parser, enc.encode("✻ ack"), now)).toEqual([]);
+    expect(feed(parser, enc.encode("✻ ack\nshift+tab to cycle"), now)).toEqual([]);
     expect(parser.state).toBe("accumulating");
 
     // tick fires before the quiet window elapses → no event.
@@ -142,9 +146,10 @@ describe("pty-output-parser — sentinel flow (synthetic)", () => {
 
     let now = 1000;
     startTurn(parser, uuid, sentinelBytes, now);
-    // Include `✻` so the activity-indicator gate is satisfied — the
-    // debounce test isn't about gating, but quiet can't fire without it.
-    feed(parser, enc.encode("✻ first chunk"), now);
+    // Include `✻` (activity gate) and the idle footer "to cycle" (turn-done
+    // gate, issue #316) — the debounce test isn't about gating, but quiet
+    // can't fire without both being satisfied.
+    feed(parser, enc.encode("✻ first chunk\nshift+tab to cycle"), now);
 
     // Quiet window elapses → quiet fires.
     now += 200;
@@ -372,11 +377,126 @@ describe("pty-output-parser — sentinel flow (synthetic)", () => {
     now += 200;
     expect(tick(parser, now)).toEqual([]);
 
-    // Spinner appears → gate opens.
-    feed(parser, enc.encode("✻ thinking"), now);
+    // Spinner appears (activity gate opens), then claude returns to the idle
+    // prompt (footer "to cycle" — turn-done gate, issue #316).
+    feed(parser, enc.encode("✻ thinking\nshift+tab to cycle"), now);
     expect(parser.sawActivityIndicatorThisTurn).toBe(true);
 
     // Quiet window elapses → quiet now fires.
+    const qEvs = tick(parser, now + 200);
+    expect(qEvs.length).toBe(1);
+    expect(qEvs[0]!.type).toBe("quiet");
+  });
+
+  test("issue #316: mid-turn quiet during a tool wait (spinner, no idle footer) does NOT fire; quiet fires once the idle footer returns", () => {
+    const enc = new TextEncoder();
+    const parser = createParser({ quietWindowMs: 100 });
+    const uuid = "uuid-316-toolwait";
+    const sentinelBytes = encodeSentinel(buildSentinel(uuid));
+
+    let now = 1000;
+    startTurn(parser, uuid, sentinelBytes, now);
+
+    // Claude starts generating (spinner → activity gate opens), calls a tool,
+    // and the stream goes quiet WHILE the tool runs. The bottom-of-screen
+    // footer shows the running/interrupt state — NOT the idle "to cycle" hint.
+    feed(parser, enc.encode("✻ Running bash… esc to interrupt"), now);
+    expect(parser.sawActivityIndicatorThisTurn).toBe(true);
+
+    // Quiet window elapses mid-turn. Pre-#316 this fired `quiet` and completed
+    // the turn prematurely (losing the rest of the work); post-#316 the missing
+    // idle footer withholds it.
+    now += 200;
+    expect(tick(parser, now)).toEqual([]);
+    // Still withheld after many quiet windows while the tool is running.
+    now += 5000;
+    expect(tick(parser, now)).toEqual([]);
+
+    // Tool finishes, claude produces the rest of the answer and returns to the
+    // idle prompt — the footer's "to cycle" hint reappears.
+    feed(parser, enc.encode("done.\nshift+tab to cycle"), now);
+
+    // NOW quiet fires — the turn is genuinely complete.
+    const qEvs = tick(parser, now + 200);
+    expect(qEvs.length).toBe(1);
+    expect(qEvs[0]!.type).toBe("quiet");
+  });
+
+  test("issue #316: idle footer is detected even when CUF sequences render the inter-word space", () => {
+    const enc = new TextEncoder();
+    const parser = createParser({ quietWindowMs: 100 });
+    const uuid = "uuid-316-cuf";
+    const sentinelBytes = encodeSentinel(buildSentinel(uuid));
+
+    let now = 1000;
+    startTurn(parser, uuid, sentinelBytes, now);
+
+    // claude 2.1.89+ renders inter-word spaces as CUF (cursor-forward)
+    // sequences, so the footer arrives as "to\x1b[1Ccycle" (no literal space)
+    // wrapped in colour codes. The parser must expand CUF back to spaces and
+    // strip ANSI before matching, or the gate would never open.
+    feed(parser, enc.encode("✻ ok\x1b[38;5;244mshift+tab\x1b[1Cto\x1b[1Ccycle"), now);
+    expect(parser.sawActivityIndicatorThisTurn).toBe(true);
+
+    const qEvs = tick(parser, now + 200);
+    expect(qEvs.length).toBe(1);
+    expect(qEvs[0]!.type).toBe("quiet");
+  });
+
+  test("issue #316: bare 'to cycle' in response prose (not the footer) does NOT trip the gate", () => {
+    const enc = new TextEncoder();
+    const parser = createParser({ quietWindowMs: 100 });
+    const uuid = "uuid-316-prose";
+    const sentinelBytes = encodeSentinel(buildSentinel(uuid));
+
+    let now = 1000;
+    startTurn(parser, uuid, sentinelBytes, now);
+
+    // Response body legitimately contains the words "to cycle" (explaining a
+    // loop) — but claude is mid-turn, about to call a tool, and the idle
+    // footer's anchored "tab to cycle" hint is NOT present. Matching the bare
+    // "to cycle" here would falsely satisfy the gate and let a subsequent
+    // tool-wait quiet complete the turn early — the exact bug #316 fixes.
+    feed(parser, enc.encode("✻ Here's a loop to cycle through the frames:"), now);
+    expect(parser.sawByteSinceTurnStart).toBe(true);
+    expect(parser.sawActivityIndicatorThisTurn).toBe(true);
+
+    // Quiet window elapses mid-turn → NO quiet (anchored marker absent).
+    now += 200;
+    expect(tick(parser, now)).toEqual([]);
+    now += 5000;
+    expect(tick(parser, now)).toEqual([]);
+
+    // Turn finishes → real footer "shift+tab to cycle" (contains "tab to
+    // cycle") → quiet fires.
+    feed(parser, enc.encode(" done.\nshift+tab to cycle"), now);
+    const qEvs = tick(parser, now + 200);
+    expect(qEvs.length).toBe(1);
+    expect(qEvs[0]!.type).toBe("quiet");
+  });
+
+  test("issue #316: a stale footer marker is evicted from footerTail once >2048 bytes accumulate", () => {
+    const enc = new TextEncoder();
+    const parser = createParser({ quietWindowMs: 100 });
+    const uuid = "uuid-316-evict";
+    const sentinelBytes = encodeSentinel(buildSentinel(uuid));
+
+    let now = 1000;
+    startTurn(parser, uuid, sentinelBytes, now);
+
+    // A stale footer paints early in the turn (e.g. a resumed-session
+    // scrollback replay), then the turn keeps generating well past the
+    // 2048-byte footerTail cap — the stale marker must be evicted so it cannot
+    // satisfy the gate during a later mid-turn tool-wait quiet.
+    feed(parser, enc.encode("✻ shift+tab to cycle"), now); // stale marker + spinner
+    feed(parser, enc.encode("x".repeat(3000)), now); // push it out of the 2048-byte tail
+    expect(parser.sawActivityIndicatorThisTurn).toBe(true);
+
+    now += 200;
+    expect(tick(parser, now)).toEqual([]); // marker evicted → no quiet
+
+    // Real footer returns at turn end → quiet fires.
+    feed(parser, enc.encode("\nshift+tab to cycle"), now);
     const qEvs = tick(parser, now + 200);
     expect(qEvs.length).toBe(1);
     expect(qEvs[0]!.type).toBe("quiet");

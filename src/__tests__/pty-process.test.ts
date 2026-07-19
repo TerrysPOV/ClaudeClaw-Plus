@@ -379,6 +379,10 @@ describe("PtyProcess — runTurn sentinel-echo (clean boundary)", () => {
   // status-box row and in resumed scrollback. Real claude emits
   // spinners while generating; `/bin/cat` doesn't, so we slip one
   // into the prompt and let cat echo it back to satisfy the gate.
+  // The prompts ALSO carry the idle REPL footer "to cycle" (issue #316):
+  // the parser only treats quiet as turn-completion once claude has returned
+  // to the idle prompt. `/bin/cat` echoes it back, standing in for the footer
+  // real claude paints when a turn finishes.
 
   test("cat echoes the sentinel back → cleanBoundary=true", async () => {
     const proc = await spawnPty(
@@ -389,7 +393,7 @@ describe("PtyProcess — runTurn sentinel-echo (clean boundary)", () => {
         sentinelMaxWaitMs: 5000,
       }),
     );
-    const result = await proc.runTurn("✻ hello world", { timeoutMs: 5000 });
+    const result = await proc.runTurn("✻ hello world shift+tab to cycle", { timeoutMs: 5000 });
     expect(result.cleanBoundary).toBe(true);
     // cat echoes the prompt; the response should contain it.
     expect(result.text.toLowerCase()).toContain("hello world");
@@ -407,7 +411,7 @@ describe("PtyProcess — runTurn sentinel-echo (clean boundary)", () => {
         sentinelMaxWaitMs: 5000,
       }),
     );
-    const longPrompt = `✻ ${"x".repeat(500)}`;
+    const longPrompt = `✻ ${"x".repeat(500)} shift+tab to cycle`;
     const result = await proc.runTurn(longPrompt, { timeoutMs: 5000 });
     expect(result.cleanBoundary).toBe(true);
     expect(result.text).toContain("x".repeat(20));
@@ -424,7 +428,7 @@ describe("PtyProcess — runTurn sentinel-echo (clean boundary)", () => {
       }),
     );
     let chunkBytes = 0;
-    const result = await proc.runTurn("✻ streaming-test-payload", {
+    const result = await proc.runTurn("✻ streaming-test-payload shift+tab to cycle", {
       timeoutMs: 5000,
       onChunk: (s) => {
         chunkBytes += s.length;
@@ -455,7 +459,7 @@ describe("PtyProcess — runTurn sentinel max-wait fallback", () => {
     const proc = await spawnPty(
       baseOpts({
         _commandOverride: "/bin/sh",
-        _argsOverride: ["-c", "stty -echo; printf '\\xe2\\x9c\\xbb'; sleep 5"],
+        _argsOverride: ["-c", "stty -echo; printf '\\xe2\\x9c\\xbb shift+tab to cycle'; sleep 5"],
         quietWindowMs: 50,
         sentinelMaxWaitMs: 250,
       }),
@@ -488,7 +492,7 @@ describe("PtyProcess — runTurn sentinel max-wait fallback", () => {
         _commandOverride: "/bin/sh",
         _argsOverride: [
           "-c",
-          "echo BANNER_BANNER_BANNER_PRETURN; stty -echo; printf '\\xe2\\x9c\\xbb response-bytes-during-turn'; sleep 5",
+          "echo BANNER_BANNER_BANNER_PRETURN; stty -echo; printf '\\xe2\\x9c\\xbb response-bytes-during-turn shift+tab to cycle'; sleep 5",
         ],
         quietWindowMs: 100,
         sentinelMaxWaitMs: 400,
@@ -545,7 +549,7 @@ describe("PtyProcess — sentinel UUID override hook", () => {
         _sentinelUuidOverride: () => "pinned-uuid-1234",
       }),
     );
-    const result = await proc.runTurn("✻ hi", { timeoutMs: 5000 });
+    const result = await proc.runTurn("✻ hi shift+tab to cycle", { timeoutMs: 5000 });
     expect(result.cleanBoundary).toBe(true);
     await proc.dispose();
   });
@@ -566,7 +570,7 @@ describe("PtyProcess — concurrency", () => {
     // per Codex P1 on PR #124); without it the first turn never
     // completes and the test times out instead of exercising the
     // concurrency rejection.
-    const t1 = proc.runTurn("✻ first", { timeoutMs: 5000 });
+    const t1 = proc.runTurn("✻ first shift+tab to cycle", { timeoutMs: 5000 });
     let err: unknown;
     try {
       await proc.runTurn("✻ second", { timeoutMs: 5000 });

@@ -64,6 +64,16 @@
 /** Quiet window before the supervisor writes the sentinel. Default 500ms. */
 export const DEFAULT_QUIET_WINDOW_MS = 500;
 
+/** Rolling raw-output tail size (bytes) kept for idle-REPL-footer detection.
+ *  Large enough to always contain the current bottom-of-screen footer paint,
+ *  small enough to stay cheap. Issue #316. */
+const FOOTER_TAIL_MAX = 2048;
+
+/** Lenient decoder for the footer tail. The tail can start mid-UTF-8-char, so
+ *  fatal:false lets partial leading bytes decode to replacement chars without
+ *  throwing — fine for a substring match. */
+const _footerDecoder = new TextDecoder("utf-8", { fatal: false });
+
 /** State of the parser. */
 export type ParserState = "idle" | "accumulating" | "awaiting-sentinel" | "complete";
 
@@ -138,6 +148,13 @@ export interface Parser {
   pending: Uint8Array;
   /** Stream offset that the first byte of `pending` represents. */
   pendingBaseOffset: number;
+  /** Rolling tail of recent raw output bytes (ANSI-laden), capped at
+   *  `FOOTER_TAIL_MAX`. Used by `tick` to detect claude's idle REPL footer
+   *  ("to cycle"), which only reappears when the turn is genuinely done — NOT
+   *  during a mid-turn tool/sub-agent wait (which also goes quiet). Gating
+   *  `quiet` on it stops a mid-turn quiet from completing the turn early.
+   *  Issue #316. */
+  footerTail: Uint8Array;
 }
 
 /** Create a fresh parser instance (in `idle` state). */
@@ -157,6 +174,7 @@ export function createParser(opts?: { quietWindowMs?: number }): Parser {
     activityScanCarry: new Uint8Array(0),
     pending: new Uint8Array(0),
     pendingBaseOffset: 0,
+    footerTail: new Uint8Array(0),
   };
 }
 
@@ -187,6 +205,10 @@ export function startTurn(
   parser.activityScanCarry = new Uint8Array(0);
   parser.pending = new Uint8Array(0);
   parser.pendingBaseOffset = parser.totalBytes;
+  // Empty the footer tail so the idle-footer detection reflects THIS turn's
+  // completion, not a stale "to cycle" left in the buffer from the pre-turn
+  // idle prompt. Issue #316.
+  parser.footerTail = new Uint8Array(0);
   return { type: "turn-start", offset: parser.turnStartOffset };
 }
 
@@ -211,6 +233,15 @@ export function feed(parser: Parser, chunk: Uint8Array, now: number): ParserEven
     // Activity-indicator scan — strengthens issue #87's gate so the
     // sentinel isn't written when the only bytes seen are TUI redraws.
     scanForActivityIndicator(parser, chunk);
+    // Issue #316: keep a rolling tail of raw output so `tick` can detect the
+    // idle REPL footer that only reappears when the turn is truly done, and
+    // NOT during a mid-turn tool/sub-agent wait (which also goes quiet).
+    const footerCombined =
+      parser.footerTail.length === 0 ? chunk : concatBytes(parser.footerTail, chunk);
+    parser.footerTail =
+      footerCombined.length > FOOTER_TAIL_MAX
+        ? footerCombined.slice(footerCombined.length - FOOTER_TAIL_MAX)
+        : footerCombined;
   }
 
   // We only scan for the sentinel after the supervisor has actually written
@@ -253,6 +284,32 @@ export function feed(parser: Parser, chunk: Uint8Array, now: number): ParserEven
 }
 
 /**
+ * True when the parser's recent output tail shows claude's idle REPL footer —
+ * the mode-cycler hint that only paints when claude is idle at the prompt (turn
+ * genuinely done), and is ABSENT while a turn is in progress, including mid-turn
+ * tool/sub-agent waits (which paint an interrupt/running footer). Gating `quiet`
+ * on this stops a mid-turn quiet from being mistaken for turn completion (#316).
+ *
+ * Matches **"tab to cycle"**, the version-stable core of the hint ("shift+tab to
+ * cycle" in older CLIs, "tab to cycle permission modes" in 2.1.168+). It is
+ * DELIBERATELY not the bare "to cycle": `footerTail` holds ALL recent output
+ * (response prose, tool output, echoed file contents), so a bare "to cycle"
+ * substring could appear in legitimate turn content ("a loop to cycle through …")
+ * and falsely satisfy the gate mid-turn — reintroducing the very bug this fixes.
+ * "tab to cycle" mirrors the stricter marker `session-agent-process` uses in its
+ * boot-dialog matcher for exactly this prose-safety reason.
+ *
+ * CUF cursor-forward sequences (which render inter-word spaces on claude 2.1.89+)
+ * are expanded back to spaces BEFORE stripping ANSI, so a footer rendered as
+ * "tab\x1b[1Cto\x1b[1Ccycle" still matches.
+ */
+function hasIdleReplFooter(parser: Parser): boolean {
+  if (parser.footerTail.length === 0) return false;
+  const text = stripAnsi(expandCursorForwardToSpaces(_footerDecoder.decode(parser.footerTail)));
+  return text.toLowerCase().includes("tab to cycle");
+}
+
+/**
  * Tick the parser's quiet timer. The supervisor should call this on a regular
  * interval (e.g. every 50ms). When the parser is in `accumulating` state and
  * `now - lastByteAt >= quietWindowMs`, emits a single `quiet` event so the
@@ -283,6 +340,13 @@ export function tick(parser: Parser, now: number): ParserEvent[] {
   // supervisor's `sentinelMaxWaitMs` (default 30s) fails the turn
   // visibly — better than returning garbage.
   if (!parser.sawActivityIndicatorThisTurn) return [];
+  // Issue #316: a mid-turn tool call / sub-agent wait ALSO makes the stream go
+  // quiet, but claude has not returned to its idle prompt — its footer shows
+  // the running/interrupt state, not the mode-cycler "to cycle" hint. Only
+  // treat quiet as turn-completion once the idle REPL footer is showing, so a
+  // mid-turn tool-wait quiet no longer completes the turn prematurely. The
+  // outer turn timeout remains the backstop if a future CLI renames the hint.
+  if (!hasIdleReplFooter(parser)) return [];
   if (now - parser.lastByteAt < parser.quietWindowMs) return [];
   parser.quietEmitted = true;
   return [{ type: "quiet", offset: parser.totalBytes }];
@@ -315,6 +379,7 @@ export function resetTurn(parser: Parser): void {
   parser.activityScanCarry = new Uint8Array(0);
   parser.pending = new Uint8Array(0);
   parser.pendingBaseOffset = parser.totalBytes;
+  parser.footerTail = new Uint8Array(0);
 }
 
 /**
