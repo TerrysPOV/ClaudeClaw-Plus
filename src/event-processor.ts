@@ -251,8 +251,13 @@ export async function processNext(): Promise<boolean> {
   isProcessing = true;
 
   try {
-    // Find next pending event
+    // Find next pending event, capturing the dedupe key it was selected with.
+    // The key must travel with the event: `onEvent` below receives the record
+    // by reference, so recomputing the key after the handler has run would
+    // depend on no handler ever mutating it. Carrying it forward makes the
+    // recorded key provably the same one `isDuplicate` tested.
     let nextEvent: EventRecord | null = null;
+    let nextDedupeKey: string | null = null;
 
     for await (const event of readFrom(lastProcessedSeq + 1)) {
       // Skip non-pending events and internal events (like status updates)
@@ -267,6 +272,7 @@ export async function processNext(): Promise<boolean> {
         continue;
       }
       nextEvent = event;
+      nextDedupeKey = eventDedupeKey;
       break;
     }
 
@@ -296,8 +302,21 @@ export async function processNext(): Promise<boolean> {
         status: "done",
       });
 
-      // Record for deduplication
-      await recordProcessed(nextEvent, dedupeKey);
+      // Record for deduplication under the key this event was selected with.
+      //
+      // Throws rather than falling back to `getDedupeKey(nextEvent)`: that
+      // fallback IS the defect this fixes (recomputing after the handler may
+      // have mutated the record), so an invariant violation must fail loudly
+      // instead of silently recording under a key that was never checked.
+      // Unreachable as written — `nextEvent` and `nextDedupeKey` are assigned
+      // together immediately before the `break`, and the `!nextEvent` guard is
+      // the only way past the loop — but TS cannot narrow one from the other.
+      if (nextDedupeKey === null) {
+        throw new Error(
+          `[processor] internal: no dedupe key captured for event ${nextEvent.id} (seq ${nextEvent.seq})`,
+        );
+      }
+      await recordProcessed(nextEvent, nextDedupeKey);
 
       lastProcessedSeq = nextEvent.seq;
       console.log(`[processor] Successfully processed event ${nextEvent.id}`);

@@ -12,6 +12,7 @@ import {
   initProcessor,
   processNext,
   processPending,
+  processPersistedEvent,
   getPendingCount,
   getLastProcessedSeq,
   getDedupeStats,
@@ -122,6 +123,67 @@ describe("Event Processor", () => {
 
     expect(processCount).toBe(1);
     expect(hasDedupeKey(dedupeKey)).toBe(true);
+  });
+
+  it("dedupes correctly even when the handler mutates the event it was given", async () => {
+    // Regression guard for the key/event pairing. The dedupe key is computed
+    // when an event is SELECTED (and tested against `isDuplicate`), but
+    // `onEvent` receives the record by reference and runs before the key is
+    // recorded. Recomputing the key after the handler instead of carrying it
+    // forward would record the event under a key that was never checked — so
+    // an identical event would not be recognised as a duplicate.
+    //
+    // Asserted via the observable consequence (processed once, not twice)
+    // rather than the key value, because `getDedupeKey` is module-private and
+    // recomputing it here would just recreate the fixture drift #304 is about.
+    let processCount = 0;
+    await initProcessor({
+      retentionDays: 7,
+      onEvent: async (event) => {
+        processCount++;
+        // A handler mutating the record it was handed. Nothing in
+        // `ProcessorConfig["onEvent"]` forbids this.
+        (event.payload as Record<string, unknown>).mutatedByHandler = true;
+        return { success: true };
+      },
+    });
+
+    // Two identical events, no upstream dedupeKey -> same canonical key.
+    const payload = { original: "value" };
+    await append(createTestEntry({ payload: { ...payload }, dedupeKey: "" }));
+    await append(createTestEntry({ payload: { ...payload }, dedupeKey: "" }));
+
+    await processPending();
+
+    expect(processCount).toBe(1);
+  });
+
+  it("processPersistedEvent also records the key the event was selected with", async () => {
+    // The sibling of the bug fixed above. `processPersistedEvent` captures
+    // `const dedupeKey = getDedupeKey(event)` BEFORE calling `onEvent` and
+    // reuses it afterwards — already correct, but nothing guarded it, so a
+    // refactor to recompute after the handler would silently reintroduce the
+    // identical defect on a path the daemon actually uses (start.ts ->
+    // initGatewayProcessor -> getGatewayProcessor -> processPersistedEvent).
+    let processCount = 0;
+    await initProcessor({
+      retentionDays: 7,
+      onEvent: async (event) => {
+        processCount++;
+        (event.payload as Record<string, unknown>).mutatedByHandler = true;
+        return { success: true };
+      },
+    });
+
+    const payload = { sibling: "value" };
+    const first = await append(createTestEntry({ payload: { ...payload }, dedupeKey: "" }));
+    await append(createTestEntry({ payload: { ...payload }, dedupeKey: "" }));
+
+    // Process the first by id, then let the queue pick up the second.
+    await processPersistedEvent(first.id);
+    await processPending();
+
+    expect(processCount).toBe(1);
   });
 
   it("should handle event failure with retry", async () => {
