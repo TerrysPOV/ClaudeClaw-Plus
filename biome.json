@@ -20,7 +20,7 @@
       "!.planning",
       "!dist",
       "!.codegraph",
-      "!src/__tests__/fixtures"
+      "!src/__tests__/fixtures/mock-mcp-server.ts"
     ],
     "ignoreUnknown": true
   },
