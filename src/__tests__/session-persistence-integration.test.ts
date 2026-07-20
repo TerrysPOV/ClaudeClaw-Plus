@@ -38,13 +38,10 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { _resetHttpGateway, getHttpGateway } from "../plugins/http-gateway.js";
 import { _resetMcpBridge, getMcpBridge } from "../plugins/mcp-bridge.js";
-import {
-  _resetMcpMultiplexer,
-  McpMultiplexerPlugin,
-  type MuxSettingsView,
-} from "../plugins/mcp-multiplexer/index.js";
+import { _resetMcpMultiplexer, McpMultiplexerPlugin } from "../plugins/mcp-multiplexer/index.js";
 import { _resetIdentityStore } from "../plugins/mcp-multiplexer/pty-identity.js";
 import { SessionPersistenceStore } from "../plugins/mcp-multiplexer/session-persistence.js";
+import { makeMuxSettingsView } from "./fixtures/mux-settings-view.js";
 
 const MOCK_SERVER = fileURLToPath(new URL("./fixtures/mock-mcp-server.ts", import.meta.url));
 const BUN_BIN = process.execPath;
@@ -68,22 +65,6 @@ function writeProxyConfig(dir: string, names: string[]): string {
   const path = join(dir, "mcp-proxy.json");
   writeFileSync(path, JSON.stringify(cfg, null, 2));
   return path;
-}
-
-function makeSettingsView(partial: Partial<MuxSettingsView>): () => MuxSettingsView {
-  const view: MuxSettingsView = {
-    webEnabled: true,
-    webHost: "127.0.0.1",
-    webPort: 4632,
-    shared: [],
-    stateless: [],
-    healthProbeIntervalMs: 0,
-    sessionPersistenceEnabled: true,
-    sessionMaxAgeSeconds: 3600,
-    sessionPersistencePath: "",
-    ...partial,
-  };
-  return () => view;
 }
 
 /** Real factory — constructs an actual `SessionPersistenceStore`. */
@@ -275,7 +256,7 @@ describe("session-persistence integration — round-trip + replay", () => {
     await withAudit(async (ev) => {
       plugin = new McpMultiplexerPlugin({
         configPath: cfg,
-        settingsView: makeSettingsView({
+        settingsView: makeMuxSettingsView({
           shared: ["alpha"],
           sessionPersistenceEnabled: true,
           sessionPersistencePath: persistRoot,
@@ -340,7 +321,7 @@ describe("session-persistence integration — round-trip + replay", () => {
     await withAudit(async (events2) => {
       plugin = new McpMultiplexerPlugin({
         configPath: cfg,
-        settingsView: makeSettingsView({
+        settingsView: makeMuxSettingsView({
           shared: ["alpha"],
           sessionPersistenceEnabled: true,
           sessionPersistencePath: persistRoot,
@@ -428,7 +409,7 @@ describe("session-persistence integration — TTL expiration on replay", () => {
     await withAudit(async (events) => {
       plugin = new McpMultiplexerPlugin({
         configPath: cfg,
-        settingsView: makeSettingsView({
+        settingsView: makeMuxSettingsView({
           shared: ["alpha"],
           sessionPersistenceEnabled: true,
           sessionPersistencePath: persistRoot,
@@ -488,7 +469,7 @@ describe("session-persistence integration — integrity check on replay", () => 
     await withAudit(async (events) => {
       plugin = new McpMultiplexerPlugin({
         configPath: cfg,
-        settingsView: makeSettingsView({
+        settingsView: makeMuxSettingsView({
           shared: ["alpha"],
           sessionPersistenceEnabled: true,
           sessionPersistencePath: persistRoot,
@@ -539,7 +520,7 @@ describe("session-persistence integration — file corruption on replay", () => 
     await withAudit(async (events) => {
       plugin = new McpMultiplexerPlugin({
         configPath: cfg,
-        settingsView: makeSettingsView({
+        settingsView: makeMuxSettingsView({
           shared: ["alpha", "beta"],
           sessionPersistenceEnabled: true,
           sessionPersistencePath: persistRoot,
@@ -591,7 +572,7 @@ describe("session-persistence integration — runtime GC", () => {
     // Daemon up, drive a live bucket, persist a fresh record.
     plugin = new McpMultiplexerPlugin({
       configPath: cfg,
-      settingsView: makeSettingsView({
+      settingsView: makeMuxSettingsView({
         shared: ["alpha"],
         sessionPersistenceEnabled: true,
         sessionPersistencePath: persistRoot,
@@ -696,7 +677,7 @@ describe("session-persistence integration — kill-switch", () => {
     await withAudit(async (events) => {
       plugin = new McpMultiplexerPlugin({
         configPath: cfg,
-        settingsView: makeSettingsView({
+        settingsView: makeMuxSettingsView({
           shared: ["alpha"],
           sessionPersistenceEnabled: false, // kill-switch
           sessionPersistencePath: persistRoot,
@@ -760,7 +741,7 @@ describe("session-persistence integration — stateless server skips persistence
     await withAudit(async (events) => {
       plugin = new McpMultiplexerPlugin({
         configPath: cfg,
-        settingsView: makeSettingsView({
+        settingsView: makeMuxSettingsView({
           shared: ["alpha", "beta"],
           stateless: ["beta"], // beta is stateless → no persistence
           sessionPersistenceEnabled: true,

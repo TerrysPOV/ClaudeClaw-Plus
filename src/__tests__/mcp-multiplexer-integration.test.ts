@@ -28,14 +28,11 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import {
-  McpMultiplexerPlugin,
-  _resetMcpMultiplexer,
-  type MuxSettingsView,
-} from "../plugins/mcp-multiplexer/index.js";
+import { McpMultiplexerPlugin, _resetMcpMultiplexer } from "../plugins/mcp-multiplexer/index.js";
 import { _resetHttpGateway, getHttpGateway } from "../plugins/http-gateway.js";
 import { _resetMcpBridge, getMcpBridge } from "../plugins/mcp-bridge.js";
 import { _resetIdentityStore } from "../plugins/mcp-multiplexer/pty-identity.js";
+import { makeMuxSettingsView } from "./fixtures/mux-settings-view.js";
 
 const MOCK_SERVER = fileURLToPath(new URL("./fixtures/mock-mcp-server.ts", import.meta.url));
 const BUN_BIN = process.execPath;
@@ -59,25 +56,6 @@ function writeProxyConfig(dir: string, names: string[]): string {
   const path = join(dir, "mcp-proxy.json");
   writeFileSync(path, JSON.stringify(cfg, null, 2));
   return path;
-}
-
-function makeSettingsView(partial: Partial<MuxSettingsView>): () => MuxSettingsView {
-  const view: MuxSettingsView = {
-    webEnabled: true,
-    webHost: "127.0.0.1",
-    webPort: 4632,
-    shared: [],
-    stateless: [],
-    healthProbeIntervalMs: 0,
-    // Phase B added these fields to MuxSettingsView. Tests pre-dating
-    // Phase B set defaults that disable persistence so behaviour is
-    // identical to PR #71.
-    sessionPersistenceEnabled: false,
-    sessionMaxAgeSeconds: 3600,
-    sessionPersistencePath: "",
-    ...partial,
-  };
-  return () => view;
 }
 
 /** Start a hermetic Bun.serve listener on an ephemeral loopback port
@@ -197,7 +175,7 @@ describe("mcp-multiplexer integration — happy path", () => {
     const cfg = writeProxyConfig(tmpDir, ["alpha"]);
     plugin = new McpMultiplexerPlugin({
       configPath: cfg,
-      settingsView: makeSettingsView({
+      settingsView: makeMuxSettingsView({
         webEnabled: true,
         shared: ["alpha"],
       }),
@@ -244,7 +222,7 @@ describe("mcp-multiplexer integration — per-PTY auth", () => {
     const cfg = writeProxyConfig(tmpDir, ["alpha"]);
     plugin = new McpMultiplexerPlugin({
       configPath: cfg,
-      settingsView: makeSettingsView({
+      settingsView: makeMuxSettingsView({
         webEnabled: true,
         shared: ["alpha"],
       }),
@@ -312,7 +290,7 @@ describe("mcp-multiplexer integration — auth rejection", () => {
     const cfg = writeProxyConfig(tmpDir, ["alpha"]);
     plugin = new McpMultiplexerPlugin({
       configPath: cfg,
-      settingsView: makeSettingsView({
+      settingsView: makeMuxSettingsView({
         webEnabled: true,
         shared: ["alpha"],
       }),
@@ -368,7 +346,7 @@ describe("mcp-multiplexer integration — auth rejection", () => {
     const cfg = writeProxyConfig(tmpDir, ["alpha"]);
     plugin = new McpMultiplexerPlugin({
       configPath: cfg,
-      settingsView: makeSettingsView({
+      settingsView: makeMuxSettingsView({
         webEnabled: true,
         shared: ["alpha"],
       }),
@@ -407,7 +385,7 @@ describe("mcp-multiplexer integration — stateful vs stateless demux", () => {
     const cfg = writeProxyConfig(tmpDir, ["alpha", "beta"]);
     plugin = new McpMultiplexerPlugin({
       configPath: cfg,
-      settingsView: makeSettingsView({
+      settingsView: makeMuxSettingsView({
         webEnabled: true,
         shared: ["alpha", "beta"],
         stateless: ["beta"],
@@ -511,7 +489,7 @@ describe("mcp-multiplexer integration — bridge callback path", () => {
     const cfg = writeProxyConfig(tmpDir, ["alpha"]);
     plugin = new McpMultiplexerPlugin({
       configPath: cfg,
-      settingsView: makeSettingsView({
+      settingsView: makeMuxSettingsView({
         webEnabled: true,
         shared: ["alpha"],
       }),
@@ -542,7 +520,7 @@ describe("mcp-multiplexer integration — crash + health probe transition", () =
     const cfg = writeProxyConfig(tmpDir, ["alpha"]);
     plugin = new McpMultiplexerPlugin({
       configPath: cfg,
-      settingsView: makeSettingsView({
+      settingsView: makeMuxSettingsView({
         webEnabled: true,
         shared: ["alpha"],
         // Keep the probe disabled so we drive sampling deterministically.

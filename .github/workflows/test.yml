@@ -30,9 +30,16 @@ jobs:
       # shared process) and infra-dependent tests (DB/queue CI doesn't provide).
       # Folding those in would make CI permanently red. Tracked for cleanup — see
       # the issue linked in the PR — after which these paths widen toward full.
+      # `src/__tests__/mcp-multiplexer-integration.test.ts` added #304: first
+      # file reclaimed from the excluded root suite (was 0 pass / 7 fail on a
+      # stale settings fixture; now 7 pass, verified 6/6 across repeat runs).
+      # Its sibling `session-persistence-integration.test.ts` is fixed too but
+      # deliberately NOT added yet — it carries a load-sensitive flake tracked
+      # in #326, and adding it would make CI randomly red.
+      #
       # `src/adapters` added #301: the adapter suites are clean (252 pass) and
       # they are where outbound routing and turn-semantics risk actually lives.
       # Without them the adapter half of a delivery change never runs in CI —
       # and there is no typecheck step to back it up.
       - name: Run tests (clean suites)
-        run: bun test src/bus src/adapters src/tuner src/observability src/skills-tuner src/plugins/eval-framework src/__tests__/governance
+        run: bun test src/bus src/adapters src/tuner src/observability src/skills-tuner src/plugins/eval-framework src/__tests__/governance src/__tests__/mcp-multiplexer-integration.test.ts
