@@ -1,3 +1,4 @@
+import { describe, expect, test } from "bun:test";
 import {
   isNormalizedEvent,
   isValidChannel,
@@ -7,6 +8,8 @@ import {
   normalizeWebhookEvent,
   Channel,
   type NormalizedEvent,
+  type CronEvent,
+  type WebhookEvent,
 } from "../../gateway/normalizer";
 
 // --- Type guard tests ---
