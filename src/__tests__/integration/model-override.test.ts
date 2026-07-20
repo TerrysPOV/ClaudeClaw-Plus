@@ -14,7 +14,7 @@ import { join } from "path";
 import { createAgent } from "../../agents";
 import { loadJobs, resolveJobModel, type Job } from "../../jobs";
 import * as runnerMod from "../../runner";
-import { loadSettings } from "../../config";
+import { initConfig, loadSettings } from "../../config";
 
 const PROJECT = process.cwd();
 const AGENTS_DIR = join(PROJECT, "agents");
@@ -45,6 +45,9 @@ async function writeJobFileRaw(agentName: string, label: string, body: string): 
 }
 
 beforeAll(async () => {
+  // See runner.test.ts: initConfig seeds the gitignored settings file that
+  // loadSettings would otherwise ENOENT on in a clean checkout.
+  await initConfig();
   await loadSettings();
 });
 
