@@ -488,8 +488,69 @@ export class TelegramAdapter {
         { agent_id: agentId, topics: ["system.request_human"] },
         (event) => void this.handleRequestHuman(agentId, event),
       ),
+      // #301: out-of-band operator alerts. Deliberately its own topic and its
+      // own handler — routing it through `handleResponseText` would apply turn
+      // semantics to a non-reply (close the receipt as `turn_observed` and
+      // edit the alert over the agent's live reply message).
+      this.bus.subscribe(
+        { agent_id: agentId, topics: ["system.operator_alert"] },
+        (event) => void this.handleOperatorAlert(agentId, event),
+      ),
     );
     this.subscriptions.set(agentId, subs);
+  }
+
+  /**
+   * #301 — deliver an out-of-band operator alert as a NEW message.
+   *
+   * Contrast with `handleResponseText`: this deliberately does not
+   * `armReceiptTimeout`, `stopSpinner`, `closeTelegramReceipt`, or edit
+   * `lastBotMessage`. An alert is not turn output, so applying turn semantics
+   * to it would corrupt the receipt of — and overwrite the visible reply of —
+   * the very turn the watchdog is reporting on.
+   */
+  private async handleOperatorAlert(agentId: string, event: BusEvent): Promise<void> {
+    if (!eventBelongsToTelegram(event)) return;
+    const payload = event.payload as { text?: string };
+    const text = typeof payload.text === "string" ? payload.text : "";
+    if (!text) return;
+    const target = this.targetForAgent(agentId);
+    if (!target) {
+      // Never drop an operator alert silently. In send-only mode
+      // (`telegram.receiveEnabled: false`, #260) `lastChatPerAgent` is never
+      // populated, so an agent reachable only via `defaultAgentId` lands
+      // here — and an alert that reaches neither chat nor a greppable log
+      // line defeats the point of #301. Matches the sibling handlers.
+      this.logger.warn(`[telegram-adapter] no target chat for operator_alert on agent ${agentId}`);
+      return;
+    }
+    // Via sendHtml, not safeSendMessage: the alert text carries markdown
+    // (the `**stall-watchdog**` prefix), which Telegram renders as literal
+    // asterisks without the markdown→HTML conversion. sendHtml is a pure
+    // send wrapper and touches no turn state.
+    //
+    // `message_thread_id` is forwarded like every other send in this file:
+    // without it a forum-group alert lands in General instead of the topic
+    // the operator actually watches (and General is often closed, which then
+    // 400s).
+    //
+    // The plain-text fallback is sendHtml's documented caller contract (see
+    // its JSDoc). The alert interpolates an arbitrary `err.message` from
+    // SessionManager.restart, making it the least predictable input to
+    // markdownToTelegramHtml in this file — so a malformed-markup 400 must
+    // degrade to unformatted text, not vanish. Dropping it here would
+    // contradict the no-silent-drop rule enforced just above.
+    const send = { chat_id: target.chat_id, text, message_thread_id: target.message_thread_id };
+    await this.safe("sendMessage", async () => {
+      try {
+        return await this.sendHtml(send);
+      } catch (err) {
+        // Only a malformed-HTML 400 warrants raw text; anything else (429,
+        // network, benign 400) rethrows to `safe`, which logs it.
+        if (!isTelegramHtmlParseError(err)) throw err;
+        return await this.api.sendMessage(send);
+      }
+    });
   }
 
   private async handleResponseText(agentId: string, event: BusEvent): Promise<void> {

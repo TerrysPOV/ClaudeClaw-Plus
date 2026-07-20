@@ -30,5 +30,9 @@ jobs:
       # shared process) and infra-dependent tests (DB/queue CI doesn't provide).
       # Folding those in would make CI permanently red. Tracked for cleanup — see
       # the issue linked in the PR — after which these paths widen toward full.
+      # `src/adapters` added #301: the adapter suites are clean (252 pass) and
+      # they are where outbound routing and turn-semantics risk actually lives.
+      # Without them the adapter half of a delivery change never runs in CI —
+      # and there is no typecheck step to back it up.
       - name: Run tests (clean suites)
-        run: bun test src/bus src/tuner src/observability src/skills-tuner src/plugins/eval-framework src/__tests__/governance
+        run: bun test src/bus src/adapters src/tuner src/observability src/skills-tuner src/plugins/eval-framework src/__tests__/governance
