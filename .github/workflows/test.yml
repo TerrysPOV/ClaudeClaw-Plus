@@ -7,6 +7,28 @@ on:
     branches: [main]
 
 jobs:
+  typecheck:
+    name: Typecheck ratchet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Ratchet, not a gate (#327). The repo has a pre-existing type-error
+      # backlog recorded in `.tsc-baseline`; this fails only if the count
+      # GOES UP, so new type errors cannot be introduced while the backlog is
+      # paid down separately. A typecheck step would have caught #329's
+      # `dedupeKey is not defined` in April and #330's object-into-a-string
+      # argument at author time.
+      - name: Typecheck (no new type errors)
+        run: bun run typecheck
+
   test:
     name: Bun test (module suites)
     runs-on: ubuntu-latest
