@@ -11,7 +11,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach, spyOn, test } from "bun:test";
 import * as runnerMod from "../runner";
 import * as configMod from "../config";
-import { loadSettings, getSettings } from "../config";
+import { initConfig, loadSettings, getSettings } from "../config";
 
 const SENTINEL = "RUNNER_TEST_SENTINEL";
 
@@ -19,6 +19,13 @@ let runOnceSpy: ReturnType<typeof spyOn> | null = null;
 const capturedModels: string[] = [];
 
 beforeAll(async () => {
+  // `initConfig` first: it writes DEFAULT_SETTINGS when the settings file is
+  // absent, whereas `loadSettings` reads unconditionally and throws ENOENT.
+  // The file is gitignored, so without this the suite passes only when some
+  // earlier test happened to create it — today that is
+  // `mcp_proxy_skip_shared.test.ts`, which sorts before this file
+  // alphabetically and masks the dependency in a full-suite run.
+  await initConfig();
   await loadSettings();
 });
 
