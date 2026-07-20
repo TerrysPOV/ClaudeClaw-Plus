@@ -1260,6 +1260,228 @@ describe("TelegramAdapter — request_human flow", () => {
 });
 
 /* ────────────────────────────────────────────────────────────────────── */
+/* #301 — out-of-band operator alerts                                       */
+/* ────────────────────────────────────────────────────────────────────── */
+
+describe("TelegramAdapter — system.operator_alert (#301)", () => {
+  /** Drive one inbound prompt so the agent has a live chat + turn. */
+  async function feedInbound(): Promise<void> {
+    api.enqueueUpdates([
+      {
+        message: {
+          message_id: 50,
+          from: { id: 42 },
+          chat: { id: 100, type: "private" },
+          text: "hello",
+        },
+      },
+    ]);
+    await waitFor(() => bus.prompts.length > 0);
+  }
+
+  it("delivers the alert as a NEW message", async () => {
+    adapter = await startAdapter();
+    await feedInbound();
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: {
+        level: "critical",
+        text: "stall-watchdog: looked ALIVE",
+        source: "stall-watchdog",
+      },
+    });
+
+    await waitFor(() => api.sendMessages.length === 1);
+    expect(api.sendMessages[0]?.chat_id).toBe(100);
+    expect(api.sendMessages[0]?.text).toContain("looked ALIVE");
+  });
+
+  it("does NOT overwrite the agent's live reply message", async () => {
+    // The bug this guards: routing the alert through `handleResponseText`
+    // would take the edit-in-place branch and replace the in-flight reply of
+    // the very agent the watchdog is reporting on.
+    adapter = await startAdapter();
+    await feedInbound();
+
+    // Open a live turn.
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "working", intent: "progress" },
+    });
+    await waitFor(() => api.sendMessages.length === 1);
+    const editsBefore = api.editMessages.length;
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: { level: "critical", text: "watchdog alert", source: "stall-watchdog" },
+    });
+
+    // Fresh send, and the live turn message is untouched.
+    await waitFor(() => api.sendMessages.length === 2);
+    expect(api.editMessages.length).toBe(editsBefore);
+    expect(api.sendMessages[1]?.text).toContain("watchdog alert");
+  });
+
+  it("drops an alert with no text rather than posting an empty message", async () => {
+    adapter = await startAdapter();
+    await feedInbound();
+    const before = api.sendMessages.length;
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: { level: "warn", source: "stall-watchdog" },
+    });
+
+    await new Promise((r) => setTimeout(r, 30));
+    expect(api.sendMessages.length).toBe(before);
+  });
+
+  it("converts the markdown prefix to HTML rather than sending literal asterisks", async () => {
+    adapter = await startAdapter();
+    await feedInbound();
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: {
+        level: "critical",
+        text: "**stall-watchdog** looked ALIVE",
+        source: "stall-watchdog",
+      },
+    });
+
+    await waitFor(() => api.sendMessages.length === 1);
+    const sent = api.sendMessages[0];
+    expect(sent?.parse_mode).toBe("HTML");
+    expect(sent?.text).toContain("<b>stall-watchdog</b>");
+    expect(sent?.text).not.toContain("**");
+  });
+
+  it("WARNS instead of dropping silently when the agent has no known chat", async () => {
+    // Send-only deployments (telegram.receiveEnabled:false, #260) never
+    // populate lastChatPerAgent, so an agent with no static routing.chats
+    // entry lands here. An alert that reaches neither chat nor a greppable
+    // log line would defeat the point of #301.
+    const warnings: string[] = [];
+    // `global` is subscribed (defaultAgentId) but has NO routing.chats entry,
+    // so targetForAgent falls through to null once lastChatPerAgent is empty.
+    adapter = await startAdapter({
+      routing: { chats: { "100": "triage" }, defaultAgentId: "global" },
+      receiveEnabled: false,
+      logger: { ...SILENT_LOGGER, warn: (m: string) => warnings.push(m) },
+    });
+    // NOTE: deliberately no feedInbound() — lastChatPerAgent stays empty.
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "global",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: { level: "critical", text: "alert for an unrouted agent", source: "stall-watchdog" },
+    });
+
+    await waitFor(() => warnings.length > 0);
+    expect(warnings.some((w) => w.includes("operator_alert"))).toBe(true);
+    expect(warnings.some((w) => w.includes("global"))).toBe(true);
+    expect(api.sendMessages).toHaveLength(0);
+  });
+
+  it("forwards message_thread_id so a forum alert lands in the watched topic", async () => {
+    adapter = await startAdapter();
+    // Inbound from a forum topic → lastChatPerAgent carries the thread id.
+    api.enqueueUpdates([
+      {
+        message: {
+          message_id: 51,
+          from: { id: 42 },
+          chat: { id: 100, type: "supergroup" },
+          message_thread_id: 5,
+          text: "hello",
+        },
+      },
+    ]);
+    await waitFor(() => bus.prompts.length > 0);
+    const before = api.sendMessages.length;
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: { level: "critical", text: "forum alert", source: "stall-watchdog" },
+    });
+
+    await waitFor(() => api.sendMessages.length === before + 1);
+    // Without this the alert posts to General, not the topic being watched.
+    expect(api.sendMessages[before]?.message_thread_id).toBe(5);
+  });
+
+  it("falls back to plain text when the HTML send 400s on malformed markup", async () => {
+    // sendHtml's documented caller contract. The alert interpolates an
+    // arbitrary err.message, so a parse 400 must degrade to unformatted
+    // text rather than vanish — dropping it would defeat #301.
+    adapter = await startAdapter();
+    await feedInbound();
+    const before = api.sendMessages.length;
+
+    let firstCall = true;
+    const realSend = api.sendMessage.bind(api);
+    api.sendMessage = async (params) => {
+      if (firstCall && params.parse_mode === "HTML") {
+        firstCall = false;
+        throw new Error("Telegram API 400: can't parse entities: unmatched tag");
+      }
+      return realSend(params);
+    };
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: { level: "critical", text: "**alert** with bad markup", source: "stall-watchdog" },
+    });
+
+    await waitFor(() => api.sendMessages.length === before + 1);
+    const sent = api.sendMessages[before];
+    // Delivered, and as plain text (no parse_mode) rather than dropped.
+    expect(sent?.parse_mode).toBeUndefined();
+    expect(sent?.text).toContain("alert");
+  });
+
+  it("still delivers via the static routing.chats fallback with no inbound message", async () => {
+    adapter = await startAdapter({ routing: { chats: { "100": "triage" } } });
+    // No feedInbound() — must resolve the target from routing.chats alone.
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: { level: "warn", text: "static-route alert", source: "stall-watchdog" },
+    });
+
+    await waitFor(() => api.sendMessages.length === 1);
+    expect(api.sendMessages[0]?.chat_id).toBe(100);
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────── */
 /* stop() cleanup                                                           */
 /* ────────────────────────────────────────────────────────────────────── */
 
@@ -1268,8 +1490,9 @@ describe("TelegramAdapter — stop()", () => {
     adapter = await startAdapter({
       routing: { chats: { "100": "triage", "200": "research" } },
     });
-    // Two agents × four topics (text, edit_text, permission, request_human) = eight.
-    expect(bus.state().subscriberCount).toBe(8);
+    // Two agents × five topics (text, edit_text, permission, request_human,
+    // operator_alert — the last added by #301) = ten.
+    expect(bus.state().subscriberCount).toBe(10);
     await adapter.stop();
     adapter = null;
     expect(bus.state().subscriberCount).toBe(0);

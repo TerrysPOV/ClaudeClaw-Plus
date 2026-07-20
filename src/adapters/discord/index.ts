@@ -158,7 +158,14 @@ export class DiscordAdapter {
       const sub = this.bus.subscribe(
         {
           agent_id: agentId,
-          topics: ["response.text", "channel.permission_request", "system.request_human"],
+          topics: [
+            "response.text",
+            "channel.permission_request",
+            "system.request_human",
+            // #301: out-of-band operator alerts (stall watchdog). A dedicated
+            // topic, not `response.text`, so it carries no turn semantics.
+            "system.operator_alert",
+          ],
         },
         (event) => this.handleBusEvent(agentId, event),
       );
@@ -539,6 +546,30 @@ export class DiscordAdapter {
       for (const channelId of targetChannels) {
         void this.safeSendMessage(channelId, prompt, components);
       }
+      return;
+    }
+
+    // #301: an out-of-band operator alert (e.g. the stall watchdog flagging a
+    // kill that looked like a false positive). Rendered as a standalone
+    // message — it is NOT a reply, so it must not touch turn state, edit a
+    // live message, or register a pending ask.
+    if (event.topic === "system.operator_alert") {
+      const payload = event.payload as { text?: string };
+      const text = typeof payload.text === "string" ? payload.text : "";
+      if (!text) return;
+      // Deliberately ONE channel, unlike the reply fan-out below.
+      // `targetChannels` is already `[primaryChannel]` when the operator set
+      // one; without an entry it degrades to `channelsForAgent`, i.e. every
+      // channel AND thread mapped to the agent (#151's opt-in containment —
+      // see the comment above). For a periodic heartbeat that is merely
+      // noisy; for a stall alert it is an alert storm into places like
+      // `daily-digest-*`, and the watchdog's guards bound alerts per SESSION,
+      // not per channel. Taking the first also matches Telegram's
+      // single-target semantics, so one logical alert has the same blast
+      // radius on both surfaces.
+      const alertChannel = targetChannels[0];
+      if (!alertChannel) return;
+      void this.safeSendMessage(alertChannel, text);
       return;
     }
 

@@ -463,4 +463,102 @@ describe("DiscordAdapter — multi-agent fan-out", () => {
     expect(byCh.get("ch-2")).toBe("for ops");
     expect(byCh.get("th-1")).toBe("for ops");
   });
+  /* #301 — out-of-band operator alerts (stall watchdog). */
+
+  it("renders a system.operator_alert to the agent's primary channel", async () => {
+    adapter = await startAdapter(h, {
+      routing: {
+        channels: { "ch-2": "ops" },
+        threads: { "th-1": "ops" },
+        dmAgentId: "global",
+        primaryChannelByAgent: { ops: "ch-2" },
+      },
+    });
+    h.bus.emit({
+      ts: Date.now(),
+      agent_id: "ops",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: {
+        level: "critical",
+        text: "stall-watchdog: looked ALIVE",
+        source: "stall-watchdog",
+      },
+    });
+    // Narrowed to the operator's primary channel, not fanned out to th-1.
+    expect(h.rest.sent.map((m) => m.channelId)).toEqual(["ch-2"]);
+    expect(h.rest.sent[0]?.text).toContain("looked ALIVE");
+  });
+
+  it("never routes an alert for agent A to a channel owned only by agent B", async () => {
+    adapter = await startAdapter(h, {
+      routing: { channels: { "ch-1": "triage", "ch-2": "ops" }, dmAgentId: "global" },
+    });
+    h.bus.emit({
+      ts: Date.now(),
+      agent_id: "ops",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: { level: "warn", text: "ops alert", source: "stall-watchdog" },
+    });
+    expect(h.rest.sent.map((m) => m.channelId)).toEqual(["ch-2"]);
+  });
+
+  it("posts an alert to ONE channel even when the agent owns several and no primary is set", async () => {
+    // #151's fan-out containment is opt-in: without a primaryChannelByAgent
+    // entry, targetChannels degrades to every channel AND thread mapped to
+    // the agent. Tolerable for a periodic heartbeat; an alert storm for a
+    // stall alert, whose guards bound per session, not per channel.
+    adapter = await startAdapter(h, {
+      routing: {
+        channels: { "ch-1": "ops", "ch-2": "ops" },
+        threads: { "th-1": "ops" },
+        dmAgentId: "global",
+        // deliberately NO primaryChannelByAgent — the documented default
+      },
+    });
+    h.bus.emit({
+      ts: Date.now(),
+      agent_id: "ops",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: { level: "critical", text: "wedged", source: "stall-watchdog" },
+    });
+
+    // A reply would fan out to all three; an alert must not.
+    expect(h.rest.sent).toHaveLength(1);
+  });
+
+  it("still fans a normal reply out to every routed channel (alert narrowing is alert-only)", async () => {
+    adapter = await startAdapter(h, {
+      routing: {
+        channels: { "ch-1": "ops", "ch-2": "ops" },
+        threads: { "th-1": "ops" },
+        dmAgentId: "global",
+      },
+    });
+    h.bus.emit({
+      ts: Date.now(),
+      agent_id: "ops",
+      session_id: "s",
+      topic: "response.text",
+      payload: { text: "a normal reply" },
+    });
+
+    expect(h.rest.sent.map((m) => m.channelId).sort()).toEqual(["ch-1", "ch-2", "th-1"]);
+  });
+
+  it("drops an alert with no text rather than posting an empty message", async () => {
+    adapter = await startAdapter(h, {
+      routing: { channels: { "ch-2": "ops" }, dmAgentId: "global" },
+    });
+    h.bus.emit({
+      ts: Date.now(),
+      agent_id: "ops",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: { level: "warn", source: "stall-watchdog" },
+    });
+    expect(h.rest.sent).toHaveLength(0);
+  });
 });

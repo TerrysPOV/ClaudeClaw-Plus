@@ -53,6 +53,7 @@ import { peekSession } from "../sessions";
 import { generateSummary } from "../rotation";
 import { getSettings } from "../config";
 import { StallWatchdog, DEFAULT_STALL_CONFIG, type StallWatchdogConfig } from "./stall-watchdog";
+import { createStallAlertNotifier } from "./stall-alert-delivery";
 import { probeProcessTreeCpu, classifyKill, appendStallKillAudit } from "./stall-forensics";
 
 export interface BusRuntimeHandle {
@@ -609,10 +610,11 @@ export async function mountBusRuntime(
         });
         return outcome;
       },
-      notify: (level, message) => {
-        if (level === "critical") logger.error("[stall-watchdog]", message);
-        else logger.warn("[stall-watchdog]", message);
-      },
+      // #301: log AND deliver to the operator's chat surface. A wrong kill
+      // (suspected_false_positive) is the case the operator most needs to see
+      // — it means a ceiling is too tight — and it previously reached only
+      // journalctl + stall-kills.jsonl.
+      notify: createStallAlertNotifier({ bus, logger }),
       now: () => Date.now(),
     });
     stallWatchdog.start();

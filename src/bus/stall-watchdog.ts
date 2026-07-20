@@ -268,8 +268,21 @@ export interface StallWatchdogDeps {
     ceiling: ToolCeiling;
     snapshot: ForensicSnapshot;
   }): Promise<StallKillOutcome>;
-  /** Surface a warn / false-positive flag to the operator (Discord/critical log). */
-  notify(level: "warn" | "critical", message: string): void;
+  /**
+   * Surface a warn / false-positive flag to the operator: the daemon log plus
+   * whichever chat surfaces are mounted (Discord and/or Telegram, via #301's
+   * `system.operator_alert` topic).
+   *
+   * `agentId` is the stalled agent the alert is ABOUT. The wiring uses it to
+   * route the alert to that agent's operator channel (#301) — a bus alert has
+   * no inbound origin to reply to, so routing has to be keyed on the agent.
+   *
+   * Implementations MUST be best-effort: a delivery failure must never
+   * interrupt recovery. Callers do NOT rate-limit here — every call site is
+   * already behind an existing guard (the per-tool `warned` latch, the
+   * `killing` set, or the `restartFailedAt` cooldown).
+   */
+  notify(level: "warn" | "critical", message: string, agentId: string): void;
   /** Clock seam (tests inject a deterministic clock). */
   now(): number;
 }
@@ -351,6 +364,7 @@ export class StallWatchdog {
             `Session ${s.agentId} has had \`${decision.tool}\` outstanding for ` +
               `${Math.round(decision.outstandingMs / 1000)}s (warn ${decision.ceiling.warnSeconds}s / ` +
               `kill ${decision.ceiling.killSeconds}s).`,
+            s.agentId,
           );
         }
         continue;
@@ -367,6 +381,7 @@ export class StallWatchdog {
             `Session ${s.agentId} \`${decision.tool}\` outstanding ` +
               `${Math.round(decision.outstandingMs / 1000)}s — past kill ceiling ` +
               `(${decision.ceiling.killSeconds}s) but stallWatchdog.action=warn, NOT restarting.`,
+            s.agentId,
           );
         }
         continue;
@@ -429,6 +444,7 @@ export class StallWatchdog {
         "critical",
         `Stall-kill of ${s.agentId} FAILED to restart: ${err instanceof Error ? err.message : String(err)}. ` +
           `Backing off ${Math.round(this.config.restartFailureCooldownMs / 1000)}s before retry.`,
+        s.agentId,
       );
       return;
     }
@@ -461,12 +477,14 @@ export class StallWatchdog {
           `(cpuAdvancing=${snapshot.cpuAdvancing}, outputRecencyMs=${snapshot.outputRecencyMs}). ` +
           `If this tool legitimately runs that long, raise \`stallWatchdog.ceilings.${cls}.killSeconds\`` +
           (outcome.suggestedKillSeconds ? ` (suggest ~${outcome.suggestedKillSeconds}s).` : `.`),
+        s.agentId,
       );
     } else {
       this.deps.notify(
         "warn",
         `Stall-killed ${s.agentId} on \`${decision.tool}\` after ` +
           `${Math.round(decision.outstandingMs / 1000)}s (genuine wedge — session respawned).`,
+        s.agentId,
       );
     }
   }

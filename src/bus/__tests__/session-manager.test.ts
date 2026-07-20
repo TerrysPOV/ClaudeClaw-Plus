@@ -745,7 +745,20 @@ describe("session-id collision rotation", () => {
         `echo "Error: Session ID 99999999-9999-9999-9999-999999999bad is already in use."; exit 1`,
       ],
       busSocketPath: "/tmp/test-bus-rotate.sock",
-      sessionCollisionDetectMs: 300,
+      // 2000ms, not 300ms. An UPPER BOUND, not a fixed wait, FOR A STAND-IN
+      // THAT EXITS WITHIN IT — the sibling at the top of this describe keeps
+      // 500ms deliberately, because its retry stand-in `sleep 60`s and so
+      // burns the whole window; do not "fix the inconsistency" by raising it.
+      // `detectSessionIdCollision` resolves as soon as `proc.onExit` fires,
+      // so a fast stand-in still finishes in ~ms and the suite pays nothing.
+      // Observed: at 300ms these tests flaked under the CPU contention of
+      // concurrently running test files; at 2000ms they passed 10/10 in
+      // isolation and across repeated full-suite runs.
+      // NOT claimed: that the window is the only race here. The detector
+      // also depends on the marker chunk arriving before `onExit`
+      // (session-manager.ts:421-435), which no window size fixes. If these
+      // flake again, suspect that ordering rather than raising the bound.
+      sessionCollisionDetectMs: 2000,
       persistRotatedSessionId: async () => {},
       logger: { warn: () => {}, info: () => {}, error: () => {} },
     });
@@ -764,7 +777,20 @@ describe("session-id collision rotation", () => {
       commandOverride: "/bin/sh",
       argsOverride: ["-c", "echo unrelated boot error; exit 1"],
       busSocketPath: "/tmp/test-bus-rotate.sock",
-      sessionCollisionDetectMs: 300,
+      // 2000ms, not 300ms. An UPPER BOUND, not a fixed wait, FOR A STAND-IN
+      // THAT EXITS WITHIN IT — the sibling at the top of this describe keeps
+      // 500ms deliberately, because its retry stand-in `sleep 60`s and so
+      // burns the whole window; do not "fix the inconsistency" by raising it.
+      // `detectSessionIdCollision` resolves as soon as `proc.onExit` fires,
+      // so a fast stand-in still finishes in ~ms and the suite pays nothing.
+      // Observed: at 300ms these tests flaked under the CPU contention of
+      // concurrently running test files; at 2000ms they passed 10/10 in
+      // isolation and across repeated full-suite runs.
+      // NOT claimed: that the window is the only race here. The detector
+      // also depends on the marker chunk arriving before `onExit`
+      // (session-manager.ts:421-435), which no window size fixes. If these
+      // flake again, suspect that ordering rather than raising the bound.
+      sessionCollisionDetectMs: 2000,
       persistRotatedSessionId: async (agentId, sessionId) => {
         persisted.push({ agentId, sessionId });
       },
@@ -790,7 +816,20 @@ describe("session-id collision rotation", () => {
       // inside the detection window.
       argsOverride: ["-c", "echo non-collision crash; exit 1"],
       busSocketPath: "/tmp/test-bus-rotate.sock",
-      sessionCollisionDetectMs: 300,
+      // 2000ms, not 300ms. An UPPER BOUND, not a fixed wait, FOR A STAND-IN
+      // THAT EXITS WITHIN IT — the sibling at the top of this describe keeps
+      // 500ms deliberately, because its retry stand-in `sleep 60`s and so
+      // burns the whole window; do not "fix the inconsistency" by raising it.
+      // `detectSessionIdCollision` resolves as soon as `proc.onExit` fires,
+      // so a fast stand-in still finishes in ~ms and the suite pays nothing.
+      // Observed: at 300ms these tests flaked under the CPU contention of
+      // concurrently running test files; at 2000ms they passed 10/10 in
+      // isolation and across repeated full-suite runs.
+      // NOT claimed: that the window is the only race here. The detector
+      // also depends on the marker chunk arriving before `onExit`
+      // (session-manager.ts:421-435), which no window size fixes. If these
+      // flake again, suspect that ordering rather than raising the bound.
+      sessionCollisionDetectMs: 2000,
       logger: { warn: () => {}, info: () => {}, error: () => {} },
     });
     const agent = mkAgent({ id: "rot-race", session_id: STALE });
