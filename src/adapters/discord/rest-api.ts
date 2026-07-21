@@ -38,7 +38,12 @@ export class DiscordRestApi implements DiscordRestApiLike {
     const chunks = chunkContent(text);
     if (chunks.length === 0) return;
     for (let i = 0; i < chunks.length; i++) {
-      const body: Record<string, unknown> = { content: chunks[i] };
+      // #323: deny all mention parsing — outbound text is model-generated,
+      // never operator-authored, so an @everyone/@here/role ping must not fire.
+      const body: Record<string, unknown> = {
+        content: chunks[i],
+        allowed_mentions: { parse: [] },
+      };
       if (components && i === chunks.length - 1) body.components = components;
       await this.call("POST", `/channels/${channelId}/messages`, body);
     }
@@ -62,7 +67,7 @@ export class DiscordRestApi implements DiscordRestApiLike {
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ type: 4, data: body }),
+        body: JSON.stringify({ type: 4, data: { ...body, allowed_mentions: { parse: [] } } }),
       },
     );
     if (!res.ok) {
