@@ -969,7 +969,9 @@ describe("SlackAdapter — stop() cleanup", () => {
       routing: { channels: { C100: "triage", C200: "research" } },
     });
     // Two agents × three topics = six subscriptions.
-    expect(bus.state().subscriberCount).toBe(6);
+    // 2 agents x 4 subscriptions (response.text, permission_request,
+    // request_human, operator_alert #325).
+    expect(bus.state().subscriberCount).toBe(8);
     await adapter.stop();
     adapter = null;
     expect(bus.state().subscriberCount).toBe(0);
@@ -1737,5 +1739,51 @@ describe("SlackAdapter — tailer echo suppression (#217)", () => {
     await waitFor(() => api.sent.length > 0);
     expect(api.sent).toHaveLength(1);
     expect(api.sent[0]?.text).toBe("recovered");
+  });
+
+  it("delivers system.operator_alert as a standalone message (#325)", async () => {
+    adapter = await startAdapter();
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "system.operator_alert",
+      payload: { text: "stall watchdog: possible false-positive kill" },
+    });
+    await waitFor(() => api.sent.length > 0);
+    expect(api.sent[0]?.channel).toBe("C100");
+    expect(api.sent[0]?.text).toContain("stall watchdog");
+  });
+
+  it("bounds system.operator_alert to the primary channel, not a fan-out (#325)", async () => {
+    adapter = await startAdapter({
+      routing: {
+        channels: { C100: "triage", C200: "triage" },
+        primaryChannelByAgent: { triage: "C200" },
+      },
+    });
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "system.operator_alert",
+      payload: { text: "one alert" },
+    });
+    await waitFor(() => api.sent.length > 0);
+    expect(api.sent).toHaveLength(1);
+    expect(api.sent[0]?.channel).toBe("C200");
+  });
+
+  it("drops an empty system.operator_alert (#325)", async () => {
+    adapter = await startAdapter();
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "system.operator_alert",
+      payload: { text: "" },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(api.sent).toHaveLength(0);
   });
 });

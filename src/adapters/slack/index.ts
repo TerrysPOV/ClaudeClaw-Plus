@@ -602,8 +602,32 @@ export class SlackAdapter {
         { agent_id: agentId, topics: ["system.request_human"] },
         (event) => void this.handleRequestHuman(agentId, event),
       ),
+      this.bus.subscribe(
+        { agent_id: agentId, topics: ["system.operator_alert"] },
+        (event) => void this.handleOperatorAlert(agentId, event),
+      ),
     ];
     this.subscriptions.set(agentId, subs);
+  }
+
+  private async handleOperatorAlert(agentId: string, event: BusEvent): Promise<void> {
+    if (!eventBelongsToSlack(event)) return;
+    const payload = event.payload as { text?: string };
+    const text = typeof payload.text === "string" ? payload.text : "";
+    if (!text) return;
+    // #325/#301: a standalone out-of-band operator alert (e.g. the stall
+    // watchdog). It is NOT a reply — it must not touch turn state or register
+    // a pending ask, so it deliberately does NOT go through handleResponseText.
+    // Bound to ONE channel (the primary when set), mirroring Discord/Telegram:
+    // the fan-out fallback maps every channel AND thread for the agent, which
+    // is an alert storm for a stall alert, not a heartbeat.
+    const alertChannel =
+      this.primaryChannelByAgent?.[agentId] ?? this.resolveTargetChannels(agentId, null)[0];
+    if (!alertChannel) {
+      this.logger.warn(`[slack-adapter] no target channel for operator_alert on agent ${agentId}`);
+      return;
+    }
+    await this.safePostMessage({ channel: alertChannel, text });
   }
 
   private async handleResponseText(agentId: string, event: BusEvent): Promise<void> {
