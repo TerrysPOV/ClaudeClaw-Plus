@@ -27,7 +27,7 @@ function evt(
 
 function stateWith(tools: Array<{ id: string; name: string; startedAt: number }>) {
   const s = newSessionState("reg", "s1", 0);
-  for (const t of tools) s.outstanding.set(t.id, { ...t, warned: false });
+  for (const t of tools) s.outstanding.set(t.id, { ...t, warned: false, criticalWarned: false });
   return s;
 }
 
@@ -430,5 +430,21 @@ describe("stop() while a kill is mid-flight", () => {
 
     expect(calls.restart).toBe(0); // no restart started after stop() began
     expect(calls.recordKill).toBe(0); // and the kill aborted before recording
+  });
+
+  it("warn-only mode fires BOTH warn and critical for one tool crossing both ceilings (#322)", async () => {
+    const { deps, rec } = recordingDeps();
+    const warnOnly = { ...DEFAULT_STALL_CONFIG, action: "warn" as const };
+    const wd = new StallWatchdog(warnOnly, deps);
+    wd.ingest(evt("response.tool_use", 0, { id: "b1", name: "Bash" }));
+    // cross the warn ceiling (past 300s, before the 900s kill ceiling) → soft warn
+    await wd.sweep((C.bash.warnSeconds + 1) * 1000);
+    // later cross the kill ceiling → the critical "NOT restarting" escalation must
+    // still fire, even though the soft warn already latched (the #322 bug).
+    await wd.sweep((C.bash.killSeconds + 1) * 1000);
+    expect(rec.notify.some((n) => n.level === "warn")).toBe(true);
+    const crit = rec.notify.find((n) => n.level === "critical");
+    expect(crit).toBeDefined();
+    expect(crit?.message).toContain("NOT restarting");
   });
 });

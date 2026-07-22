@@ -32,7 +32,6 @@ import {
   type TelemetryProvider,
   type TelemetryStream,
   TELEMETRY_CONTRACT_VERSION,
-  TELEMETRY_STREAMS,
 } from "../../skills-tuner/core/telemetry.js";
 
 // ── Wire contract ────────────────────────────────────────────────────────────
@@ -64,7 +63,14 @@ interface QueryResult {
 }
 
 const QueryArgsSchema = z.object({
-  stream: z.enum(TELEMETRY_STREAMS),
+  // Not `z.enum(TELEMETRY_STREAMS)`: `buildHostTelemetryProvider`'s
+  // `extraProducers` can advertise operator-defined (`custom.<name>`) streams
+  // via `telemetry__capabilities`, so the served query surface must accept them
+  // too — otherwise a stream reported `available` here would reject at query
+  // time and `McpTelemetryProvider.query` would silently degrade to `[]`
+  // (available-but-always-empty). Bounded length since this is socket-exposed;
+  // unknown streams simply return no samples (each producer owns its own).
+  stream: z.string().min(1).max(128),
   start: z.string(),
   end: z.string(),
   filters: z.record(z.string(), z.string()).optional(),
