@@ -173,6 +173,9 @@ interface OutstandingTool {
   startedAt: number;
   /** True once a `warn` has been emitted, so we don't ping every sweep. */
   warned: boolean;
+  /** #322: separate latch for the warn-only CRITICAL escalation, so it
+   *  fires once even after the soft `warned` latch is already set. */
+  criticalWarned: boolean;
 }
 
 export interface SessionStallState {
@@ -328,7 +331,13 @@ export class StallWatchdog {
       case "response.tool_use": {
         const p = e.payload as { id?: string; name?: string };
         if (p?.id && p?.name) {
-          s.outstanding.set(p.id, { id: p.id, name: p.name, startedAt: e.ts, warned: false });
+          s.outstanding.set(p.id, {
+          id: p.id,
+          name: p.name,
+          startedAt: e.ts,
+          warned: false,
+          criticalWarned: false,
+        });
         }
         break;
       }
@@ -374,8 +383,8 @@ export class StallWatchdog {
       if (this.config.action === "warn") {
         // warn-only mode: flag at the kill ceiling but never restart.
         const t = s.outstanding.get(decision.toolUseId);
-        if (t && !t.warned) {
-          t.warned = true;
+        if (t && !t.criticalWarned) {
+          t.criticalWarned = true;
           this.deps.notify(
             "critical",
             `Session ${s.agentId} \`${decision.tool}\` outstanding ` +
