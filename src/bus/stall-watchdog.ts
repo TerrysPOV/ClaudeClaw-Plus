@@ -203,13 +203,19 @@ type StallSignal = {
   ceiling: ToolCeiling;
 };
 
-// `warn` and `kill` are DISTINCT members (not a combined `"warn" | "kill"`),
-// so `Extract<StallDecision, { action: "kill" }>` resolves to the kill member
-// instead of `never` and `handleKill`'s body is actually type-checked (#324).
-export type StallDecision =
-  | { action: "none" }
-  | ({ action: "warn" } & StallSignal)
-  | ({ action: "kill" } & StallSignal);
+/**
+ * A decision to kill — its own named member so `handleKill` can type its
+ * parameter directly on it (#324). Deliberately NOT
+ * `Extract<StallDecision, { action: "kill" }>`: that construct silently
+ * resolves to `never` if the union is ever recombined into one
+ * `{ action: "warn" | "kill" }` member — and since every access on `never`
+ * compiles, handleKill's body would go un-type-checked again with no signal.
+ */
+type KillDecision = { action: "kill" } & StallSignal;
+
+// `warn` and `kill` are DISTINCT members (not a combined `"warn" | "kill"`), so
+// each carries a single literal discriminant the consumers can narrow on.
+export type StallDecision = { action: "none" } | ({ action: "warn" } & StallSignal) | KillDecision;
 
 const rank = (a: StallDecision["action"]): number => (a === "kill" ? 2 : a === "warn" ? 1 : 0);
 
@@ -428,7 +434,7 @@ export class StallWatchdog {
   /** capture forensic → restart → classify+audit → flag false positives. */
   private async handleKill(
     s: SessionStallState,
-    decision: Extract<StallDecision, { action: "kill" }>,
+    decision: KillDecision,
     now: number,
   ): Promise<void> {
     let snapshot: ForensicSnapshot = { cpuAdvancing: null, outputRecencyMs: null };
