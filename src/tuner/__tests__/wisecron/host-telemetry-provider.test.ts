@@ -802,3 +802,110 @@ describe("buildHostTelemetryProvider — extraProducers (operator extension poin
     expect(after).toBe(before);
   });
 });
+
+describe("CompositeTelemetryProvider — double-served stream guard (#319 review)", () => {
+  // A producer that owns exactly one stream at a fixed availability, optionally
+  // returning one sample for it — lets us stage the contested-available case
+  // deterministically (no built-in probe/fs flakiness).
+  class FixedProducer implements TelemetryProvider {
+    constructor(
+      private readonly stream: string,
+      private readonly available: boolean,
+      private readonly sample?: MetricSample,
+    ) {}
+    contractVersion(): string {
+      return "1.0.0";
+    }
+    capabilities() {
+      return [
+        {
+          stream: this.stream as TelemetryStream,
+          schemaVersion: "1.0.0",
+          available: this.available,
+        },
+      ];
+    }
+    async query(stream: TelemetryStream): Promise<MetricSample[]> {
+      return stream === this.stream && this.sample ? [this.sample] : [];
+    }
+  }
+
+  function captureWarn<T>(fn: () => T): { result: T; warnings: string[] } {
+    const warnings: string[] = [];
+    const orig = console.warn;
+    console.warn = (msg?: unknown) => {
+      warnings.push(String(msg));
+    };
+    try {
+      return { result: fn(), warnings };
+    } finally {
+      console.warn = orig;
+    }
+  }
+
+  it("two producers serving the same stream available → one capability, warns once, query still doubles", async () => {
+    const composite = new CompositeTelemetryProvider([
+      new FixedProducer("tool_call", true, { ts: new Date(NOW_MS), value: 1 }),
+      new FixedProducer("tool_call", true, { ts: new Date(NOW_MS), value: 2 }),
+    ]);
+
+    const { result: caps, warnings } = captureWarn(() => {
+      const first = composite.capabilities();
+      composite.capabilities(); // second call must NOT re-warn (once per instance)
+      return first;
+    });
+
+    // The manifest keeps ONE entry (the first producer); the second is hidden.
+    expect(caps.filter((c) => c.stream === "tool_call")).toHaveLength(1);
+    // Guard fired exactly once despite two capabilities() calls.
+    expect(warnings.filter((w) => w.includes("tool_call"))).toHaveLength(1);
+
+    // But query() concatenates — the guard warns, it does NOT dedupe. This pins
+    // the double-count so a future "silent dedupe" refactor is a conscious choice.
+    const samples = await composite.query("tool_call" as TelemetryStream, RANGE);
+    expect(samples).toHaveLength(2);
+  });
+
+  it("upgrading an UNAVAILABLE built-in does not trip the guard", () => {
+    class UpgradeProducer implements TelemetryProvider {
+      contractVersion(): string {
+        return "1.0.0";
+      }
+      capabilities() {
+        return [
+          { stream: "memory_signal" as TelemetryStream, schemaVersion: "1.0.0", available: true },
+        ];
+      }
+      async query(): Promise<MetricSample[]> {
+        return [];
+      }
+    }
+    // No memorySignalHistoryPath → the built-in memory_signal ships unavailable,
+    // so the operator producer legitimately upgrades it — not a conflict.
+    const { result: provider, warnings } = captureWarn(() =>
+      buildHostTelemetryProvider({ extraProducers: [new UpgradeProducer()] }),
+    );
+    const cap = provider.capabilities().find((c) => c.stream === "memory_signal");
+    expect(cap?.available).toBe(true);
+    expect(warnings.filter((w) => w.includes("memory_signal"))).toHaveLength(0);
+  });
+
+  it("a disjoint custom stream never leaks into a built-in stream's query()", async () => {
+    class CustomProducer implements TelemetryProvider {
+      contractVersion(): string {
+        return "1.0.0";
+      }
+      capabilities() {
+        return [
+          { stream: "custom.demo" as TelemetryStream, schemaVersion: "1.0.0", available: true },
+        ];
+      }
+      async query(stream: TelemetryStream): Promise<MetricSample[]> {
+        return stream === "custom.demo" ? [{ ts: new Date(NOW_MS), value: 7 }] : [];
+      }
+    }
+    const provider = buildHostTelemetryProvider({ extraProducers: [new CustomProducer()] });
+    const toolCall = await provider.query("tool_call" as TelemetryStream, RANGE);
+    expect(toolCall.every((s) => s.value !== 7)).toBe(true);
+  });
+});

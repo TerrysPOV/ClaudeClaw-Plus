@@ -945,6 +945,10 @@ export class TemplateFeedbackTelemetryProducer implements TelemetryProvider {
 export class CompositeTelemetryProvider implements TelemetryProvider, ViewManifestSource {
   constructor(private readonly providers: TelemetryProvider[]) {}
 
+  /** Streams already flagged as double-served, so the guard warns once per
+   *  stream per instance instead of every `capabilities()` call. */
+  private readonly warnedStreamConflicts = new Set<string>();
+
   contractVersion(): string {
     return TELEMETRY_CONTRACT_VERSION;
   }
@@ -958,6 +962,18 @@ export class CompositeTelemetryProvider implements TelemetryProvider, ViewManife
       // First writer wins; an available producer upgrades a prior unavailable.
       if (!cur) best.set(c.stream, c);
       else if (!cur.available && c.available) best.set(c.stream, c);
+      else if (cur.available && c.available && !this.warnedStreamConflicts.has(c.stream)) {
+        // Two producers both serve this stream `available`. The merge keeps the
+        // first (this manifest hides the second), but `query()` concatenates
+        // every producer — so the second's samples silently double-count.
+        // Producers MUST own disjoint streams; see `extraProducers`' contract.
+        this.warnedStreamConflicts.add(c.stream);
+        console.warn(
+          `[telemetry] stream "${c.stream}" is served \`available\` by more than one ` +
+            `producer — query() will double-count it. Producers must own disjoint streams ` +
+            `(an extraProducer may only upgrade an \`unavailable\` built-in).`,
+        );
+      }
     }
     for (const s of TELEMETRY_STREAMS) {
       if (!best.has(s)) {
@@ -1045,10 +1061,20 @@ export interface HostTelemetryConfig {
   /**
    * Operator-supplied producers composed alongside the built-ins — the
    * extension point for a host to add its own telemetry source (or a custom
-   * stream) without editing this function. Each is merged into the composite
-   * exactly like a built-in: its `capabilities()` win the per-stream merge
-   * when available, and its `query()` results are concatenated. Custom streams
-   * SHOULD be namespaced (`custom.<name>`).
+   * stream) without editing this function. Composed LAST.
+   *
+   * Contract — each producer MUST own streams DISJOINT from every `available`
+   * built-in stream:
+   * - `capabilities()` merge is first-available-wins, so an extraProducer only
+   *   ever UPGRADES a built-in that shipped `unavailable`; it can NOT override a
+   *   built-in that is already `available` (that built-in was listed first).
+   * - `query()` CONCATENATES every producer, so if an extraProducer claims a
+   *   stream a built-in already serves `available`, its samples double-count
+   *   (the capability manifest hides it, but the data still flows). This is
+   *   operator misconfiguration — `buildHostTelemetryProvider` warns on it.
+   *
+   * Custom streams SHOULD be namespaced (`custom.<name>`) to stay disjoint from
+   * current and future built-ins.
    */
   extraProducers?: TelemetryProvider[];
 }

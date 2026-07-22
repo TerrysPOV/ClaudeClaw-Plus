@@ -12,7 +12,7 @@
 import type { Registry } from "../../skills-tuner/core/registry.js";
 import type { LLMClient } from "../../skills-tuner/core/llm.js";
 import type { TunableSubject } from "../../skills-tuner/core/interfaces.js";
-import type { TelemetryProvider, TelemetryStream } from "../../skills-tuner/core/telemetry.js";
+import type { KnownTelemetryStream, TelemetryProvider } from "../../skills-tuner/core/telemetry.js";
 import { AuditLog } from "../../skills-tuner/core/audit-log.js";
 import { activateFitness } from "../../skills-tuner/core/fitness.js";
 import {
@@ -60,7 +60,7 @@ export interface WisecronContext {
  * Honours per-subject `enabled` flags in settings.subjects.
  */
 /** Maps each producer-dependent subject to the telemetry stream it consumes. */
-const SUBJECT_STREAM: Partial<Record<string, TelemetryStream>> = {
+const SUBJECT_STREAM: Partial<Record<string, KnownTelemetryStream>> = {
   cron: "cron_run",
   hook: "hook_exec",
   mcp_plugin: "tool_call",
