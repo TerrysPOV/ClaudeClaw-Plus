@@ -284,7 +284,8 @@ async function sendMessage(
   const chunks = discordMessageChunks(text);
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
-    const body: Record<string, unknown> = { content: chunk };
+    // #323: deny mention parsing — chunk is model output.
+    const body: Record<string, unknown> = { content: chunk, allowed_mentions: { parse: [] } };
     // Attach components only to the last chunk
     if (components && i === chunks.length - 1) {
       body.components = components;
@@ -402,7 +403,10 @@ async function sendMessageWithImages(
   const chunks = discordMessageChunks(text || "​");
   const uploadText = chunks.pop() ?? "​";
   for (const chunk of chunks) {
-    await discordApi(token, "POST", `/channels/${channelId}/messages`, { content: chunk });
+    await discordApi(token, "POST", `/channels/${channelId}/messages`, {
+      content: chunk,
+      allowed_mentions: { parse: [] },
+    });
   }
 
   await uploadImageMessage(token, channelId, uploadText, imagePaths);
@@ -416,7 +420,7 @@ async function uploadImageMessage(
   attempt = 0,
 ): Promise<void> {
   const form = new FormData();
-  form.append("payload_json", JSON.stringify({ content: text }));
+  form.append("payload_json", JSON.stringify({ content: text, allowed_mentions: { parse: [] } }));
   for (let i = 0; i < imagePaths.length; i++) {
     const file = Bun.file(imagePaths[i]);
     form.append(`files[${i}]`, file, basename(imagePaths[i]));
@@ -684,7 +688,8 @@ async function respondToInteraction(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       type: 4, // CHANNEL_MESSAGE_WITH_SOURCE
-      data,
+      // #323: deny mention parsing on every interaction response.
+      data: { ...data, allowed_mentions: { parse: [] } },
     }),
   });
 }
@@ -754,6 +759,7 @@ function makeDiscordStreamCallback(token: string, channelId: string): DiscordStr
       try {
         await discordApi(token, "PATCH", `/channels/${channelId}/messages/${streamMsgId}`, {
           content,
+          allowed_mentions: { parse: [] },
         });
       } catch (err) {
         debugLog(`Stream edit failed: ${err instanceof Error ? err.message : err}`);
@@ -1409,7 +1415,7 @@ async function handleInteractionCreate(
         {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ content: result.message }),
+          body: JSON.stringify({ content: result.message, allowed_mentions: { parse: [] } }),
         },
       );
       return;
