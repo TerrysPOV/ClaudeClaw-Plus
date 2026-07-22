@@ -195,15 +195,21 @@ export function newSessionState(
   return { agentId, sessionId, outstanding: new Map(), lastActivityAt: now };
 }
 
+/** The shared shape of an actionable stall (everything but the verb). */
+type StallSignal = {
+  tool: string;
+  toolUseId: string;
+  outstandingMs: number;
+  ceiling: ToolCeiling;
+};
+
+// `warn` and `kill` are DISTINCT members (not a combined `"warn" | "kill"`),
+// so `Extract<StallDecision, { action: "kill" }>` resolves to the kill member
+// instead of `never` and `handleKill`'s body is actually type-checked (#324).
 export type StallDecision =
   | { action: "none" }
-  | {
-      action: "warn" | "kill";
-      tool: string;
-      toolUseId: string;
-      outstandingMs: number;
-      ceiling: ToolCeiling;
-    };
+  | ({ action: "warn" } & StallSignal)
+  | ({ action: "kill" } & StallSignal);
 
 const rank = (a: StallDecision["action"]): number => (a === "kill" ? 2 : a === "warn" ? 1 : 0);
 
@@ -233,7 +239,16 @@ export function evaluateStall(
       rank(action) > rank(worst.action) ||
       (rank(action) === rank(worst.action) && age > worstAge)
     ) {
-      worst = { action, tool: t.name, toolUseId: t.id, outstandingMs: age, ceiling: c };
+      // `action` is narrowed to "warn" | "kill" here (the "none" case
+      // continued above). Build with a LITERAL action so the object is
+      // assignable to the split union.
+      const signal: StallSignal = {
+        tool: t.name,
+        toolUseId: t.id,
+        outstandingMs: age,
+        ceiling: c,
+      };
+      worst = action === "kill" ? { action: "kill", ...signal } : { action: "warn", ...signal };
       worstAge = age;
     }
   }
