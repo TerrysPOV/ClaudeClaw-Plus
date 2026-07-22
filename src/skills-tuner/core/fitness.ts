@@ -14,6 +14,7 @@
 
 import type { TunableSubject } from "./interfaces.js";
 import type {
+  KnownTelemetryStream,
   Metric,
   TelemetryCapability,
   TelemetryProvider,
@@ -163,7 +164,7 @@ export function activateFitness(
  */
 export async function deriveCapabilitiesFromHealthChecks(
   subjects: readonly TunableSubject[],
-  subjectStream: Partial<Record<string, TelemetryStream>>,
+  subjectStream: Partial<Record<string, KnownTelemetryStream>>,
   schemaVersion = TELEMETRY_CONTRACT_VERSION,
 ): Promise<TelemetryCapability[]> {
   const caps: TelemetryCapability[] = [];

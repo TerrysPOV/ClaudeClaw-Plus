@@ -80,6 +80,13 @@ export interface BusWebUiBridge {
    * daemon boot.
    */
   defaultAgentId: string;
+  /**
+   * #315: ids of agents with an in-flight turn, for the pre-auth `/api/health`
+   * busy signal. Lets an external restart guard drain-then-restart instead of
+   * killing a turn mid-flight. Bus-derived, so absent in legacy (non-bus) mode
+   * → the health field is simply omitted.
+   */
+  activeTurnAgents: () => string[];
 }
 
 export interface BusWebUiPromptResult {

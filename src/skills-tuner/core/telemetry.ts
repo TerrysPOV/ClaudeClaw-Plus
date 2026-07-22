@@ -49,7 +49,18 @@ export const TELEMETRY_STREAMS = [
   "memory_signal",
 ] as const;
 
-export type TelemetryStream = (typeof TELEMETRY_STREAMS)[number];
+/** The built-in streams this repo ships producers for. */
+export type KnownTelemetryStream = (typeof TELEMETRY_STREAMS)[number];
+/**
+ * A telemetry stream name. One of the built-in {@link KnownTelemetryStream}s,
+ * OR any operator-defined string — so a host-composed producer (see
+ * `buildHostTelemetryProvider`'s `extraProducers`) can advertise its own
+ * signal without editing this enum. The `& {}` preserves literal autocomplete
+ * for the known streams while widening to `string`. Custom producers SHOULD
+ * namespace their streams (e.g. `custom.<name>`) to avoid colliding with a
+ * future built-in.
+ */
+export type TelemetryStream = KnownTelemetryStream | (string & {});
 
 /**
  * The whole contract surface is versioned per host release for certification.

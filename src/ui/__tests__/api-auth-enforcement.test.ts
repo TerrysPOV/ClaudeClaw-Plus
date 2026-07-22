@@ -121,3 +121,72 @@ describe("/api/* web token enforcement (issue #164 PR B)", () => {
     expect(res.status).toBe(401);
   });
 });
+
+describe("/api/health busy signal (#315)", () => {
+  // A controllable stub for the bus bridge's turn-active accessor. Casting the
+  // bridge sidesteps the (unused-here) sendPromptAndAwait result shape.
+  let activeTurns: string[] = [];
+  let busyHandle: WebServerHandle;
+  let busyBase: string;
+
+  beforeAll(() => {
+    busyHandle = startWebUi({
+      host: "127.0.0.1",
+      port: 0,
+      token: TOKEN,
+      getSnapshot: snapshot,
+      bus: {
+        defaultAgentId: "agent-0",
+        activeTurnAgents: () => activeTurns,
+        sendPromptAndAwait: async () => ({}),
+      } as unknown as NonNullable<Parameters<typeof startWebUi>[0]["bus"]>,
+    });
+    busyBase = `http://127.0.0.1:${busyHandle.port}`;
+  });
+
+  afterAll(() => busyHandle.stop());
+
+  it("omits busy/activeTurns when no bus is wired (legacy mode)", async () => {
+    const anon = await (
+      await fetch(`${base}/api/health`, { headers: { Host: `127.0.0.1:${handle.port}` } })
+    ).json();
+    expect(anon.busy).toBeUndefined();
+    expect(anon.activeTurns).toBeUndefined();
+  });
+
+  it("busy=false with no in-flight turn; ok stays true (busy is orthogonal to health)", async () => {
+    activeTurns = [];
+    const res = await fetch(`${busyBase}/api/health`, {
+      headers: { Host: `127.0.0.1:${busyHandle.port}` },
+    });
+    const j = await res.json();
+    expect(res.status).toBe(200);
+    expect(j.ok).toBe(true);
+    expect(j.busy).toBe(false);
+  });
+
+  it("busy=true while a turn is in flight; ok still true", async () => {
+    activeTurns = ["agent-0"];
+    const j = await (
+      await fetch(`${busyBase}/api/health`, { headers: { Host: `127.0.0.1:${busyHandle.port}` } })
+    ).json();
+    expect(j.ok).toBe(true);
+    expect(j.busy).toBe(true);
+  });
+
+  it("pre-auth carries ONLY the boolean; the count needs the token (#178 rule)", async () => {
+    activeTurns = ["agent-0", "agent-1"];
+    const anon = await (
+      await fetch(`${busyBase}/api/health`, { headers: { Host: `127.0.0.1:${busyHandle.port}` } })
+    ).json();
+    const authed = await (
+      await fetch(`${busyBase}/api/health`, {
+        headers: { Host: `127.0.0.1:${busyHandle.port}`, Authorization: `Bearer ${TOKEN}` },
+      })
+    ).json();
+    expect(anon.busy).toBe(true);
+    expect(anon.activeTurns).toBeUndefined(); // count not leaked pre-auth
+    expect(authed.busy).toBe(true);
+    expect(authed.activeTurns).toBe(2); // count visible with the web token
+  });
+});

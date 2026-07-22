@@ -106,4 +106,21 @@ describe("DiscordRestApi", () => {
     const api = new DiscordRestApi({ token: "tok", logger: SILENT, fetchImpl: fake.fetchImpl });
     await expect(api.sendMessage("c1", "x")).rejects.toThrow(/403/);
   });
+
+  it("sendMessage denies all mention parsing (#323)", async () => {
+    const fake = makeFakeFetch();
+    const api = new DiscordRestApi({ token: "tok", logger: SILENT, fetchImpl: fake.fetchImpl });
+    await api.sendMessage("c1", "hello @everyone");
+    const body = JSON.parse(fake.calls[0]?.body ?? "{}");
+    expect(body.allowed_mentions).toEqual({ parse: [] });
+  });
+
+  it("respondToInteraction denies all mention parsing (#323)", async () => {
+    const fake = makeFakeFetch();
+    const api = new DiscordRestApi({ token: "tok", logger: SILENT, fetchImpl: fake.fetchImpl });
+    await api.respondToInteraction("i1", "t1", { content: "ack @here" });
+    const body = JSON.parse(fake.calls[0]?.body ?? "{}");
+    expect(body.data.allowed_mentions).toEqual({ parse: [] });
+    expect(body.data.content).toBe("ack @here");
+  });
 });
