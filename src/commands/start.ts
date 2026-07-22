@@ -1220,6 +1220,8 @@ export async function start(args: string[] = []) {
             busCoreForWebUi && busRuntimeSpawnedAgents[0]
               ? {
                   defaultAgentId: busRuntimeSpawnedAgents[0],
+                  activeTurnAgents: () =>
+                    (busCoreForWebUi as NonNullable<typeof busCoreForWebUi>).activeTurnAgents(),
                   sendPromptAndAwait: (agentId, text, sendOpts) =>
                     streamBusPrompt(
                       busCoreForWebUi as NonNullable<typeof busCoreForWebUi>,
