@@ -332,12 +332,12 @@ export class StallWatchdog {
         const p = e.payload as { id?: string; name?: string };
         if (p?.id && p?.name) {
           s.outstanding.set(p.id, {
-          id: p.id,
-          name: p.name,
-          startedAt: e.ts,
-          warned: false,
-          criticalWarned: false,
-        });
+            id: p.id,
+            name: p.name,
+            startedAt: e.ts,
+            warned: false,
+            criticalWarned: false,
+          });
         }
         break;
       }
