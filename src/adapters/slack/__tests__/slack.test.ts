@@ -29,7 +29,12 @@
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { randomUUID, createHmac } from "node:crypto";
-import { SlackAdapter, buildPermissionBlocks, PERMISSION_ACTION_ID_REGEX } from "../index";
+import {
+  SlackAdapter,
+  buildPermissionBlocks,
+  PERMISSION_ACTION_ID_REGEX,
+  mdToSlackMrkdwn,
+} from "../index";
 import type { BusCore, SendPromptRequest } from "../../../bus/core";
 import type {
   Subscription,
@@ -1799,5 +1804,77 @@ describe("SlackAdapter — tailer echo suppression (#217)", () => {
     await waitFor(() => api.sent.length > 0);
     expect(api.sent[0]?.text).toContain("*stall-watchdog*");
     expect(api.sent[0]?.text).not.toContain("**");
+  });
+
+  it("drops a payload-less system.operator_alert without an unhandled rejection (#325)", async () => {
+    // The subscription callback is fire-and-forget (`void handleOperatorAlert`),
+    // so a throw on a payload-less event surfaces as an UNHANDLED rejection, not
+    // via api.sent. Capture it directly — a passing api.sent assertion alone
+    // would not distinguish the pre-fix crash.
+    const rejections: unknown[] = [];
+    const onRej = (e: unknown) => rejections.push(e);
+    process.on("unhandledRejection", onRej);
+    try {
+      adapter = await startAdapter();
+      bus.emit({
+        ts: Date.now(),
+        agent_id: "triage",
+        session_id: "s1",
+        topic: "system.operator_alert",
+      } as unknown as BusEvent);
+      // A well-formed alert AFTER it must still deliver (handler survived).
+      bus.emit({
+        ts: Date.now(),
+        agent_id: "triage",
+        session_id: "s1",
+        topic: "system.operator_alert",
+        payload: { text: "still alive" },
+      });
+      await waitFor(() => api.sent.length > 0);
+      await new Promise((r) => setTimeout(r, 20)); // let any pending rejection settle
+      expect(rejections).toHaveLength(0);
+      expect(api.sent).toHaveLength(1);
+      expect(api.sent[0]?.text).toBe("still alive");
+    } finally {
+      process.off("unhandledRejection", onRej);
+    }
+  });
+
+  it("drops a system.operator_alert whose payload has no text field (#325)", async () => {
+    adapter = await startAdapter();
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "system.operator_alert",
+      payload: { other: 1 } as unknown as { text?: string },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(api.sent).toHaveLength(0);
+  });
+
+  it("skips a tailer-origin system.operator_alert (echo guard, #325)", async () => {
+    adapter = await startAdapter();
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "system.operator_alert",
+      payload: { text: "echo", _meta: { source: TAILER_EVENT_SOURCE } },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(api.sent).toHaveLength(0);
+  });
+});
+
+describe("mdToSlackMrkdwn — Markdown → Slack mrkdwn (#325)", () => {
+  it("converts bold, strikethrough, links and headers; leaves compatible markup", () => {
+    expect(mdToSlackMrkdwn("**b** and __b2__")).toBe("*b* and *b2*");
+    expect(mdToSlackMrkdwn("~~gone~~")).toBe("~gone~");
+    expect(mdToSlackMrkdwn("see [docs](https://x.io/y)")).toBe("see <https://x.io/y|docs>");
+    expect(mdToSlackMrkdwn("# Title")).toBe("*Title*");
+    // multi-line bold converts (dotAll); code/italic pass through unchanged.
+    expect(mdToSlackMrkdwn("**two\nlines**")).toBe("*two\nlines*");
+    expect(mdToSlackMrkdwn("`code` and _i_")).toBe("`code` and _i_");
   });
 });
