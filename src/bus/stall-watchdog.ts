@@ -198,15 +198,27 @@ export function newSessionState(
   return { agentId, sessionId, outstanding: new Map(), lastActivityAt: now };
 }
 
-export type StallDecision =
-  | { action: "none" }
-  | {
-      action: "warn" | "kill";
-      tool: string;
-      toolUseId: string;
-      outstandingMs: number;
-      ceiling: ToolCeiling;
-    };
+/** The shared shape of an actionable stall (everything but the verb). */
+type StallSignal = {
+  tool: string;
+  toolUseId: string;
+  outstandingMs: number;
+  ceiling: ToolCeiling;
+};
+
+/**
+ * A decision to kill — its own named member so `handleKill` can type its
+ * parameter directly on it (#324). Deliberately NOT
+ * `Extract<StallDecision, { action: "kill" }>`: that construct silently
+ * resolves to `never` if the union is ever recombined into one
+ * `{ action: "warn" | "kill" }` member — and since every access on `never`
+ * compiles, handleKill's body would go un-type-checked again with no signal.
+ */
+type KillDecision = { action: "kill" } & StallSignal;
+
+// `warn` and `kill` are DISTINCT members (not a combined `"warn" | "kill"`), so
+// each carries a single literal discriminant the consumers can narrow on.
+export type StallDecision = { action: "none" } | ({ action: "warn" } & StallSignal) | KillDecision;
 
 const rank = (a: StallDecision["action"]): number => (a === "kill" ? 2 : a === "warn" ? 1 : 0);
 
@@ -236,7 +248,16 @@ export function evaluateStall(
       rank(action) > rank(worst.action) ||
       (rank(action) === rank(worst.action) && age > worstAge)
     ) {
-      worst = { action, tool: t.name, toolUseId: t.id, outstandingMs: age, ceiling: c };
+      // `action` is narrowed to "warn" | "kill" here (the "none" case
+      // continued above). Build with a LITERAL action so the object is
+      // assignable to the split union.
+      const signal: StallSignal = {
+        tool: t.name,
+        toolUseId: t.id,
+        outstandingMs: age,
+        ceiling: c,
+      };
+      worst = action === "kill" ? { action: "kill", ...signal } : { action: "warn", ...signal };
       worstAge = age;
     }
   }
@@ -422,7 +443,7 @@ export class StallWatchdog {
   /** capture forensic → restart → classify+audit → flag false positives. */
   private async handleKill(
     s: SessionStallState,
-    decision: Extract<StallDecision, { action: "kill" }>,
+    decision: KillDecision,
     now: number,
   ): Promise<void> {
     let snapshot: ForensicSnapshot = { cpuAdvancing: null, outputRecencyMs: null };
