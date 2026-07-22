@@ -50,12 +50,64 @@ describe("finding-ledger — reconcile (level-triggered lifecycle)", () => {
     expect(s.entries).toHaveLength(0); // emitted once, then dropped
   });
 
-  it("re-fires when a resolving finding reappears", () => {
+  it("a resolving finding that reappears returns to firing WITHOUT a new open edge", () => {
     let s = reconcile([], [f("a")], T0, { forCycles: 1, resolveAfterCycles: 3 });
-    s = reconcile(s.entries, [], T1, { forCycles: 1, resolveAfterCycles: 3 }); // resolving
+    s = reconcile(s.entries, [], T1, { forCycles: 1, resolveAfterCycles: 3 }); // resolving (not resolved)
     s = reconcile(s.entries, [f("a")], T2, { forCycles: 1, resolveAfterCycles: 3 }); // back
     expect(s.entries[0]?.state).toBe("firing");
-    expect(s.newlyFiring.map((e) => e.fingerprint)).toEqual(["a"]);
+    // It never emitted a matching newlyResolved, so returning is NOT a new open
+    // — re-emitting newlyFiring would be an unbalanced edge (Alertmanager keeps
+    // it continuously firing). The alert stays open with its original firstSeen.
+    expect(s.newlyFiring).toHaveLength(0);
+    expect(s.entries[0]?.firstSeen).toBe(T0);
+  });
+
+  it("an alternating (present/absent) finding emits exactly one open edge across the oscillation", () => {
+    let opens = 0;
+    let s = reconcile([], [f("a")], T0, { forCycles: 1, resolveAfterCycles: 3 }); // open #1
+    opens += s.newlyFiring.length;
+    for (const [present, t] of [
+      [false, T1],
+      [true, T2],
+      [false, T3],
+      [true, T0],
+    ] as const) {
+      s = reconcile(s.entries, present ? [f("a")] : [], t, { forCycles: 1, resolveAfterCycles: 3 });
+      opens += s.newlyFiring.length;
+    }
+    expect(opens).toBe(1); // no re-spam while it stays open (never resolved)
+  });
+
+  it("clamps a non-finite debounce config to the default instead of poisoning the threshold", () => {
+    // Math.max(1, NaN) === NaN would make `seenStreak >= NaN` always false → nothing
+    // ever fires. NaN must fall back to the default (2): pending, then firing.
+    const r1 = reconcile([], [f("a")], T0, { forCycles: Number.NaN });
+    expect(r1.entries[0]?.state).toBe("pending");
+    const r2 = reconcile(r1.entries, [f("a")], T1, { forCycles: Number.NaN });
+    expect(r2.entries[0]?.state).toBe("firing");
+  });
+
+  it("dedups a duplicate-fingerprint prior on resolve (one close edge, not two)", () => {
+    const dup: LedgerEntry[] = [
+      {
+        fingerprint: "a",
+        state: "firing",
+        firstSeen: T0,
+        lastSeen: T0,
+        seenStreak: 3,
+        missStreak: 0,
+      },
+      {
+        fingerprint: "a",
+        state: "firing",
+        firstSeen: T0,
+        lastSeen: T0,
+        seenStreak: 3,
+        missStreak: 0,
+      },
+    ];
+    const r = reconcile(dup, [], T1, { resolveAfterCycles: 1 });
+    expect(r.newlyResolved).toHaveLength(1);
   });
 
   it("suppresses a flap: appear/miss/appear under the debounce never fires", () => {

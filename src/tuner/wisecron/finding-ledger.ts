@@ -58,6 +58,14 @@ export interface ReconcileResult {
 const DEFAULT_FOR = 2;
 const DEFAULT_RESOLVE_AFTER = 2;
 
+/** Clamp a debounce count to a finite integer ≥ 1. `Math.max(1, NaN)` is `NaN`,
+ *  so a non-finite/garbage config value must fall back to the default BEFORE the
+ *  floor — otherwise it poisons the `>=` threshold and silently disables the
+ *  transition it gates. */
+function cycleCount(v: number | undefined, fallback: number): number {
+  return Math.max(1, Number.isFinite(v) ? (v as number) : fallback);
+}
+
 /**
  * Advance the ledger by one cycle. `prior` = the persisted ledger; `current` =
  * every finding the producers emit THIS cycle. Level-triggered: identity is the
@@ -69,8 +77,8 @@ export function reconcile(
   nowIso: string,
   cfg: LedgerConfig = {},
 ): ReconcileResult {
-  const forCycles = Math.max(1, cfg.forCycles ?? DEFAULT_FOR);
-  const resolveAfter = Math.max(1, cfg.resolveAfterCycles ?? DEFAULT_RESOLVE_AFTER);
+  const forCycles = cycleCount(cfg.forCycles, DEFAULT_FOR);
+  const resolveAfter = cycleCount(cfg.resolveAfterCycles, DEFAULT_RESOLVE_AFTER);
 
   const priorByFp = new Map(prior.map((e) => [e.fingerprint, e]));
   // Last-writer-wins if a producer emits a fingerprint twice in one cycle.
@@ -117,11 +125,20 @@ export function reconcile(
       meta: finding.meta ?? prev.meta,
     };
     next.push(entry);
-    if (state === "firing" && prev.state !== "firing") newlyFiring.push(entry); // pending→firing or resolving→firing (re-fire)
+    // Only a genuine open (pending/new → firing) is an "opens" edge. A
+    // resolving→firing return is NOT a new open: the finding never emitted a
+    // matching newlyResolved (it stayed under the resolve debounce), so
+    // re-emitting newlyFiring would be an unbalanced edge and spam a consumer on
+    // every reappearance of a duty-cycling finding. Alertmanager keeps such an
+    // alert continuously firing with no new notification — mirror that.
+    if (state === "firing" && !wasOpen) newlyFiring.push(entry);
   }
 
-  // 2) Absent fingerprints: advance toward resolved.
-  for (const prev of prior) {
+  // 2) Absent fingerprints: advance toward resolved. Iterate the deduped map
+  //    (not the raw `prior` array) so a duplicate-fingerprint prior — e.g. an
+  //    appended/corrupted persisted ledger — can't double-emit newlyResolved or
+  //    push duplicate entries into `next`; section 1 already keys off this map.
+  for (const prev of priorByFp.values()) {
     if (currentByFp.has(prev.fingerprint) || prev.state === "resolved") continue;
     // A still-`pending` finding that never confirmed just evaporates: no open
     // edge was ever emitted, so it gets no `resolving`/`resolved` edge either.
