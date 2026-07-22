@@ -1824,6 +1824,30 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
   }
 }
 
+/**
+ * Ack for an `already:<decision>:<resolved_at>` resolution (#314) — the user
+ * tapped a pending-action button whose action was resolved earlier (a
+ * double-tap, a Telegram callback retry after a slow ack, or a duplicate
+ * notification). Names the PRIOR decision and when it happened, so the ack is
+ * informative instead of the alarming "not found" the boolean resolver forced.
+ *
+ * `resolved_at` is the ISO timestamp the resolver reports; it is rendered
+ * `DD/MM HH:MM` when parseable, omitted otherwise.
+ */
+export function ackForAlready(resolution: string): string {
+  const rest = resolution.slice("already:".length);
+  const sep = rest.indexOf(":");
+  const decision = (sep === -1 ? rest : rest.slice(0, sep)).toLowerCase();
+  const at = sep === -1 ? "" : rest.slice(sep + 1);
+  // "2026-07-16T11:51…" → " (16/07 11:51)"
+  const m = at.match(/^\d{4}-(\d{2})-(\d{2})T(\d{2}:\d{2})/);
+  const when = m ? ` (${m[2]}/${m[1]} ${m[3]})` : "";
+  if (decision === "reject" || decision === "cancel" || decision === "rejected")
+    return `❌ Déjà rejeté${when}`;
+  if (decision === "skip" || decision === "skipped") return `⏸ Déjà reporté${when}`;
+  return `✅ Déjà approuvé${when}`;
+}
+
 // --- Callback query handler ---
 
 async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> {
@@ -1896,7 +1920,12 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
               "python3",
               [
                 "-c",
-                "import sys; sys.path.insert(0, sys.argv[1]); from pending import resolve_pending; ok = resolve_pending(int(sys.argv[2]), sys.argv[3]); print('ok' if ok else 'not_found')",
+                // #314: prefer the richer `resolve_pending_ex`
+                // (ok|not_found|already:<decision>:<at>) when the operator's lib
+                // provides it, so an already-resolved tap is distinguishable from
+                // a genuinely unknown/expired one; fall back to the boolean
+                // `resolve_pending` otherwise (zero regression for older libs).
+                "import sys; sys.path.insert(0, sys.argv[1]); import pending; f = getattr(pending, 'resolve_pending_ex', None); print(f(int(sys.argv[2]), sys.argv[3]) if f else ('ok' if pending.resolve_pending(int(sys.argv[2]), sys.argv[3]) else 'not_found'))",
                 pendingLibPath,
                 actionId,
                 decision,
@@ -1913,8 +1942,11 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
           if (decLower === "skip") ackText = "⏸ Plus tard";
           else if (decLower === "reject" || decLower === "cancel") ackText = "❌ Rejeté";
           else ackText = "✅ Approuvé";
+        } else if (result.stdout.startsWith("already:")) {
+          // #314: already resolved — ack the prior decision, not "not found".
+          ackText = ackForAlready(result.stdout);
         } else {
-          ackText = "⚠️ Action introuvable ou déjà traitée";
+          ackText = "⚠️ Action introuvable";
         }
         // Edit original message to show decision
         if (query.message) {
