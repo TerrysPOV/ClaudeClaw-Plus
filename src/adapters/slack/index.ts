@@ -76,6 +76,21 @@ function eventBelongsToSlack(event: BusEvent): boolean {
 }
 
 /**
+ * Minimal Markdown → Slack `mrkdwn` conversion for out-of-band alert text.
+ * Slack mrkdwn is NOT Markdown: bold is a single `*`, strikethrough a single
+ * `~`, links are `<url|text>`, and there are no `#` headers. This covers the
+ * constructs an operator-alert producer realistically emits; `_italic_` and
+ * `` `code` `` already render the same in both, so they pass through untouched.
+ */
+export function mdToSlackMrkdwn(md: string): string {
+  return md
+    .replace(/(\*\*|__)([\s\S]+?)\1/g, "*$2*") // **bold** / __bold__ → *bold*
+    .replace(/~~([\s\S]+?)~~/g, "~$1~") // ~~strike~~ → ~strike~
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, "<$2|$1>") // [t](url) → <url|t>
+    .replace(/^#{1,6}[ \t]+(.+)$/gm, "*$1*"); // # Header → *Header* (no headers in mrkdwn)
+}
+
+/**
  * Cap on the `seenEventIds` LRU. Slack retries every ~1s up to 3 times,
  * so a 5k entry cap covers >1h of traffic at 1 event/sec — far beyond
  * the retry window — while bounding memory to ~5k strings (~200kB).
@@ -602,8 +617,51 @@ export class SlackAdapter {
         { agent_id: agentId, topics: ["system.request_human"] },
         (event) => void this.handleRequestHuman(agentId, event),
       ),
+      this.bus.subscribe(
+        { agent_id: agentId, topics: ["system.operator_alert"] },
+        (event) => void this.handleOperatorAlert(agentId, event),
+      ),
     ];
     this.subscriptions.set(agentId, subs);
+  }
+
+  private async handleOperatorAlert(agentId: string, event: BusEvent): Promise<void> {
+    if (!eventBelongsToSlack(event)) return;
+    // Consistency with handleResponseText: never re-deliver the JSONL tailer's
+    // observability echo. operator_alert is in-process today (no tailer echo),
+    // so this is a defensive no-op that keeps the guard uniform across handlers.
+    if (isTailerOriginEvent(event)) return;
+    // Defensive: `payload?.text` — a payload-less event must be dropped, not
+    // crash (the callback is fire-and-forget `void`, so a throw here is an
+    // unhandled rejection). Mirrors handleResponseText.
+    const payload = event.payload as { text?: string } | undefined;
+    const text = typeof payload?.text === "string" ? payload.text : "";
+    if (!text) return;
+    // #325/#301: a standalone out-of-band operator alert (e.g. the stall
+    // watchdog). It is NOT a reply — it must not touch turn state or register
+    // a pending ask, so it deliberately does NOT go through handleResponseText.
+    // Bound to ONE channel (the primary when set), mirroring Discord/Telegram:
+    // the fan-out fallback maps every channel AND thread for the agent, which
+    // is an alert storm for a stall alert, not a heartbeat.
+    // resolveTargetChannels already collapses to [primary] when set, so no
+    // separate primaryChannelByAgent lookup is needed here.
+    const targets = this.resolveTargetChannels(agentId, null);
+    const alertChannel = targets[0];
+    if (!alertChannel) {
+      this.logger.warn(`[slack-adapter] no target channel for operator_alert on agent ${agentId}`);
+      return;
+    }
+    // No primary set AND >1 candidate → the [0] pick is arbitrary (config key
+    // order). Surface it so the operator can pin a channel instead of an alert
+    // silently landing somewhere they don't watch.
+    if (targets.length > 1) {
+      this.logger.warn(
+        `[slack-adapter] operator_alert for agent ${agentId} has ${targets.length} candidate ` +
+          `channels and no primaryChannelByAgent; delivering to ${alertChannel}. Set ` +
+          `routing.primaryChannelByAgent.${agentId} to target a specific channel.`,
+      );
+    }
+    await this.safePostMessage({ channel: alertChannel, text: mdToSlackMrkdwn(text) });
   }
 
   private async handleResponseText(agentId: string, event: BusEvent): Promise<void> {
