@@ -67,6 +67,30 @@ describe("finding-ledger — reconcile (level-triggered lifecycle)", () => {
     expect(s.newlyFiring).toHaveLength(0);
   });
 
+  it("a firing finding survives a single-cycle blip without dropping out of firing (#320 review)", () => {
+    // Defaults: forCycles=2, resolveAfterCycles=2.
+    let s = reconcile([], [f("a")], T0); // pending (seen=1)
+    s = reconcile(s.entries, [f("a")], T1); // firing (seen=2)
+    expect(s.entries[0]?.state).toBe("firing");
+    s = reconcile(s.entries, [], T2); // one miss → resolving (still open, < resolveAfter)
+    expect(s.entries[0]?.state).toBe("resolving");
+    s = reconcile(s.entries, [f("a")], T3); // back after the blip
+    // Pre-fix bug: demoted to `pending` (seenStreak reset on entering resolving),
+    // so it fell out of the firing set and needed a full re-debounce. Fixed:
+    // a confirmed-open finding that reappears stays firing.
+    expect(s.entries[0]?.state).toBe("firing");
+  });
+
+  it("a still-pending finding that vanishes emits no resolve edge (never opened) (#320 review)", () => {
+    // forCycles=3 keeps it pending; it never fires, so a disappearance must not
+    // synthesize a `resolved` close-edge for an alert that never opened.
+    let s = reconcile([], [f("a")], T0, { forCycles: 3, resolveAfterCycles: 2 }); // pending
+    s = reconcile(s.entries, [], T1, { forCycles: 3, resolveAfterCycles: 2 }); // gone
+    s = reconcile(s.entries, [], T2, { forCycles: 3, resolveAfterCycles: 2 }); // still gone
+    expect(s.newlyResolved).toHaveLength(0); // never fired → no close edge
+    expect(s.entries).toHaveLength(0); // simply dropped
+  });
+
   it("tracks multiple fingerprints independently and carries meta", () => {
     const r1 = reconcile([], [f("a", { severity: "high" }), f("b")], T0, { forCycles: 1 });
     const r2 = reconcile(r1.entries, [f("a", { severity: "high" })], T1, {

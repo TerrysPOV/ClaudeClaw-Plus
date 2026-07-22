@@ -101,8 +101,13 @@ export function reconcile(
       continue;
     }
     const seenStreak = prev.seenStreak + 1;
-    const wasOpen = prev.state === "firing";
-    const state: FindingState = seenStreak >= forCycles ? "firing" : "pending";
+    const wasOpen = prev.state === "firing" || prev.state === "resolving";
+    // Once confirmed open, a re-sighting keeps it firing. A sub-`resolveAfter`
+    // blip (firing→resolving→present) must NOT restart the `forCycles` debounce,
+    // or the entry would drop back to `pending`, fall out of the firing set, and
+    // re-fire — exactly the flap this ledger exists to suppress. Only a still-
+    // `pending` entry (never confirmed) debounces toward firing.
+    const state: FindingState = wasOpen || seenStreak >= forCycles ? "firing" : "pending";
     const entry: LedgerEntry = {
       ...prev,
       state,
@@ -112,12 +117,17 @@ export function reconcile(
       meta: finding.meta ?? prev.meta,
     };
     next.push(entry);
-    if (state === "firing" && !wasOpen) newlyFiring.push(entry); // pending→firing or resolving→firing (re-fire)
+    if (state === "firing" && prev.state !== "firing") newlyFiring.push(entry); // pending→firing or resolving→firing (re-fire)
   }
 
   // 2) Absent fingerprints: advance toward resolved.
   for (const prev of prior) {
     if (currentByFp.has(prev.fingerprint) || prev.state === "resolved") continue;
+    // A still-`pending` finding that never confirmed just evaporates: no open
+    // edge was ever emitted, so it gets no `resolving`/`resolved` edge either.
+    // This also keeps `resolving` meaning strictly "was open" — the section-1
+    // re-sighting relies on that to jump a returning finding straight to firing.
+    if (prev.state === "pending") continue;
     const missStreak = prev.missStreak + 1;
     if (missStreak >= resolveAfter) {
       newlyResolved.push({ ...prev, state: "resolved", missStreak, seenStreak: 0 });
