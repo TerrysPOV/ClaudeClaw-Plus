@@ -15,6 +15,11 @@ import type { DiscordRestApiLike } from "./types";
 const DISCORD_API = "https://discord.com/api/v10";
 const DISCORD_MAX_MESSAGE_LEN = 2000;
 
+/** #323: deny ALL mention parsing on outbound (model-generated) content — a
+ *  single source every content-bearing send references, so the guarantee is
+ *  greppable/one-place-to-change instead of a literal copy-pasted per site. */
+const DENY_ALL_MENTIONS = { parse: [] as string[] } as const;
+
 export interface DiscordRestApiOptions {
   token: string;
   logger?: Pick<Console, "warn" | "info" | "error">;
@@ -42,7 +47,7 @@ export class DiscordRestApi implements DiscordRestApiLike {
       // never operator-authored, so an @everyone/@here/role ping must not fire.
       const body: Record<string, unknown> = {
         content: chunks[i],
-        allowed_mentions: { parse: [] },
+        allowed_mentions: DENY_ALL_MENTIONS,
       };
       if (components && i === chunks.length - 1) body.components = components;
       await this.call("POST", `/channels/${channelId}/messages`, body);
@@ -67,7 +72,7 @@ export class DiscordRestApi implements DiscordRestApiLike {
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ type: 4, data: { ...body, allowed_mentions: { parse: [] } } }),
+        body: JSON.stringify({ type: 4, data: { ...body, allowed_mentions: DENY_ALL_MENTIONS } }),
       },
     );
     if (!res.ok) {
