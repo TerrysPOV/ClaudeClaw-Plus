@@ -34,6 +34,7 @@ import {
   buildPermissionBlocks,
   PERMISSION_ACTION_ID_REGEX,
   mdToSlackMrkdwn,
+  defangSlackMentions,
 } from "../index";
 import type { BusCore, SendPromptRequest } from "../../../bus/core";
 import type {
@@ -1876,5 +1877,42 @@ describe("mdToSlackMrkdwn — Markdown → Slack mrkdwn (#325)", () => {
     // multi-line bold converts (dotAll); code/italic pass through unchanged.
     expect(mdToSlackMrkdwn("**two\nlines**")).toBe("*two\nlines*");
     expect(mdToSlackMrkdwn("`code` and _i_")).toBe("`code` and _i_");
+  });
+});
+
+describe("defangSlackMentions — neutralise broadcast/user tokens (#336)", () => {
+  it("defangs @channel/@here/@everyone broadcasts to inert text", () => {
+    expect(defangSlackMentions("heads up <!channel> now")).toBe("heads up @channel now");
+    expect(defangSlackMentions("<!here> and <!everyone>")).toBe("@here and @everyone");
+  });
+
+  it("defangs user and subteam mentions, preferring the display name", () => {
+    expect(defangSlackMentions("ping <@U12345>")).toBe("ping @U12345");
+    expect(defangSlackMentions("ping <@U12345|alice>")).toBe("ping @alice");
+    expect(defangSlackMentions("cc <!subteam^S1|@oncall>")).toBe("cc @oncall");
+    expect(defangSlackMentions("cc <!subteam^S1>")).toBe("cc @subteam");
+  });
+
+  it("leaves mrkdwn links and plain text untouched", () => {
+    // Must not mangle mdToSlackMrkdwn output (`<url|label>`), nor inert `@foo`.
+    expect(defangSlackMentions("see <https://x.io/y|docs>")).toBe("see <https://x.io/y|docs>");
+    expect(defangSlackMentions("just @channel plain")).toBe("just @channel plain");
+    expect(defangSlackMentions("no tokens here")).toBe("no tokens here");
+  });
+});
+
+describe("SlackAdapter — outbound mention defang at the send boundary (#336)", () => {
+  it("defangs a broadcast token in a response.text before posting", async () => {
+    adapter = await startAdapter();
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "deploy done <!channel>", origin: "slack", origin_id: "C100" },
+    });
+    await waitFor(() => api.sent.length > 0);
+    expect(api.sent[0]?.text).toBe("deploy done @channel");
+    expect(api.sent[0]?.text).not.toContain("<!channel>");
   });
 });

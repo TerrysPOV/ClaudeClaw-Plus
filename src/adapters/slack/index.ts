@@ -91,6 +91,30 @@ export function mdToSlackMrkdwn(md: string): string {
 }
 
 /**
+ * #336: neutralise Slack broadcast/user mention TOKENS in outbound text so
+ * model-generated or interpolated content (tool names, `err.message`, …) can't
+ * fire a real @channel/@here/@everyone/@user ping. Slack renders `<!channel>`,
+ * `<!here>`, `<!everyone>`, `<!subteam^…>` and `<@U…>` as live pings regardless
+ * of `link_names`, and there is no `allowed_mentions` equivalent — so the send
+ * boundary is the only lever (same threat class as the Discord #323 fix).
+ *
+ * Each token is rewritten to its INERT plain-text form (`@channel`, `@here`, the
+ * handle/display name…) — inert because the adapter never sets `link_names`, so
+ * a bare `@name` does not auto-link. `<url|label>` links are left untouched
+ * (they match neither `<!` nor `<@`), preserving {@link mdToSlackMrkdwn} output.
+ */
+export function defangSlackMentions(text: string): string {
+  return text
+    .replace(/<!(channel|here|everyone)>/g, "@$1")
+    .replace(/<!subteam\^[A-Z0-9]+(?:\|@?([^>]+))?>/g, (_m, name) =>
+      name ? `@${name}` : "@subteam",
+    )
+    .replace(/<@([A-Z0-9]+)(?:\|@?([^>]+))?>/g, (_m: string, id: string, name?: string) =>
+      name ? `@${name}` : `@${id}`,
+    );
+}
+
+/**
  * Cap on the `seenEventIds` LRU. Slack retries every ~1s up to 3 times,
  * so a 5k entry cap covers >1h of traffic at 1 event/sec — far beyond
  * the retry window — while bounding memory to ~5k strings (~200kB).
@@ -823,8 +847,13 @@ export class SlackAdapter {
     thread_ts?: string;
     blocks?: SlackBlock[];
   }): Promise<void> {
+    // #336: defang mention/broadcast tokens on EVERY outbound send — this is the
+    // single choke point all handlers (response.text, permission, request_human,
+    // operator_alert) route through, so no site can forget it. (Block Kit `blocks`
+    // are adapter-authored, not model output; the `text` field is the vector.)
+    const safe = { ...params, text: defangSlackMentions(params.text) };
     try {
-      const res = await this.api.postMessage(params);
+      const res = await this.api.postMessage(safe);
       if (!res.ok) {
         this.logger.error(`[slack-adapter] chat.postMessage error: ${res.error ?? "unknown"}`);
       }
