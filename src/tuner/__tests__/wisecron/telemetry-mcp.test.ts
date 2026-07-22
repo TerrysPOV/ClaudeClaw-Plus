@@ -103,6 +103,44 @@ describe("registerHostTelemetryTools + bridgeToolCaller (in-process)", () => {
     expect(host.queries[0]?.stream).toBe("cron_run");
   });
 
+  it("round-trips a custom (extraProducer) stream through the served MCP surface", async () => {
+    // A host whose only stream is operator-defined (`custom.<name>`) — the
+    // extraProducers path. Regression guard: QueryArgsSchema once validated
+    // `stream` against the closed TELEMETRY_STREAMS enum, so a custom stream was
+    // advertised available via telemetry__capabilities but rejected at query
+    // time, and McpTelemetryProvider.query silently degraded to [].
+    class CustomHost implements TelemetryProvider {
+      contractVersion(): string {
+        return TELEMETRY_CONTRACT_VERSION;
+      }
+      capabilities(): TelemetryCapability[] {
+        return [
+          {
+            stream: "custom.demo" as TelemetryStream,
+            schemaVersion: TELEMETRY_CONTRACT_VERSION,
+            available: true,
+          },
+        ];
+      }
+      async query(stream: TelemetryStream): Promise<MetricSample[]> {
+        return stream === "custom.demo" ? [{ ts: IN, value: 42, labels: { source: "demo" } }] : [];
+      }
+    }
+    const bridge = new PluginMcpBridge(join(tmpDir, "audit.jsonl"));
+    registerHostTelemetryTools(bridge, { provider: new CustomHost() });
+    const provider = new McpTelemetryProvider(bridgeToolCaller(bridge));
+    await provider.connect();
+
+    // Advertised available over the wire...
+    const cap = provider.capabilities().find((c) => c.stream === "custom.demo");
+    expect(cap?.available).toBe(true);
+    // ...AND actually queryable over the wire (not silently empty).
+    const samples = await provider.query("custom.demo" as TelemetryStream, RANGE);
+    expect(samples).toHaveLength(1);
+    expect(samples[0]?.value).toBe(42);
+    expect(samples[0]?.labels).toEqual({ source: "demo" });
+  });
+
   it("re-registration replaces the prior tools (idempotent surface)", () => {
     const bridge = new PluginMcpBridge(join(tmpDir, "audit.jsonl"));
     registerHostTelemetryTools(bridge, { provider: new StubHostProvider() });
