@@ -1786,4 +1786,18 @@ describe("SlackAdapter — tailer echo suppression (#217)", () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(api.sent).toHaveLength(0);
   });
+
+  it("converts markdown bold to Slack mrkdwn in operator_alert (#325)", async () => {
+    adapter = await startAdapter();
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "system.operator_alert",
+      payload: { text: "\u{1F6E1}\uFE0F **stall-watchdog** flagged a kill" },
+    });
+    await waitFor(() => api.sent.length > 0);
+    expect(api.sent[0]?.text).toContain("*stall-watchdog*");
+    expect(api.sent[0]?.text).not.toContain("**");
+  });
 });

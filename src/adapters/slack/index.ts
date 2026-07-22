@@ -627,7 +627,12 @@ export class SlackAdapter {
       this.logger.warn(`[slack-adapter] no target channel for operator_alert on agent ${agentId}`);
       return;
     }
-    await this.safePostMessage({ channel: alertChannel, text });
+    // The alert text uses markdown bold (**x**), but Slack mrkdwn bold is a
+    // SINGLE asterisk, so **x** would render with literal asterisks. Convert it
+    // (the sibling adapters handle their own markup: Discord ** is native,
+    // Telegram converts to HTML). #325.
+    const mrkdwn = text.replace(/\*\*(.+?)\*\*/g, "*$1*");
+    await this.safePostMessage({ channel: alertChannel, text: mrkdwn });
   }
 
   private async handleResponseText(agentId: string, event: BusEvent): Promise<void> {
