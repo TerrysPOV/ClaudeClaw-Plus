@@ -368,6 +368,9 @@ ${pageStyles}
     </aside>
   </div>
 
+  <!-- #325: out-of-band operator alerts (stall watchdog, …), polled via /api/state. Hidden when empty. -->
+  <section class="operator-alerts" id="operator-alerts" aria-live="polite" hidden></section>
+
   <script>
 ${pageScript}
   </script>

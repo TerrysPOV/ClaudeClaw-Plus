@@ -1940,4 +1940,26 @@ export const pageStyles = String.raw`    :root {
   .lr-tiers { grid-template-columns: 1fr; }
   .lr-row { flex-direction: column; align-items: flex-start; }
 }
+
+/* #325: operator-alerts panel (polled via /api/state). Hidden when empty. */
+.operator-alerts {
+  margin: 12px auto 0;
+  max-width: 720px;
+  width: 100%;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.operator-alerts[hidden] { display: none; }
+.op-alert-head { font-size: 12px; font-weight: 600; color: var(--muted); letter-spacing: 0.03em; }
+.op-alert { display: flex; align-items: flex-start; gap: 8px; padding: 6px 8px; border-radius: 8px; border-left: 3px solid var(--warn); background: #ffffff08; }
+.op-alert.critical { border-left-color: var(--bad); }
+.op-alert-icon { flex-shrink: 0; line-height: 1.4; }
+.op-alert-body { min-width: 0; }
+.op-alert-text { font-size: 13px; color: var(--text); white-space: pre-wrap; word-break: break-word; }
+.op-alert-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
 `;

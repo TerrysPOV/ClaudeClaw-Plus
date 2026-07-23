@@ -358,7 +358,10 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
       }
 
       if (url.pathname === "/api/state") {
-        return json(await buildState(opts.getSnapshot()));
+        // #325: fold the bus-derived operator alerts into the polled state.
+        // Absent bus (legacy mode) → empty list, no panel.
+        const state = await buildState(opts.getSnapshot());
+        return json({ ...state, operatorAlerts: opts.bus?.recentOperatorAlerts?.() ?? [] });
       }
 
       if (url.pathname === "/api/settings") {
