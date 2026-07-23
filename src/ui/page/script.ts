@@ -126,6 +126,36 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
     const quickJobsList = $("quick-jobs-list");
     const jobsBubbleEl = $("jobs-bubble");
     const uptimeBubbleEl = $("uptime-bubble");
+    const alertsEl = $("operator-alerts");
+
+    // #325: render the polled operator-alerts panel (newest first). Hidden when
+    // empty. Text is model/interpolated → always esc()'d.
+    function renderOperatorAlerts(alerts) {
+      if (!alertsEl) return;
+      const list = Array.isArray(alerts) ? alerts.slice().reverse() : [];
+      if (list.length === 0) {
+        alertsEl.hidden = true;
+        alertsEl.innerHTML = "";
+        return;
+      }
+      const rows = list.map((a) => {
+        const lvl = a && a.level === "critical" ? "critical" : "warn";
+        const icon = lvl === "critical" ? "🔴" : "⚠️";
+        const when = a && typeof a.ts === "number" ? new Date(a.ts).toLocaleTimeString() : "";
+        const meta = [a && a.agentId, a && a.source, when]
+          .filter(Boolean)
+          .map((s) => esc(String(s)))
+          .join(" · ");
+        return '<div class="op-alert ' + lvl + '">' +
+          '<span class="op-alert-icon">' + icon + "</span>" +
+          '<div class="op-alert-body">' +
+          '<div class="op-alert-text">' + esc(String((a && a.text) || "")) + "</div>" +
+          (meta ? '<div class="op-alert-meta">' + meta + "</div>" : "") +
+          "</div></div>";
+      }).join("");
+      alertsEl.innerHTML = '<div class="op-alert-head">⚠️ Operator alerts</div>' + rows;
+      alertsEl.hidden = false;
+    }
     let hbBusy = false;
     let hbSaveBusy = false;
     let use12Hour = localStorage.getItem("clock.format") === "12";
@@ -509,6 +539,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
             '<div class="side-value">' + esc(fmtDur(state.daemon?.uptimeMs ?? 0)) + "</div>" +
             '<div class="side-label">Uptime</div>';
         }
+        renderOperatorAlerts(state.operatorAlerts);
       } catch (err) {
         dockEl.innerHTML = '<div class="pill bad"><div class="pill-label"><span class="pill-icon">⚠️</span>Status</div><div class="pill-value">Offline</div></div>';
         if (jobsBubbleEl) {
@@ -521,6 +552,7 @@ export const pageScript = String.raw`    const $ = (id) => document.getElementBy
         if (uptimeBubbleEl) {
           uptimeBubbleEl.innerHTML = '<div class="side-icon">⏱️</div><div class="side-value">-</div><div class="side-label">Uptime</div>';
         }
+        renderOperatorAlerts([]);
       }
     }
     function smoothScrollTo(top) {

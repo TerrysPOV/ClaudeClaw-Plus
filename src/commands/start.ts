@@ -478,6 +478,11 @@ export async function start(args: string[] = []) {
   // turns Task/Agent tool_use → tool_result into board cards. Instantiated in the
   // deferred-spawn block once the bus + agents are up; stopped on teardown.
   let kanbanTracker: import("../bus/kanban-tracker").KanbanTracker | null = null;
+  // #325: recent operator alerts (stall watchdog, …) for the polled /api/state
+  // dashboard panel — a global bus subscriber over `system.operator_alert`.
+  // Mounted with the bus, detached on teardown; the web bridge reads it via
+  // `recentOperatorAlerts`.
+  let operatorAlertBuffer: import("../bus/operator-alert-buffer").OperatorAlertBuffer | null = null;
 
   // Plugin system — initialize before gateway start
   const pluginManager = new PluginManager(process.cwd());
@@ -633,6 +638,15 @@ export async function start(args: string[] = []) {
         console.error("[kanban-tracker] shutdown failed", err);
       }
       kanbanTracker = null;
+    }
+    // #325: detach the operator-alert buffer before the bus stops.
+    if (operatorAlertBuffer) {
+      try {
+        operatorAlertBuffer.detach();
+      } catch (err) {
+        console.error("[operator-alert-buffer] shutdown failed", err);
+      }
+      operatorAlertBuffer = null;
     }
     if (busRuntimeHandle) {
       try {
@@ -967,6 +981,17 @@ export async function start(args: string[] = []) {
       });
       busRuntimeHandle.attachScheduler(schedulerHandle);
 
+      // #325: mount the operator-alert buffer now that the bus is up — a global
+      // subscriber over `system.operator_alert` feeding the web dashboard's
+      // polled alerts panel. Detached in shutdown() below.
+      try {
+        const { OperatorAlertBuffer } = await import("../bus/operator-alert-buffer");
+        operatorAlertBuffer = new OperatorAlertBuffer();
+        operatorAlertBuffer.attach(busRuntimeHandle.bus);
+      } catch (err) {
+        console.error("[operator-alert-buffer] mount failed", err);
+      }
+
       // #294: mount the live Kanban tracker now that the bus + agents are up.
       // A pure global bus subscriber — maps subagent (Task/Agent) tool_use →
       // tool_result onto the Web UI board via the (previously unwired) kanban
@@ -1222,6 +1247,8 @@ export async function start(args: string[] = []) {
                   defaultAgentId: busRuntimeSpawnedAgents[0],
                   activeTurnAgents: () =>
                     (busCoreForWebUi as NonNullable<typeof busCoreForWebUi>).activeTurnAgents(),
+                  // #325: feed the dashboard's polled operator-alerts panel.
+                  recentOperatorAlerts: () => operatorAlertBuffer?.recent() ?? [],
                   sendPromptAndAwait: (agentId, text, sendOpts) =>
                     streamBusPrompt(
                       busCoreForWebUi as NonNullable<typeof busCoreForWebUi>,
