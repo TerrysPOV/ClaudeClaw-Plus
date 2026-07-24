@@ -29,7 +29,7 @@
  */
 
 import { existsSync } from "node:fs";
-import { mkdir, unlink } from "node:fs/promises";
+import { mkdir, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { getAgentsDir, getJobsDir } from "../config";
 import { validateJobLabel } from "../agents";
@@ -121,12 +121,20 @@ export async function scheduleTask(input: ScheduleTaskInput): Promise<ScheduledT
   const { dir, scope } = resolveTarget(input.agentId);
   await mkdir(dir, { recursive: true });
   const path = join(dir, `${input.label}.md`);
-  if (existsSync(path)) {
-    throw new Error(
-      `a scheduled task named "${input.label}" already exists — delete it first or choose another label`,
-    );
+  // Exclusive create ("wx") IS the duplicate check — atomic, so two concurrent
+  // schedule_task calls with the same label can't both pass a separate
+  // existsSync() and race to overwrite one another. EEXIST maps to the friendly
+  // "already exists" error; any other error propagates.
+  try {
+    await writeFile(path, renderTaskFile(input), { flag: "wx" });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new Error(
+        `a scheduled task named "${input.label}" already exists — delete it first or choose another label`,
+      );
+    }
+    throw err;
   }
-  await Bun.write(path, renderTaskFile(input));
   return { label: input.label, cron: input.cron, recurring: input.recurring === true, scope };
 }
 

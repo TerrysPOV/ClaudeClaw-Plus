@@ -33,6 +33,7 @@ import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { NATIVE_SCHEDULING_TOOLS_BLOCKLIST } from "../config";
 import { cleanSpawnEnv, withCleanProcessEnv } from "../runner";
 import {
   deleteConfigForPty,
@@ -359,30 +360,6 @@ const PLUS_BUS_TOOL_NAMES = [
   "mcp__plugin_claudeclaw-plus_plus-bus__ask",
   "mcp__plugin_claudeclaw-plus_plus-bus__cancel",
   "mcp__plugin_claudeclaw-plus_plus-bus__request_human",
-];
-
-/**
- * Claude Code's native scheduling tools, blocked unconditionally on every
- * bus agent via `--disallowedTools`.
- *
- * These are session-scoped: a wakeup they register is delivered only if the
- * exact underlying Claude session that created it is still live at fire time.
- * Under the bus runtime, sessions rotate and churn independently of the
- * daemon, so a reminder scheduled for hours later silently never fires (the
- * #342 "call the GP for Ginna at 8am" incident). ClaudeClaw+'s own
- * file-backed job scheduler (`schedule_job` bus tool → `agents/<id>/jobs/`)
- * is durable across session boundaries and is the only correct path here, so
- * the native tools are removed rather than left as a tempting wrong door.
- *
- * This is a hardcoded floor, not operator-configurable: the tools are broken
- * by architecture under bus, not merely a security preference, and hardcoding
- * means the block takes effect on deploy with no settings.json edit.
- */
-const NATIVE_SCHEDULING_TOOLS_BLOCKLIST = [
-  "CronCreate",
-  "CronDelete",
-  "CronList",
-  "ScheduleWakeup",
 ];
 
 /**

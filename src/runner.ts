@@ -27,6 +27,7 @@ import {
 import {
   getSettings,
   DEFAULT_SESSION_TIMEOUT_MS,
+  NATIVE_SCHEDULING_TOOLS_BLOCKLIST,
   type ModelConfig,
   type SecurityConfig,
   type AgenticMode,
@@ -1351,28 +1352,36 @@ export function buildSecurityArgs(security: SecurityConfig): string[] {
       ? ["--dangerously-skip-permissions"]
       : ["--permission-mode", permissionMode];
 
-  switch (security.level) {
-    case "locked":
-      // Include Write tool so memory persistence works even in locked mode
-      args.push("--tools", "Read,Grep,Glob,Write");
-      break;
-    case "strict":
-      args.push("--disallowedTools", "Bash,WebSearch,WebFetch");
-      break;
-    case "moderate":
-      // all tools available, scoped to project dir via system prompt
-      break;
-    case "unrestricted":
-      // all tools, no directory restriction
-      break;
+  // Native scheduling tools (CronCreate/…) are broken in every daemon-spawned
+  // claude process — a headless `claude -p` is a one-shot that exits before any
+  // wakeup could fire (#342). Block them everywhere buildSecurityArgs is used,
+  // merged into a single `--disallowedTools` alongside the level's own denials
+  // and any operator config, so multiple `--disallowedTools` flags can't fight.
+  const disallowed = new Set<string>(NATIVE_SCHEDULING_TOOLS_BLOCKLIST);
+
+  if (security.level === "locked") {
+    // Include Write tool so memory persistence works even in locked mode. This
+    // is an allow-LIST (`--tools`): everything else, native cron included, is
+    // already unavailable, so no `--disallowedTools` is needed here.
+    args.push("--tools", "Read,Grep,Glob,Write");
+    if (security.allowedTools.length > 0) {
+      args.push("--allowedTools", security.allowedTools.join(" "));
+    }
+    return args;
   }
+
+  if (security.level === "strict") {
+    disallowed.add("Bash");
+    disallowed.add("WebSearch");
+    disallowed.add("WebFetch");
+  }
+  // "moderate" / "unrestricted": all tools available except the merged denials.
+  for (const tool of security.disallowedTools) disallowed.add(tool);
 
   if (security.allowedTools.length > 0) {
     args.push("--allowedTools", security.allowedTools.join(" "));
   }
-  if (security.disallowedTools.length > 0) {
-    args.push("--disallowedTools", security.disallowedTools.join(" "));
-  }
+  args.push("--disallowedTools", [...disallowed].join(","));
 
   return args;
 }

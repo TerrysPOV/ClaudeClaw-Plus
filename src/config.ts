@@ -46,6 +46,29 @@ export const DEFAULT_SESSION_TIMEOUT_MS = 120 * 60 * 1000;
 
 export const DEFAULT_IMAGE_OUTPUT_ROOT = join(HEARTBEAT_DIR, "outbox", "discord");
 
+/**
+ * Claude Code's native scheduling tools, blocked on every claude process the
+ * daemon spawns — both the interactive bus PTY session (`buildClaudeArgs`) and
+ * every headless `claude -p` path (`buildSecurityArgs`, e.g. the `dispatch_job`
+ * subagent runner).
+ *
+ * Their wakeups are tied to the specific session that registered them. Under
+ * the bus runtime a session rotates/churns independently of the daemon, and a
+ * headless dispatch is a one-shot process that exits immediately — so a
+ * wakeup scheduled through these tools silently never fires (issue #342, the
+ * lost "call the GP for Ginna at 8am" reminder). ClaudeClaw+'s own file-backed
+ * scheduler (`schedule_task`) is durable across those boundaries and is the
+ * only correct path, so the native tools are removed rather than left as a
+ * tempting wrong door. Hardcoded, not operator-configurable: they're broken by
+ * architecture here, not a security preference.
+ */
+export const NATIVE_SCHEDULING_TOOLS_BLOCKLIST = [
+  "CronCreate",
+  "CronDelete",
+  "CronList",
+  "ScheduleWakeup",
+] as const;
+
 export function getJobsDir(): string {
   if (cached?.jobsDir) {
     return isAbsolute(cached.jobsDir) ? cached.jobsDir : join(process.cwd(), cached.jobsDir);

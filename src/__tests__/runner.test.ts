@@ -502,3 +502,65 @@ describe("withCleanProcessEnv (oat01 exception wiring)", () => {
     }
   });
 });
+
+/* ───────────────────────────────────────────────────────────────────── */
+/* buildSecurityArgs — native scheduling-tool block on headless paths     */
+/* (#342: dispatch_job / any `claude -p` must not reach native cron)      */
+/* ───────────────────────────────────────────────────────────────────── */
+
+describe("buildSecurityArgs — native scheduling-tool block", () => {
+  const NATIVE = ["CronCreate", "CronDelete", "CronList", "ScheduleWakeup"];
+
+  function disallowedOf(args: string[]): string[] {
+    const i = args.indexOf("--disallowedTools");
+    return i >= 0 ? args[i + 1].split(",") : [];
+  }
+
+  it("blocks the four native tools at the default 'moderate' level", () => {
+    const args = runnerMod.buildSecurityArgs({
+      level: "moderate",
+      allowedTools: [],
+      disallowedTools: [],
+    });
+    const blocked = disallowedOf(args);
+    for (const t of NATIVE) expect(blocked).toContain(t);
+  });
+
+  it("keeps the strict denials AND adds the native tools at 'strict'", () => {
+    const args = runnerMod.buildSecurityArgs({
+      level: "strict",
+      allowedTools: [],
+      disallowedTools: [],
+    });
+    const blocked = disallowedOf(args);
+    for (const t of [...NATIVE, "Bash", "WebSearch", "WebFetch"]) {
+      expect(blocked).toContain(t);
+    }
+  });
+
+  it("merges operator-configured disallowedTools with the native block (single flag)", () => {
+    const args = runnerMod.buildSecurityArgs({
+      level: "moderate",
+      allowedTools: [],
+      disallowedTools: ["SomeCustomTool"],
+    });
+    // Exactly one --disallowedTools flag, containing both.
+    expect(args.filter((a) => a === "--disallowedTools")).toHaveLength(1);
+    const blocked = disallowedOf(args);
+    expect(blocked).toContain("SomeCustomTool");
+    for (const t of NATIVE) expect(blocked).toContain(t);
+  });
+
+  it("locked mode uses the --tools allow-list (native cron already excluded)", () => {
+    const args = runnerMod.buildSecurityArgs({
+      level: "locked",
+      allowedTools: [],
+      disallowedTools: [],
+    });
+    const toolsIdx = args.indexOf("--tools");
+    expect(toolsIdx).toBeGreaterThanOrEqual(0);
+    expect(args[toolsIdx + 1]).toBe("Read,Grep,Glob,Write");
+    // The allow-list already excludes CronCreate; no --disallowedTools needed.
+    for (const t of NATIVE) expect(args[toolsIdx + 1].split(",")).not.toContain(t);
+  });
+});
