@@ -326,13 +326,20 @@ export interface IpcRequestHuman {
  * Bus core stamps it as the job's dispatcher (never trusting a client-supplied
  * value) so results route back to the caller. `op` selects the runner method;
  * `payload` carries the tool args (validated by the runner, not here).
+ *
+ * The `schedule` / `list_scheduled` / `unschedule` ops back the durable
+ * scheduled-task tools (`schedule_task` etc.). Unlike the four AgentJobRunner
+ * ops they don't touch the runner at all — Bus core handles them directly via
+ * `schedule-ops.ts`, writing file-backed cron jobs in the daemon's cwd so the
+ * hot-reload loop schedules them. They're on this same envelope to reuse the
+ * correlated round-trip plumbing.
  */
 export interface IpcJobRequest {
   type: "job_request";
   agent_id: string;
   /** Correlation id the matching `IpcJobResult` must echo. */
   req_id: string;
-  op: "dispatch" | "status" | "list" | "cancel";
+  op: "dispatch" | "status" | "list" | "cancel" | "schedule" | "list_scheduled" | "unschedule";
   payload: Record<string, unknown>;
 }
 

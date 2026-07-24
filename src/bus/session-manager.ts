@@ -33,6 +33,7 @@ import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { NATIVE_SCHEDULING_TOOLS_BLOCKLIST } from "../config";
 import { cleanSpawnEnv, withCleanProcessEnv } from "../runner";
 import {
   deleteConfigForPty,
@@ -481,6 +482,12 @@ export function buildClaudeArgs(agent: AgentConfig, mode: SupervisionMode): stri
   }
   args.push("--plugin-dir", resolveClaudeclawPluginRoot());
   args.push("--allowedTools", PLUS_BUS_TOOL_NAMES.join(","));
+  // Block Claude Code's native session-scoped scheduling tools so the agent
+  // is funnelled to the durable `schedule_job` bus tool instead. See the
+  // NATIVE_SCHEDULING_TOOLS_BLOCKLIST comment for why (the #342 lost-reminder
+  // incident). Comma-joined to match `--allowedTools` above and the value
+  // `claude` parses for `--disallowedTools`.
+  args.push("--disallowedTools", NATIVE_SCHEDULING_TOOLS_BLOCKLIST.join(","));
   args.push(
     "--dangerously-load-development-channels",
     `plugin:${CLAUDECLAW_PLUGIN_NAME}@${PLUGIN_MARKETPLACE_TAG}`,
