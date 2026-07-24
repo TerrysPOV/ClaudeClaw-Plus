@@ -76,6 +76,12 @@ function toWireJobView(v: JobView): Record<string, unknown> {
   };
 }
 import { evaluate, type PolicyDecision, type ToolRequestContext } from "../policy/engine";
+import {
+  deleteScheduledTask,
+  listScheduledTasks,
+  scheduleTask,
+  type ScheduleTaskInput,
+} from "./schedule-ops";
 
 /** Escape XML text content (`&`, `<`, `>`) so a `</channel>` in user text
  *  can't close the wrapper element early and inject sibling markup. */
@@ -1438,6 +1444,14 @@ export class BusCoreImpl implements BusCore {
    * becomes `ok:false` — never a silent drop that would hang the caller).
    */
   private handleJobRequest(agentId: string, msg: IpcJobRequest): void {
+    // Durable scheduled-task ops are independent of the AgentJobRunner — they
+    // only write/read file-backed cron jobs in the daemon's cwd, so they must
+    // NOT be gated on `this.jobHandler` (which guards the headless dispatch
+    // runner). Route them before that gate.
+    if (msg.op === "schedule" || msg.op === "list_scheduled" || msg.op === "unschedule") {
+      void this.handleScheduleRequest(agentId, msg);
+      return;
+    }
     const handler = this.jobHandler;
     if (!handler) {
       this.sendJobResult(agentId, msg.req_id, {
@@ -1498,6 +1512,54 @@ export class BusCoreImpl implements BusCore {
       }
     } catch (err) {
       this.onError(err, { ctx: "job_request", op: msg.op, agent_id: agentId });
+      this.sendJobResult(agentId, msg.req_id, {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  /**
+   * Handle the durable scheduled-task ops (`schedule` / `list_scheduled` /
+   * `unschedule`) inline in the daemon. Writing the job file here — not in the
+   * agent's MCP subprocess — is deliberate: the daemon's cwd is the project
+   * root, so `schedule-ops.ts` resolves the same jobs dir that `loadJobs()`
+   * scans and the 30s hot-reload picks up. Errors (bad cron, bad label,
+   * duplicate) are returned as `ok:false` so the agent sees a clear message
+   * rather than a silent miss.
+   */
+  private async handleScheduleRequest(agentId: string, msg: IpcJobRequest): Promise<void> {
+    const p = (msg.payload ?? {}) as {
+      label?: unknown;
+      cron?: unknown;
+      prompt?: unknown;
+      recurring?: unknown;
+      model?: unknown;
+    };
+    try {
+      if (msg.op === "schedule") {
+        const input: ScheduleTaskInput = {
+          agentId,
+          label: typeof p.label === "string" ? p.label : "",
+          cron: typeof p.cron === "string" ? p.cron : "",
+          prompt: typeof p.prompt === "string" ? p.prompt : "",
+          ...(typeof p.recurring === "boolean" ? { recurring: p.recurring } : {}),
+          ...(typeof p.model === "string" ? { model: p.model } : {}),
+        };
+        const summary = await scheduleTask(input);
+        this.sendJobResult(agentId, msg.req_id, { ok: true, result: summary });
+        return;
+      }
+      if (msg.op === "list_scheduled") {
+        const tasks = await listScheduledTasks(agentId);
+        this.sendJobResult(agentId, msg.req_id, { ok: true, result: tasks });
+        return;
+      }
+      // unschedule
+      await deleteScheduledTask(agentId, typeof p.label === "string" ? p.label : "");
+      this.sendJobResult(agentId, msg.req_id, { ok: true, result: { deleted: true } });
+    } catch (err) {
+      this.onError(err, { ctx: "schedule_request", op: msg.op, agent_id: agentId });
       this.sendJobResult(agentId, msg.req_id, {
         ok: false,
         error: err instanceof Error ? err.message : String(err),

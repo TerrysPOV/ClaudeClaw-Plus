@@ -294,6 +294,18 @@ const JobIdArgsSchema = z.object({
   job_id: z.string(),
 });
 
+const ScheduleTaskArgsSchema = z.object({
+  label: z.string().max(128),
+  cron: z.string().max(128),
+  prompt: z.string().max(100_000),
+  recurring: z.boolean().optional(),
+  model: z.string().max(64).optional(),
+});
+
+const DeleteScheduledTaskArgsSchema = z.object({
+  label: z.string().max(128),
+});
+
 /**
  * Bound on how long a job-control call waits for Bus core's `IpcJobResult`.
  * All four ops resolve SYNCHRONOUSLY in the daemon runner, so a reply is
@@ -480,6 +492,12 @@ export class BusMcpServer {
           return this.handleListJobs();
         case "cancel_job":
           return this.handleCancelJob(rawArgs);
+        case "schedule_task":
+          return this.handleScheduleTask(rawArgs);
+        case "list_scheduled_tasks":
+          return this.handleListScheduledTasks();
+        case "delete_scheduled_task":
+          return this.handleDeleteScheduledTask(rawArgs);
         default:
           return {
             content: [{ type: "text", text: `Unknown tool: ${name}` }],
@@ -822,6 +840,31 @@ export class BusMcpServer {
   private async handleCancelJob(raw: unknown) {
     const args = JobIdArgsSchema.parse(raw ?? {});
     const res = await this.jobRequest("cancel", { job_id: args.job_id });
+    return this.jobResultContent(res);
+  }
+
+  /* ── Durable scheduled-task tool handlers (#342) ────────────────── */
+
+  private async handleScheduleTask(raw: unknown) {
+    const args = ScheduleTaskArgsSchema.parse(raw ?? {});
+    const res = await this.jobRequest("schedule", {
+      label: args.label,
+      cron: args.cron,
+      prompt: args.prompt,
+      ...(args.recurring !== undefined ? { recurring: args.recurring } : {}),
+      ...(args.model !== undefined ? { model: args.model } : {}),
+    });
+    return this.jobResultContent(res);
+  }
+
+  private async handleListScheduledTasks() {
+    const res = await this.jobRequest("list_scheduled", {});
+    return this.jobResultContent(res);
+  }
+
+  private async handleDeleteScheduledTask(raw: unknown) {
+    const args = DeleteScheduledTaskArgsSchema.parse(raw ?? {});
+    const res = await this.jobRequest("unschedule", { label: args.label });
     return this.jobResultContent(res);
   }
 }

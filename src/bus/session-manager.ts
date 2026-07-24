@@ -362,6 +362,30 @@ const PLUS_BUS_TOOL_NAMES = [
 ];
 
 /**
+ * Claude Code's native scheduling tools, blocked unconditionally on every
+ * bus agent via `--disallowedTools`.
+ *
+ * These are session-scoped: a wakeup they register is delivered only if the
+ * exact underlying Claude session that created it is still live at fire time.
+ * Under the bus runtime, sessions rotate and churn independently of the
+ * daemon, so a reminder scheduled for hours later silently never fires (the
+ * #342 "call the GP for Ginna at 8am" incident). ClaudeClaw+'s own
+ * file-backed job scheduler (`schedule_job` bus tool → `agents/<id>/jobs/`)
+ * is durable across session boundaries and is the only correct path here, so
+ * the native tools are removed rather than left as a tempting wrong door.
+ *
+ * This is a hardcoded floor, not operator-configurable: the tools are broken
+ * by architecture under bus, not merely a security preference, and hardcoding
+ * means the block takes effect on deploy with no settings.json edit.
+ */
+const NATIVE_SCHEDULING_TOOLS_BLOCKLIST = [
+  "CronCreate",
+  "CronDelete",
+  "CronList",
+  "ScheduleWakeup",
+];
+
+/**
  * Resolve the absolute path to the ClaudeClaw+ plugin root — the
  * directory containing `.claude-plugin/plugin.json` and `.mcp.json`.
  * Computed from `session-manager.ts`'s own location: this file lives
@@ -481,6 +505,12 @@ export function buildClaudeArgs(agent: AgentConfig, mode: SupervisionMode): stri
   }
   args.push("--plugin-dir", resolveClaudeclawPluginRoot());
   args.push("--allowedTools", PLUS_BUS_TOOL_NAMES.join(","));
+  // Block Claude Code's native session-scoped scheduling tools so the agent
+  // is funnelled to the durable `schedule_job` bus tool instead. See the
+  // NATIVE_SCHEDULING_TOOLS_BLOCKLIST comment for why (the #342 lost-reminder
+  // incident). Comma-joined to match `--allowedTools` above and the value
+  // `claude` parses for `--disallowedTools`.
+  args.push("--disallowedTools", NATIVE_SCHEDULING_TOOLS_BLOCKLIST.join(","));
   args.push(
     "--dangerously-load-development-channels",
     `plugin:${CLAUDECLAW_PLUGIN_NAME}@${PLUGIN_MARKETPLACE_TAG}`,

@@ -28,6 +28,7 @@ import { join } from "node:path";
 import { encodeCwdForProjectsDir } from "../jsonl-line-types";
 import type { ReceiptRecord } from "../receipt";
 import {
+  buildClaudeArgs,
   defaultSupervisionFor,
   resolveAgentCwd,
   SessionManager,
@@ -55,6 +56,29 @@ describe("defaultSupervisionFor", () => {
     const nonChannel: BusOrigin[] = ["cron", "heartbeat", "cli", "rest"];
     for (const origin of nonChannel) {
       expect(defaultSupervisionFor(origin)).toBe("process-stream-json");
+    }
+  });
+});
+
+/* ───────────────────────────────────────────────────────────────────── */
+/* buildClaudeArgs — native scheduling-tool block (#342)                 */
+/* ───────────────────────────────────────────────────────────────────── */
+
+describe("buildClaudeArgs — native scheduling-tool block", () => {
+  it("blocks CronCreate/CronDelete/CronList/ScheduleWakeup on every spawned bus agent", () => {
+    const agent: AgentConfig = {
+      id: "default",
+      cwd: "/tmp",
+      session_id: "11111111-2222-3333-4444-555555555555",
+    };
+    const args = buildClaudeArgs(agent, "pty-stdin");
+    const idx = args.indexOf("--disallowedTools");
+    expect(idx).toBeGreaterThanOrEqual(0);
+    const value = args[idx + 1];
+    // Comma-joined, matching the neighbouring --allowedTools convention.
+    const blocked = value.split(",");
+    for (const tool of ["CronCreate", "CronDelete", "CronList", "ScheduleWakeup"]) {
+      expect(blocked).toContain(tool);
     }
   });
 });
