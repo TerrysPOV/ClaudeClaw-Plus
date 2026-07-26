@@ -14,7 +14,7 @@
 
 import { loadAgentJobsUnfiltered, agentDirExists, type Job } from "../jobs";
 import { run as defaultRun } from "../runner";
-import { resolvePrompt as defaultResolvePrompt } from "../config";
+import { resolvePrompt as defaultResolvePrompt, initConfig, loadSettings } from "../config";
 
 export interface FireResult {
   success: boolean;
@@ -156,6 +156,16 @@ export async function runFireCommand(
 
   const { agent, label } = parsed;
   out(`Firing ${agent}:${label}...\n`);
+
+  // The daemon's fire path (discord/telegram → fireJob) runs with config
+  // already loaded, but the standalone `claudeclaw fire` CLI does not —
+  // without this, fireJob → execClaude → getSettings() throws
+  // "Settings not loaded". Mirror send.ts and init before dispatching.
+  // Skipped when a test injects its own runner (no real claude spawn).
+  if (!opts.runner) {
+    await initConfig();
+    await loadSettings();
+  }
 
   const result = await fireJob(agent, label, opts);
 
