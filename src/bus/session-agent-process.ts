@@ -22,17 +22,28 @@ import type { ChildProcess } from "node:child_process";
 // process-stream-json, tmux) must not require the native PTY dep just to
 // construct an AgentProcess (Codex P1 on PR #149).
 import { sanitizePtyPromptText } from "../runner/pty-prompt-sanitizer";
+// `pty-output-parser` is a pure module (no bun-pty), so reusing its
+// cursor-move→space expander does NOT pull the native PTY dep into the bus
+// module — same rationale as importing the sanitiser above.
+import { expandCursorForwardToSpaces } from "../runner/pty-output-parser";
 import type { SupervisionMode } from "./types";
 
 /** Strip ANSI OSC/CSI escape sequences so dialog matching survives the
  *  cursor-positioning escapes the CLI interleaves into rendered text. Without
  *  this, a raw substring like "development channels" silently stops matching
- *  after a CLI build renders it as "development\x1b[32Gchannels". Mirrors the
- *  stripper in `runner/pty-process.ts` (kept local to avoid importing the PTY
- *  runner into the bus module). */
+ *  after a CLI build renders it as "development\x1b[32Gchannels".
+ *
+ *  CRITICALLY, cursor-move escapes are first EXPANDED to word-boundary spaces
+ *  (`expandCursorForwardToSpaces`: CUF `\x1B[<n>C` #119, CHA `\x1B[<n>G` #345),
+ *  not merely deleted. claude 2.1.220 lays out dialog affordances by absolute
+ *  column ("Enter\x1B[39Gto\x1B[42Gconfirm"), so deleting the escape alone would
+ *  glue the words ("Entertoconfirm") and break the literal `includes("Enter to
+ *  confirm")` / `includes("Yes, I accept")` dialog gates — leaving a spawned
+ *  agent stuck at the boot dialog. This is the bus-path analogue of the #345
+ *  pty-supervisor footer hang. */
 function stripAnsiEscapes(text: string): string {
   return (
-    text
+    expandCursorForwardToSpaces(text)
       // biome-ignore lint/suspicious/noControlCharactersInRegex: OSC escape sequences require control bytes.
       .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
       // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI CSI escape stripper.

@@ -67,5 +67,13 @@ jobs:
       # they are where outbound routing and turn-semantics risk actually lives.
       # Without them the adapter half of a delivery change never runs in CI —
       # and there is no typecheck step to back it up.
+      #
+      # `src/__tests__/pty-boot-dialog.test.ts` added here: the boot-dialog
+      # watcher guards agents getting past claude's startup confirmation
+      # dialogs. Its exclusion is why a stale-fixture failure — and a real
+      # CHA-rendering drift bug in the watcher's ANSI stripper (the bus-path
+      # analogue of the #345 pty-supervisor footer hang) — slipped past CI.
+      # Fast (~0.5s), pure fake-PTY, no infra; verified 0 fail in the shared
+      # process (1443 pass across the clean suites) and stable across repeat runs.
       - name: Run tests (clean suites)
-        run: bun test src/bus src/adapters src/tuner src/observability src/skills-tuner src/plugins/eval-framework src/__tests__/governance src/__tests__/mcp-multiplexer-integration.test.ts src/__tests__/event-processor.test.ts
+        run: bun test src/bus src/adapters src/tuner src/observability src/skills-tuner src/plugins/eval-framework src/__tests__/governance src/__tests__/mcp-multiplexer-integration.test.ts src/__tests__/event-processor.test.ts src/__tests__/pty-boot-dialog.test.ts

@@ -46,9 +46,27 @@ describe("PtyAgentProcess boot-dialog watcher (issue #193)", () => {
   test("answers the dev-channels dialog with a bare Enter (its default is accept)", () => {
     const { pty, writes, emit } = makeFakePty();
     new PtyAgentProcess("main", pty);
+    // The real dialog carries the "Enter to confirm" affordance below the
+    // selected ("❯") option — the generic-confirm branch keys on it.
     emit(
       "WARNING: Loading development channels\n" +
-        "❯ 1. I am using this for local development\n  2. Exit",
+        "❯ 1. I am using this for local development\n  2. Exit\n" +
+        "Enter to confirm · Esc to cancel",
+    );
+    expect(writes).toEqual(["\r"]);
+  });
+
+  test("answers a CHA-rendered dev-channels dialog (claude 2.1.220 absolute-column layout; regression for the #345 drift class)", () => {
+    const { pty, writes, emit } = makeFakePty();
+    new PtyAgentProcess("main", pty);
+    // claude 2.1.220 positions words by absolute column (CHA, `\x1B[<col>G`).
+    // Before stripAnsiEscapes expanded CHA to spaces, "Enter\x1B[..Gto\x1B[..Gconfirm"
+    // collapsed to "Entertoconfirm" and the includes("Enter to confirm") gate
+    // never fired — the dialog went unanswered and the agent hung at boot.
+    emit(
+      "WARNING: Loading development channels\n" +
+        "❯ 1. I am using this for local development\n  2. Exit\n" +
+        "Enter\x1b[39Gto\x1b[42Gconfirm\x1b[49G· Esc to cancel",
     );
     expect(writes).toEqual(["\r"]);
   });
