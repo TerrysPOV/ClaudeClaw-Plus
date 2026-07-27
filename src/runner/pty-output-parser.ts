@@ -533,24 +533,39 @@ const CUF_MAX_SPACES = 128;
  * Handled:
  *   - `\x1B[<n>C`  → CUF (Cursor Forward n columns) — emit min(n, CAP) spaces.
  *   - `\x1B[C`     → CUF with default 1 — emit one space.
+ *   - `\x1B[<n>G`  → CHA (Cursor Horizontal Absolute) — emit a SINGLE space.
+ *     claude 2.1.220 lays out the idle REPL footer by absolute column
+ *     (`(shift+tab\x1B[39Gto\x1B[42Gcycle)`) instead of CUF. Without expanding
+ *     it, `stripAnsi` erases the moves and glues the words into
+ *     `(shift+tabtocycle)`, so `hasIdleReplFooter`'s "tab to cycle" match never
+ *     fires — `tick` withholds `quiet`, the sentinel is never written, and the
+ *     pty-supervisor turn hangs to its full timeout (the reg/suzy/publisher
+ *     job failures). A single space can't reproduce the exact column gap (that
+ *     needs running-column tracking) but it preserves the WORD BOUNDARY, which
+ *     is all the footer gate and word-recovery consumers actually need.
  *
  * Not handled (deliberately):
- *   - `\x1B[<n>G`  → CHA (absolute column) — needs current column tracking
- *     to compute the right padding; out of scope for a band-aid. Operators
- *     hitting this case should validate on the Bus runtime (Sprint 5) which
- *     reads JSONL instead of PTY rendering.
  *   - `\x1B[<n>D`  → CUB (Cursor Back) — only matters for redraws, not
  *     for first-pass word-boundary recovery.
  *   - `\x1B[<r>;<c>H` → CUP (Cursor Position) — full terminal-emulation
- *     territory; same JSONL-replacement rationale as CHA.
+ *     territory; validate on the Bus runtime (JSONL) instead.
  */
 export function expandCursorForwardToSpaces(text: string): string {
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: CUF is an ANSI CSI sequence.
-  return text.replace(/\x1b\[(\d*)C/g, (_match, digits: string) => {
-    const n = digits.length === 0 ? 1 : parseInt(digits, 10);
-    if (!Number.isFinite(n) || n <= 0) return " ";
-    return " ".repeat(Math.min(n, CUF_MAX_SPACES));
-  });
+  return (
+    text
+      // CUF (Cursor Forward, `\x1B[<n>C`) → min(n, CAP) spaces. Issue #119.
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: CUF is an ANSI CSI sequence.
+      .replace(/\x1b\[(\d*)C/g, (_match, digits: string) => {
+        const n = digits.length === 0 ? 1 : parseInt(digits, 10);
+        if (!Number.isFinite(n) || n <= 0) return " ";
+        return " ".repeat(Math.min(n, CUF_MAX_SPACES));
+      })
+      // CHA (Cursor Horizontal Absolute, `\x1B[<n>G`) → a single word-boundary
+      // space. claude 2.1.220 positions footer words by absolute column; see
+      // the docstring for why one space (not exact padding) is sufficient.
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: CHA is an ANSI CSI sequence.
+      .replace(/\x1b\[\d*G/g, " ")
+  );
 }
 
 /**

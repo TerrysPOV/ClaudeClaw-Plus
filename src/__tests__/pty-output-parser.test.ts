@@ -443,6 +443,35 @@ describe("pty-output-parser — sentinel flow (synthetic)", () => {
     expect(qEvs[0]!.type).toBe("quiet");
   });
 
+  test("issue #344: idle footer positioned by CHA (claude 2.1.220) opens the gate and fires quiet — regression for the reg/suzy/publisher pty-supervisor hang", () => {
+    const enc = new TextEncoder();
+    const parser = createParser({ quietWindowMs: 100 });
+    const uuid = "uuid-344-cha";
+    const sentinelBytes = encodeSentinel(buildSentinel(uuid));
+
+    const now = 1000;
+    startTurn(parser, uuid, sentinelBytes, now);
+
+    // claude 2.1.220 lays out the REPL footer with CHA (Cursor Horizontal
+    // Absolute, `\x1B[<col>G`) rather than CUF — the exact bytes captured from
+    // the production PTY: "(shift+tab\x1B[39Gto\x1B[42Gcycle)". Before the CHA
+    // pre-pass, stripAnsi erased the moves and glued the words into
+    // "(shift+tabtocycle)", so hasIdleReplFooter's "tab to cycle" match never
+    // fired → quiet withheld → sentinel never written → turn hung to timeout.
+    feed(
+      parser,
+      enc.encode(
+        "✻ ok\x1b[28G(shift+tab\x1b[39Gto\x1b[42Gcycle)\x1b[49G·\x1b[51G←\x1b[53Gfor\x1b[57Gagents",
+      ),
+      now,
+    );
+    expect(parser.sawActivityIndicatorThisTurn).toBe(true);
+
+    const qEvs = tick(parser, now + 200);
+    expect(qEvs.length).toBe(1);
+    expect(qEvs[0]!.type).toBe("quiet");
+  });
+
   test("issue #316: bare 'to cycle' in response prose (not the footer) does NOT trip the gate", () => {
     const enc = new TextEncoder();
     const parser = createParser({ quietWindowMs: 100 });
@@ -710,6 +739,18 @@ describe("stripAnsi", () => {
     const out = stripAnsi("a\x1b[9999Cb");
     // 128-space cap from CUF_MAX_SPACES.
     expect(out).toBe(`a${" ".repeat(128)}b`);
+  });
+
+  // Regression for #344: claude 2.1.220 positions the REPL footer words by
+  // absolute column via CHA (`\x1B[<n>G`) instead of CUF. Without the CHA
+  // pre-pass the words glued together ("(shift+tabtocycle)") and the
+  // idle-footer gate never matched, hanging every pty-supervisor turn.
+  test("recovers word boundaries from CHA sequences (claude 2.1.220 footer)", () => {
+    expect(stripAnsi("(shift+tab\x1b[39Gto\x1b[42Gcycle)")).toBe("(shift+tab to cycle)");
+  });
+
+  test("converts \\x1B[G (no count) to a single space", () => {
+    expect(stripAnsi("foo\x1b[Gbar")).toBe("foo bar");
   });
 });
 
