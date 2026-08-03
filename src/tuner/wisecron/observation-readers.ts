@@ -16,11 +16,18 @@
  * Wired in `registerWisecronSubjects`; each subject keeps its injectable seam,
  * so tests can still override with fixtures.
  */
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { DEFAULT_TOOL_CALL_LOG } from "../../observability/tool-call-sink.js";
 import { DEFAULT_MODE_DISPATCH_LOG } from "../../governance/mode-dispatch-journal.js";
+import {
+  getModelBenchmarks,
+  DEFAULT_TTL_MS,
+  type ModelBenchmark,
+  type FetchBenchmarksOptions,
+} from "../subjects/model-routing-benchmarks.js";
+import { enrichWithAnthropicCoding } from "../subjects/anthropic-benchmarks.js";
 
 function expandHome(p: string): string {
   return p.startsWith("~") ? p.replace(/^~/, homedir()) : p;
@@ -119,6 +126,56 @@ export function makeModeDispatchReader(
       });
     }
     return out;
+  };
+}
+
+/**
+ * `ModelRoutingSubject.benchmarkProvider` factory — the "research scout" feeder.
+ *
+ * The subject is deliberately pure: it NEVER fetches the web itself, and its
+ * default provider is `async () => []`, so with nothing injected the benchmark
+ * reroute has no external evidence and proposes nothing (safe, but inert). That
+ * default was never overridden at composition, which is the direct cause of the
+ * routing subject never surfacing a new-model reroute — the twin of the obs=0
+ * gap `makeModeDispatchReader` closes on the cost side.
+ *
+ * This factory lives at the runtime seam (not inside the subject) and injects
+ * the already-built scout: cache-first `getModelBenchmarks` (Artificial Analysis
+ * free tier, `ARTIFICIAL_ANALYSIS_API_KEY`), then `enrichWithAnthropicCoding` to
+ * fill Claude coding gaps the AA free tier leaves null. Graceful throughout — a
+ * missing key or benchmark outage yields `[]`, never a throw, so the proactive
+ * loop is never stalled. `fetchImpl`/`nowMs` stay injectable for tests.
+ */
+export function makeBenchmarkProvider(
+  opts: {
+    cachePath?: string;
+    ttlMs?: number;
+    apiKey?: string;
+    fetchImpl?: FetchBenchmarksOptions["fetchImpl"];
+    nowMs?: () => number;
+  } = {},
+): (models: string[]) => Promise<ModelBenchmark[]> {
+  const cachePath = expandHome(
+    opts.cachePath ?? join(homedir(), ".claude", "tuner", "model-benchmarks-cache.json"),
+  );
+  const ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
+  const now = opts.nowMs ?? (() => Date.now());
+  return async (models: string[]) => {
+    // writeBenchmarkCache uses writeFileSync without mkdir; ensure the dir once.
+    try {
+      mkdirSync(dirname(cachePath), { recursive: true });
+    } catch {
+      /* best-effort; a cache-dir failure degrades to fetch-every-time, not a throw */
+    }
+    const rows = await getModelBenchmarks({
+      models,
+      cachePath,
+      ttlMs,
+      apiKey: opts.apiKey,
+      fetchImpl: opts.fetchImpl,
+      nowMs: now(),
+    });
+    return enrichWithAnthropicCoding(rows);
   };
 }
 

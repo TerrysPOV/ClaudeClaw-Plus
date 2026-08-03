@@ -38,7 +38,7 @@ import { SkillsSubject } from "../subjects/skills-subject.js";
 // proactive content-patch face). The remaining wisecron subjects (cron,
 // claude_md, hook, prompt_template, agent) land in their own follow-up bricks
 // once the loop has earned its keep.
-import { makeModeDispatchReader } from "./observation-readers.js";
+import { makeModeDispatchReader, makeBenchmarkProvider } from "./observation-readers.js";
 
 export interface WisecronContext {
   db: WisecronStateDB;
@@ -114,6 +114,14 @@ export function registerWisecronSubjects(
         dispatchReader: makeModeDispatchReader(
           cfg("model_routing").observation_log as string | undefined,
         ),
+        // Inject the research-scout feeder so the benchmark reroute has external
+        // evidence. The subject's default benchmarkProvider is `() => []` (never
+        // wired at composition), the direct cause of it never surfacing a
+        // new-model reroute — the benchmark-side twin of the dispatchReader gap.
+        benchmarkProvider: makeBenchmarkProvider({
+          cachePath: cfg("model_routing").benchmark_cache_path as string | undefined,
+          ttlMs: cfg("model_routing").benchmark_ttl_ms as number | undefined,
+        }),
       }),
     );
 
