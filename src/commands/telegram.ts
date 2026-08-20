@@ -21,7 +21,7 @@ import { resetSession, resetFallbackSession, peekSession } from "../sessions";
 import { peekThreadSession, removeThreadSession } from "../sessionManager";
 import { readFile, mkdir } from "node:fs/promises";
 import { existsSync, realpathSync, statSync, mkdirSync } from "node:fs";
-import { execFile } from "node:child_process";
+import { execFile, type ExecFileException } from "node:child_process";
 import { homedir } from "node:os";
 import { resolve, sep } from "node:path";
 import { resolveSkillPrompt, listSkills } from "../skills";
@@ -1848,6 +1848,66 @@ export function ackForAlready(resolution: string): string {
   return `✅ Déjà approuvé${when}`;
 }
 
+/** The four outcomes a pending resolver can report. `no_answer` is not a
+ *  statement about the action — it means we never got a verdict. */
+export type ResolverVerdict = "ok" | "already" | "not_found" | "no_answer";
+
+/**
+ * Read the resolver's verdict off its stdout.
+ *
+ * The verdict is the LAST non-empty line, not the whole buffer: the resolver is
+ * operator-supplied, and a resolver that logs its own diagnostics (a failed
+ * notification edit, a deprecation notice) prints them before the verdict it
+ * was asked for. Comparing the whole buffer classifies "diagnostic\nok" as
+ * garbage and misreports a decision that was in fact applied.
+ */
+export function parseResolverVerdict(stdout: string): { verdict: ResolverVerdict; line: string } {
+  const line =
+    stdout
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .pop() ?? "";
+  if (line === "ok") return { verdict: "ok", line };
+  if (line.startsWith("already:")) return { verdict: "already", line };
+  if (line === "not_found") return { verdict: "not_found", line };
+  return { verdict: "no_answer", line };
+}
+
+/**
+ * Ack for a pending-action resolution.
+ *
+ * `not_found` is a statement about the action: the id is unknown, the button is
+ * stale. `no_answer` is a statement about the resolver: it never printed a
+ * verdict, so the action's fate is unknown — the resolver commits its decision
+ * before we read its exit status, so the tap may well have applied. Acking both
+ * as "not found" claims the tap was rejected when it may have landed.
+ */
+export function ackForResolution(stdout: string, decision: string): string {
+  const { verdict, line } = parseResolverVerdict(stdout);
+  if (verdict === "ok") {
+    const decLower = decision.toLowerCase();
+    if (decLower === "skip") return "⏸ Plus tard";
+    if (decLower === "reject" || decLower === "cancel") return "❌ Rejeté";
+    return "✅ Approuvé";
+  }
+  if (verdict === "already") return ackForAlready(line);
+  if (verdict === "not_found") return "⚠️ Action introuvable";
+  return "⚠️ Erreur — réessaie";
+}
+
+/**
+ * Strip credentials from resolver diagnostics before they reach the log. A
+ * resolver that fails while calling the Bot API can put the bot token — which
+ * lives in the request URL — into its stderr. Mirrors the redaction the PTY
+ * tail applies for the same reason.
+ */
+export function redactResolverDiagnostics(text: string): string {
+  return text
+    .replace(/\bbot\d+:[A-Za-z0-9_-]{20,}/g, "bot<redacted>")
+    .replace(/\bBearer\s+[A-Za-z0-9_.-]{16,}/g, "Bearer <redacted>");
+}
+
 // --- Callback query handler ---
 
 async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> {
@@ -1914,42 +1974,61 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
       ackText = "⚠️ Pending action handler not configured";
     } else {
       try {
-        const result = await new Promise<{ code: number; stdout: string; stderr: string }>(
-          (resolve) => {
-            execFile(
-              "python3",
-              [
-                "-c",
-                // #314: prefer the richer `resolve_pending_ex`
-                // (ok|not_found|already:<decision>:<at>) when the operator's lib
-                // provides it, so an already-resolved tap is distinguishable from
-                // a genuinely unknown/expired one; fall back to the boolean
-                // `resolve_pending` otherwise (zero regression for older libs).
-                "import sys; sys.path.insert(0, sys.argv[1]); import pending; f = getattr(pending, 'resolve_pending_ex', None); print(f(int(sys.argv[2]), sys.argv[3]) if f else ('ok' if pending.resolve_pending(int(sys.argv[2]), sys.argv[3]) else 'not_found'))",
-                pendingLibPath,
-                actionId,
-                decision,
-              ],
-              { timeout: 5000 },
-              (err: Error | null, stdout: string, stderr: string) => {
-                resolve({ code: err ? 1 : 0, stdout: stdout.trim(), stderr });
-              },
-            );
-          },
-        );
-        if (result.stdout === "ok") {
-          const decLower = decision.toLowerCase();
-          if (decLower === "skip") ackText = "⏸ Plus tard";
-          else if (decLower === "reject" || decLower === "cancel") ackText = "❌ Rejeté";
-          else ackText = "✅ Approuvé";
-        } else if (result.stdout.startsWith("already:")) {
-          // #314: already resolved — ack the prior decision, not "not found".
-          ackText = ackForAlready(result.stdout);
-        } else {
-          ackText = "⚠️ Action introuvable";
+        const result = await new Promise<{
+          code: number | string | null;
+          signal: string | null;
+          timedOut: boolean;
+          stdout: string;
+          stderr: string;
+        }>((resolve) => {
+          execFile(
+            "python3",
+            [
+              "-c",
+              // #314: prefer the richer `resolve_pending_ex`
+              // (ok|not_found|already:<decision>:<at>) when the operator's lib
+              // provides it, so an already-resolved tap is distinguishable from
+              // a genuinely unknown/expired one; fall back to the boolean
+              // `resolve_pending` otherwise (zero regression for older libs).
+              "import sys; sys.path.insert(0, sys.argv[1]); import pending; f = getattr(pending, 'resolve_pending_ex', None); print(f(int(sys.argv[2]), sys.argv[3]) if f else ('ok' if pending.resolve_pending(int(sys.argv[2]), sys.argv[3]) else 'not_found'))",
+              pendingLibPath,
+              actionId,
+              decision,
+            ],
+            { timeout: 5000 },
+            (err: ExecFileException | null, stdout: string, stderr: string) => {
+              // `err` carries the real exit code, or a signal when the 5s
+              // timeout killed the process — the three failure shapes this
+              // branch has to tell apart.
+              resolve({
+                code: err?.code ?? (err ? 1 : 0),
+                signal: err?.signal ?? null,
+                timedOut: err?.killed === true,
+                stdout: stdout.trim(),
+                stderr,
+              });
+            },
+          );
+        });
+        const { verdict } = parseResolverVerdict(result.stdout);
+        ackText = ackForResolution(result.stdout, decision);
+        if (verdict === "no_answer") {
+          // No verdict: the ack cannot say whether the decision was applied, so
+          // the operator needs the reason it failed.
+          const how = result.timedOut
+            ? "timed out"
+            : result.signal
+              ? `killed by ${result.signal}`
+              : `exit ${result.code}`;
+          const why = redactResolverDiagnostics(result.stderr).trim().slice(0, 200) || "no stderr";
+          console.warn(
+            `[Telegram] pending resolver reported no verdict for action ${actionId} (${how}): ${why}`,
+          );
         }
-        // Edit original message to show decision
-        if (query.message) {
+        // Edit the original message to record the decision — but only once we
+        // know one was taken. Editing strips the keyboard, and an ack that asks
+        // the user to retry must not delete the buttons it is pointing them at.
+        if (query.message && verdict !== "no_answer") {
           const originalText = query.message.text ?? "";
           await callApi(config.token, "editMessageText", {
             chat_id: query.message.chat.id,
