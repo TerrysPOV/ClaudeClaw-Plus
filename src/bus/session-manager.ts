@@ -295,25 +295,35 @@ export function synthesizeAgentJobMcpConfig(
 /**
  * Drop a job's multiplexer identity and delete its synthesized config file.
  * Best-effort and idempotent: a job that never got a config (dormant
- * multiplexer) releases nothing, and a failure to unlink never fails the job
- * — the run is already over by the time this is called.
+ * multiplexer) releases nothing, and a failure never fails the job — the run
+ * is already over by the time this is called.
+ *
+ * Deliberately NOT async, mirroring `cleanupAgentMcpConfig`: `revoke` closes
+ * transports and writes the multiplexer's persistence file, so awaiting it
+ * would sit between the job settling and `AgentJobRunner.finish()` — holding
+ * a concurrency slot for the whole teardown, and holding it FOREVER if a
+ * close ever hangs. The unlink stays synchronous so the 0600 bearer file is
+ * gone the moment the run ends.
+ *
+ * Failures are logged rather than swallowed: a directory that has become
+ * unwritable would otherwise leave a live bearer token on disk after every
+ * dispatch with no operator signal at all.
  */
-export async function releaseAgentJobMcpConfig(
+export function releaseAgentJobMcpConfig(
   jobKey: string,
   synth: BusMcpConfigSynthesizer | null,
   cwd: string,
-): Promise<void> {
+  logger: Pick<Console, "warn"> = console,
+): void {
   if (!synth) return;
   try {
-    await synth.revoke(jobKey);
-  } catch {
-    // best-effort — the multiplexer's revoke is documented as idempotent.
-  }
-  try {
     deleteConfigForPty(cwd, jobKey);
-  } catch {
-    // best-effort — operator may have removed the directory.
+  } catch (err) {
+    logger.warn(`[bus-session] job=${jobKey} mcp-config cleanup failed`, err);
   }
+  Promise.resolve(synth.revoke(jobKey)).catch((err) =>
+    logger.warn(`[bus-session] job=${jobKey} mcp identity revoke failed`, err),
+  );
 }
 
 /* ───────────────────────────────────────────────────────────────────── */

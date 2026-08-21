@@ -13,10 +13,11 @@
  *      throws.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PtyIdentity } from "../../runner/pty-mcp-config-writer";
+import { buildAgentJobArgs } from "../../runner";
 import { withAgentJobMcpConfig } from "../runtime-mount";
 import {
   type BusMcpConfigSynthesizer,
@@ -104,8 +105,10 @@ describe("synthesizeAgentJobMcpConfig", () => {
   it("revokes the identity and rethrows when the write fails (never a silent no-MCP run)", () => {
     const { synth, revoked } = makeSynth();
     // A path under a regular file: mkdir of `.claudeclaw` fails with ENOTDIR.
+    // Written synchronously on purpose — an unawaited async write would let
+    // mkdir(recursive) create the path as a DIRECTORY and invert this test.
     const notADir = join(cwd, "regular-file");
-    Bun.write(notADir, "x");
+    writeFileSync(notADir, "x");
 
     expect(() => synthesizeAgentJobMcpConfig("agent-job-boom", synth, notADir)).toThrow();
     expect(revoked).toEqual(["agent-job-boom"]);
@@ -118,7 +121,7 @@ describe("releaseAgentJobMcpConfig", () => {
     const path = synthesizeAgentJobMcpConfig("agent-job-rel", synth, cwd) as string;
     expect(existsSync(path)).toBe(true);
 
-    await releaseAgentJobMcpConfig("agent-job-rel", synth, cwd);
+    releaseAgentJobMcpConfig("agent-job-rel", synth, cwd);
 
     expect(revoked).toEqual(["agent-job-rel"]);
     expect(existsSync(path)).toBe(false);
@@ -126,9 +129,9 @@ describe("releaseAgentJobMcpConfig", () => {
 
   it("is idempotent and a no-op when the multiplexer is dormant", async () => {
     const { synth } = makeSynth();
-    await releaseAgentJobMcpConfig("agent-job-never-issued", synth, cwd);
-    await releaseAgentJobMcpConfig("agent-job-never-issued", synth, cwd);
-    await releaseAgentJobMcpConfig("agent-job-never-issued", null, cwd);
+    releaseAgentJobMcpConfig("agent-job-never-issued", synth, cwd);
+    releaseAgentJobMcpConfig("agent-job-never-issued", synth, cwd);
+    releaseAgentJobMcpConfig("agent-job-never-issued", null, cwd);
   });
 });
 
@@ -174,5 +177,70 @@ describe("withAgentJobMcpConfig", () => {
 
     expect(revoked).toEqual(issued);
     expect(existsSync(join(cwd, ".claudeclaw", `mcp-pty-${issued[0]}.json`))).toBe(false);
+  });
+});
+
+describe("release under a real (async) revoke", () => {
+  it("does not wait on multiplexer teardown — the job's slot is freed immediately", async () => {
+    // The real `revoke` is `plugin.releaseIdentity`, which closes transports
+    // and writes the multiplexer's persistence file. Awaiting it would hold
+    // the job's concurrency slot for the whole teardown — and forever if a
+    // close ever hangs.
+    let settle: (() => void) | undefined;
+    const { synth } = makeSynth({
+      revoke: () =>
+        new Promise<void>((resolve) => {
+          settle = resolve;
+        }),
+    });
+
+    const started = Date.now();
+    await withAgentJobMcpConfig(cwd, synth, async () => "done");
+    // Returned while the teardown promise is still pending.
+    expect(settle).toBeDefined();
+    expect(Date.now() - started).toBeLessThan(1000);
+    settle?.();
+  });
+
+  it("logs instead of swallowing when the revoke rejects (a live token would stay issued)", async () => {
+    const warnings: unknown[][] = [];
+    const { synth } = makeSynth({
+      revoke: () => Promise.reject(new Error("multiplexer down")),
+    });
+
+    await withAgentJobMcpConfig(cwd, synth, async () => "done", {
+      warn: (...args: unknown[]) => {
+        warnings.push(args);
+      },
+    });
+    // The rejection is handled on a microtask — let it land.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(warnings.length).toBeGreaterThan(0);
+    expect(String(warnings[0][0])).toContain("revoke failed");
+  });
+});
+
+describe("buildAgentJobArgs", () => {
+  const base = { prompt: "do the thing", securityArgs: ["--sec"], persona: "SOUL" };
+
+  it("passes --mcp-config through to the spawned claude", () => {
+    const args = buildAgentJobArgs({ ...base, mcpConfigPath: "/tmp/x/mcp-pty-agent-job-1.json" });
+    const at = args.indexOf("--mcp-config");
+    expect(at).toBeGreaterThan(-1);
+    expect(args[at + 1]).toBe("/tmp/x/mcp-pty-agent-job-1.json");
+  });
+
+  it("omits the flag entirely when the multiplexer is dormant", () => {
+    expect(buildAgentJobArgs(base)).not.toContain("--mcp-config");
+    // Dormant argv is byte-identical to the pre-fix shape.
+    expect(buildAgentJobArgs(base).slice(1)).toEqual([
+      "-p",
+      "do the thing",
+      "--sec",
+      "--append-system-prompt",
+      "SOUL",
+    ]);
   });
 });

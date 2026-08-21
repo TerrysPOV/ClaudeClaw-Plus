@@ -820,6 +820,25 @@ export async function runClaudeOnce(
 }
 
 /**
+ * Build the argv for one headless agent job.
+ *
+ * Extracted so the `--mcp-config` wiring is directly assertable: without the
+ * flag a dispatched job cannot reach any of the operator's `mcp.shared`
+ * servers, while the agent that dispatched it reaches all of them.
+ */
+export function buildAgentJobArgs(input: {
+  prompt: string;
+  securityArgs: string[];
+  persona: string;
+  mcpConfigPath?: string;
+}): string[] {
+  const args = [CLAUDE_EXECUTABLE, "-p", input.prompt, ...input.securityArgs];
+  if (input.persona) args.push("--append-system-prompt", input.persona);
+  if (input.mcpConfigPath) args.push("--mcp-config", input.mcpConfigPath);
+  return args;
+}
+
+/**
  * Run a named agent as a one-shot headless job (for the bus AgentJobRunner). Loads
  * the agent's persona (IDENTITY/SOUL/CLAUDE.md), runs `claude -p <prompt>` in the
  * agent's dir with plain-text output, and returns the final text. Honours the
@@ -847,13 +866,12 @@ export async function runAgentJobHeadless(input: {
   validateModelString(input.model, "agent job");
   const ctx = await loadAgent(input.agent);
   const persona = await loadAgentPrompts(input.agent);
-  const args = [CLAUDE_EXECUTABLE, "-p", input.prompt, ...buildSecurityArgs(settings.security)];
-  if (persona) args.push("--append-system-prompt", persona);
-  // Without this the job spawns with no MCP servers at all — the gap that
-  // made a dispatched job strictly less capable than the agent that
-  // dispatched it (no shared servers, however the operator configured
-  // `mcp.shared`).
-  if (input.mcpConfigPath) args.push("--mcp-config", input.mcpConfigPath);
+  const args = buildAgentJobArgs({
+    prompt: input.prompt,
+    securityArgs: buildSecurityArgs(settings.security),
+    persona,
+    mcpConfigPath: input.mcpConfigPath,
+  });
   const model = input.model?.trim() || settings.model;
   const { rawStdout, stderr, exitCode } = await runClaudeOnce(
     args,

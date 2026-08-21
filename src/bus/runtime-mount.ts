@@ -382,40 +382,6 @@ export function deliverAgentJobResult(
  * half-mounted daemon. This mirrors Sprint 4's `SlackAdapter.start()`
  * rollback pattern (Codex PR #117 P2 fix).
  */
-/**
- * Mint a job-scoped MCP identity, run one agent job with the synthesized
- * `--mcp-config`, and release the identity when the run ends.
- *
- * Issue #165 wired `mcp.shared` into the legacy PTY supervisor and then into
- * the bus agent spawn. The agent-job spawn (`dispatch_job`) is the third
- * spawn path and was never wired: it builds its argv by hand, so a dispatched
- * job started with no MCP servers at all while the agent that dispatched it —
- * spawned by the same daemon, from the same settings — had every shared
- * server. This closes that gap.
- *
- * A job's identity is per-run, unlike an agent's (one agent = one long-lived
- * PTY = one identity), so it is released in a `finally`: without that, every
- * dispatched job would leak an identity in the multiplexer's registry and a
- * 0600 config file in the agent's directory.
- *
- * Exported for tests — the production caller is the `runAgentJob` dep below.
- */
-export async function withAgentJobMcpConfig<T>(
-  cwd: string,
-  synth: BusMcpConfigSynthesizer | null,
-  run: (mcpConfigPath: string | undefined) => Promise<T>,
-): Promise<T> {
-  // Generated, never caller- or model-supplied: the key lands in the
-  // synthesized file's name.
-  const jobKey = `agent-job-${randomUUID()}`;
-  const mcpConfigPath = synthesizeAgentJobMcpConfig(jobKey, synth, cwd);
-  try {
-    return await run(mcpConfigPath);
-  } finally {
-    await releaseAgentJobMcpConfig(jobKey, synth, cwd);
-  }
-}
-
 export async function mountBusRuntime(
   opts: MountBusRuntimeOptions = {},
 ): Promise<BusRuntimeHandle> {
@@ -491,6 +457,7 @@ export async function mountBusRuntime(
           cwd,
           sessionManager.getMcpConfigSynthesizer(),
           (mcpConfigPath) => runAgentJobHeadless({ ...input, mcpConfigPath }),
+          logger,
         );
       },
       isKnownAgent: agentExists,
@@ -808,5 +775,42 @@ export async function mountBusRuntime(
       }
     }
     throw err;
+  }
+}
+
+/**
+ * Mint a job-scoped MCP identity, run one agent job with the synthesized
+ * `--mcp-config`, and release the identity when the run ends.
+ *
+ * Issue #165 wired `mcp.shared` into the legacy PTY supervisor and then into
+ * the bus agent spawn. The agent-job spawn (`dispatch_job`) is the third
+ * spawn path and was never wired: it builds its argv by hand, so a dispatched
+ * job started with no MCP servers at all while the agent that dispatched it —
+ * spawned by the same daemon, from the same settings — had every shared
+ * server. This closes that gap.
+ *
+ * A job's identity is per-run, unlike an agent's (one agent = one long-lived
+ * PTY = one identity), so it is released in a `finally`: without that, every
+ * dispatched job would leak an identity in the multiplexer's registry and a
+ * 0600 config file in the agent's directory.
+ *
+ * Exported for tests — the production caller is the `runAgentJob` dep below.
+ */
+export async function withAgentJobMcpConfig<T>(
+  cwd: string,
+  synth: BusMcpConfigSynthesizer | null,
+  run: (mcpConfigPath: string | undefined) => Promise<T>,
+  logger: Pick<Console, "warn"> = console,
+): Promise<T> {
+  // Generated, never caller- or model-supplied: the key lands in the
+  // synthesized file's name.
+  const jobKey = `agent-job-${randomUUID()}`;
+  const mcpConfigPath = synthesizeAgentJobMcpConfig(jobKey, synth, cwd);
+  try {
+    return await run(mcpConfigPath);
+  } finally {
+    // Not awaited by design — see `releaseAgentJobMcpConfig`. The job's
+    // concurrency slot must not be held open by multiplexer teardown.
+    releaseAgentJobMcpConfig(jobKey, synth, cwd, logger);
   }
 }
