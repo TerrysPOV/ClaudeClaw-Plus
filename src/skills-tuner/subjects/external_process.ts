@@ -47,6 +47,63 @@ const RpcResponseSchema = z.union([
   z.object({ error: z.string() }).strict(),
 ]);
 
+const MAX_STREAM_CHARS = 500;
+
+/**
+ * Truncate on a code-point boundary so a clipped message never ends on half of
+ * a surrogate pair (which would become U+FFFD once the message is encoded).
+ */
+function clip(text: string): string {
+  const points = Array.from(text);
+  return points.length <= MAX_STREAM_CHARS ? text : points.slice(0, MAX_STREAM_CHARS).join("");
+}
+
+/**
+ * Decode the RPC envelope a subject wrote to stdout, if there is one.
+ *
+ * The protocol is line-oriented — the template prints one JSON object per line
+ * (see examples/external_subject_python_template.py) — so the envelope is the
+ * LAST non-empty line, and anything a subject logged before it is not JSON.
+ * Parsing the whole buffer would therefore miss the envelope of any subject
+ * that logs before it fails.
+ */
+function stdoutEnvelope(stdout: string): { error: string } | { result: unknown } | undefined {
+  const lines = stdout.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]?.trim();
+    if (!line) continue;
+    try {
+      const envelope = RpcResponseSchema.safeParse(JSON.parse(line));
+      return envelope.success ? envelope.data : undefined;
+    } catch {
+      // The last non-empty line is not JSON — treat stdout as raw output.
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Describe what a failing subject left behind, preferring its own diagnosis.
+ */
+function failureDetails(stdout: string, stderr: string): string {
+  const details: string[] = [];
+  const envelope = stdoutEnvelope(stdout);
+  if (envelope && "error" in envelope) {
+    details.push(`error: ${clip(envelope.error)}`);
+  } else if (envelope) {
+    // A result payload on a failure path is not a diagnosis; naming it keeps
+    // the subject's data out of the exception message.
+    details.push("stdout: result payload");
+  } else if (stdout.trim()) {
+    details.push(`stdout: ${clip(stdout)}`);
+  }
+  if (stderr.trim()) {
+    details.push(`stderr: ${clip(stderr)}`);
+  }
+  return details.length > 0 ? details.join(" | ") : "no output on stdout or stderr";
+}
+
 export class ExternalProcessSubject extends TunableSubject {
   readonly name: string;
   readonly risk_tier: RiskTier;
@@ -87,7 +144,14 @@ export class ExternalProcessSubject extends TunableSubject {
     const exitCode: number = await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         proc.kill("SIGKILL");
-        reject(new Error(`ExternalProcess ${this.name} timed out after ${timeoutMs}ms`));
+        // A subject can report its own failure and then hang; surface whatever it
+        // wrote so a timeout is not the only thing the operator gets.
+        reject(
+          new Error(
+            `ExternalProcess ${this.name} timed out after ${timeoutMs}ms. ` +
+              failureDetails(stdout, stderr),
+          ),
+        );
       }, timeoutMs);
       proc.on("exit", (code) => {
         clearTimeout(timer);
@@ -100,8 +164,12 @@ export class ExternalProcessSubject extends TunableSubject {
     });
 
     if (exitCode !== 0) {
+      // The documented stdio protocol (see examples/external_subject_python_template.py)
+      // has a failing subject print `{"error": "<message>"}` to STDOUT and then exit
+      // non-zero, so the subject's own diagnosis lives on stdout, not stderr. Report
+      // both streams — a subject may legitimately log to stderr as well.
       throw new Error(
-        `ExternalProcess ${this.name} exited ${exitCode}. stderr: ${stderr.slice(0, 500)}`,
+        `ExternalProcess ${this.name} exited ${exitCode}. ${failureDetails(stdout, stderr)}`,
       );
     }
 
@@ -109,9 +177,7 @@ export class ExternalProcessSubject extends TunableSubject {
     try {
       parsed = JSON.parse(stdout);
     } catch {
-      throw new Error(
-        `ExternalProcess ${this.name} returned invalid JSON: ${stdout.slice(0, 500)}`,
-      );
+      throw new Error(`ExternalProcess ${this.name} returned invalid JSON: ${clip(stdout)}`);
     }
 
     const validated = RpcResponseSchema.parse(parsed);
