@@ -832,6 +832,13 @@ export async function runAgentJobHeadless(input: {
   model?: string;
   timeoutMs: number;
   signal: AbortSignal;
+  /**
+   * Absolute path to a synthesized `--mcp-config` for this job, or omitted
+   * when the MCP multiplexer is dormant. Minted and released by the caller
+   * (the bus wires the job runner and owns the multiplexer identity); this
+   * function only forwards the flag to the spawned `claude`.
+   */
+  mcpConfigPath?: string;
 }): Promise<{ exitCode: number; resultText?: string; error?: string; timedOut?: boolean }> {
   const settings = getSettings();
   // Security review (#296 PR 3): validate the caller-supplied model against the
@@ -842,6 +849,11 @@ export async function runAgentJobHeadless(input: {
   const persona = await loadAgentPrompts(input.agent);
   const args = [CLAUDE_EXECUTABLE, "-p", input.prompt, ...buildSecurityArgs(settings.security)];
   if (persona) args.push("--append-system-prompt", persona);
+  // Without this the job spawns with no MCP servers at all — the gap that
+  // made a dispatched job strictly less capable than the agent that
+  // dispatched it (no shared servers, however the operator configured
+  // `mcp.shared`).
+  if (input.mcpConfigPath) args.push("--mcp-config", input.mcpConfigPath);
   const model = input.model?.trim() || settings.model;
   const { rawStdout, stderr, exitCode } = await runClaudeOnce(
     args,

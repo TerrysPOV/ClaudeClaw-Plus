@@ -216,10 +216,29 @@ export function synthesizeBusMcpConfig(
   cwd: string,
 ): string | undefined {
   if (agent.mcp_config) return undefined;
+  return synthesizeMcpConfigForKey(agent.id, synth, cwd);
+}
+
+/**
+ * Shared core of the bus-side synthesis, keyed on an arbitrary spawn key
+ * rather than on an `AgentConfig`. Long-lived bus agents key on the stable
+ * `agent.id`; headless agent jobs key on a freshly-minted job key so two
+ * concurrent jobs for the same agent never share an identity or clobber
+ * each other's config file.
+ *
+ * The key lands in the synthesized file name (`mcp-pty-<key>.json`), so
+ * callers MUST pass a value they generate themselves — never operator or
+ * model-supplied text.
+ */
+function synthesizeMcpConfigForKey(
+  key: string,
+  synth: BusMcpConfigSynthesizer | null,
+  cwd: string,
+): string | undefined {
   if (!synth) return undefined;
   if (synth.sharedServers.length === 0) return undefined;
 
-  const identity = synth.issue(agent.id);
+  const identity = synth.issue(key);
   // Roll back the just-minted identity if the on-disk write fails
   // (EACCES, ENOSPC, EROFS, mkdir failure). Without this, the throw
   // escapes the spawn-dispatch try/catch in `spawnAgentInternal`
@@ -230,7 +249,7 @@ export function synthesizeBusMcpConfig(
   let path: string;
   try {
     ({ path } = writeConfigForPty({
-      ptyId: agent.id,
+      ptyId: key,
       cwd,
       sharedServers: synth.sharedServers.map((name) => ({ name })),
       perPtyServers: [],
@@ -238,12 +257,63 @@ export function synthesizeBusMcpConfig(
       identity,
     }));
   } catch (err) {
-    Promise.resolve(synth.revoke(agent.id)).catch(() => {
+    Promise.resolve(synth.revoke(key)).catch(() => {
       // Fire-and-forget; the throw below is the operator-visible signal.
     });
     throw err;
   }
   return path.length > 0 ? path : undefined;
+}
+
+/**
+ * Synthesize a per-JOB `--mcp-config` for the headless agent-job spawn path
+ * (`dispatch_job` → `runAgentJobHeadless`).
+ *
+ * Issue #165 wired `mcp.shared` into the legacy PTY supervisor and then into
+ * the bus agent spawn. The agent-job spawn is the THIRD spawn path and was
+ * never wired: `runAgentJobHeadless` builds its argv by hand, so a dispatched
+ * job started with no `--mcp-config` at all and could not reach a single
+ * shared server — while the dispatching agent, spawned from the same daemon,
+ * could.
+ *
+ * Unlike a long-lived agent (one agent = one identity for the process's whole
+ * life), a job's identity is minted per run and MUST be released when the run
+ * ends — see `releaseAgentJobMcpConfig`. Callers pass a generated `jobKey`.
+ *
+ * Throws when synthesis is active but the write fails, matching the
+ * supervisor's contract (SPEC §4.5: fail the spawn, never fall through to a
+ * silent no-MCP run). The job is then marked failed with that error.
+ */
+export function synthesizeAgentJobMcpConfig(
+  jobKey: string,
+  synth: BusMcpConfigSynthesizer | null,
+  cwd: string,
+): string | undefined {
+  return synthesizeMcpConfigForKey(jobKey, synth, cwd);
+}
+
+/**
+ * Drop a job's multiplexer identity and delete its synthesized config file.
+ * Best-effort and idempotent: a job that never got a config (dormant
+ * multiplexer) releases nothing, and a failure to unlink never fails the job
+ * — the run is already over by the time this is called.
+ */
+export async function releaseAgentJobMcpConfig(
+  jobKey: string,
+  synth: BusMcpConfigSynthesizer | null,
+  cwd: string,
+): Promise<void> {
+  if (!synth) return;
+  try {
+    await synth.revoke(jobKey);
+  } catch {
+    // best-effort — the multiplexer's revoke is documented as idempotent.
+  }
+  try {
+    deleteConfigForPty(cwd, jobKey);
+  } catch {
+    // best-effort — operator may have removed the directory.
+  }
 }
 
 /* ───────────────────────────────────────────────────────────────────── */
@@ -573,6 +643,16 @@ export class SessionManager {
    */
   setMcpConfigSynthesizer(synth: BusMcpConfigSynthesizer | null): void {
     this.mcpSynth = synth;
+  }
+
+  /**
+   * The wired synthesizer, or `null` when the multiplexer is dormant. Read by
+   * the agent-job spawn path, which lives outside this class but needs the
+   * same issuer so a dispatched job reaches the same shared servers as the
+   * agent that dispatched it.
+   */
+  getMcpConfigSynthesizer(): BusMcpConfigSynthesizer | null {
+    return this.mcpSynth;
   }
 
   async spawnAgent(agent: AgentConfig, origin: BusOrigin): Promise<AgentProcess> {
