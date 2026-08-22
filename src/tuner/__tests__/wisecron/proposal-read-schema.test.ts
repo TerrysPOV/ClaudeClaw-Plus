@@ -1,0 +1,196 @@
+/**
+ * Read path vs emit path for a persisted proposal.
+ *
+ * The bound on `alternatives` constrains what a subject may EMIT. While one
+ * schema served both directions it also gated rehydration, so a row written
+ * without that runtime check — `persistProposal` stringifies without
+ * re-validating — became unreadable on the way back out. And, because the
+ * listing path parsed rows eagerly, that single row failed every query walking
+ * it, counts over unrelated valid rows included.
+ *
+ * These tests pin both halves: the emit bound is enforced at persist time, the
+ * read schema no longer applies it, and a listing survives a row it cannot
+ * parse while still naming it. Rows an older binary would have left behind are
+ * seeded with a raw INSERT — a test for read-path tolerance must not depend on
+ * the write path tolerating the same thing.
+ */
+
+import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { WisecronStateDB } from "../../wisecron/state-db.js";
+import type { ProposalStatus } from "../../wisecron/state-db.js";
+import {
+  PersistedProposalSchema,
+  ProposalSchema,
+  UnsignedProposalSchema,
+} from "../../../skills-tuner/core/types.js";
+import type { Alternative, Proposal } from "../../../skills-tuner/core/types.js";
+
+let tmpDir: string;
+let dbPath: string;
+let db: WisecronStateDB;
+
+/**
+ * A row as an older binary left it: written BEHIND the current write path, which
+ * is the only honest way to stand in for bytes already on disk. Seeding through
+ * `persistProposal` would prove nothing — that path validates.
+ */
+function seedLegacyRow(proposal: Proposal, status: ProposalStatus = "pending"): void {
+  const raw = new Database(dbPath);
+  const now = new Date().toISOString();
+  raw
+    .prepare(
+      "INSERT INTO proposals(id, subject, status, proposal_json, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+    )
+    .run(String(proposal.id), proposal.subject, status, JSON.stringify(proposal), now, now);
+  raw.close();
+}
+
+function alts(n: number): Alternative[] {
+  return Array.from({ length: n }, (_, i) => ({
+    id: `a${i + 1}`,
+    label: `alt ${i + 1}`,
+    diff_or_content: `content ${i + 1}`,
+    tradeoff: "",
+  }));
+}
+
+function makeProposal(id: number, alternatives: Alternative[] = alts(2)): Proposal {
+  return {
+    id,
+    cluster_id: `c${id}`,
+    subject: "fake",
+    kind: "noop",
+    target_path: join(tmpDir, `target-${id}.txt`),
+    pattern_signature: `sig:${id}`,
+    created_at: new Date("2026-01-01T00:00:00Z"),
+    alternatives,
+    signature: "valid-sig",
+  } as Proposal;
+}
+
+/** A row whose stored JSON no longer satisfies the read schema (empty signature). */
+function makeCorrupt(id: number): Proposal {
+  return { ...makeProposal(id), signature: "" } as Proposal;
+}
+
+/** Sorted ids of a listing, for order-independent assertions. */
+function ids(rows: Array<{ id: string }>): string[] {
+  return rows.map((r) => r.id).sort();
+}
+
+/** What `rowToStoredProposal` sees: the proposal after a JSON round-trip. */
+function persistedJson(p: Proposal): unknown {
+  return JSON.parse(JSON.stringify(p));
+}
+
+beforeEach(() => {
+  tmpDir = mkdtempSync(join(tmpdir(), "proposal-read-schema-"));
+  dbPath = join(tmpDir, "wisecron.db");
+  db = new WisecronStateDB(dbPath);
+});
+
+afterEach(() => {
+  db.close();
+  rmSync(tmpDir, { recursive: true, force: true });
+});
+
+describe("proposal schemas — emit bound vs read bound", () => {
+  it("the emit schemas still reject more alternatives than the bound allows", () => {
+    const { signature: _sig, ...unsigned } = makeProposal(1, alts(4));
+    expect(() => UnsignedProposalSchema.parse(unsigned)).toThrow();
+    expect(() => ProposalSchema.parse(makeProposal(1, alts(4)))).toThrow();
+  });
+
+  it("the emit schemas still accept a proposal inside the bound", () => {
+    expect(ProposalSchema.parse(makeProposal(1, alts(3))).alternatives).toHaveLength(3);
+  });
+
+  it("the read schema accepts a row written under a looser bound", () => {
+    const parsed = PersistedProposalSchema.parse(persistedJson(makeProposal(1, alts(4))));
+    expect(parsed.alternatives).toHaveLength(4);
+    expect(parsed.alternatives.map((a) => a.id)).toEqual(["a1", "a2", "a3", "a4"]);
+  });
+
+  it("the read schema keeps every other constraint (lower bound, signature, dates)", () => {
+    expect(() => PersistedProposalSchema.parse(persistedJson(makeProposal(1, [])))).toThrow();
+    expect(() => PersistedProposalSchema.parse(persistedJson(makeCorrupt(1)))).toThrow();
+    const parsed = PersistedProposalSchema.parse(persistedJson(makeProposal(1)));
+    expect(parsed.created_at).toBeInstanceOf(Date);
+    expect(parsed.created_at.toISOString()).toBe("2026-01-01T00:00:00.000Z");
+  });
+});
+
+describe("WisecronStateDB — the emit gate at persist time", () => {
+  it("refuses a proposal carrying more alternatives than the emit bound allows", () => {
+    expect(() => db.persistProposal(makeProposal(1, alts(4)))).toThrow();
+    expect(db.listProposalsDetailed().proposals).toEqual([]);
+  });
+
+  it("accepts a proposal inside the bound", () => {
+    db.persistProposal(makeProposal(1, alts(3)));
+    expect(db.getStoredProposal("1")?.proposal.alternatives).toHaveLength(3);
+  });
+});
+
+describe("WisecronStateDB — rehydrating persisted proposals", () => {
+  it("reads back a legacy row carrying four alternatives", () => {
+    seedLegacyRow(makeProposal(1, alts(4)), "refused");
+
+    expect(db.getStoredProposal("1")?.proposal.alternatives).toHaveLength(4);
+    expect(db.listProposalsDetailed().proposals).toHaveLength(1);
+    expect(db.listProposalsDetailed("refused").proposals).toHaveLength(1);
+  });
+
+  it("reads back a well-formed store unchanged, with nothing reported unreadable", () => {
+    db.persistProposal(makeProposal(1));
+    db.persistProposal(makeProposal(2));
+    db.setProposalStatus("2", "refused");
+
+    const listing = db.listProposalsDetailed();
+    expect(listing.unreadable).toEqual([]);
+    expect(ids(listing.proposals)).toEqual(["1", "2"]);
+    expect(ids(db.listProposalsDetailed("refused").proposals)).toEqual(["2"]);
+    const alternatives = db.getStoredProposal("1")?.proposal.alternatives;
+    expect(alternatives?.map((a) => a.id)).toEqual(["a1", "a2"]);
+  });
+
+  it("returns the good rows and names the one it skipped", () => {
+    db.persistProposal(makeProposal(1));
+    seedLegacyRow(makeCorrupt(2));
+    seedLegacyRow(makeProposal(3, alts(4)), "refused");
+
+    const listing = db.listProposalsDetailed();
+    expect(ids(listing.proposals)).toEqual(["1", "3"]);
+    expect(listing.unreadable).toHaveLength(1);
+    expect(listing.unreadable[0]).toMatchObject({ id: "2", subject: "fake", status: "pending" });
+    expect(listing.unreadable[0]?.error).toBeTruthy();
+  });
+
+  it("isolates the bad row on a status-filtered listing too", () => {
+    db.persistProposal(makeProposal(1));
+    seedLegacyRow(makeCorrupt(2));
+
+    const listing = db.listProposalsDetailed("pending");
+    expect(ids(listing.proposals)).toEqual(["1"]);
+    expect(ids(listing.unreadable)).toEqual(["2"]);
+  });
+
+  it("still throws when a single-row fetch names the unreadable row", () => {
+    seedLegacyRow(makeCorrupt(2));
+
+    expect(() => db.getStoredProposal("2")).toThrow();
+    expect(db.getStoredProposal("404")).toBeNull();
+  });
+
+  it("answers existence for an unreadable row without rehydrating it", () => {
+    seedLegacyRow(makeCorrupt(2));
+
+    expect(db.hasProposal("2")).toBe(true);
+    expect(db.hasProposal("404")).toBe(false);
+  });
+});

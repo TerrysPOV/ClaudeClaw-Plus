@@ -35,7 +35,12 @@ import { z } from "zod";
 import type { PluginMcpBridge } from "../../plugins/mcp-bridge.js";
 import type { WisecronBundle } from "../../skills-tuner/cli/wisecron-bootstrap.js";
 import { computeProposalSignature, loadSecret } from "../../skills-tuner/core/security.js";
-import type { ProposalStatus, StoredProposal } from "./state-db.js";
+import type {
+  ProposalListing,
+  ProposalStatus,
+  StoredProposal,
+  UnreadableProposalRow,
+} from "./state-db.js";
 import type { AppliedBy } from "./types.js";
 import type { UnsignedProposal } from "../../skills-tuner/core/types.js";
 
@@ -176,6 +181,26 @@ function toView(p: StoredProposal): ProposalView {
   };
 }
 
+/**
+ * A listing result. `unreadable` is present only when a stored row failed to
+ * rehydrate: the good rows still come back, and the rows that were skipped are
+ * named here rather than dropped without a trace.
+ */
+interface ListResult {
+  count: number;
+  proposals: ProposalView[];
+  unreadable?: UnreadableProposalRow[];
+}
+
+function toListResult(listing: ProposalListing): ListResult {
+  const result: ListResult = {
+    count: listing.proposals.length,
+    proposals: listing.proposals.map(toView),
+  };
+  if (listing.unreadable.length > 0) result.unreadable = listing.unreadable;
+  return result;
+}
+
 export interface RegisterGateOpts {
   /**
    * Actor stamped on the apply/revision row and on gate audit records — which
@@ -263,7 +288,9 @@ export function registerWisecronGateTools(
         ? args.pattern_signature
         : `${RESEARCH_PREFIX}${args.pattern_signature}`;
       const id = researchProposalId(args.subject, sig);
-      const deduped = db.getStoredProposal(String(id)) !== null;
+      // Existence only: dedup does not need the row's contents, and a row the
+      // read schema cannot parse must not turn a re-injection into a hard error.
+      const deduped = db.hasProposal(String(id));
       const unsigned: UnsignedProposal = {
         id,
         cluster_id: sig,
@@ -292,22 +319,21 @@ export function registerWisecronGateTools(
 
   bridge.registerPluginTool(GATE_PLUGIN_ID, {
     name: "pending",
-    description: "List persisted proposals awaiting apply (status=pending).",
+    description:
+      "List persisted proposals awaiting apply (status=pending). Rows that fail to " +
+      "parse are reported under 'unreadable' instead of failing the listing.",
     schema: z.object({}),
-    handler: (): { count: number; proposals: ProposalView[] } => {
-      const pending = db.listProposals("pending");
-      return { count: pending.length, proposals: pending.map(toView) };
-    },
+    handler: (): ListResult => toListResult(db.listProposalsDetailed("pending")),
   });
 
   bridge.registerPluginTool(GATE_PLUGIN_ID, {
     name: "list",
-    description: "List proposals, optionally filtered by status (pending|applied|refused).",
+    description:
+      "List proposals, optionally filtered by status (pending|applied|refused). Rows " +
+      "that fail to parse are reported under 'unreadable' instead of failing the listing.",
     schema: ListArgs,
-    handler: (args: z.infer<typeof ListArgs>): { count: number; proposals: ProposalView[] } => {
-      const rows = db.listProposals(args.status);
-      return { count: rows.length, proposals: rows.map(toView) };
-    },
+    handler: (args: z.infer<typeof ListArgs>): ListResult =>
+      toListResult(db.listProposalsDetailed(args.status)),
   });
 
   bridge.registerPluginTool(GATE_PLUGIN_ID, {
@@ -449,12 +475,19 @@ export function registerWisecronGateTools(
 
   bridge.registerPluginTool(GATE_PLUGIN_ID, {
     name: "status",
-    description: "Counts of proposals by lifecycle status (pending/applied/refused).",
+    description:
+      "Counts of proposals by lifecycle status (pending/applied/refused), plus an " +
+      "'unreadable' count when some stored row could not be parsed.",
     schema: z.object({}),
-    handler: () => {
+    handler: (): Record<ProposalStatus, number> & { unreadable?: number } => {
       const counts: Record<ProposalStatus, number> = { pending: 0, applied: 0, refused: 0 };
-      for (const p of db.listProposals()) counts[p.status]++;
-      return counts;
+      // Per-row isolation: this walks EVERY row, including terminal ones no
+      // caller will ever act on again, so one unparseable row must not be able
+      // to take the whole summary down with it. Skipped rows are counted out
+      // loud rather than folded into a status bucket.
+      const { proposals, unreadable } = db.listProposalsDetailed();
+      for (const p of proposals) counts[p.status]++;
+      return unreadable.length > 0 ? { ...counts, unreadable: unreadable.length } : counts;
     },
   });
 

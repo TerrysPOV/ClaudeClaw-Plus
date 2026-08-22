@@ -3,8 +3,8 @@ import { existsSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 import { homedir } from "node:os";
 import type { RevisionRecord, ScheduleState, AppliedBy } from "./types.js";
-import type { Patch, Proposal } from "../../skills-tuner/core/types.js";
-import { ProposalSchema } from "../../skills-tuner/core/types.js";
+import type { Patch, PersistedProposal, Proposal } from "../../skills-tuner/core/types.js";
+import { PersistedProposalSchema, ProposalSchema } from "../../skills-tuner/core/types.js";
 
 interface SubjectStateRow {
   subject: string;
@@ -57,9 +57,23 @@ export interface StoredProposal {
   id: string;
   subject: string;
   status: ProposalStatus;
-  proposal: Proposal;
+  proposal: PersistedProposal;
   created_at: Date;
   updated_at: Date;
+}
+
+/** A stored row that could not be rehydrated, reported instead of dropped. */
+export interface UnreadableProposalRow {
+  id: string;
+  subject: string;
+  status: string;
+  error: string;
+}
+
+/** A proposal listing: the rows that parsed, plus the ones that did not. */
+export interface ProposalListing {
+  proposals: StoredProposal[];
+  unreadable: UnreadableProposalRow[];
 }
 
 function rowToStoredProposal(row: ProposalRow): StoredProposal {
@@ -67,10 +81,12 @@ function rowToStoredProposal(row: ProposalRow): StoredProposal {
     id: row.id,
     subject: row.subject,
     status: row.status as ProposalStatus,
-    // ProposalSchema coerces created_at (string in JSON) back to a Date so the
-    // canonical signature re-derivation (which calls created_at.toISOString())
-    // matches what was signed at persist time.
-    proposal: ProposalSchema.parse(JSON.parse(row.proposal_json)),
+    // Read path: PersistedProposalSchema, NOT the emit schema — a row on disk is
+    // validated against the shape it was written under, not against the bounds a
+    // subject must respect today. It coerces created_at (string in JSON) back to
+    // a Date so the canonical signature re-derivation (which calls
+    // created_at.toISOString()) matches what was signed at persist time.
+    proposal: PersistedProposalSchema.parse(JSON.parse(row.proposal_json)),
     created_at: new Date(row.created_at),
     updated_at: new Date(row.updated_at),
   };
@@ -364,6 +380,12 @@ export class WisecronStateDB {
    * resurrects an applied/refused proposal or clobbers its status.
    */
   persistProposal(proposal: Proposal): void {
+    // Emit gate. The read path deliberately no longer carries the alternatives
+    // upper bound, so this is where a subject that emits more alternatives than
+    // the contract allows is rejected: at the write, loudly, while it is still a
+    // live bug someone can fix — not on the way back out, years later, against a
+    // row nobody can change any more.
+    ProposalSchema.parse(proposal);
     const now = new Date().toISOString();
     this.db
       .prepare(`
@@ -374,7 +396,15 @@ export class WisecronStateDB {
       .run(String(proposal.id), proposal.subject, JSON.stringify(proposal), now, now);
   }
 
-  listProposals(status?: ProposalStatus): StoredProposal[] {
+  /**
+   * Listing with per-row error isolation: one row whose stored JSON no longer
+   * parses is reported in `unreadable` instead of aborting the whole query. A
+   * listing walks rows the caller did not name — including terminal ones it will
+   * never act on — so a single bad row must not be able to hide every good one.
+   * Skipped rows are always returned, never dropped silently: the caller decides
+   * whether to surface them.
+   */
+  listProposalsDetailed(status?: ProposalStatus): ProposalListing {
     const rows = (
       status
         ? this.db
@@ -382,9 +412,37 @@ export class WisecronStateDB {
             .all(status)
         : this.db.prepare("SELECT * FROM proposals ORDER BY created_at DESC").all()
     ) as ProposalRow[];
-    return rows.map(rowToStoredProposal);
+    const proposals: StoredProposal[] = [];
+    const unreadable: UnreadableProposalRow[] = [];
+    for (const row of rows) {
+      try {
+        proposals.push(rowToStoredProposal(row));
+      } catch (err) {
+        unreadable.push({
+          id: row.id,
+          subject: row.subject,
+          status: row.status,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    return { proposals, unreadable };
   }
 
+  /**
+   * Existence only — never rehydrates the row, so a row the read schema cannot
+   * parse still answers an existence question (dedup) instead of throwing.
+   */
+  hasProposal(id: string): boolean {
+    return this.db.prepare("SELECT 1 FROM proposals WHERE id = ?").get(id) != null;
+  }
+
+  /**
+   * Single-row fetch. Unlike the listing path this still throws on a row that
+   * fails to parse: the caller asked for THIS proposal by id, and reporting an
+   * unreadable row as `null` would read as "no such proposal" — the lifecycle
+   * handlers would then answer "not found" for a row that is on disk.
+   */
   getStoredProposal(id: string): StoredProposal | null {
     const row = this.db.prepare("SELECT * FROM proposals WHERE id = ?").get(id) as
       | ProposalRow

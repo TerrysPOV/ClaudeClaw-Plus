@@ -8,12 +8,14 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { PluginMcpBridge } from "../../../plugins/mcp-bridge.js";
 import { WisecronStateDB } from "../../wisecron/state-db.js";
+import type { ProposalStatus } from "../../wisecron/state-db.js";
 import type { WisecronBundle } from "../../../skills-tuner/cli/wisecron-bootstrap.js";
 import type { Proposal, UnsignedProposal } from "../../../skills-tuner/core/types.js";
 import {
@@ -30,6 +32,7 @@ import {
 } from "../../wisecron/gate-mcp.js";
 
 let tmpDir: string;
+let dbPath: string;
 let db: WisecronStateDB;
 let bridge: PluginMcpBridge;
 let auditEvents: Array<{ event: string; detail?: Record<string, unknown> }>;
@@ -51,6 +54,28 @@ function makeUnsigned(id: number, overrides: Partial<UnsignedProposal> = {}): Un
 /** Seed a pending proposal directly (persistProposal does not verify signatures). */
 function seedPending(id: number, overrides: Partial<Proposal> = {}): void {
   db.persistProposal({ ...makeUnsigned(id), signature: "valid-sig", ...overrides } as Proposal);
+}
+
+/**
+ * Seed a row BEHIND the write path, the way an older binary left it. Rows that
+ * the current emit gate would reject cannot go through `persistProposal` — and
+ * a test for read-path tolerance must not lean on the write path tolerating the
+ * same thing.
+ */
+function seedLegacyRow(
+  id: number,
+  overrides: Partial<Proposal> = {},
+  status: ProposalStatus = "pending",
+): void {
+  const proposal = { ...makeUnsigned(id), signature: "valid-sig", ...overrides } as Proposal;
+  const raw = new Database(dbPath);
+  const now = new Date().toISOString();
+  raw
+    .prepare(
+      "INSERT INTO proposals(id, subject, status, proposal_json, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+    )
+    .run(String(id), proposal.subject, status, JSON.stringify(proposal), now, now);
+  raw.close();
 }
 
 function makeBundle(overrides: Record<string, unknown> = {}): WisecronBundle {
@@ -85,7 +110,8 @@ function makeBundle(overrides: Record<string, unknown> = {}): WisecronBundle {
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "gate-mcp-"));
-  db = new WisecronStateDB(join(tmpDir, "wisecron.db"));
+  dbPath = join(tmpDir, "wisecron.db");
+  db = new WisecronStateDB(dbPath);
   bridge = new PluginMcpBridge(join(tmpDir, "plugin-audit.jsonl"));
   auditEvents = [];
 });
@@ -127,7 +153,7 @@ describe("tuner__propose", () => {
     expect(res.window_hours).toBe(12);
     expect(res.subjects[0]).toMatchObject({ subject: "fake", proposed: 1 });
 
-    const pending = db.listProposals("pending");
+    const pending = db.listProposalsDetailed("pending").proposals;
     expect(pending).toHaveLength(1);
     expect(pending[0]?.id).toBe("7");
     expect(auditEvents.some((e) => e.event === "gate_propose")).toBe(true);
@@ -157,7 +183,7 @@ describe("tuner__propose_external (research injection)", () => {
     expect(res.deduped).toBe(false);
     expect(res.pattern_signature).toBe("research:model-upgrade-opus48");
 
-    const pending = db.listProposals("pending");
+    const pending = db.listProposalsDetailed("pending").proposals;
     expect(pending).toHaveLength(1);
     expect(pending[0]?.proposal.pattern_signature.startsWith("research:")).toBe(true);
     expect(
@@ -171,7 +197,33 @@ describe("tuner__propose_external (research injection)", () => {
     };
     expect(again.id).toBe(res.id);
     expect(again.deduped).toBe(true);
-    expect(db.listProposals("pending")).toHaveLength(1);
+    expect(db.listProposalsDetailed("pending").proposals).toHaveLength(1);
+  });
+
+  it("dedups against a row the read path cannot rehydrate", async () => {
+    registerWisecronGateTools(bridge, makeBundle());
+    const args = {
+      subject: "fake",
+      target_path: join(tmpDir, "config.yaml"),
+      pattern_signature: "model-upgrade-opus48",
+      alternatives: [{ id: "upgrade", diff_or_content: "after", label: "", tradeoff: "" }],
+    };
+    const first = (await bridge.invokeTool(TUNER_PROPOSE_EXTERNAL_TOOL, args)) as { id: string };
+
+    // Corrupt the stored row behind the API. Dedup asks an existence question,
+    // so it must not rehydrate the row and hard-error on the re-injection.
+    const raw = new Database(dbPath);
+    raw
+      .prepare("UPDATE proposals SET proposal_json = ? WHERE id = ?")
+      .run(JSON.stringify({ not: "a proposal" }), first.id);
+    raw.close();
+
+    const again = (await bridge.invokeTool(TUNER_PROPOSE_EXTERNAL_TOOL, args)) as {
+      id: string;
+      deduped: boolean;
+    };
+    expect(again.id).toBe(first.id);
+    expect(again.deduped).toBe(true);
   });
 
   it("rejects an unregistered subject", async () => {
@@ -207,7 +259,7 @@ describe("tuner__propose_external (research injection)", () => {
       }),
     ).rejects.toThrow(/outside the managed surface/);
     // Nothing persisted.
-    expect(db.listProposals("pending")).toHaveLength(0);
+    expect(db.listProposalsDetailed("pending").proposals).toHaveLength(0);
   });
 
   it("accepts a target_path INSIDE the declared managed surface", async () => {
@@ -226,7 +278,7 @@ describe("tuner__propose_external (research injection)", () => {
       alternatives: [{ id: "a", diff_or_content: "modes: {}\n", label: "", tradeoff: "" }],
     })) as { deduped: boolean };
     expect(res.deduped).toBe(false);
-    expect(db.listProposals("pending")).toHaveLength(1);
+    expect(db.listProposalsDetailed("pending").proposals).toHaveLength(1);
   });
 });
 
@@ -268,6 +320,63 @@ describe("tuner__pending / tuner__list / tuner__status", () => {
     registerWisecronGateTools(bridge, makeBundle());
     const counts = (await bridge.invokeTool(TUNER_STATUS_TOOL, {})) as Record<string, number>;
     expect(counts).toEqual({ pending: 2, applied: 0, refused: 1 });
+  });
+});
+
+describe("listing surfaces — rows the read path cannot rehydrate", () => {
+  /** Written when the emit bound still allowed four alternatives. */
+  const legacyAlts = ["a1", "a2", "a3", "a4"].map((id) => ({
+    id,
+    label: "",
+    diff_or_content: `content ${id}`,
+    tradeoff: "",
+  }));
+
+  it("lists a stored row that carries four alternatives", async () => {
+    seedLegacyRow(9, { alternatives: legacyAlts });
+    registerWisecronGateTools(bridge, makeBundle());
+
+    const res = (await bridge.invokeTool(TUNER_LIST_TOOL, {})) as {
+      count: number;
+      proposals: Array<{ id: string; alternatives: string[] }>;
+      unreadable?: unknown[];
+    };
+    expect(res.count).toBe(1);
+    expect(res.proposals[0]).toMatchObject({ id: "9", alternatives: ["a1", "a2", "a3", "a4"] });
+    expect(res.unreadable).toBeUndefined();
+  });
+
+  it("status counts the readable rows and reports how many it skipped", async () => {
+    seedPending(1);
+    seedPending(2);
+    db.setProposalStatus("2", "refused");
+    // The shape that motivated this: a terminal row nobody will act on again,
+    // carrying four alternatives, sitting in the way of an unfiltered walk.
+    seedLegacyRow(4, { alternatives: legacyAlts }, "refused");
+    seedLegacyRow(3, { signature: "" }); // unreadable: fails the read schema
+    registerWisecronGateTools(bridge, makeBundle());
+
+    const counts = (await bridge.invokeTool(TUNER_STATUS_TOOL, {})) as Record<string, number>;
+    expect(counts).toEqual({ pending: 1, applied: 0, refused: 2, unreadable: 1 });
+  });
+
+  it("list and pending return the good rows and name the skipped one", async () => {
+    seedPending(1);
+    seedLegacyRow(2, { signature: "" }); // unreadable: fails the read schema
+    registerWisecronGateTools(bridge, makeBundle());
+
+    for (const tool of [TUNER_LIST_TOOL, TUNER_PENDING_TOOL]) {
+      const res = (await bridge.invokeTool(tool, {})) as {
+        count: number;
+        proposals: Array<{ id: string }>;
+        unreadable?: Array<{ id: string; subject: string; error: string }>;
+      };
+      expect(res.count).toBe(1);
+      expect(res.proposals[0]?.id).toBe("1");
+      expect(res.unreadable).toHaveLength(1);
+      expect(res.unreadable?.[0]).toMatchObject({ id: "2", subject: "fake" });
+      expect(res.unreadable?.[0]?.error).toBeTruthy();
+    }
   });
 });
 
