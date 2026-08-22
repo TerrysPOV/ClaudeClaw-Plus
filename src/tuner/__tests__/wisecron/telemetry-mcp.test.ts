@@ -312,3 +312,39 @@ describe("telemetry_query audit provenance", () => {
 // full `serveTunerOverMcp` wiring (which also serves the mutating `tuner__*`
 // gate) lives with the OutcomeLoop PR, not this read-only telemetry PR. The
 // in-process bridge tests above exercise the host + client contract.
+
+describe("telemetry query — a failing audit sink does not take the query down", () => {
+  class TinyProvider implements TelemetryProvider {
+    contractVersion(): string {
+      return TELEMETRY_CONTRACT_VERSION;
+    }
+    capabilities(): TelemetryCapability[] {
+      return [{ stream: "cron_run", available: true, schemaVersion: TELEMETRY_CONTRACT_VERSION }];
+    }
+    async query(): Promise<MetricSample[]> {
+      return [{ ts: new Date("2026-01-01T00:00:00.000Z"), value: 1 }];
+    }
+  }
+
+  it("still returns samples when append throws", async () => {
+    const bridge = new PluginMcpBridge(join(tmpDir, "audit-throws.jsonl"));
+    registerHostTelemetryTools(bridge, {
+      provider: new TinyProvider(),
+      // A full disk is the case this guard exists for. The query had every
+      // reason to succeed; provenance is a decoration on it, and a
+      // decoration must not decide whether the read answers.
+      audit: {
+        append: () => {
+          throw new Error("ENOSPC: no space left on device, write");
+        },
+      } as unknown as AuditLog,
+    });
+
+    const res = (await bridge.invokeTool(TELEMETRY_QUERY_TOOL, {
+      stream: "cron_run",
+      start: "2026-01-01T00:00:00.000Z",
+      end: "2026-01-02T00:00:00.000Z",
+    })) as { samples: unknown[] };
+    expect(res.samples).toHaveLength(1);
+  });
+});

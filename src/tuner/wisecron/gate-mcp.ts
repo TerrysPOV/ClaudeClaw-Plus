@@ -323,7 +323,15 @@ function auditStoreDegraded(
         unreadable_ids: ids,
         unreadable_ids_truncated: unreadable.length - ids.length,
         unknown_status: statuses,
-        unknown_status_truncated: Object.keys(unknownStatus).length - Object.keys(statuses).length,
+        // ROWS, like the response carries. Naming only the omitted STATUSES
+        // would let one omitted name hide any number of rows with nothing in
+        // the record to recover them from — the same silent loss this whole
+        // change set removes, and the chain is the surface that has to
+        // survive the query. Note the neighbouring `unreadable` pair already
+        // gets this right; the two must not disagree.
+        unknown_status_rows: Object.values(unknownStatus).reduce((a, b) => a + b, 0),
+        unknown_status_names_omitted:
+          Object.keys(unknownStatus).length - Object.keys(statuses).length,
       },
     });
   } catch {
@@ -577,7 +585,13 @@ export function registerWisecronGateTools(
           injected: true,
           id: String(id),
           subject: args.subject,
-          deduped,
+          // A COUNT, not a boolean. `tuner__propose` writes `deduped` as a
+          // number under this same event name, and a chain where one key
+          // holds two types is a trap for whoever queries it: `deduped > 0`
+          // silently drops every boolean record, `=== true` drops every
+          // numeric one. The tool's own response keeps its boolean shape —
+          // this is the chain's contract, not the wire's.
+          deduped: deduped ? 1 : 0,
           existing_unreadable: existingUnreadable,
         },
       });
@@ -776,7 +790,9 @@ export function registerWisecronGateTools(
       "lifecycle union), 'unknown_status_other' (rows in such a status whose name is not " +
       "listed individually) and 'unreadable' (rows whose stored JSON could not be parsed). " +
       "pending + applied + refused + unknown_status values + unknown_status_other + " +
-      "unreadable always equals 'total'.",
+      "unreadable always equals 'total'. 'unknown_status_names_omitted' is a count of " +
+      "status NAMES left out of 'unknown_status' and is NOT part of that sum — the rows " +
+      "behind them are already counted in 'unknown_status_other'.",
     schema: z.object({}),
     handler: (): StatusResult => {
       // Per-row isolation: this walks EVERY row, including terminal ones no

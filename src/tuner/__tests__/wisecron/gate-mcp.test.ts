@@ -1011,7 +1011,12 @@ describe("status — capping the response never breaks the sum", () => {
     // the response; the remaining rows must still be accounted for, or the
     // cap meant to stop a runaway response reintroduces the silent loss this
     // whole change set exists to remove.
-    for (let i = 1; i <= 25; i++) seedLegacyRow(i, {}, `legacy-${i}`);
+    // 21 statuses over 25 rows: four of them hold two rows each, so a name
+    // count and a row count cannot coincide. A fixture with one row per
+    // status passes under either semantics and proves nothing about which
+    // one is implemented.
+    for (let i = 1; i <= 21; i++) seedLegacyRow(i, {}, `legacy-${i}`);
+    for (let i = 22; i <= 25; i++) seedLegacyRow(i, {}, `legacy-${i - 21}`);
     registerWisecronGateTools(bridge, makeBundle());
 
     const c = (await bridge.invokeTool(TUNER_STATUS_TOOL, {})) as {
@@ -1021,6 +1026,7 @@ describe("status — capping the response never breaks the sum", () => {
       total: number;
       unknown_status?: Record<string, number>;
       unknown_status_other?: number;
+      unknown_status_names_omitted?: number;
       unreadable?: number;
     };
     const bucketed =
@@ -1033,7 +1039,12 @@ describe("status — capping the response never breaks the sum", () => {
     expect(c.total).toBe(25);
     expect(bucketed).toBe(c.total);
     expect(Object.keys(c.unknown_status ?? {})).toHaveLength(20);
-    expect(c.unknown_status_other).toBe(5);
+    // One status name omitted, but the rows behind the omission are what the
+    // remainder must count.
+    expect(c.unknown_status_names_omitted).toBe(1);
+    expect(c.unknown_status_other).toBe(
+      25 - Object.values(c.unknown_status ?? {}).reduce((a, b) => a + b, 0),
+    );
   });
 
   it("counts ROWS, not names, when the omitted status is heavily populated", async () => {
@@ -1163,5 +1174,49 @@ describe("propose — deduped is reported wherever proposed is", () => {
     expect(res.subjects[0]?.error).toContain("disk is full");
     expect(res.subjects[0]?.proposed).toBe(0);
     expect(res.subjects[0]?.deduped).toBe(2);
+  });
+});
+
+describe("the degradation record carries rows, like the response does", () => {
+  it("records how many rows sit behind an omitted status name", async () => {
+    // 20 statuses of one row, plus one holding fifty. The heavy one is the
+    // one left out of the names — so a record that counts only names would
+    // say "1 omitted" and lose fifty rows, with nothing to recover them from.
+    const raw = new Database(dbPath);
+    const ins = raw.prepare(
+      "INSERT INTO proposals(id, subject, status, proposal_json, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+    );
+    let id = 1;
+    for (let i = 1; i <= 20; i++) {
+      const ts = `2026-08-2${i % 10}T12:00:00.000Z`;
+      ins.run(
+        String(id),
+        "fake",
+        `s${i}`,
+        JSON.stringify({ ...makeUnsigned(id), signature: "valid-sig" }),
+        ts,
+        ts,
+      );
+      id++;
+    }
+    for (let i = 0; i < 50; i++) {
+      const ts = "2026-01-01T00:00:00.000Z";
+      ins.run(
+        String(id),
+        "fake",
+        "bulk",
+        JSON.stringify({ ...makeUnsigned(id), signature: "valid-sig" }),
+        ts,
+        ts,
+      );
+      id++;
+    }
+    raw.close();
+    registerWisecronGateTools(bridge, makeBundle());
+    await bridge.invokeTool(TUNER_STATUS_TOOL, {});
+
+    const rec = auditEvents.find((e) => e.event === "gate_store_degraded");
+    expect(rec?.detail?.unknown_status_rows).toBe(70);
+    expect(rec?.detail?.unknown_status_names_omitted).toBe(1);
   });
 });
