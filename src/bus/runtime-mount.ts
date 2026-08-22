@@ -56,7 +56,7 @@ import { detectOrphanAgents, formatOrphanWarnings } from "./orphan-agent-detect"
 import { createPromptStreamHandler } from "./receipt-wiring";
 import { peekSession } from "../sessions";
 import { generateSummary } from "../rotation";
-import { getSettings } from "../config";
+import { getSettings, type BusAgentSettings } from "../config";
 import { StallWatchdog, DEFAULT_STALL_CONFIG, type StallWatchdogConfig } from "./stall-watchdog";
 import { createStallAlertNotifier } from "./stall-alert-delivery";
 import { probeProcessTreeCpu, classifyKill, appendStallKillAudit } from "./stall-forensics";
@@ -452,6 +452,14 @@ export async function mountBusRuntime(
       // owns the synthesizer), hand the path to the runner, and release it
       // when the run ends — a job's identity is per-run, unlike an agent's.
       runAgentJob: async (input) => {
+        // Precedence, mirroring `synthesizeBusMcpConfig`: an operator-supplied
+        // static `agent.mcp_config` ALWAYS wins. Forward it unchanged and skip
+        // synthesis entirely, so the job's MCP surface matches the long-lived
+        // agent it runs as and exactly one `--mcp-config` is ever emitted.
+        const staticPath = staticAgentMcpConfig(input.agent, readSettingsAgents());
+        if (staticPath) {
+          return runAgentJobHeadless({ ...input, mcpConfigPath: staticPath });
+        }
         const cwd = (await loadAgent(input.agent)).dir;
         return withAgentJobMcpConfig(
           cwd,
@@ -779,8 +787,43 @@ export async function mountBusRuntime(
 }
 
 /**
+ * The operator's static `agent.mcp_config` for the agent a job was dispatched
+ * to, or `undefined` when that agent has none.
+ *
+ * `settings.agents[].id` and the `agents/<name>` directory `dispatch_job`
+ * validates against are the SAME namespace (`id` "becomes … the
+ * `agents/<id>/session.json` directory" — see `BusAgentSettings.id`), so an
+ * entry carrying `mcp_config` is reachable by name from a dispatch and must
+ * be honoured on the job path exactly as `buildClaudeArgs` honours it on the
+ * agent path.
+ *
+ * Pure + exported so the precedence rule is directly assertable without
+ * standing up a daemon.
+ */
+export function staticAgentMcpConfig(
+  agentId: string,
+  agents: readonly BusAgentSettings[],
+): string | undefined {
+  return agents.find((a) => a.id === agentId)?.mcp_config;
+}
+
+/** `settings.agents`, or `[]` when settings aren't loaded (early boot / tests). */
+function readSettingsAgents(): readonly BusAgentSettings[] {
+  try {
+    return getSettings().agents;
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Mint a job-scoped MCP identity, run one agent job with the synthesized
  * `--mcp-config`, and release the identity when the run ends.
+ *
+ * Scope: `mcp.shared` (multiplexer) servers only. An agent carrying a static
+ * `agent.mcp_config` never reaches this function — the caller forwards that
+ * path directly (see the `runAgentJob` dep above), matching
+ * `synthesizeBusMcpConfig`'s "static ALWAYS wins" rule.
  *
  * Issue #165 wired `mcp.shared` into the legacy PTY supervisor and then into
  * the bus agent spawn. The agent-job spawn (`dispatch_job`) is the third

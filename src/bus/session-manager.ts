@@ -280,6 +280,12 @@ function synthesizeMcpConfigForKey(
  * life), a job's identity is minted per run and MUST be released when the run
  * ends — see `releaseAgentJobMcpConfig`. Callers pass a generated `jobKey`.
  *
+ * Scope is `mcp.shared` only, and there is deliberately no `AgentConfig`
+ * parameter: the "static `agent.mcp_config` ALWAYS wins" precedence that
+ * `synthesizeBusMcpConfig` enforces is applied by the CALLER on this path
+ * (`staticAgentMcpConfig` in `runtime-mount.ts`), which forwards the
+ * operator's path instead of calling this function at all.
+ *
  * Throws when synthesis is active but the write fails, matching the
  * supervisor's contract (SPEC §4.5: fail the spawn, never fall through to a
  * silent no-MCP run). The job is then marked failed with that error.
@@ -658,8 +664,13 @@ export class SessionManager {
   /**
    * The wired synthesizer, or `null` when the multiplexer is dormant. Read by
    * the agent-job spawn path, which lives outside this class but needs the
-   * same issuer so a dispatched job reaches the same shared servers as the
-   * agent that dispatched it.
+   * same issuer so a dispatched job reaches the same `mcp.shared` servers as
+   * the agent that dispatched it.
+   *
+   * Only relevant for agents WITHOUT a static `agent.mcp_config`: as on the
+   * agent path (`synthesizeBusMcpConfig`), a static config wins and synthesis
+   * is skipped, so the job runs with the operator's file and no shared
+   * servers — the same surface the long-lived agent gets.
    */
   getMcpConfigSynthesizer(): BusMcpConfigSynthesizer | null {
     return this.mcpSynth;

@@ -11,6 +11,9 @@
  *   3. `withAgentJobMcpConfig` — the mint → run → release wrapper actually
  *      hands the path to the run and releases it, including when the run
  *      throws.
+ *   4. `staticAgentMcpConfig` — the precedence rule: an operator-supplied
+ *      static `agent.mcp_config` wins over synthesis on the job path, exactly
+ *      as it does on the agent path (`synthesizeBusMcpConfig`).
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -18,7 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PtyIdentity } from "../../runner/pty-mcp-config-writer";
 import { buildAgentJobArgs } from "../../runner";
-import { withAgentJobMcpConfig } from "../runtime-mount";
+import { staticAgentMcpConfig, withAgentJobMcpConfig } from "../runtime-mount";
 import {
   type BusMcpConfigSynthesizer,
   releaseAgentJobMcpConfig,
@@ -219,6 +222,39 @@ describe("release under a real (async) revoke", () => {
 
     expect(warnings.length).toBeGreaterThan(0);
     expect(String(warnings[0][0])).toContain("revoke failed");
+  });
+});
+
+describe("staticAgentMcpConfig", () => {
+  const agents = [{ id: "plain" }, { id: "narrowed", mcp_config: "/etc/claudeclaw/servers.json" }];
+
+  it("returns the operator's static config so the job path can skip synthesis", () => {
+    // Without this, a job dispatched to `narrowed` would get the FULL
+    // `mcp.shared` set the operator deliberately opted that agent out of,
+    // and would never see the operator's own servers.
+    expect(staticAgentMcpConfig("narrowed", agents)).toBe("/etc/claudeclaw/servers.json");
+  });
+
+  it("returns undefined for an agent with no static config (synthesis applies)", () => {
+    expect(staticAgentMcpConfig("plain", agents)).toBeUndefined();
+  });
+
+  it("returns undefined for an agent absent from settings (dir-only agent)", () => {
+    // `dispatch_job` validates against `agents/<name>/`, which can exist
+    // without a matching `settings.agents` entry.
+    expect(staticAgentMcpConfig("not-in-settings", agents)).toBeUndefined();
+    expect(staticAgentMcpConfig("plain", [])).toBeUndefined();
+  });
+
+  it("keeps exactly one --mcp-config in the argv when a static config wins", () => {
+    const args = buildAgentJobArgs({
+      prompt: "p",
+      securityArgs: [],
+      persona: "",
+      mcpConfigPath: staticAgentMcpConfig("narrowed", agents),
+    });
+    expect(args.filter((a) => a === "--mcp-config")).toHaveLength(1);
+    expect(args[args.indexOf("--mcp-config") + 1]).toBe("/etc/claudeclaw/servers.json");
   });
 });
 
