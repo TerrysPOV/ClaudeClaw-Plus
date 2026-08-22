@@ -770,6 +770,51 @@ describe("McpHttpHandler — session-less discovery probe", () => {
     expect(body.id).toBeNull();
   });
 
+  /** Same as `authed`, but with an explicit `content-length` header and a
+   *  body padded past PEEK_MAX_BYTES. `new Request(url, { body })` sets no
+   *  content-length of its own, so without this the peek's declared-size
+   *  branch — the one production actually takes over a socket — is never
+   *  exercised. Mirrors `bigRpcRequest` in the #72 item 11 block. */
+  function authedBig(method: string, targetBodyBytes: number): Request {
+    const id = issueIdentity("suzy");
+    const padding = "x".repeat(Math.max(0, targetBodyBytes - 80));
+    const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: { padding } });
+    return new Request("http://127.0.0.1:4632/mcp/test", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        "content-length": String(body.length),
+        [PTY_ID_HEADER]: "suzy",
+        [PTY_TS_HEADER]: String(Date.now()),
+        ...id.headers,
+      },
+      body,
+    });
+  }
+
+  // Regression: the audit peek skips bodies over PEEK_MAX_BYTES, so gating
+  // the probe answer on that peek alone let a >4 KiB probe fall through to
+  // the transport and 400 — the exact failure this guard exists to prevent.
+  // Reproduced over a real socket before the fix; in-process it needs the
+  // declared content-length that `authedBig` supplies.
+  it("answers a probe larger than the audit peek threshold", async () => {
+    const req = authedBig("server/discover", 8192);
+    expect(req.headers.get("content-length")).not.toBeNull();
+    expect(Number(req.headers.get("content-length"))).toBeGreaterThan(4096);
+
+    const resp = await handler!.handle(req);
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as { error: { code: number } };
+    expect(body.error.code).toBe(-32601);
+  });
+
+  it("does not divert other large methods onto the probe path", async () => {
+    const resp = await handler!.handle(authedBig("tools/list", 8192));
+    expect(resp.status).not.toBe(401);
+    expect(await resp.text()).not.toContain("-32601");
+  });
+
   it("still authenticates the probe — no bearer, no answer", async () => {
     const resp = await handler!.handle(
       rpcRequest({ jsonrpc: "2.0", id: 1, method: "server/discover" }),

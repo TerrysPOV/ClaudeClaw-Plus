@@ -78,6 +78,11 @@ export interface McpHttpHandlerOpts {
  *  would OOM the daemon. */
 const MAX_BODY_BYTES = 1_048_576; // 1 MiB
 
+/** Session header minted by the SDK's Streamable HTTP transport. A request
+ *  that carries it already completed the handshake, so it can never be the
+ *  pre-session discovery probe. */
+const SESSION_ID_HEADER = "mcp-session-id";
+
 /**
  * Maximum body size we'll clone + JSON.parse for the audit-log peek
  * (#72 item 11). Above this threshold we skip the peek entirely — the
@@ -110,8 +115,13 @@ const PEEK_MAX_BYTES = 4096;
  * server name, ptyId, timestamp, etc. The bulk of multiplexer traffic
  * (tool listings, small dispatches) is well under 4KB and continues
  * to get the peek.
+ *
+ * `maxBytes` overrides that ceiling for callers that need the method
+ * for a *correctness* decision rather than for the audit row — the
+ * skip above is a memory optimisation and must never silently change
+ * how a request is routed. See the discovery-probe guard in `handle`.
  */
-async function _readBody(req: Request): Promise<unknown> {
+async function _readBody(req: Request, maxBytes: number = PEEK_MAX_BYTES): Promise<unknown> {
   const ct = req.headers.get("content-type") ?? "";
   if (!ct.toLowerCase().includes("json")) return undefined;
   // Skip the clone+parse when the body is big enough to materially
@@ -121,7 +131,7 @@ async function _readBody(req: Request): Promise<unknown> {
   const declared = req.headers.get("content-length");
   if (declared !== null) {
     const n = Number(declared);
-    if (Number.isFinite(n) && n > PEEK_MAX_BYTES) {
+    if (Number.isFinite(n) && n > maxBytes) {
       return undefined;
     }
   }
@@ -331,9 +341,26 @@ export class McpHttpHandler {
     // fall back to the classic `initialize` handshake and connect.
     // Verified against claude-code 2.1.239: with the 400 the servers are
     // dropped; with this response the same client connects and lists tools.
+    //
+    // The audit peek below skips any body whose declared Content-Length is
+    // over `PEEK_MAX_BYTES` (#72 item 11). That skip is a memory
+    // optimisation for large tool calls, and it must not decide whether
+    // this probe is answered: a probe over 4 KiB would fall through to the
+    // transport and reproduce the exact 400 this guard exists to prevent.
+    // So when the cheap peek came back empty and the request carries no
+    // session id — the only requests that can be a pre-session probe, and
+    // never the large tool-call bodies the skip was written for — re-read
+    // with the ceiling lifted to the 1 MiB body cap `_enforceBodyCap`
+    // already enforces. The audit row keeps the cheap peek's semantics.
     const peek = await _readBody(safeReq);
-    if (_peekRpcMethod(peek) === "server/discover") {
-      const probeId = (peek as { id?: unknown } | undefined)?.id ?? null;
+    const probePeek =
+      peek !== undefined
+        ? peek
+        : safeReq.headers.get(SESSION_ID_HEADER) === null
+          ? await _readBody(safeReq, MAX_BODY_BYTES)
+          : undefined;
+    if (_peekRpcMethod(probePeek) === "server/discover") {
+      const probeId = (probePeek as { id?: unknown } | undefined)?.id ?? null;
       return new Response(
         JSON.stringify({
           jsonrpc: "2.0",
