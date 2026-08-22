@@ -10,7 +10,7 @@ import {
   PTY_ID_HEADER,
   PTY_TS_HEADER,
 } from "../pty-identity.js";
-import { _resetMcpBridge, _setMcpBridge } from "../../mcp-bridge.js";
+import { _resetMcpBridge, _setMcpBridge, getMcpBridge } from "../../mcp-bridge.js";
 
 const MOCK_SERVER = fileURLToPath(
   new URL("../../../__tests__/fixtures/mock-mcp-server.ts", import.meta.url),
@@ -918,11 +918,77 @@ describe("McpHttpHandler — a bucket orphaned by a mid-request release", () => 
 
     // The request loses — correctly. Its PTY is gone.
     expect(resp.status).toBe(401);
+    // Assert the REASON, not just the status. 401 is reachable three ways on
+    // this path, and the pre-auth one (`invalid_bearer`, turns 0-1) satisfies
+    // both of the other assertions here while proving nothing: no bucket was
+    // ever built, so of course none was stranded. Pin `pty_released` and the
+    // test can no longer drift into that window silently — add an `await`
+    // upstream of the auth check and this fails loudly with the wrong code,
+    // which is the signal to retune the turn count above.
+    expect((await resp.json()).error.code).toBe("pty_released");
     // And crucially it did not resurrect the bucket. Before the guard, the
     // `delete` above found nothing (the key was not in the map yet) and
     // this insert landed afterwards, stranding a bucket under a ptyId that
     // — being a one-shot job key — no request would ever look up again.
     expect(handler!.health().bucket_keys as string[]).toEqual([]);
+  });
+
+  it("is not inserted when the key was revoked and RE-ISSUED mid-request", async () => {
+    const dead = issueIdentity("job-3");
+
+    const inFlight = handler!.handle(initialize("job-3", dead.headers[AUTH_HEADER]!));
+    for (let i = 0; i < 4; i++) await Promise.resolve();
+
+    // Teardown, then a NEW identity minted under the same key before the
+    // in-flight request resumes. This is not hypothetical: the bus session
+    // manager revokes fire-and-forget and re-issues under the same agent id
+    // on its collision-retry and respawn paths, so both halves land inside
+    // one request's window.
+    revokeIdentity("job-3");
+    await handler!.releasePty("job-3");
+    issueIdentity("job-3");
+
+    const resp = await inFlight;
+
+    // Asking "does SOME identity exist for this key" answers yes here and
+    // lets the dead PTY's request install a bucket under the live key —
+    // initialized with a session id only the dead client holds. Asking
+    // "does the identity honour THIS bearer" is the question that matters.
+    expect(resp.status).toBe(401);
+    expect((await resp.json()).error.code).toBe("pty_released");
+    expect(handler!.health().bucket_keys as string[]).toEqual([]);
+  });
+
+  it("bounds the swept-bucket audit's ptyId list and counts what it omits", async () => {
+    // 25 orphans, cap is 20. An audit line that names every reclaimed key
+    // grows with the number of PTYs the daemon has ever seen; an unbounded
+    // audit payload was a blocking finding on the sibling PR.
+    const audits: Array<{ event: string; payload: Record<string, unknown> }> = [];
+    const bridge = getMcpBridge();
+    const origAudit = bridge.audit.bind(bridge);
+    bridge.audit = (event, payload) => {
+      audits.push({ event, payload });
+    };
+    try {
+      for (let i = 0; i < 25; i++) {
+        const id = issueIdentity(`job-mass-${i}`);
+        await handler!.handle(initialize(`job-mass-${i}`, id.headers[AUTH_HEADER]!));
+        revokeIdentity(`job-mass-${i}`);
+      }
+
+      expect(await handler!.sweepOrphanedBuckets()).toBe(25);
+
+      const swept = audits.find((a) => a.event === "multiplexer_buckets_swept");
+      expect(swept).toBeDefined();
+      // The COUNT stays exact — that is the number an operator acts on.
+      expect(swept!.payload.reclaimed).toBe(25);
+      // The NAMES are a capped sample, and the shortfall is stated rather
+      // than left for the reader to infer from a short array.
+      expect((swept!.payload.pty_ids as string[]).length).toBe(20);
+      expect(swept!.payload.pty_ids_omitted).toBe(5);
+    } finally {
+      bridge.audit = origAudit;
+    }
   });
 
   it("is reclaimed by the sweep when it slips through anyway", async () => {
@@ -938,10 +1004,24 @@ describe("McpHttpHandler — a bucket orphaned by a mid-request release", () => 
     // reaches `releasePty` without going through `releaseIdentity` leaves.
     revokeIdentity("job-2");
 
+    // Seed the rate-limit windows directly. The test handler runs with the
+    // limiter disabled (`_rlMax <= 0`), so `handle()` never creates an entry
+    // and asserting on an empty map would pass no matter what the sweep did.
+    const windows = (handler as unknown as { _rlWindows: Map<string, number[]> })._rlWindows;
+    windows.set("job-2", [Date.now()]);
+    windows.set("pty-live", [Date.now()]);
+
     expect(await handler!.sweepOrphanedBuckets()).toBe(1);
     // The live PTY is untouched — the sweep keys on identity, not on idle
     // time, so a healthy session that simply went quiet is never reaped.
     expect(handler!.health().bucket_keys as string[]).toEqual(["pty-live"]);
+
+    // The bucket is not the only thing keyed by ptyId. `releasePty` clears
+    // the rate-limit window too, and the sweep has to be symmetric with it:
+    // reclaiming 21 KB of bucket while leaving a window entry per one-shot
+    // `agent-job-<uuid>` moves the unbounded growth instead of stopping it.
+    expect(windows.has("job-2")).toBe(false);
+    expect(windows.has("pty-live")).toBe(true);
 
     // Idempotent: a second pass finds nothing left to do.
     expect(await handler!.sweepOrphanedBuckets()).toBe(0);

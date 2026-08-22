@@ -258,7 +258,12 @@ export class McpMultiplexerPlugin {
    *   - no `persistenceFactory` was supplied (W1 not yet merged), OR
    *   - the factory returned null (degraded — disk/permission errors). */
   private persistence: SessionPersistenceStore | null = null;
-  /** Periodic GC sweep. Null when persistence is dormant. */
+  /** Periodic GC tick: the persisted-record GC AND the orphaned-bucket
+   *  sweep. Armed whenever the plugin is running — NOT gated on persistence.
+   *  The sweep bounds in-memory buckets, which a handler accumulates whether
+   *  or not anything is written to disk, so gating the tick on a store would
+   *  leave exactly the handlers with no persistence unswept. Null only while
+   *  the plugin is stopped or dormant. */
   private gcTimer: ReturnType<typeof setInterval> | null = null;
   /** #72 item 7: file to check for shared-name collisions at startup.
    *  Defaults to `~/.claude/mcp.json`; tests can override. */

@@ -164,6 +164,13 @@ export class SessionPersistenceStore {
     this.maxAgeMs = opts.maxAgeMs ?? DEFAULT_MAX_AGE_MS;
   }
 
+  /** The record TTL, in ms. Read by the multiplexer's orphan sweep so the
+   *  grace it grants a replayed-but-unclaimed bucket expires on the same
+   *  clock as the on-disk record that bucket exists to preserve. */
+  get maxAge(): number {
+    return this.maxAgeMs;
+  }
+
   // ── Public API ─────────────────────────────────────────────────────────
 
   /**
