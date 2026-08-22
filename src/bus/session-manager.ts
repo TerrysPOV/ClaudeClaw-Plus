@@ -226,9 +226,12 @@ export function synthesizeBusMcpConfig(
  * concurrent jobs for the same agent never share an identity or clobber
  * each other's config file.
  *
- * The key lands in the synthesized file name (`mcp-pty-<key>.json`), so
- * callers MUST pass a value they generate themselves — never operator or
- * model-supplied text.
+ * The key lands in the synthesized file name (`mcp-pty-<key>.json`), so it
+ * must be safe as a path segment. Both current callers satisfy that
+ * differently: the agent path passes `agent.id`, which is operator-supplied
+ * but validated upstream, and the job path passes a freshly-minted job key.
+ * What the contract actually forbids is an unvalidated value — model-supplied
+ * text in particular must never reach this parameter.
  */
 function synthesizeMcpConfigForKey(
   key: string,
