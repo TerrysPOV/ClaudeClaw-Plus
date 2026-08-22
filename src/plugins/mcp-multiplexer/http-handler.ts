@@ -948,11 +948,26 @@ export class McpHttpHandler {
         // `400 -32600 "Server already initialized"`. Guard on transport
         // identity so a bucket already replaced by the reinitialize path
         // above is not evicted out from under its successor.
-        if (this_buckets.get(bucketKey)?.transport === transport) {
-          this_buckets.delete(bucketKey);
+        //
+        // The body is wrapped because of WHERE this callback sits, not
+        // because of what it does. `handleDeleteRequest` runs
+        // `await this._onsessionclosed?.(...)` and only THEN
+        // `await this.close()` — so a throw in here skips the SDK's own
+        // teardown while the bucket is already out of the map, leaving it
+        // unreachable by both `stop()` and `releasePty()`. Nothing below
+        // can throw today (`drop()` is `async`, so it rejects rather than
+        // throwing), which is exactly how the `audit.append` blocker on
+        // the sibling PR looked right up until a signature changed.
+        try {
+          if (this_buckets.get(bucketKey)?.transport === transport) {
+            this_buckets.delete(bucketKey);
+          }
+          if (!persistence || stateless) return;
+          persistence.drop(serverName, bucketKey).catch(() => {});
+        } catch {
+          // Deliberately swallowed: the caller's `close()` is worth more
+          // than this callback's bookkeeping.
         }
-        if (!persistence || stateless) return;
-        persistence.drop(serverName, bucketKey).catch(() => {});
       },
     });
     await sdkServer.connect(transport);

@@ -1069,3 +1069,69 @@ describe("mcp-multiplexer integration — crash + health probe transition", () =
     }
   });
 });
+
+// ── 7) onsessionclosed runs in front of the SDK's own teardown ───────────────
+
+describe("mcp-multiplexer integration — onsessionclosed is throw-proof", () => {
+  it("a synchronously-throwing persistence drop still lets the SDK close the transport", async () => {
+    const cfg = writeProxyConfig(tmpDir, ["alpha"]);
+
+    // An in-memory stand-in for `SessionPersistenceStore`. Nothing here
+    // touches disk, which is why this test lives in THIS file: its sibling
+    // `session-persistence-integration.test.ts` is deliberately excluded
+    // from CI for a load-sensitive flake (#326), so a test placed there
+    // would never actually gate anything.
+    const store = {
+      record: async () => {},
+      touch: async () => {},
+      loadAll: async () => [],
+      garbageCollect: async () => ({ scanned: 0, kept: 0, dropped: 0 }),
+      // The one that matters: a SYNCHRONOUS throw, not a rejected promise.
+      // `drop()` is `async` today, so the `.catch()` in the callback always
+      // attaches and this shape is unreachable — that is the point. The
+      // callback runs BEFORE the SDK's own `await this.close()` inside
+      // `handleDeleteRequest`, so the day someone drops that `async`, an
+      // unguarded body takes the transport teardown down with it and
+      // answers the client's DELETE with a 500.
+      drop: () => {
+        throw new Error("drop exploded");
+      },
+    };
+
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeMuxSettingsView({
+        webEnabled: true,
+        shared: ["alpha"],
+        sessionPersistenceEnabled: true,
+        sessionPersistencePath: join(tmpDir, "sessions"),
+      }),
+      persistenceFactory: () => store as unknown as SessionPersistenceStore,
+      gcTickMs: 0,
+    });
+    await plugin.start();
+    gateway = startTestGateway();
+
+    const ident = plugin.issueIdentity("pty-throw");
+    const conn = await connectClient({
+      origin: gateway.origin,
+      server: "alpha",
+      ptyId: "pty-throw",
+      bearer: ident.headers.Authorization,
+    });
+    await conn.client.callTool({ name: "echo", arguments: { message: "pre-delete" } });
+
+    const handler = plugin._getHandler("alpha");
+    expect((handler?.health() as { bucket_keys: string[] }).bucket_keys).toEqual(["pty-throw"]);
+
+    // The assertion IS the absence of a throw: `terminateSession()` raises on
+    // any non-2xx (405 excepted), so a 500 from a poisoned callback fails here.
+    await conn.transport.terminateSession();
+    await new Promise((r) => setTimeout(r, 50));
+
+    // And the bucket still went with the session it belonged to.
+    expect((handler?.health() as { bucket_keys: string[] }).bucket_keys).toEqual([]);
+
+    await conn.close();
+  });
+});
