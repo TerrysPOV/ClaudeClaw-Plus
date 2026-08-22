@@ -31,7 +31,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { McpMultiplexerPlugin, _resetMcpMultiplexer } from "../plugins/mcp-multiplexer/index.js";
 import { _resetHttpGateway, getHttpGateway } from "../plugins/http-gateway.js";
 import { _resetMcpBridge, getMcpBridge } from "../plugins/mcp-bridge.js";
-import { _resetIdentityStore } from "../plugins/mcp-multiplexer/pty-identity.js";
+import { _resetIdentityStore, revokeIdentity } from "../plugins/mcp-multiplexer/pty-identity.js";
 import { makeMuxSettingsView } from "./fixtures/mux-settings-view.js";
 
 const MOCK_SERVER = fileURLToPath(new URL("./fixtures/mock-mcp-server.ts", import.meta.url));
@@ -707,6 +707,49 @@ describe("mcp-multiplexer integration — stateless server serves concurrent cli
     // Restoring `releasePty`'s old `if (this.stateless) return` early exit
     // passes every other test in this repo; this is the one that catches it.
     await plugin.releaseIdentity("pty-x");
+    expect((handler?.health() as { bucket_keys: string[] }).bucket_keys).toEqual([]);
+
+    await conn.close();
+  });
+});
+
+describe("mcp-multiplexer integration — GC tick reclaims orphaned buckets", () => {
+  it("sweeps a bucket whose identity is gone, on a handler with no persistence", async () => {
+    const cfg = writeProxyConfig(tmpDir, ["beta"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeMuxSettingsView({
+        webEnabled: true,
+        shared: ["beta"],
+        // Stateless → the handler's persistence store is undefined. That used
+        // to mean no GC tick at all, so these were exactly the handlers with
+        // nothing reclaiming their buckets.
+        stateless: ["beta"],
+      }),
+      gcTickMs: 0, // drive it by hand
+    });
+    await plugin.start();
+    gateway = startTestGateway();
+
+    const ident = plugin.issueIdentity("job-9");
+    const conn = await connectClient({
+      origin: gateway.origin,
+      server: "beta",
+      ptyId: "job-9",
+      bearer: ident.headers.Authorization,
+    });
+    await conn.client.listTools();
+
+    const handler = plugin._getHandler("beta");
+    expect((handler?.health() as { bucket_keys: string[] }).bucket_keys).toEqual(["job-9"]);
+
+    // The orphan state: identity revoked, bucket still in the map. This is
+    // what the mid-request release race leaves behind, and a dispatched
+    // job's ptyId never recurs, so nothing would ever pick it up again.
+    revokeIdentity("job-9");
+    expect((handler?.health() as { bucket_keys: string[] }).bucket_keys).toEqual(["job-9"]);
+
+    await plugin._runGCTickForTests();
     expect((handler?.health() as { bucket_keys: string[] }).bucket_keys).toEqual([]);
 
     await conn.close();

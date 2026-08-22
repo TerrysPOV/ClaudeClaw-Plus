@@ -856,3 +856,94 @@ describe("McpHttpHandler — session-less discovery probe", () => {
     expect(body).not.toContain("-32601");
   });
 });
+
+// ── Orphaned buckets (issue #355) ───────────────────────────────────────────
+
+describe("McpHttpHandler — a bucket orphaned by a mid-request release", () => {
+  let proc: McpServerProcess | null = null;
+  let handler: McpHttpHandler | null = null;
+
+  beforeEach(async () => {
+    _resetIdentityStore();
+    _resetMcpBridge();
+    proc = new McpServerProcess("test", makeServerConfig());
+    await proc.start();
+    handler = new McpHttpHandler({ serverName: "test", proc, stateless: true });
+  });
+
+  afterEach(async () => {
+    await handler?.stop();
+    await proc?.stop();
+    _resetIdentityStore();
+    _resetMcpBridge();
+  });
+
+  function initialize(ptyId: string, bearer: string): Request {
+    return rpcRequest(
+      {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "test", version: "1.0" },
+        },
+      },
+      { [PTY_ID_HEADER]: ptyId, [AUTH_HEADER]: bearer },
+    );
+  }
+
+  it("is not inserted after its own teardown", async () => {
+    const ident = issueIdentity("job-1");
+
+    // Start the request but do NOT await it. `handle()` yields on the body
+    // cap read, then authenticates, then yields again on the audit peek and
+    // on the bucket build before `buckets.set` runs.
+    const inFlight = handler!.handle(initialize("job-1", ident.headers[AUTH_HEADER]!));
+
+    // Land the teardown INSIDE that window. Measured against this handler
+    // with the guard removed, the window is microtask turns 2-6: turns 0-1
+    // are still pre-auth (the request just 401s, nothing is built), and
+    // from turn 7 the transport is already serving the request. Four sits
+    // in the middle.
+    for (let i = 0; i < 4; i++) await Promise.resolve();
+
+    // Production order: `releaseIdentity` revokes the identity first, then
+    // tears down the handlers.
+    revokeIdentity("job-1");
+    await handler!.releasePty("job-1");
+
+    const resp = await inFlight;
+
+    // The request loses — correctly. Its PTY is gone.
+    expect(resp.status).toBe(401);
+    // And crucially it did not resurrect the bucket. Before the guard, the
+    // `delete` above found nothing (the key was not in the map yet) and
+    // this insert landed afterwards, stranding a bucket under a ptyId that
+    // — being a one-shot job key — no request would ever look up again.
+    expect(handler!.health().bucket_keys as string[]).toEqual([]);
+  });
+
+  it("is reclaimed by the sweep when it slips through anyway", async () => {
+    const live = issueIdentity("pty-live");
+    const doomed = issueIdentity("job-2");
+
+    await handler!.handle(initialize("pty-live", live.headers[AUTH_HEADER]!));
+    await handler!.handle(initialize("job-2", doomed.headers[AUTH_HEADER]!));
+    expect((handler!.health().bucket_keys as string[]).sort()).toEqual(["job-2", "pty-live"]);
+
+    // Simulate the orphan directly: identity gone, bucket still in the map.
+    // This is the state the race produces, and also what any caller that
+    // reaches `releasePty` without going through `releaseIdentity` leaves.
+    revokeIdentity("job-2");
+
+    expect(await handler!.sweepOrphanedBuckets()).toBe(1);
+    // The live PTY is untouched — the sweep keys on identity, not on idle
+    // time, so a healthy session that simply went quiet is never reaped.
+    expect(handler!.health().bucket_keys as string[]).toEqual(["pty-live"]);
+
+    // Idempotent: a second pass finds nothing left to do.
+    expect(await handler!.sweepOrphanedBuckets()).toBe(0);
+  });
+});

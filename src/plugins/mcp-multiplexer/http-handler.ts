@@ -35,7 +35,13 @@ import { getMcpBridge } from "../mcp-bridge.js";
 import { getMetricsRegistry } from "./metrics.js";
 import { getResponseCache } from "./cache.js";
 import type { McpServerProcess } from "../mcp-proxy/server-process.js";
-import { AUTH_HEADER, PTY_ID_HEADER, PTY_TS_HEADER, verifyBearer } from "./pty-identity.js";
+import {
+  AUTH_HEADER,
+  getIdentity,
+  PTY_ID_HEADER,
+  PTY_TS_HEADER,
+  verifyBearer,
+} from "./pty-identity.js";
 import type { SessionPersistenceStore } from "./session-persistence.js";
 
 /** Pair of objects making up a live MCP session against this server. */
@@ -438,9 +444,9 @@ export class McpHttpHandler {
 
     const isNewBucket = !bucket;
     if (!bucket) {
+      let fresh: ServerBucket;
       try {
-        bucket = await this._createBucket(bucketKey);
-        this.buckets.set(bucketKey, bucket);
+        fresh = await this._createBucket(bucketKey);
       } catch (err) {
         return _errResponse(
           500,
@@ -448,6 +454,33 @@ export class McpHttpHandler {
           err instanceof Error ? err.message : String(err),
         );
       }
+      // Everything between the auth check and this line yields — the body
+      // cap read, the audit peek, the bucket build. A `releasePty` landing
+      // in that window deletes by key and finds nothing, because the key
+      // is not in the map yet. Inserting now would resurrect the PTY we
+      // just tore down, and for a dispatched job — whose ptyId is a
+      // one-shot `agent-job-<uuid>` — nothing would ever look it up, hold
+      // it, or reap it again.
+      //
+      // `releaseIdentity` revokes the identity BEFORE it calls
+      // `releasePty`, so a vanished identity is the signal that teardown
+      // started while we were awaiting. Drop the bucket we just built and
+      // answer the way any post-teardown request is answered.
+      if (getIdentity(ptyId) === undefined) {
+        getMcpBridge().audit("multiplexer_bucket_release_raced", {
+          server: this.serverName,
+          pty_id: ptyId,
+        });
+        try {
+          await fresh.transport.close();
+        } catch {}
+        try {
+          await fresh.sdkServer.close();
+        } catch {}
+        return _errResponse(401, "pty_released", `pty ${ptyId} was released mid-request`);
+      }
+      bucket = fresh;
+      this.buckets.set(bucketKey, bucket);
     }
     bucket.lastUsed = Date.now();
     // Touch the persisted record on bucket reuse so the GC sweep keeps
@@ -542,6 +575,53 @@ export class McpHttpHandler {
     try {
       await bucket.sdkServer.close();
     } catch {}
+  }
+
+  /**
+   * Reclaim buckets whose PTY no longer has an issued identity.
+   *
+   * A bucket can survive its `releasePty` — see the race guarded in
+   * `handle()`, and any future caller that reaches `releasePty` without
+   * going through `releaseIdentity`. For a long-lived ptyId that is merely
+   * untidy: the next request under the same key adopts the orphan. For a
+   * dispatched agent job it is permanent, because the ptyId is a one-shot
+   * `agent-job-<uuid>` that never recurs — so the orphan is never looked
+   * up, never released, and (before this sweep) never reaped.
+   *
+   * Keyed on identity rather than on an idle TTL deliberately: a bucket
+   * whose identity is gone is PROVABLY dead — no caller can ever
+   * authenticate to it again — whereas an idle bucket may belong to a
+   * healthy long-lived PTY that simply went quiet, and reaping it would
+   * force a pointless re-handshake.
+   *
+   * Returns the number of buckets reclaimed. Never throws: a close that
+   * fails still leaves the map entry gone, which is the part that matters.
+   */
+  async sweepOrphanedBuckets(): Promise<number> {
+    const orphans: ServerBucket[] = [];
+    for (const [key, bucket] of this.buckets) {
+      if (getIdentity(key) === undefined) {
+        this.buckets.delete(key);
+        orphans.push(bucket);
+      }
+    }
+    if (orphans.length === 0) return 0;
+    getMcpBridge().audit("multiplexer_buckets_swept", {
+      server: this.serverName,
+      reclaimed: orphans.length,
+      pty_ids: orphans.map((b) => b.bucketKey),
+    });
+    await Promise.allSettled(
+      orphans.map(async (b) => {
+        try {
+          await b.transport.close();
+        } catch {}
+        try {
+          await b.sdkServer.close();
+        } catch {}
+      }),
+    );
+    return orphans.length;
   }
 
   /** Tear down every bucket and refuse further requests.

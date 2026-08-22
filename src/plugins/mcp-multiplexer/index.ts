@@ -695,7 +695,11 @@ export class McpMultiplexerPlugin {
 
   private _startGCTick(intervalMs: number): void {
     if (intervalMs <= 0) return;
-    if (!this.persistence) return;
+    // Deliberately NOT gated on `this.persistence` any more. The tick now
+    // also reclaims orphaned in-memory buckets, and a handler with no
+    // persistence store is exactly the case that most needs it: `stateless`
+    // servers have `persistence` set to undefined, so gating here left them
+    // with no sweep at all.
     this.gcTimer = setInterval(() => {
       void this._runGCTick();
     }, intervalMs);
@@ -711,18 +715,34 @@ export class McpMultiplexerPlugin {
     }
   }
 
-  /** One GC pass. Delegates the TTL sweep to the persistence layer;
-   *  the store emits `mcp_session_gc` per dropped entry internally. */
+  /** One GC pass. Two independent sweeps, each isolated so a failure in
+   *  one still runs the other:
+   *    - on-disk session records, TTL-based, delegated to the persistence
+   *      layer (it emits `mcp_session_gc` per dropped entry internally);
+   *    - in-memory buckets whose PTY identity is gone, which is how a
+   *      bucket orphaned by a mid-request `releasePty` gets reclaimed. */
   private async _runGCTick(): Promise<void> {
-    if (!this.persistence) return;
-    try {
-      await this.persistence.garbageCollect();
-    } catch (err) {
-      console.warn(
-        `[mcp-multiplexer] persistence GC failed (continuing): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
+    if (this.persistence) {
+      try {
+        await this.persistence.garbageCollect();
+      } catch (err) {
+        console.warn(
+          `[mcp-multiplexer] persistence GC failed (continuing): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+    for (const handler of this.handlers.values()) {
+      try {
+        await handler.sweepOrphanedBuckets();
+      } catch (err) {
+        console.warn(
+          `[mcp-multiplexer] bucket sweep failed (continuing): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
     }
   }
 
