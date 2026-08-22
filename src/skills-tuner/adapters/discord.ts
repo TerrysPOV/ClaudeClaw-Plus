@@ -50,7 +50,20 @@ export class DiscordAdapter extends Adapter {
 
   async renderProposal(proposal: Proposal): Promise<void> {
     const baseUrl = this.cfg.baseUrl ?? "https://discord.com/api/v10";
-    const content = this.formatProposalText(proposal);
+    // What fits as one-click buttons, and what does not. The read path
+    // deliberately no longer bounds `alternatives`, so a legacy row can carry
+    // more than any chat surface can render — and dropping the remainder
+    // without saying so is the silent loss this whole change set exists to
+    // remove. The full list is in the message text either way; only the
+    // buttons are limited, so the honest fix is to name the gap.
+    const buttonBudget = MAX_APPLY_ROWS * MAX_BUTTONS_PER_ROW;
+    const shownAlternatives = proposal.alternatives.slice(0, buttonBudget);
+    const hiddenCount = proposal.alternatives.length - shownAlternatives.length;
+    const content =
+      this.formatProposalText(proposal) +
+      (hiddenCount > 0
+        ? `\n\n_${shownAlternatives.length} of ${proposal.alternatives.length} alternatives have a button here; apply the rest with \`tuner__apply\`._`
+        : "");
 
     // One Apply button per alternative, chunked across action rows. Discord
     // caps a row at 5 buttons and a message at 5 rows, and it rejects the
@@ -61,7 +74,7 @@ export class DiscordAdapter extends Adapter {
     // so this always fits". That bound is a runaway guard, not a UI contract,
     // and it does not belong in a rendering assumption: the last row is
     // reserved for Refuse/Edit, so what actually fits here is 4 rows of 5.
-    const applyButtons = proposal.alternatives.map((alt) => ({
+    const applyButtons = shownAlternatives.map((alt) => ({
       type: COMPONENT_BUTTON,
       style: BUTTON_STYLE_PRIMARY,
       label: truncate("Apply " + alt.id + ": " + alt.label, MAX_BUTTON_LABEL),

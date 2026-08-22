@@ -441,7 +441,13 @@ export class WisecronStateDB {
       VALUES (?, ?, 'pending', ?, ?, ?)
       ON CONFLICT(id) DO NOTHING
     `)
-      .run(String(proposal.id), proposal.subject, JSON.stringify(proposal), now, now);
+      // `parsed.data`, not the caller's object. The emit schema coerces
+      // (`created_at: z.coerce.date()`), so a non-TypeScript caller can pass a
+      // date as text, satisfy the gate, and have the un-normalised form
+      // written — after which the canonical signature, derived from
+      // `created_at.toISOString()`, no longer matches on read. Validating and
+      // then storing something else makes the gate decorative.
+      .run(String(parsed.data.id), parsed.data.subject, JSON.stringify(parsed.data), now, now);
   }
 
   /**
@@ -508,9 +514,14 @@ export class WisecronStateDB {
   /**
    * Back-compat shim for the pre-isolation signature. `WisecronStateDB` is
    * public surface of a published plugin, so the rename to
-   * `listProposalsDetailed` should not silently break an out-of-tree caller on
-   * a patch bump. Drops the `unreadable` half — callers that care use the
-   * detailed form.
+   * `listProposalsDetailed` should not silently remove the method an
+   * out-of-tree caller depends on.
+   *
+   * It is NOT a transparent restoration: this shape has nowhere to report a
+   * skipped row, so on a degraded store it throws rather than returning a
+   * short list the caller has no reason to distrust. That is a deliberate
+   * breaking choice — a caller surviving on a degraded store must move to
+   * `listProposalsDetailed`, and the error says so.
    */
   listProposals(status?: ProposalStatus): StoredProposal[] {
     const { proposals, unreadable } = this.listProposalsDetailed(status);
@@ -520,10 +531,12 @@ export class WisecronStateDB {
       // short listing it has no reason to distrust — the exact silent loss
       // this store was changed to stop. A caller that wants to survive a
       // degraded store asks for it explicitly.
+      const named = unreadable.slice(0, 20).map((r) => r.id);
+      const more = unreadable.length - named.length;
       throw new Error(
         `${unreadable.length} stored proposal(s) could not be rehydrated ` +
-          `(${unreadable.map((r) => r.id).join(", ")}); use listProposalsDetailed() ` +
-          `to receive them alongside the readable rows`,
+          `(${named.join(", ")}${more > 0 ? `, and ${more} more` : ""}); ` +
+          `use listProposalsDetailed() to receive them alongside the readable rows`,
       );
     }
     return proposals;

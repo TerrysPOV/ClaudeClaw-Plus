@@ -808,3 +808,95 @@ describe("propose — a storage failure is not a subject's bug", () => {
     expect(res.subjects[0]?.observations).toBeUndefined();
   });
 });
+
+// ── What a run reports when storage fails partway ───────────────────────────
+
+describe("propose — rows written before a failure are still counted", () => {
+  it("reports what actually reached the store, not zero", async () => {
+    let calls = 0;
+    const flakyDb = {
+      ...db,
+      persistProposal: (p: Proposal) => {
+        calls++;
+        // Two land, the third hits a full disk.
+        if (calls > 2) throw new Error("database or disk is full");
+        db.persistProposal(p);
+      },
+      listProposalsDetailed: () => db.listProposalsDetailed(),
+    };
+    registerWisecronGateTools(
+      bridge,
+      makeBundle({
+        db: flakyDb,
+        engine: {
+          runCycle: async () => ({
+            proposals: [makeUnsigned(1), makeUnsigned(2), makeUnsigned(3)],
+            observations: 4,
+            clusters: 1,
+          }),
+        },
+      }),
+    );
+
+    const res = (await bridge.invokeTool(TUNER_PROPOSE_TOOL, { sinceHours: 12 })) as {
+      total_proposed: number;
+      subjects: Array<{ proposed: number; error?: string; observations?: number }>;
+    };
+
+    // `persistProposal` is a bare autocommit INSERT — the two rows are
+    // durably on disk and pending apply. Reporting 0 would be a summary that
+    // loses rows while looking clean, which is the defect this whole change
+    // set exists to remove.
+    expect(
+      db
+        .listProposalsDetailed()
+        .proposals.map((p) => p.id)
+        .sort(),
+    ).toEqual(["1", "2"]);
+    expect(res.total_proposed).toBe(2);
+    expect(res.subjects[0]?.proposed).toBe(2);
+    expect(res.subjects[0]?.error).toContain("disk is full");
+    // Still unknown, still omitted — unlike `proposed`, which is measured.
+    expect(res.subjects[0]?.observations).toBeUndefined();
+  });
+});
+
+describe("store degradation audit — per view, and it recovers", () => {
+  it("does not suppress one tool's report because another tool reported first", async () => {
+    seedPending(1);
+    seedLegacyRow(2, {}, "rejected");
+    seedLegacyRow(3, { signature: "" });
+    registerWisecronGateTools(bridge, makeBundle());
+
+    // A dashboard polls more than one tool. `status` walks every row and
+    // carries unknown_status; `pending` sees only its filtered slice. With a
+    // single shared slot the two thrash each other and nothing is suppressed.
+    for (let i = 0; i < 4; i++) {
+      await bridge.invokeTool(TUNER_STATUS_TOOL, {});
+      await bridge.invokeTool(TUNER_PENDING_TOOL, {});
+    }
+    const records = auditEvents.filter((e) => e.event === "gate_store_degraded");
+    // One per distinct view, not one per poll.
+    expect(records).toHaveLength(2);
+    expect(new Set(records.map((r) => r.detail?.view))).toEqual(new Set(["status", "pending"]));
+  });
+
+  it("audits a degradation again after it was repaired", async () => {
+    seedLegacyRow(1, { signature: "" });
+    registerWisecronGateTools(bridge, makeBundle());
+    await bridge.invokeTool(TUNER_STATUS_TOOL, {});
+    expect(auditEvents.filter((e) => e.event === "gate_store_degraded")).toHaveLength(1);
+
+    // Repaired: the healthy read must CLEAR what was remembered, otherwise an
+    // identical recurrence matches the stale fingerprint and is never
+    // recorded again — and the chain shows a degradation that never ended.
+    const raw = new Database(dbPath);
+    raw.prepare("DELETE FROM proposals WHERE id = ?").run("1");
+    raw.close();
+    await bridge.invokeTool(TUNER_STATUS_TOOL, {});
+
+    seedLegacyRow(1, { signature: "" });
+    await bridge.invokeTool(TUNER_STATUS_TOOL, {});
+    expect(auditEvents.filter((e) => e.event === "gate_store_degraded")).toHaveLength(2);
+  });
+});

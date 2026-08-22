@@ -2,6 +2,9 @@ import { Adapter } from "../core/interfaces.js";
 import type { Proposal } from "../core/types.js";
 import type { CallbackHandler } from "./base.js";
 
+/** Buttons per inline-keyboard row — a phone-width compromise. */
+const MAX_BUTTONS_PER_ROW = 2;
+
 export interface TelegramAdapterConfig {
   botToken: string;
   chatId: string;
@@ -22,12 +25,23 @@ export class TelegramAdapter extends Adapter {
   async renderProposal(proposal: Proposal): Promise<void> {
     const baseUrl = this.cfg.baseUrl ?? "https://api.telegram.org";
     const text = this.formatProposalText(proposal);
-    const reply_markup = {
-      inline_keyboard: [
-        proposal.alternatives.map((alt) => ({
+    // Chunked rather than one row of everything. Telegram has no hard cap
+    // small enough to fail here, but the read path no longer bounds
+    // `alternatives`, and a single row of a dozen buttons is unusable on a
+    // phone — which is where these are read. Nothing is dropped, so there is
+    // no truncation to declare.
+    const applyRows: Array<Array<{ text: string; callback_data: string }>> = [];
+    for (let i = 0; i < proposal.alternatives.length; i += MAX_BUTTONS_PER_ROW) {
+      applyRows.push(
+        proposal.alternatives.slice(i, i + MAX_BUTTONS_PER_ROW).map((alt) => ({
           text: "Apply " + alt.id + ": " + alt.label.slice(0, 30),
           callback_data: "apply:" + proposal.id + ":" + alt.id,
         })),
+      );
+    }
+    const reply_markup = {
+      inline_keyboard: [
+        ...applyRows,
         [
           { text: "Refuse", callback_data: "refuse:" + proposal.id },
           { text: "Edit", callback_data: "edit:" + proposal.id },

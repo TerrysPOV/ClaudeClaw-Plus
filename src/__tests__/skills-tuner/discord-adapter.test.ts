@@ -274,3 +274,58 @@ describe("DiscordAdapter.formatProposalText", () => {
     expect(txt).toContain("no tradeoff");
   });
 });
+
+// ─── Rendering a row the read path no longer bounds ──────────────────────────
+
+describe("DiscordAdapter — many alternatives", () => {
+  function alts(n: number) {
+    return Array.from({ length: n }, (_, i) => ({
+      id: `a${i + 1}`,
+      label: `Option ${i + 1}`,
+      diff_or_content: "x",
+      tradeoff: "",
+    }));
+  }
+
+  it("chunks Apply buttons across rows and keeps Refuse/Edit last", async () => {
+    const adapter = new DiscordAdapter(makeConfig());
+    await adapter.renderProposal(makeProposal({ alternatives: alts(12) }));
+    const body = JSON.parse(capturedCalls[0]!.init?.body as string);
+
+    // Discord rejects the whole message past 5 buttons in a row, so 12 must
+    // arrive as 5 + 5 + 2, then the decision row.
+    expect(body.components).toHaveLength(4);
+    expect(
+      body.components.slice(0, 3).map((r: { components: unknown[] }) => r.components.length),
+    ).toEqual([5, 5, 2]);
+    const decisionRow = body.components[3];
+    expect(decisionRow.components.map((b: { custom_id: string }) => b.custom_id)).toEqual([
+      "refuse:42",
+      "edit:42",
+    ]);
+  });
+
+  it("says so when there are more alternatives than buttons available", async () => {
+    const adapter = new DiscordAdapter(makeConfig());
+    await adapter.renderProposal(makeProposal({ alternatives: alts(24) }));
+    const body = JSON.parse(capturedCalls[0]!.init?.body as string);
+
+    // 4 apply rows of 5 is the ceiling — the 5th row is Refuse/Edit.
+    expect(body.components).toHaveLength(5);
+    expect(body.components[3].components).toHaveLength(5);
+
+    // The four that do not fit are NOT dropped in silence. Every alternative
+    // is listed in the message text; the gap is in the buttons, and the
+    // message names it.
+    expect(body.content).toContain("20 of 24 alternatives");
+    expect(body.content).toContain("tuner__apply");
+  });
+
+  it("stays silent about truncation when everything fits", async () => {
+    const adapter = new DiscordAdapter(makeConfig());
+    await adapter.renderProposal(makeProposal({ alternatives: alts(20) }));
+    const body = JSON.parse(capturedCalls[0]!.init?.body as string);
+    expect(body.components).toHaveLength(5);
+    expect(body.content).not.toContain("alternatives have a button");
+  });
+});

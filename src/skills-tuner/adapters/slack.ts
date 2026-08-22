@@ -18,6 +18,11 @@ export interface SlackAdapterConfig {
 }
 
 // Slack Block Kit limits we enforce defensively
+/** Slack caps an `actions` block at 25 elements and rejects the whole message
+ *  past it. Refuse and Edit take two, leaving 23 for Apply buttons. */
+const MAX_ACTIONS_ELEMENTS = 25;
+const MAX_APPLY_BUTTONS = MAX_ACTIONS_ELEMENTS - 2;
+
 const MAX_BUTTON_TEXT = 75; // chars
 const MAX_ACTION_VALUE = 2000; // chars
 const MAX_ACTION_ID = 255; // chars
@@ -38,16 +43,22 @@ export class SlackAdapter extends Adapter {
 
   async renderProposal(proposal: Proposal): Promise<void> {
     const baseUrl = this.cfg.baseUrl ?? "https://slack.com/api";
-    const headerText = this.formatProposalText(proposal);
-
     // Block Kit actions block — one Apply per alternative + Refuse + Edit.
-    // Slack allows up to 25 elements per `actions` block. The alternatives
-    // bound is a runaway guard rather than a UI contract, so this does not
-    // lean on it: at the current guard of 20 the block holds 22 elements and
-    // still fits, and the guard would have to more than double before it
-    // did not.
+    // Slack rejects the message outright past 25 elements in an `actions`
+    // block, and the read path deliberately no longer bounds `alternatives`,
+    // so a legacy row can exceed it. Enforcing the limit here rather than
+    // leaning on the emit guard: that guard does not apply to a row already
+    // on disk, which is precisely the row this code has to render.
+    const shownAlternatives = proposal.alternatives.slice(0, MAX_APPLY_BUTTONS);
+    const hiddenCount = proposal.alternatives.length - shownAlternatives.length;
+    const headerText =
+      this.formatProposalText(proposal) +
+      (hiddenCount > 0
+        ? `\n\n_${shownAlternatives.length} of ${proposal.alternatives.length} alternatives have a button here; apply the rest with \`tuner__apply\`._`
+        : "");
+
     const elements = [
-      ...proposal.alternatives.map((alt) => ({
+      ...shownAlternatives.map((alt) => ({
         type: "button",
         text: {
           type: "plain_text",

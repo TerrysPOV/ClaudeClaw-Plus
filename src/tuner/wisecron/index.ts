@@ -273,7 +273,14 @@ export {
   type TelemetryMcpClient,
 } from "./telemetry-mcp.js";
 export { serveTunerOverMcp, type ServedTuner, type ServeTunerOverMcpOpts } from "./serve.js";
-export { WisecronStateDB } from "./state-db.js";
+// `ProposalRejectedError` and `isKnownProposalStatus` ship alongside the class
+// deliberately. `StoredProposal.status` widened from the lifecycle union to
+// `string` (a store outlives the binary that wrote it), so an out-of-tree
+// caller needs the guard to re-narrow it; and a caller that isolates emit
+// refusals must be able to tell one from a disk failure by `instanceof`
+// rather than by matching on a message.
+export { WisecronStateDB, ProposalRejectedError, isKnownProposalStatus } from "./state-db.js";
+export type { ProposalStatus, StoredProposal, UnreadableProposalRow } from "./state-db.js";
 export { AdaptiveScheduler } from "./adaptive-scheduler.js";
 export { ProposalEngine } from "./proposal-engine.js";
 export { ApplyPipeline } from "./apply-pipeline.js";

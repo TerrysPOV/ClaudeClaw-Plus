@@ -161,6 +161,9 @@ const MatureArgs = z.object({
  *  counting them instead. */
 const MAX_REJECTED_REPORTED = 20;
 
+/** Same bound for the degradation audit's id and status lists. */
+const MAX_DEGRADED_IDS_REPORTED = 20;
+
 interface ProposeResult {
   window_hours: number;
   total_proposed: number;
@@ -247,34 +250,63 @@ interface StatusResult {
 function auditStoreDegraded(
   audit: WisecronBundle["audit"],
   source: string,
+  view: string,
   unreadable: readonly UnreadableProposalRow[],
   unknownStatus: Record<string, number> = {},
-  seen?: { last: string },
+  seen?: Record<string, string>,
 ): void {
-  if (unreadable.length === 0 && Object.keys(unknownStatus).length === 0) return;
   // Degradation is a STATE, not an event: the rows stay broken until someone
   // repairs them, and `status` is the health-dashboard tool, so it gets
   // polled. Appending on every poll would write thousands of identical
   // records a year into a chain that never rotates and is re-read whole on
   // every construction — burying the gate_apply/gate_refuse provenance it
   // exists to protect. Emit on change only.
-  const fingerprint = JSON.stringify({
-    unreadable: [...unreadable.map((r) => r.id)].sort(),
-    unknown: Object.entries(unknownStatus).sort(),
-  });
-  if (seen) {
-    if (seen.last === fingerprint) return;
-    seen.last = fingerprint;
+  //
+  // Keyed PER VIEW. The three tools that call this see different slices —
+  // `status` walks every row and carries `unknown_status`, `pending` sees
+  // only unreadable rows in one status — so a single shared slot is thrashed
+  // by any dashboard polling more than one of them, and suppresses nothing.
+  const fingerprint =
+    unreadable.length === 0 && Object.keys(unknownStatus).length === 0
+      ? ""
+      : JSON.stringify({
+          unreadable: [...unreadable.map((r) => r.id)].sort(),
+          unknown: Object.entries(unknownStatus).sort(),
+        });
+
+  // A healthy read CLEARS the slot rather than returning early. Otherwise a
+  // degradation that is repaired and then recurs identically matches the
+  // stale fingerprint and is never audited again — and the chain shows a
+  // degradation that started and never ended.
+  if (fingerprint === "") {
+    if (seen) delete seen[view];
+    return;
   }
+  if (seen && seen[view] === fingerprint) return;
+
+  // Bounded for the same reason `rejected[]` is: a degraded store is exactly
+  // where these lists get long, and this one is written into a chain that is
+  // never rotated and re-read whole on every construction.
+  const ids = unreadable.slice(0, MAX_DEGRADED_IDS_REPORTED).map((r) => r.id);
+  const statuses = Object.fromEntries(
+    Object.entries(unknownStatus).slice(0, MAX_DEGRADED_IDS_REPORTED),
+  );
   audit?.append({
     event: "gate_store_degraded",
     detail: {
       source,
+      view,
       unreadable: unreadable.length,
-      unreadable_ids: unreadable.map((r) => r.id),
-      unknown_status: unknownStatus,
+      unreadable_ids: ids,
+      unreadable_ids_truncated: unreadable.length - ids.length,
+      unknown_status: statuses,
+      unknown_status_truncated: Object.keys(unknownStatus).length - Object.keys(statuses).length,
     },
   });
+  // Recorded only AFTER the append lands. Marking it first meant a throw from
+  // `append` — the full-disk case this file treats as first class — left the
+  // state remembered as reported with nothing on disk to show for it.
+  if (seen) seen[view] = fingerprint;
 }
 
 /**
@@ -320,7 +352,7 @@ export function registerWisecronGateTools(
   // Scoped to this registration so a rebuilt surface re-reports the current
   // state once, rather than staying silent because a previous process had
   // already seen it.
-  const degradedSeen = { last: "" };
+  const degradedSeen: Record<string, string> = {};
 
   // Re-register cleanly so a served process can rebuild the surface.
   bridge.unregisterPlugin(GATE_PLUGIN_ID);
@@ -347,9 +379,15 @@ export function registerWisecronGateTools(
       // shows no propose attempt at all despite rows having been written.
       for (const name of names) {
         if (!registry.getSubject(name)) continue;
+        // Declared OUTSIDE the try. `persistProposal` is a bare autocommit
+        // INSERT with no transaction around the loop, so a proposal written
+        // before a later failure is durably on disk and pending apply.
+        // Counting inside the try discarded those rows the moment the throw
+        // jumped to the catch — a summary reporting zero while rows sit in
+        // the store, which is the exact defect this PR exists to remove.
+        let persisted = 0;
         try {
           const result = await engine.runCycle(name, since);
-          let persisted = 0;
           for (const unsigned of result.proposals) {
             const signed = { ...unsigned, signature: computeProposalSignature(unsigned, secret) };
             try {
@@ -377,12 +415,15 @@ export function registerWisecronGateTools(
             proposed: persisted,
           });
         } catch (err) {
-          // No fabricated zeros: the cycle may have observed plenty before it
-          // failed, and asserting `observations: 0` reads as "nothing to see"
-          // rather than "we do not know". `error` is what this row carries.
+          // `observations`/`clusters` are omitted because they are genuinely
+          // unknown — the cycle may have collected plenty before it failed.
+          // `proposed` is NOT unknown: it is what actually reached the store
+          // before the failure, and reporting 0 there would be a measurable
+          // lie rather than an absence.
+          total += persisted;
           subjects.push({
             subject: name,
-            proposed: 0,
+            proposed: persisted,
             error: err instanceof Error ? err.message : String(err),
           });
         }
@@ -492,7 +533,7 @@ export function registerWisecronGateTools(
     schema: z.object({}),
     handler: (): ListResult => {
       const listing = db.listProposalsDetailed("pending");
-      auditStoreDegraded(audit, source, listing.unreadable, {}, degradedSeen);
+      auditStoreDegraded(audit, source, "pending", listing.unreadable, {}, degradedSeen);
       return toListResult(listing);
     },
   });
@@ -505,7 +546,7 @@ export function registerWisecronGateTools(
     schema: ListArgs,
     handler: (args: z.infer<typeof ListArgs>): ListResult => {
       const listing = db.listProposalsDetailed(args.status);
-      auditStoreDegraded(audit, source, listing.unreadable, {}, degradedSeen);
+      auditStoreDegraded(audit, source, "list", listing.unreadable, {}, degradedSeen);
       return toListResult(listing);
     },
   });
@@ -703,9 +744,10 @@ export function registerWisecronGateTools(
       };
       if (unknownTotal > 0) result.unknown_status = unknownStatus;
       if (unreadable.length > 0) result.unreadable = unreadable.length;
-      if (unknownTotal > 0 || unreadable.length > 0) {
-        auditStoreDegraded(audit, source, unreadable, unknownStatus, degradedSeen);
-      }
+      // Called unconditionally: a healthy read is what CLEARS the remembered
+      // fingerprint, so a degradation that is repaired and later recurs is
+      // audited again rather than matching a stale entry forever.
+      auditStoreDegraded(audit, source, "status", unreadable, unknownStatus, degradedSeen);
       return result;
     },
   });
