@@ -316,6 +316,34 @@ export class McpHttpHandler {
       );
     }
 
+    // ── Session-less discovery probe ──────────────────────────────────
+    // A client on MCP revision 2026-07-28 opens with `server/discover`
+    // BEFORE it has a session id. Our transport is session-ful
+    // (`sessionIdGenerator` is always set), so the SDK rejects that probe
+    // at the transport layer with `400 Mcp-Session-Id header is required`
+    // — a transport-level failure the client reads as "this server is
+    // unreachable", so it drops the server entirely instead of falling
+    // back to `initialize`.
+    //
+    // `server/discover` is an optional capability we do not implement.
+    // Answer it the way JSON-RPC says an unimplemented method must be
+    // answered: a well-formed error, not a broken transport. Clients then
+    // fall back to the classic `initialize` handshake and connect.
+    // Verified against claude-code 2.1.239: with the 400 the servers are
+    // dropped; with this response the same client connects and lists tools.
+    const peek = await _readBody(safeReq);
+    if (_peekRpcMethod(peek) === "server/discover") {
+      const probeId = (peek as { id?: unknown } | undefined)?.id ?? null;
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: probeId,
+          error: { code: -32601, message: "Method not found: server/discover" },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+
     // ── Upstream readiness ────────────────────────────────────────────
     // If the upstream child is mid-restart we return 503 immediately so
     // the MCP client retries instead of hanging on a dead session.
@@ -352,9 +380,9 @@ export class McpHttpHandler {
       this.persistence.touch(this.serverName, bucketKey).catch(() => {});
     }
 
-    // Peek at the body for audit observability without consuming the
-    // request stream (the transport needs to re-read it).
-    const peek = await _readBody(safeReq);
+    // `peek` was already parsed above for the discovery-probe check; it
+    // clones rather than consuming, so the transport can still read the
+    // body. Reused here for audit observability instead of parsing twice.
 
     // #72 item 5: include the client-asserted identity-issuance
     // timestamp (`X-Claudeclaw-Ts`) in the invoke audit so the audit

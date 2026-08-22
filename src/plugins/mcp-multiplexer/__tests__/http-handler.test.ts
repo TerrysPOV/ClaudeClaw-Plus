@@ -711,3 +711,76 @@ describe("McpHttpHandler — body-peek threshold for audit (#72 item 11)", () =>
     revokeIdentity("suzy");
   });
 });
+
+describe("McpHttpHandler — session-less discovery probe", () => {
+  let proc: McpServerProcess | null = null;
+  let handler: McpHttpHandler | null = null;
+
+  beforeEach(async () => {
+    _resetIdentityStore();
+    proc = new McpServerProcess("test", makeServerConfig());
+    await proc.start();
+    handler = new McpHttpHandler({ serverName: "test", proc });
+  });
+
+  afterEach(async () => {
+    if (handler) await handler.stop();
+    if (proc) await proc.stop();
+    proc = null;
+    handler = null;
+    _resetIdentityStore();
+  });
+
+  function authed(body: unknown): Request {
+    const id = issueIdentity("suzy");
+    return rpcRequest(body, {
+      [PTY_ID_HEADER]: "suzy",
+      [PTY_TS_HEADER]: String(Date.now()),
+      ...id.headers,
+    });
+  }
+
+  // A client on MCP revision 2026-07-28 probes with `server/discover` before
+  // it holds a session id. The session-ful SDK transport answers that with a
+  // transport-level 400, which the client reads as "server unreachable" and
+  // drops the server. A JSON-RPC "method not found" keeps the connection
+  // usable and lets the client fall back to `initialize`.
+  it("answers server/discover with a JSON-RPC error, not a transport 400", async () => {
+    const resp = await handler!.handle(
+      authed({ jsonrpc: "2.0", id: "server-discover-probe-1", method: "server/discover" }),
+    );
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as {
+      jsonrpc: string;
+      id: unknown;
+      error: { code: number; message: string };
+    };
+    expect(body.jsonrpc).toBe("2.0");
+    expect(body.error.code).toBe(-32601);
+    expect(body.id).toBe("server-discover-probe-1");
+  });
+
+  it("echoes a null id back when the probe carries none", async () => {
+    const resp = await handler!.handle(authed({ jsonrpc: "2.0", method: "server/discover" }));
+    expect(resp.status).toBe(200);
+    const body = (await resp.json()) as { id: unknown; error?: { code: number } };
+    // Assert the error too: without it this passes on the unpatched
+    // transport as well, which would make the test prove nothing.
+    expect(body.error?.code).toBe(-32601);
+    expect(body.id).toBeNull();
+  });
+
+  it("still authenticates the probe — no bearer, no answer", async () => {
+    const resp = await handler!.handle(
+      rpcRequest({ jsonrpc: "2.0", id: 1, method: "server/discover" }),
+    );
+    expect(resp.status).toBe(401);
+  });
+
+  it("leaves every other method on the transport path", async () => {
+    const resp = await handler!.handle(authed({ jsonrpc: "2.0", id: 1, method: "initialize" }));
+    expect(resp.status).not.toBe(401);
+    const body = (await resp.text()) as string;
+    expect(body).not.toContain("-32601");
+  });
+});
