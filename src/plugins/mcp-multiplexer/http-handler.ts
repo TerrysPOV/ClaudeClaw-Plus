@@ -52,6 +52,17 @@ interface ServerBucket {
   transport: WebStandardStreamableHTTPServerTransport;
   /** Last-touched timestamp, for diagnostics. */
   lastUsed: number;
+  /**
+   * Installed by restart replay and not yet claimed by a request.
+   *
+   * The identity store is in-memory, so a restart wipes it: a replayed bucket
+   * has NO identity until its PTY reconnects and the supervisor issues one.
+   * That is indistinguishable, to `sweepOrphanedBuckets`, from a bucket whose
+   * PTY was released — so without this flag the sweep destroys exactly the
+   * session bindings replay exists to preserve. Cleared on the first
+   * authenticated request for the key.
+   */
+  resumed?: boolean;
 }
 
 export interface McpHttpHandlerOpts {
@@ -454,10 +465,12 @@ export class McpHttpHandler {
           err instanceof Error ? err.message : String(err),
         );
       }
-      // Everything between the auth check and this line yields — the body
-      // cap read, the audit peek, the bucket build. A `releasePty` landing
-      // in that window deletes by key and finds nothing, because the key
-      // is not in the map yet. Inserting now would resurrect the PTY we
+      // Between the auth check and this line the request yields twice — the
+      // audit peek (and its re-read for a session-less body) and the bucket
+      // build itself. (The body-cap read yields too, but BEFORE auth, which
+      // is why a release landing that early simply 401s.) A `releasePty`
+      // landing in the post-auth window deletes by key and finds nothing,
+      // because the key is not in the map yet. Inserting now would resurrect the PTY we
       // just tore down, and for a dispatched job — whose ptyId is a
       // one-shot `agent-job-<uuid>` — nothing would ever look it up, hold
       // it, or reap it again.
@@ -483,6 +496,9 @@ export class McpHttpHandler {
       this.buckets.set(bucketKey, bucket);
     }
     bucket.lastUsed = Date.now();
+    // Claimed: this request authenticated, so the PTY is back and the bucket
+    // is no longer merely replayed state waiting for its owner.
+    bucket.resumed = false;
     // Touch the persisted record on bucket reuse so the GC sweep keeps
     // it. Best-effort, never blocks request dispatch. Skipped on
     // first-create — the `onsessioninitialized` callback handles the
@@ -600,12 +616,27 @@ export class McpHttpHandler {
   async sweepOrphanedBuckets(): Promise<number> {
     const orphans: ServerBucket[] = [];
     for (const [key, bucket] of this.buckets) {
+      // A replayed bucket has no identity BY CONSTRUCTION until its PTY
+      // reconnects — the identity store does not survive the restart that
+      // made replay necessary. Reaping it would throw away the session
+      // binding the whole replay path exists to keep.
+      if (bucket.resumed) continue;
       if (getIdentity(key) === undefined) {
         this.buckets.delete(key);
         orphans.push(bucket);
       }
     }
     if (orphans.length === 0) return 0;
+    // Symmetric with `releasePty`: a key whose identity is gone must not have
+    // its binding replayed at the next start either. Without this the daemon
+    // loops — restart, replay, sweep at the next tick, restart — replaying a
+    // record for a PTY that will never come back. Best-effort; the map entry
+    // is already gone, which is the part that bounds memory.
+    if (this.persistence) {
+      for (const b of orphans) {
+        this.persistence.drop(this.serverName, b.bucketKey).catch(() => {});
+      }
+    }
     getMcpBridge().audit("multiplexer_buckets_swept", {
       server: this.serverName,
       reclaimed: orphans.length,
@@ -701,6 +732,7 @@ export class McpHttpHandler {
       return existing.transport.sessionId ?? sessionId;
     }
     const bucket = await this._createBucket(ptyId, sessionId);
+    bucket.resumed = true;
     this.buckets.set(ptyId, bucket);
     return bucket.transport.sessionId ?? sessionId;
   }

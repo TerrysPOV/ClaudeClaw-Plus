@@ -496,11 +496,16 @@ export class McpMultiplexerPlugin {
     // method returns, so this ordering is safe.
     if (this.persistence) {
       await this._replayPersistedSessions();
-      // Start the GC sweep. Default cadence 1h; tests pin to 0 to drive
-      // synchronously via `_runGCTickForTests`.
-      const gcTickMs = this.gcTickMsOverride ?? 3_600_000;
-      this._startGCTick(gcTickMs);
     }
+    // The tick runs whether or not a persistence store exists — it also
+    // reclaims orphaned in-memory buckets, which is a hazard the store has no
+    // bearing on. Gating the whole thing on `this.persistence` meant an
+    // operator who turned session persistence off got no bucket sweep either,
+    // and those two knobs have nothing to do with each other.
+    // Default cadence 1h; tests pin to 0 to drive synchronously via
+    // `_runGCTickForTests`.
+    const gcTickMs = this.gcTickMsOverride ?? 3_600_000;
+    this._startGCTick(gcTickMs);
   }
 
   async stop(): Promise<void> {
@@ -695,11 +700,6 @@ export class McpMultiplexerPlugin {
 
   private _startGCTick(intervalMs: number): void {
     if (intervalMs <= 0) return;
-    // Deliberately NOT gated on `this.persistence` any more. The tick now
-    // also reclaims orphaned in-memory buckets, and a handler with no
-    // persistence store is exactly the case that most needs it: `stateless`
-    // servers have `persistence` set to undefined, so gating here left them
-    // with no sweep at all.
     this.gcTimer = setInterval(() => {
       void this._runGCTick();
     }, intervalMs);
