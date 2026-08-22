@@ -1,5 +1,6 @@
 import { Adapter } from "../core/interfaces.js";
-import type { Proposal } from "../core/types.js";
+import type { Alternative, Proposal } from "../core/types.js";
+import { elidePath, renderProposalBody, stripInlineMarkup } from "./renderable.js";
 import type { CallbackHandler } from "./base.js";
 
 export interface SlackAdapterConfig {
@@ -18,9 +19,20 @@ export interface SlackAdapterConfig {
 }
 
 // Slack Block Kit limits we enforce defensively
+/** Slack caps an `actions` block at 25 elements and rejects the message past
+ *  it. Refuse and Edit take two, leaving 23 for Apply buttons. */
+const MAX_ACTIONS_ELEMENTS = 25;
+const MAX_APPLY_BUTTONS = MAX_ACTIONS_ELEMENTS - 2;
+/** Section-block text limit. */
+const MAX_SECTION_TEXT = 3000;
+
 const MAX_BUTTON_TEXT = 75; // chars
 const MAX_ACTION_VALUE = 2000; // chars
 const MAX_ACTION_ID = 255; // chars
+/** Characters that open a markup entity in Slack `mrkdwn`. */
+/** Header budget for the one unbounded field it interpolates. */
+const MAX_TARGET_PATH = 200;
+const SLACK_MARKUP = "*_~`";
 
 export class SlackAdapter extends Adapter {
   constructor(private cfg: SlackAdapterConfig) {
@@ -38,20 +50,36 @@ export class SlackAdapter extends Adapter {
 
   async renderProposal(proposal: Proposal): Promise<void> {
     const baseUrl = this.cfg.baseUrl ?? "https://slack.com/api";
-    const headerText = this.formatProposalText(proposal);
+    // Two independent limits ride on the same button. `value` is what
+    // `handleAction` parses back; `action_id` has to stay UNIQUE inside the
+    // actions block, and Slack bounds it four times tighter. Bounding only
+    // `value` let two alternatives whose ids diverge past character 255
+    // collapse onto one `action_id` — Slack then rejects the whole block, the
+    // exact failure this guard exists to prevent. Both are checked, so neither
+    // is truncated below.
+    const { shown, text: headerText } = renderProposalBody(proposal, {
+      identifiers: [
+        { build: (alt) => "apply:" + proposal.id + ":" + alt.id, max: MAX_ACTION_VALUE },
+        {
+          build: (alt) => "tuner_apply_" + proposal.id + "_" + alt.id,
+          max: MAX_ACTION_ID,
+        },
+      ],
+      maxButtons: MAX_APPLY_BUTTONS,
+      maxText: MAX_SECTION_TEXT,
+      header: this.formatHeader(proposal),
+      block: (alt) => this.formatAlternative(alt),
+    });
 
-    // Block Kit actions block — one Apply per alternative + Refuse + Edit.
-    // Slack allows up to 25 buttons per `actions` block; alternatives are
-    // capped at 3 by AlternativeSchema so the whole row always fits.
     const elements = [
-      ...proposal.alternatives.map((alt) => ({
+      ...shown.map((alt) => ({
         type: "button",
         text: {
           type: "plain_text",
           text: truncate("Apply " + alt.id + ": " + alt.label, MAX_BUTTON_TEXT),
         },
-        value: truncate("apply:" + proposal.id + ":" + alt.id, MAX_ACTION_VALUE),
-        action_id: truncate("tuner_apply_" + proposal.id + "_" + alt.id, MAX_ACTION_ID),
+        value: "apply:" + proposal.id + ":" + alt.id,
+        action_id: "tuner_apply_" + proposal.id + "_" + alt.id,
         style: "primary",
       })),
       {
@@ -152,10 +180,7 @@ export class SlackAdapter extends Adapter {
     }
   }
 
-  formatProposalText(proposal: Proposal): string {
-    const altLines = proposal.alternatives
-      .map((a) => "*" + a.id + ".* " + a.label + "\n  _" + (a.tradeoff || "no tradeoff") + "_")
-      .join("\n\n");
+  formatHeader(proposal: Proposal): string {
     return (
       "*Proposal #" +
       proposal.id +
@@ -165,10 +190,28 @@ export class SlackAdapter extends Adapter {
       proposal.kind +
       "\n\n" +
       "Target: `" +
-      proposal.target_path +
-      "`\n\n" +
-      altLines
+      elidePath(stripInlineMarkup(proposal.target_path, SLACK_MARKUP), MAX_TARGET_PATH) +
+      "`"
     );
+  }
+
+  formatAlternative(a: Alternative): string {
+    return (
+      "*" +
+      a.id +
+      ".* " +
+      stripInlineMarkup(a.label, SLACK_MARKUP) +
+      "\n  _" +
+      (stripInlineMarkup(a.tradeoff || "", SLACK_MARKUP) || "no tradeoff") +
+      "_"
+    );
+  }
+
+  formatProposalText(proposal: Proposal, only?: readonly Alternative[]): string {
+    return [
+      this.formatHeader(proposal),
+      ...(only ?? proposal.alternatives).map((a) => this.formatAlternative(a)),
+    ].join("\n\n");
   }
 }
 
