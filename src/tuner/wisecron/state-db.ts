@@ -417,8 +417,13 @@ export class WisecronStateDB {
    * Persist a signed proposal as `pending`. Idempotent on re-run: an existing
    * row (any status) is left untouched, so re-running a cron cycle never
    * resurrects an applied/refused proposal or clobbers its status.
+   *
+   * Returns whether a row was actually INSERTED. That distinction is the
+   * whole point of the idempotence: a caller counting "proposals produced"
+   * without it counts presentations, and a cron re-running an overlapping
+   * window then reports a steady stream while writing nothing.
    */
-  persistProposal(proposal: Proposal): void {
+  persistProposal(proposal: Proposal): boolean {
     // Emit gate. The read path deliberately no longer carries the alternatives
     // upper bound, so this is where a subject that emits past it is rejected:
     // at the write, loudly, while it is still a live bug someone can fix — not
@@ -435,7 +440,7 @@ export class WisecronStateDB {
       throw new ProposalRejectedError(proposal.id, proposal.subject, why);
     }
     const now = new Date().toISOString();
-    this.db
+    const result = this.db
       .prepare(`
       INSERT INTO proposals(id, subject, status, proposal_json, created_at, updated_at)
       VALUES (?, ?, 'pending', ?, ?, ?)
@@ -448,6 +453,7 @@ export class WisecronStateDB {
       // `created_at.toISOString()`, no longer matches on read. Validating and
       // then storing something else makes the gate decorative.
       .run(String(parsed.data.id), parsed.data.subject, JSON.stringify(parsed.data), now, now);
+    return result.changes === 1;
   }
 
   /**

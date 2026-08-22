@@ -31,6 +31,11 @@ const BUTTON_STYLE_DANGER = 4; // Refuse
 const MAX_BUTTONS_PER_ROW = 5;
 const MAX_APPLY_ROWS = 4;
 
+/** Discord rejects a message whose `content` exceeds this. The proposal text
+ *  lists one label + tradeoff line per alternative, both unbounded strings, so
+ *  it crosses this well before the button budget does. */
+const MAX_CONTENT = 2000;
+
 const MAX_BUTTON_LABEL = 80;
 const MAX_CUSTOM_ID = 100;
 
@@ -59,11 +64,17 @@ export class DiscordAdapter extends Adapter {
     const buttonBudget = MAX_APPLY_ROWS * MAX_BUTTONS_PER_ROW;
     const shownAlternatives = proposal.alternatives.slice(0, buttonBudget);
     const hiddenCount = proposal.alternatives.length - shownAlternatives.length;
-    const content =
-      this.formatProposalText(proposal) +
-      (hiddenCount > 0
+    const notice =
+      hiddenCount > 0
         ? `\n\n_${shownAlternatives.length} of ${proposal.alternatives.length} alternatives have a button here; apply the rest with \`tuner__apply\`._`
-        : "");
+        : "";
+    // Trim the body, THEN append the notice, so the sentence explaining what
+    // is missing is not itself the thing that gets cut — and so the message
+    // arrives at all. A proposal with twenty ordinary alternatives already
+    // exceeds Discord's limit on text alone, which would have rejected the
+    // whole message and made the notice unreachable in production.
+    const content =
+      truncate(this.formatProposalText(proposal), MAX_CONTENT - notice.length) + notice;
 
     // One Apply button per alternative, chunked across action rows. Discord
     // caps a row at 5 buttons and a message at 5 rows, and it rejects the

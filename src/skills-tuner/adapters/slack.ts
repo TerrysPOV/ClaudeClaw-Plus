@@ -23,6 +23,10 @@ export interface SlackAdapterConfig {
 const MAX_ACTIONS_ELEMENTS = 25;
 const MAX_APPLY_BUTTONS = MAX_ACTIONS_ELEMENTS - 2;
 
+/** Slack truncates/rejects a section block's text past this. The proposal text
+ *  grows with the alternative count, so it is reached before the button cap. */
+const MAX_SECTION_TEXT = 3000;
+
 const MAX_BUTTON_TEXT = 75; // chars
 const MAX_ACTION_VALUE = 2000; // chars
 const MAX_ACTION_ID = 255; // chars
@@ -51,11 +55,14 @@ export class SlackAdapter extends Adapter {
     // on disk, which is precisely the row this code has to render.
     const shownAlternatives = proposal.alternatives.slice(0, MAX_APPLY_BUTTONS);
     const hiddenCount = proposal.alternatives.length - shownAlternatives.length;
-    const headerText =
-      this.formatProposalText(proposal) +
-      (hiddenCount > 0
+    const notice =
+      hiddenCount > 0
         ? `\n\n_${shownAlternatives.length} of ${proposal.alternatives.length} alternatives have a button here; apply the rest with \`tuner__apply\`._`
-        : "");
+        : "";
+    // Body first, notice last: the sentence explaining the gap must survive
+    // the trim, and the message has to fit at all before either matters.
+    const headerText =
+      truncate(this.formatProposalText(proposal), MAX_SECTION_TEXT - notice.length) + notice;
 
     const elements = [
       ...shownAlternatives.map((alt) => ({

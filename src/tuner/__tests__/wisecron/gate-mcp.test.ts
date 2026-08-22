@@ -820,7 +820,7 @@ describe("propose — rows written before a failure are still counted", () => {
         calls++;
         // Two land, the third hits a full disk.
         if (calls > 2) throw new Error("database or disk is full");
-        db.persistProposal(p);
+        return db.persistProposal(p);
       },
       listProposalsDetailed: () => db.listProposalsDetailed(),
     };
@@ -878,7 +878,7 @@ describe("store degradation audit — per view, and it recovers", () => {
     const records = auditEvents.filter((e) => e.event === "gate_store_degraded");
     // One per distinct view, not one per poll.
     expect(records).toHaveLength(2);
-    expect(new Set(records.map((r) => r.detail?.view))).toEqual(new Set(["status", "pending"]));
+    expect(new Set(records.map((r) => r.detail?.scope))).toEqual(new Set(["status", "pending"]));
   });
 
   it("audits a degradation again after it was repaired", async () => {
@@ -898,5 +898,102 @@ describe("store degradation audit — per view, and it recovers", () => {
     seedLegacyRow(1, { signature: "" });
     await bridge.invokeTool(TUNER_STATUS_TOOL, {});
     expect(auditEvents.filter((e) => e.event === "gate_store_degraded")).toHaveLength(2);
+  });
+});
+
+// ── The three regressions the fourth review found ───────────────────────────
+
+describe("store degradation audit — scope is the query, not the tool", () => {
+  it("does not flood when one tool is polled with different filters", async () => {
+    // `tuner__list` has four scopes: unfiltered, plus each status. Keying the
+    // memory on the tool name puts all four in one slot, and a dashboard with
+    // status tabs thrashes it — which is the exact flood the dedup exists to
+    // stop, reproduced through a single tool.
+    seedPending(1);
+    seedLegacyRow(2, { signature: "" }); // unreadable, status pending
+    seedLegacyRow(3, { signature: "" }, "applied"); // unreadable, status applied
+    registerWisecronGateTools(bridge, makeBundle());
+
+    for (let i = 0; i < 5; i++) {
+      await bridge.invokeTool(TUNER_LIST_TOOL, { status: "pending" });
+      await bridge.invokeTool(TUNER_LIST_TOOL, { status: "applied" });
+    }
+    // One per distinct scope, not one per poll.
+    expect(auditEvents.filter((e) => e.event === "gate_store_degraded")).toHaveLength(2);
+  });
+
+  it("a healthy slice does not erase a degraded slice's memory", async () => {
+    seedPending(1);
+    seedLegacyRow(2, { signature: "" }); // only `pending` is degraded
+    registerWisecronGateTools(bridge, makeBundle());
+
+    for (let i = 0; i < 5; i++) {
+      await bridge.invokeTool(TUNER_LIST_TOOL, { status: "pending" });
+      // `applied` is clean. Clearing on a healthy read must clear only its
+      // OWN scope: a clean answer to one question says nothing about another.
+      await bridge.invokeTool(TUNER_LIST_TOOL, { status: "applied" });
+    }
+    expect(auditEvents.filter((e) => e.event === "gate_store_degraded")).toHaveLength(1);
+  });
+});
+
+describe("a failing audit sink does not take the query down", () => {
+  it("still answers status, pending and list when append throws", async () => {
+    seedPending(1);
+    seedLegacyRow(2, { signature: "" });
+    registerWisecronGateTools(
+      bridge,
+      makeBundle({
+        audit: {
+          append: () => {
+            throw new Error("ENOSPC: no space left on device, write");
+          },
+        },
+      }),
+    );
+
+    // These are READS. Before this file started auditing them they could not
+    // fail on a disk problem, and a decoration must not kill what it
+    // decorates — least of all on a store that is already degraded.
+    const st = (await bridge.invokeTool(TUNER_STATUS_TOOL, {})) as { total: number };
+    expect(st.total).toBe(2);
+    const pend = (await bridge.invokeTool(TUNER_PENDING_TOOL, {})) as { count: number };
+    expect(pend.count).toBe(1);
+    const list = (await bridge.invokeTool(TUNER_LIST_TOOL, {})) as { count: number };
+    expect(list.count).toBe(1);
+  });
+});
+
+describe("propose — counts insertions, not presentations", () => {
+  it("reports zero new proposals when the window is re-run", async () => {
+    const bundle = makeBundle({
+      engine: {
+        runCycle: async () => ({
+          proposals: [makeUnsigned(1), makeUnsigned(2)],
+          observations: 3,
+          clusters: 1,
+        }),
+      },
+    });
+    registerWisecronGateTools(bridge, bundle);
+
+    const first = (await bridge.invokeTool(TUNER_PROPOSE_TOOL, { sinceHours: 12 })) as {
+      total_proposed: number;
+      subjects: Array<{ proposed: number; deduped?: number }>;
+    };
+    expect(first.total_proposed).toBe(2);
+    expect(first.subjects[0]?.deduped).toBeUndefined();
+
+    // `persistProposal` is idempotent — the same proposals present again and
+    // nothing is written. Counting the calls would report a steady stream of
+    // proposals from a cron that writes nothing.
+    const second = (await bridge.invokeTool(TUNER_PROPOSE_TOOL, { sinceHours: 12 })) as {
+      total_proposed: number;
+      subjects: Array<{ proposed: number; deduped?: number }>;
+    };
+    expect(second.total_proposed).toBe(0);
+    expect(second.subjects[0]?.proposed).toBe(0);
+    expect(second.subjects[0]?.deduped).toBe(2);
+    expect(db.listProposalsDetailed().proposals).toHaveLength(2);
   });
 });
