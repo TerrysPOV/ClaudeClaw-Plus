@@ -35,6 +35,7 @@ import { z } from "zod";
 import type { PluginMcpBridge } from "../../plugins/mcp-bridge.js";
 import type { WisecronBundle } from "../../skills-tuner/cli/wisecron-bootstrap.js";
 import { computeProposalSignature, loadSecret } from "../../skills-tuner/core/security.js";
+import { isKnownProposalStatus, ProposalRejectedError } from "./state-db.js";
 import type {
   ProposalListing,
   ProposalStatus,
@@ -156,21 +157,30 @@ const MatureArgs = z.object({
 
 // ── Result shapes ────────────────────────────────────────────────────────────
 
+/** How many individual refusals a propose response will name before it starts
+ *  counting them instead. */
+const MAX_REJECTED_REPORTED = 20;
+
 interface ProposeResult {
   window_hours: number;
   total_proposed: number;
   subjects: Array<{
     subject: string;
-    observations: number;
-    clusters: number;
+    /** Absent when the subject's cycle threw — unknown, not zero. */
+    observations?: number;
+    clusters?: number;
     proposed: number;
     /** Present when this subject's cycle failed outright; the rest of the run
      *  continued without it. */
     error?: string;
   }>;
   /** Proposals the emit gate refused, named so an operator can find the
-   *  culprit. A refusal is one subject's bug, not the run's. */
+   *  culprit. A refusal is one subject's bug, not the run's — a storage
+   *  failure is NOT reported here, it fails the subject. Capped; see
+   *  `rejected_truncated`. */
   rejected?: Array<{ subject: string; id: number; error: string }>;
+  /** How many refusals beyond the reported ones were dropped from the list. */
+  rejected_truncated?: number;
 }
 
 interface ProposeExternalResult {
@@ -187,7 +197,9 @@ interface ProposeExternalResult {
 interface ProposalView {
   id: string;
   subject: string;
-  status: ProposalStatus;
+  /** Verbatim, so a caller sees `rejected` rather than a value silently
+   *  reshaped to fit a union it never belonged to. */
+  status: string;
   target_path: string;
   kind: string;
   alternatives: string[];
@@ -206,11 +218,6 @@ function toView(p: StoredProposal): ProposalView {
   };
 }
 
-/**
- * A listing result. `unreadable` is present only when a stored row failed to
- * rehydrate: the good rows still come back, and the rows that were skipped are
- * named here rather than dropped without a trace.
- */
 /**
  * Summary shape for `tuner__status`.
  *
@@ -242,8 +249,23 @@ function auditStoreDegraded(
   source: string,
   unreadable: readonly UnreadableProposalRow[],
   unknownStatus: Record<string, number> = {},
+  seen?: { last: string },
 ): void {
   if (unreadable.length === 0 && Object.keys(unknownStatus).length === 0) return;
+  // Degradation is a STATE, not an event: the rows stay broken until someone
+  // repairs them, and `status` is the health-dashboard tool, so it gets
+  // polled. Appending on every poll would write thousands of identical
+  // records a year into a chain that never rotates and is re-read whole on
+  // every construction — burying the gate_apply/gate_refuse provenance it
+  // exists to protect. Emit on change only.
+  const fingerprint = JSON.stringify({
+    unreadable: [...unreadable.map((r) => r.id)].sort(),
+    unknown: Object.entries(unknownStatus).sort(),
+  });
+  if (seen) {
+    if (seen.last === fingerprint) return;
+    seen.last = fingerprint;
+  }
   audit?.append({
     event: "gate_store_degraded",
     detail: {
@@ -255,6 +277,11 @@ function auditStoreDegraded(
   });
 }
 
+/**
+ * A listing result. `unreadable` is present only when a stored row failed to
+ * rehydrate: the good rows still come back, and the rows that were skipped are
+ * named here rather than dropped without a trace.
+ */
 interface ListResult {
   count: number;
   proposals: ProposalView[];
@@ -290,6 +317,10 @@ export function registerWisecronGateTools(
 ): { tools: string[] } {
   const { db, engine, registry, pipeline, recorder, audit } = bundle;
   const source: AppliedBy = opts.source ?? "mcp";
+  // Scoped to this registration so a rebuilt surface re-reports the current
+  // state once, rather than staying silent because a previous process had
+  // already seen it.
+  const degradedSeen = { last: "" };
 
   // Re-register cleanly so a served process can rebuild the surface.
   bridge.unregisterPlugin(GATE_PLUGIN_ID);
@@ -306,6 +337,7 @@ export function registerWisecronGateTools(
       const secret = loadSecret();
       const subjects: ProposeResult["subjects"] = [];
       const rejected: NonNullable<ProposeResult["rejected"]> = [];
+      let rejectedTotal = 0;
       let total = 0;
       // Isolation at BOTH loop levels, for the same reason the read path has
       // it: one subject's bad output must not decide the fate of the run.
@@ -324,11 +356,17 @@ export function registerWisecronGateTools(
               db.persistProposal(signed);
               persisted++;
             } catch (err) {
-              rejected.push({
-                subject: name,
-                id: unsigned.id,
-                error: err instanceof Error ? err.message : String(err),
-              });
+              // ONLY an emit-gate refusal is the subject's own bug. Anything
+              // else here — a full disk, a locked database — is the run's
+              // problem, and filing it under `rejected` would report a
+              // healthy cycle that proposed nothing while blaming the
+              // subject for the storage layer. Let it out to the per-subject
+              // catch, which records the subject as errored.
+              if (!(err instanceof ProposalRejectedError)) throw err;
+              if (rejected.length < MAX_REJECTED_REPORTED) {
+                rejected.push({ subject: name, id: unsigned.id, error: err.reason });
+              }
+              rejectedTotal++;
             }
           }
           total += persisted;
@@ -339,10 +377,11 @@ export function registerWisecronGateTools(
             proposed: persisted,
           });
         } catch (err) {
+          // No fabricated zeros: the cycle may have observed plenty before it
+          // failed, and asserting `observations: 0` reads as "nothing to see"
+          // rather than "we do not know". `error` is what this row carries.
           subjects.push({
             subject: name,
-            observations: 0,
-            clusters: 0,
             proposed: 0,
             error: err instanceof Error ? err.message : String(err),
           });
@@ -356,12 +395,20 @@ export function registerWisecronGateTools(
           source,
           window_hours: args.sinceHours,
           total_proposed: total,
-          rejected: rejected.length,
+          rejected: rejectedTotal,
           failed_subjects: subjects.filter((sub) => sub.error).map((sub) => sub.subject),
         },
       });
       const out: ProposeResult = { window_hours: args.sinceHours, total_proposed: total, subjects };
-      if (rejected.length > 0) out.rejected = rejected;
+      if (rejectedTotal > 0) {
+        out.rejected = rejected;
+        // A looping subject is exactly what the emit guard exists to catch;
+        // handing the operator every one of its refusals over the wire would
+        // trade a runaway proposal for a runaway response.
+        if (rejectedTotal > rejected.length) {
+          out.rejected_truncated = rejectedTotal - rejected.length;
+        }
+      }
       return out;
     },
   });
@@ -445,7 +492,7 @@ export function registerWisecronGateTools(
     schema: z.object({}),
     handler: (): ListResult => {
       const listing = db.listProposalsDetailed("pending");
-      auditStoreDegraded(audit, source, listing.unreadable);
+      auditStoreDegraded(audit, source, listing.unreadable, {}, degradedSeen);
       return toListResult(listing);
     },
   });
@@ -458,7 +505,7 @@ export function registerWisecronGateTools(
     schema: ListArgs,
     handler: (args: z.infer<typeof ListArgs>): ListResult => {
       const listing = db.listProposalsDetailed(args.status);
-      auditStoreDegraded(audit, source, listing.unreadable);
+      auditStoreDegraded(audit, source, listing.unreadable, {}, degradedSeen);
       return toListResult(listing);
     },
   });
@@ -625,16 +672,28 @@ export function registerWisecronGateTools(
       // silently missing from the totals, and no `unreadable` entry to hint
       // at it, because the row parsed perfectly well. Bucket it by name
       // instead, so an operator sees what the value is and how many.
-      const unknownStatus: Record<string, number> = {};
+      //
+      // `Object.create(null)`, not `{}`: the keys here are status values read
+      // off disk, and a plain object inherits from `Object.prototype`. A row
+      // in status `toString` would make `unknownStatus[status] ?? 0` return
+      // the inherited FUNCTION, `fn + 1` a string, and the reduce below
+      // concatenate rather than add — so the row would vanish from the
+      // summary AND suppress the degradation audit, with the response
+      // looking perfectly clean. `__proto__` is worse: the assignment is
+      // swallowed by the setter outright. A prototype-less map has no such
+      // keys to inherit.
+      const unknownStatus: Record<string, number> = Object.create(null);
+      let unknownTotal = 0;
       for (const p of proposals) {
-        if (p.status === "pending" || p.status === "applied" || p.status === "refused") {
+        if (isKnownProposalStatus(p.status)) {
           counts[p.status]++;
         } else {
           unknownStatus[p.status] = (unknownStatus[p.status] ?? 0) + 1;
+          // Counted here rather than re-derived from the object, so the total
+          // cannot disagree with the walk no matter what the keys are.
+          unknownTotal++;
         }
       }
-
-      const unknownTotal = Object.values(unknownStatus).reduce((a, b) => a + b, 0);
       const result: StatusResult = {
         ...counts,
         // `total` is the arithmetic the caller can check. Every row on disk
@@ -645,7 +704,7 @@ export function registerWisecronGateTools(
       if (unknownTotal > 0) result.unknown_status = unknownStatus;
       if (unreadable.length > 0) result.unreadable = unreadable.length;
       if (unknownTotal > 0 || unreadable.length > 0) {
-        auditStoreDegraded(audit, source, unreadable, unknownStatus);
+        auditStoreDegraded(audit, source, unreadable, unknownStatus, degradedSeen);
       }
       return result;
     },

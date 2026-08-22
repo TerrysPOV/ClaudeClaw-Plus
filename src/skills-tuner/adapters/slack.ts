@@ -41,8 +41,11 @@ export class SlackAdapter extends Adapter {
     const headerText = this.formatProposalText(proposal);
 
     // Block Kit actions block — one Apply per alternative + Refuse + Edit.
-    // Slack allows up to 25 buttons per `actions` block; alternatives are
-    // capped at 3 by AlternativeSchema so the whole row always fits.
+    // Slack allows up to 25 elements per `actions` block. The alternatives
+    // bound is a runaway guard rather than a UI contract, so this does not
+    // lean on it: at the current guard of 20 the block holds 22 elements and
+    // still fits, and the guard would have to more than double before it
+    // did not.
     const elements = [
       ...proposal.alternatives.map((alt) => ({
         type: "button",

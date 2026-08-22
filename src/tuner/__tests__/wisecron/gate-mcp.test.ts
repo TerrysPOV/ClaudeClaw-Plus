@@ -705,3 +705,106 @@ describe("tuner__mature", () => {
     );
   });
 });
+
+// ── The summary's guarantees under hostile status values ────────────────────
+
+describe("status — the sum holds whatever the status column says", () => {
+  // Values that name members of Object.prototype. With a plain `{}` as the
+  // tally, `unknownStatus[status] ?? 0` returns the INHERITED member instead
+  // of undefined: `toString` makes `fn + 1` a string, the total stops being a
+  // number, `unknown_status` is never attached and the degradation audit
+  // never fires — a response that looks perfectly clean while a row is gone.
+  // `__proto__` is worse: the assignment is swallowed by the setter.
+  const HOSTILE = ["__proto__", "constructor", "toString", "hasOwnProperty", "valueOf"];
+
+  for (const status of HOSTILE) {
+    it(`counts a row in status '${status}' instead of losing it`, async () => {
+      seedPending(1);
+      seedLegacyRow(2, {}, status);
+      registerWisecronGateTools(bridge, makeBundle());
+
+      const c = (await bridge.invokeTool(TUNER_STATUS_TOOL, {})) as {
+        pending: number;
+        applied: number;
+        refused: number;
+        total: number;
+        unknown_status?: Record<string, number>;
+        unreadable?: number;
+      };
+      const bucketed =
+        c.pending +
+        c.applied +
+        c.refused +
+        Object.values(c.unknown_status ?? {}).reduce((a, b) => a + b, 0) +
+        (c.unreadable ?? 0);
+      expect(bucketed).toBe(c.total);
+      expect(c.total).toBe(2);
+      expect(c.unknown_status?.[status]).toBe(1);
+    });
+  }
+});
+
+describe("store degradation is audited, once per state", () => {
+  it("emits gate_store_degraded and does not re-emit on an unchanged store", async () => {
+    seedPending(1);
+    seedLegacyRow(2, { signature: "" }); // unreadable
+    registerWisecronGateTools(bridge, makeBundle());
+
+    await bridge.invokeTool(TUNER_STATUS_TOOL, {});
+    const first = auditEvents.filter((e) => e.event === "gate_store_degraded");
+    expect(first).toHaveLength(1);
+    expect(first[0]?.detail?.unreadable).toBe(1);
+
+    // `status` is the health-dashboard tool — it gets polled. Degradation is a
+    // state, not an event: re-appending on every poll would bury the real
+    // provenance records in a chain that never rotates.
+    await bridge.invokeTool(TUNER_STATUS_TOOL, {});
+    await bridge.invokeTool(TUNER_STATUS_TOOL, {});
+    expect(auditEvents.filter((e) => e.event === "gate_store_degraded")).toHaveLength(1);
+  });
+
+  it("re-emits when the degradation itself changes", async () => {
+    seedLegacyRow(1, { signature: "" });
+    registerWisecronGateTools(bridge, makeBundle());
+    await bridge.invokeTool(TUNER_STATUS_TOOL, {});
+    expect(auditEvents.filter((e) => e.event === "gate_store_degraded")).toHaveLength(1);
+
+    seedLegacyRow(2, { signature: "" });
+    await bridge.invokeTool(TUNER_STATUS_TOOL, {});
+    expect(auditEvents.filter((e) => e.event === "gate_store_degraded")).toHaveLength(2);
+  });
+});
+
+describe("propose — a storage failure is not a subject's bug", () => {
+  it("fails the subject instead of filing a disk error as a refused proposal", async () => {
+    const brokenDb = {
+      ...db,
+      persistProposal: () => {
+        throw new Error("database or disk is full");
+      },
+      listProposalsDetailed: () => ({ proposals: [], unreadable: [] }),
+    };
+    registerWisecronGateTools(
+      bridge,
+      makeBundle({
+        db: brokenDb,
+        engine: {
+          runCycle: async () => ({ proposals: [makeUnsigned(1)], observations: 5, clusters: 2 }),
+        },
+      }),
+    );
+
+    const res = (await bridge.invokeTool(TUNER_PROPOSE_TOOL, { sinceHours: 12 })) as {
+      total_proposed: number;
+      subjects: Array<{ subject: string; error?: string; observations?: number }>;
+      rejected?: unknown[];
+    };
+
+    // Reporting this under `rejected` would show a healthy run that proposed
+    // nothing, with the storage layer's failure blamed on the subject.
+    expect(res.rejected).toBeUndefined();
+    expect(res.subjects[0]?.error).toContain("disk is full");
+    // And no fabricated zero: the cycle observed 5 things before it failed.
+    expect(res.subjects[0]?.observations).toBeUndefined();
+  });
+});

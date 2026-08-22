@@ -326,3 +326,61 @@ describe("WisecronStateDB — the read schema's remaining strictness", () => {
     expect(unreadable).toHaveLength(2);
   });
 });
+
+// ── Degraded-store ergonomics ───────────────────────────────────────────────
+
+describe("WisecronStateDB — what a caller is told when a row will not rehydrate", () => {
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "read-schema-degraded-"));
+    dbPath = join(tmpDir, "wisecron.db");
+    db = new WisecronStateDB(dbPath);
+  });
+
+  afterEach(() => {
+    db.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  function seedRawRow(id: number, proposalJson: unknown): void {
+    const raw = new Database(dbPath);
+    const now = new Date().toISOString();
+    raw
+      .prepare(
+        "INSERT INTO proposals(id, subject, status, proposal_json, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+      )
+      .run(String(id), "fake", "pending", JSON.stringify(proposalJson), now, now);
+    raw.close();
+  }
+
+  it("the back-compat listing refuses rather than returning a short list", () => {
+    db.persistProposal(makeProposal(1));
+    seedRawRow(2, { not: "a proposal" });
+
+    // The old shape has nowhere to say "and one row was skipped", so quietly
+    // returning one row would hand a caller a truncated listing it has no
+    // reason to distrust — the silent loss this store was changed to stop.
+    expect(() => db.listProposals()).toThrow(/could not be rehydrated/);
+    expect(() => db.listProposals()).toThrow(/listProposalsDetailed/);
+
+    // Undegraded, it behaves exactly as before.
+    const clean = new WisecronStateDB(join(tmpDir, "clean.db"));
+    try {
+      clean.persistProposal(makeProposal(3));
+      expect(clean.listProposals().map((p) => p.id)).toEqual(["3"]);
+    } finally {
+      clean.close();
+    }
+  });
+
+  it("names the row and its state when a lifecycle read fails", () => {
+    seedRawRow(7, { not: "a proposal" });
+    // apply/refuse both come through getStoredProposal, so this is the error
+    // an operator actually meets. A bare schema dump gives them nothing.
+    expect(() => db.getStoredProposal("7")).toThrow(/#7/);
+    expect(() => db.getStoredProposal("7")).toThrow(/subject 'fake'/);
+    expect(() => db.getStoredProposal("7")).toThrow(/status 'pending'/);
+    // Still throws rather than returning null: null would read as "no such
+    // proposal" for a row that is very much on disk.
+    expect(db.getStoredProposal("404")).toBeNull();
+  });
+});

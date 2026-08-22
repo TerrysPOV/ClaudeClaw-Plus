@@ -40,8 +40,38 @@ export interface OutcomeRow {
   verdict: string | null;
 }
 
-/** Persisted proposal lifecycle status. */
+/**
+ * A proposal the emit gate refused. Distinct from every other failure
+ * `persistProposal` can raise — a full disk, a locked database, a corrupt
+ * file — because only this one is the SUBJECT's bug. A caller that isolates
+ * refusals so one bad proposal cannot end a run must not swallow a disk
+ * failure through the same catch and report the run as healthy.
+ */
+export class ProposalRejectedError extends Error {
+  constructor(
+    readonly proposalId: number,
+    readonly subject: string,
+    readonly reason: string,
+  ) {
+    super(`proposal #${proposalId} from subject '${subject}' is not persistable — ${reason}`);
+    this.name = "ProposalRejectedError";
+  }
+}
+
+/** Persisted proposal lifecycle status — what this binary WRITES. */
 export type ProposalStatus = "pending" | "applied" | "refused";
+
+/**
+ * Whether a stored status column value is one this binary understands.
+ *
+ * A store outlives the binary that wrote it: a production store holds rows in
+ * `rejected`, a status nothing here writes any more. `StoredProposal.status`
+ * is therefore typed as the string it actually is, and code that needs the
+ * union narrows through this guard instead of asserting.
+ */
+export function isKnownProposalStatus(status: string): status is ProposalStatus {
+  return status === "pending" || status === "applied" || status === "refused";
+}
 
 interface ProposalRow {
   id: string;
@@ -56,7 +86,10 @@ interface ProposalRow {
 export interface StoredProposal {
   id: string;
   subject: string;
-  status: ProposalStatus;
+  /** The status column verbatim. Not narrowed to `ProposalStatus`: a row an
+   *  older binary wrote can hold a value outside the union. Narrow with
+   *  `isKnownProposalStatus` where the union is required. */
+  status: string;
   proposal: PersistedProposal;
   created_at: Date;
   updated_at: Date;
@@ -80,7 +113,13 @@ function rowToStoredProposal(row: ProposalRow): StoredProposal {
   return {
     id: row.id,
     subject: row.subject,
-    status: row.status as ProposalStatus,
+    // NOT cast to `ProposalStatus`. The column is a plain string and real
+    // stores hold values this binary no longer writes — a production store
+    // has rows in `rejected`, which the union does not contain. Asserting the
+    // narrow type here would lie to every consumer, and that lie is exactly
+    // what produced a `counts[row.status]++` yielding NaN in the summary.
+    // Callers that need the union narrow it with `isKnownProposalStatus`.
+    status: row.status,
     // Read path: PersistedProposalSchema, NOT the emit schema — a row on disk is
     // validated against the shape it was written under, not against the bounds a
     // subject must respect today. It coerces created_at (string in JSON) back to
@@ -393,9 +432,7 @@ export class WisecronStateDB {
       const why = parsed.error.issues
         .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
         .join("; ");
-      throw new Error(
-        `proposal #${proposal.id} from subject '${proposal.subject}' is not persistable — ${why}`,
-      );
+      throw new ProposalRejectedError(proposal.id, proposal.subject, why);
     }
     const now = new Date().toISOString();
     this.db
@@ -476,7 +513,20 @@ export class WisecronStateDB {
    * detailed form.
    */
   listProposals(status?: ProposalStatus): StoredProposal[] {
-    return this.listProposalsDetailed(status).proposals;
+    const { proposals, unreadable } = this.listProposalsDetailed(status);
+    if (unreadable.length > 0) {
+      // Refusing beats truncating. This shape has no way to say "and N rows
+      // were skipped", so returning the good rows alone would hand a caller a
+      // short listing it has no reason to distrust — the exact silent loss
+      // this store was changed to stop. A caller that wants to survive a
+      // degraded store asks for it explicitly.
+      throw new Error(
+        `${unreadable.length} stored proposal(s) could not be rehydrated ` +
+          `(${unreadable.map((r) => r.id).join(", ")}); use listProposalsDetailed() ` +
+          `to receive them alongside the readable rows`,
+      );
+    }
+    return proposals;
   }
 
   /**
@@ -489,7 +539,21 @@ export class WisecronStateDB {
     const row = this.db.prepare("SELECT * FROM proposals WHERE id = ?").get(id) as
       | ProposalRow
       | undefined;
-    return row ? rowToStoredProposal(row) : null;
+    if (!row) return null;
+    try {
+      return rowToStoredProposal(row);
+    } catch (err) {
+      // Still throws — returning `null` would read as "no such proposal" and
+      // send a lifecycle handler down the not-found path for a row that is
+      // very much on disk. But it says WHICH row and why, instead of handing
+      // an operator a raw schema dump. This is the error they actually hit:
+      // apply and refuse both come through here.
+      const why = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `proposal #${id} (subject '${row.subject}', status '${row.status}') is on disk ` +
+          `but its stored JSON no longer rehydrates — ${why}`,
+      );
+    }
   }
 
   setProposalStatus(id: string, status: ProposalStatus): void {

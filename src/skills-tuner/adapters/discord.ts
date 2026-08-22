@@ -25,6 +25,12 @@ const BUTTON_STYLE_SECONDARY = 2; // Edit
 const BUTTON_STYLE_DANGER = 4; // Refuse
 
 // Discord limits we enforce defensively
+/** Discord API limits: 5 buttons per action row, 5 action rows per message.
+ *  The last row carries Refuse + Edit, so four are left for Apply buttons.
+ *  Exceeding either is a 400 on the whole message, not a truncation. */
+const MAX_BUTTONS_PER_ROW = 5;
+const MAX_APPLY_ROWS = 4;
+
 const MAX_BUTTON_LABEL = 80;
 const MAX_CUSTOM_ID = 100;
 
@@ -46,17 +52,32 @@ export class DiscordAdapter extends Adapter {
     const baseUrl = this.cfg.baseUrl ?? "https://discord.com/api/v10";
     const content = this.formatProposalText(proposal);
 
-    // Action row 1: one Apply button per alternative (Discord allows ≤5 buttons/row;
-    // alternatives are capped at 3 by AlternativeSchema so this always fits).
-    const applyRow = {
-      type: COMPONENT_ACTION_ROW,
-      components: proposal.alternatives.map((alt) => ({
-        type: COMPONENT_BUTTON,
-        style: BUTTON_STYLE_PRIMARY,
-        label: truncate("Apply " + alt.id + ": " + alt.label, MAX_BUTTON_LABEL),
-        custom_id: truncate("apply:" + proposal.id + ":" + alt.id, MAX_CUSTOM_ID),
-      })),
-    };
+    // One Apply button per alternative, chunked across action rows. Discord
+    // caps a row at 5 buttons and a message at 5 rows, and it rejects the
+    // whole message with 400 if either is exceeded — so an over-long
+    // proposal would not reach the operator at all.
+    //
+    // This used to assume "alternatives are capped at 3 by AlternativeSchema
+    // so this always fits". That bound is a runaway guard, not a UI contract,
+    // and it does not belong in a rendering assumption: the last row is
+    // reserved for Refuse/Edit, so what actually fits here is 4 rows of 5.
+    const applyButtons = proposal.alternatives.map((alt) => ({
+      type: COMPONENT_BUTTON,
+      style: BUTTON_STYLE_PRIMARY,
+      label: truncate("Apply " + alt.id + ": " + alt.label, MAX_BUTTON_LABEL),
+      custom_id: truncate("apply:" + proposal.id + ":" + alt.id, MAX_CUSTOM_ID),
+    }));
+    const applyRows: Array<{ type: number; components: typeof applyButtons }> = [];
+    for (
+      let i = 0;
+      i < applyButtons.length && applyRows.length < MAX_APPLY_ROWS;
+      i += MAX_BUTTONS_PER_ROW
+    ) {
+      applyRows.push({
+        type: COMPONENT_ACTION_ROW,
+        components: applyButtons.slice(i, i + MAX_BUTTONS_PER_ROW),
+      });
+    }
 
     // Action row 2: Refuse + Edit
     const decisionRow = {
@@ -85,7 +106,7 @@ export class DiscordAdapter extends Adapter {
       },
       body: JSON.stringify({
         content,
-        components: [applyRow, decisionRow],
+        components: [...applyRows, decisionRow],
       }),
     });
     if (!res.ok) {
