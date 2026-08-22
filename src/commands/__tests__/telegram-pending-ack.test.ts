@@ -4,6 +4,7 @@ import {
   ackForResolution,
   parseResolverVerdict,
   redactResolverDiagnostics,
+  describeResolverFailure,
 } from "../telegram.js";
 
 // #314: a pending-action button tapped after it was already resolved must ack
@@ -119,6 +120,33 @@ describe("redactResolverDiagnostics", () => {
     );
     expect(redactResolverDiagnostics("ConnectionRefusedError: [Errno 111]")).toBe(
       "ConnectionRefusedError: [Errno 111]",
+    );
+  });
+});
+
+describe("describeResolverFailure", () => {
+  // The four shapes execFile actually produces, confirmed against the real API:
+  // a spawn failure reports a STRING code and no signal, a timeout reports
+  // code null with a signal, an ordinary failure reports a numeric code.
+  it("names a spawn failure instead of calling it an exit status", () => {
+    expect(describeResolverFailure({ timedOut: false, signal: null, code: "ENOENT" })).toBe(
+      "spawn error ENOENT",
+    );
+  });
+
+  it("reports an ordinary non-zero exit as an exit status", () => {
+    expect(describeResolverFailure({ timedOut: false, signal: null, code: 3 })).toBe("exit 3");
+  });
+
+  it("prefers the timeout over the code the kill left behind", () => {
+    expect(describeResolverFailure({ timedOut: true, signal: "SIGTERM", code: null })).toBe(
+      "timed out",
+    );
+  });
+
+  it("names the signal when the process was killed but not by the timeout", () => {
+    expect(describeResolverFailure({ timedOut: false, signal: "SIGKILL", code: null })).toBe(
+      "killed by SIGKILL",
     );
   });
 });

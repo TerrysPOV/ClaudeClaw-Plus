@@ -1902,6 +1902,25 @@ export function ackForResolution(stdout: string, decision: string): string {
  * lives in the request URL — into its stderr. Mirrors the redaction the PTY
  * tail applies for the same reason.
  */
+/**
+ * Describe how the pending resolver failed, in the shape an operator can act on.
+ *
+ * `code` is not always an exit status: a spawn failure (ENOENT, EACCES…) reports
+ * a string there, so labelling it `exit ENOENT` would misreport the very failure
+ * this diagnostic exists to explain. A signal kill reports `code: null`, which is
+ * why the signal and timeout cases are tested first.
+ */
+export function describeResolverFailure(result: {
+  timedOut: boolean;
+  signal: string | null;
+  code: number | string | null;
+}): string {
+  if (result.timedOut) return "timed out";
+  if (result.signal) return `killed by ${result.signal}`;
+  if (typeof result.code === "string") return `spawn error ${result.code}`;
+  return `exit ${result.code}`;
+}
+
 export function redactResolverDiagnostics(text: string): string {
   return text
     .replace(/\bbot\d+:[A-Za-z0-9_-]{20,}/g, "bot<redacted>")
@@ -2015,11 +2034,7 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
         if (verdict === "no_answer") {
           // No verdict: the ack cannot say whether the decision was applied, so
           // the operator needs the reason it failed.
-          const how = result.timedOut
-            ? "timed out"
-            : result.signal
-              ? `killed by ${result.signal}`
-              : `exit ${result.code}`;
+          const how = describeResolverFailure(result);
           const why = redactResolverDiagnostics(result.stderr).trim().slice(0, 200) || "no stderr";
           console.warn(
             `[Telegram] pending resolver reported no verdict for action ${actionId} (${how}): ${why}`,
