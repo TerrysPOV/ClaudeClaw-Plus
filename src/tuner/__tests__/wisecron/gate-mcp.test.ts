@@ -878,7 +878,12 @@ describe("store degradation audit — per view, and it recovers", () => {
     const records = auditEvents.filter((e) => e.event === "gate_store_degraded");
     // One per distinct view, not one per poll.
     expect(records).toHaveLength(2);
-    expect(new Set(records.map((r) => r.detail?.scope))).toEqual(new Set(["status", "pending"]));
+    // `pending` is keyed as the query it runs, not as its own tool name —
+    // `tuner__pending` and `tuner__list(pending)` are the same query and must
+    // not record one state twice.
+    expect(new Set(records.map((r) => r.detail?.scope))).toEqual(
+      new Set(["status", "list:pending"]),
+    );
   });
 
   it("audits a degradation again after it was repaired", async () => {
@@ -995,5 +1000,168 @@ describe("propose — counts insertions, not presentations", () => {
     expect(second.subjects[0]?.proposed).toBe(0);
     expect(second.subjects[0]?.deduped).toBe(2);
     expect(db.listProposalsDetailed().proposals).toHaveLength(2);
+  });
+});
+
+// ── The fifth review's findings ─────────────────────────────────────────────
+
+describe("status — capping the response never breaks the sum", () => {
+  it("carries omitted statuses as a ROW count, not a name count", async () => {
+    // 25 distinct out-of-union statuses, one row each. Only 20 names fit in
+    // the response; the remaining rows must still be accounted for, or the
+    // cap meant to stop a runaway response reintroduces the silent loss this
+    // whole change set exists to remove.
+    for (let i = 1; i <= 25; i++) seedLegacyRow(i, {}, `legacy-${i}`);
+    registerWisecronGateTools(bridge, makeBundle());
+
+    const c = (await bridge.invokeTool(TUNER_STATUS_TOOL, {})) as {
+      pending: number;
+      applied: number;
+      refused: number;
+      total: number;
+      unknown_status?: Record<string, number>;
+      unknown_status_other?: number;
+      unreadable?: number;
+    };
+    const bucketed =
+      c.pending +
+      c.applied +
+      c.refused +
+      Object.values(c.unknown_status ?? {}).reduce((a, b) => a + b, 0) +
+      (c.unknown_status_other ?? 0) +
+      (c.unreadable ?? 0);
+    expect(c.total).toBe(25);
+    expect(bucketed).toBe(c.total);
+    expect(Object.keys(c.unknown_status ?? {})).toHaveLength(20);
+    expect(c.unknown_status_other).toBe(5);
+  });
+
+  it("counts ROWS, not names, when the omitted status is heavily populated", async () => {
+    // The listing walks newest-first, so `created_at` decides which statuses
+    // get named. Set it explicitly rather than relying on insert order at
+    // millisecond resolution: the whole point is to force the HEAVY status to
+    // be the one left out.
+    const raw = new Database(dbPath);
+    const ins = raw.prepare(
+      "INSERT INTO proposals(id, subject, status, proposal_json, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+    );
+    let id = 1;
+    // 20 distinct statuses, one row each, newest — these fill the 20 slots.
+    for (let i = 1; i <= 20; i++) {
+      const ts = `2026-08-2${i % 10}T12:00:00.000Z`;
+      ins.run(
+        String(id),
+        "fake",
+        `s${i}`,
+        JSON.stringify({ ...makeUnsigned(id), signature: "valid-sig" }),
+        ts,
+        ts,
+      );
+      id++;
+    }
+    // One status holding 50 rows, oldest — omitted from the names.
+    for (let i = 0; i < 50; i++) {
+      const ts = "2026-01-01T00:00:00.000Z";
+      ins.run(
+        String(id),
+        "fake",
+        "bulk",
+        JSON.stringify({ ...makeUnsigned(id), signature: "valid-sig" }),
+        ts,
+        ts,
+      );
+      id++;
+    }
+    raw.close();
+    registerWisecronGateTools(bridge, makeBundle());
+
+    const c = (await bridge.invokeTool(TUNER_STATUS_TOOL, {})) as {
+      total: number;
+      unknown_status?: Record<string, number>;
+      unknown_status_other?: number;
+      unknown_status_names_omitted?: number;
+    };
+    const named = Object.values(c.unknown_status ?? {}).reduce((a, b) => a + b, 0);
+    expect(c.total).toBe(70);
+    // A name count would say "1 omitted" and hide 50 rows.
+    expect(c.unknown_status_names_omitted).toBe(1);
+    expect(c.unknown_status_other).toBe(50);
+    expect(named + (c.unknown_status_other ?? 0)).toBe(70);
+  });
+});
+
+describe("propose — deduped is reported wherever proposed is", () => {
+  it("survives the error path and reaches the audit chain", async () => {
+    const bundle = makeBundle({
+      engine: {
+        runCycle: async () => ({
+          proposals: [makeUnsigned(1), makeUnsigned(2)],
+          observations: 3,
+          clusters: 1,
+        }),
+      },
+    });
+    registerWisecronGateTools(bridge, bundle);
+    await bridge.invokeTool(TUNER_PROPOSE_TOOL, { sinceHours: 12 });
+
+    auditEvents.length = 0;
+    const again = (await bridge.invokeTool(TUNER_PROPOSE_TOOL, { sinceHours: 12 })) as {
+      subjects: Array<{ deduped?: number }>;
+    };
+    expect(again.subjects[0]?.deduped).toBe(2);
+    // An auditor reading the chain must be able to tell "produced nothing"
+    // from "re-presented two known findings".
+    const rec = auditEvents.find((e) => e.event === "gate_propose");
+    expect(rec?.detail?.deduped).toBe(2);
+  });
+
+  it("keeps deduped on the subject row when the cycle then fails", async () => {
+    // First run stores both.
+    registerWisecronGateTools(
+      bridge,
+      makeBundle({
+        engine: {
+          runCycle: async () => ({
+            proposals: [makeUnsigned(1), makeUnsigned(2)],
+            observations: 2,
+            clusters: 1,
+          }),
+        },
+      }),
+    );
+    await bridge.invokeTool(TUNER_PROPOSE_TOOL, { sinceHours: 12 });
+
+    // Second run re-presents both — deduped — and then hits a storage
+    // failure on a third. `deduped` is as measured as `proposed` at that
+    // point, so dropping it is the same absence the code refuses next door.
+    let calls = 0;
+    const flaky = {
+      ...db,
+      persistProposal: (p: Proposal) => {
+        calls++;
+        if (calls > 2) throw new Error("database or disk is full");
+        return db.persistProposal(p);
+      },
+      listProposalsDetailed: () => db.listProposalsDetailed(),
+    };
+    registerWisecronGateTools(
+      bridge,
+      makeBundle({
+        db: flaky,
+        engine: {
+          runCycle: async () => ({
+            proposals: [makeUnsigned(1), makeUnsigned(2), makeUnsigned(3)],
+            observations: 2,
+            clusters: 1,
+          }),
+        },
+      }),
+    );
+    const res = (await bridge.invokeTool(TUNER_PROPOSE_TOOL, { sinceHours: 12 })) as {
+      subjects: Array<{ proposed: number; deduped?: number; error?: string }>;
+    };
+    expect(res.subjects[0]?.error).toContain("disk is full");
+    expect(res.subjects[0]?.proposed).toBe(0);
+    expect(res.subjects[0]?.deduped).toBe(2);
   });
 });

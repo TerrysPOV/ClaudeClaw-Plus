@@ -240,10 +240,13 @@ interface StatusResult {
   refused: number;
   total: number;
   unknown_status?: Record<string, number>;
-  /** Distinct unknown statuses beyond the reported ones. The counts in
-   *  `unknown_status` still sum with the rest to `total` only when this is
-   *  absent; when present, `total` remains the authority. */
-  unknown_status_truncated?: number;
+  /** ROWS whose status is outside the union and whose status name is not
+   *  listed individually in `unknown_status`. Counted so the buckets still
+   *  sum to `total`. */
+  unknown_status_other?: number;
+  /** How many distinct status names were left out of `unknown_status`. This
+   *  one is a name count, and it is never part of the sum. */
+  unknown_status_names_omitted?: number;
   unreadable?: number;
 }
 
@@ -411,6 +414,7 @@ export function registerWisecronGateTools(
       const subjects: ProposeResult["subjects"] = [];
       const rejected: NonNullable<ProposeResult["rejected"]> = [];
       let rejectedTotal = 0;
+      let dedupedTotal = 0;
       let total = 0;
       // Isolation at BOTH loop levels, for the same reason the read path has
       // it: one subject's bad output must not decide the fate of the run.
@@ -440,7 +444,10 @@ export function registerWisecronGateTools(
               // while writing nothing, which is the same summary-that-lies
               // this change set exists to remove.
               if (db.persistProposal(signed)) persisted++;
-              else deduped++;
+              else {
+                deduped++;
+                dedupedTotal++;
+              }
             } catch (err) {
               // ONLY an emit-gate refusal is the subject's own bug. Anything
               // else here — a full disk, a locked database — is the run's
@@ -473,6 +480,11 @@ export function registerWisecronGateTools(
           subjects.push({
             subject: name,
             proposed: persisted,
+            // `deduped` is known here for exactly the reason `proposed` is —
+            // both were counted before the throw. Dropping it would be the
+            // same measurable absence the comment above refuses for its
+            // sibling.
+            ...(deduped > 0 ? { deduped } : {}),
             error: err instanceof Error ? err.message : String(err),
           });
         }
@@ -485,6 +497,12 @@ export function registerWisecronGateTools(
           source,
           window_hours: args.sinceHours,
           total_proposed: total,
+          // An auditor reading the chain must be able to tell "the subject
+          // produced nothing" from "the subject re-presented findings already
+          // stored". Recording it in the response only would repeat, in the
+          // other direction, the mistake of bounding the audit record while
+          // leaving the response beside it unbounded.
+          deduped: dedupedTotal,
           rejected: rejectedTotal,
           failed_subjects: subjects.filter((sub) => sub.error).map((sub) => sub.subject),
         },
@@ -582,7 +600,11 @@ export function registerWisecronGateTools(
     schema: z.object({}),
     handler: (): ListResult => {
       const listing = db.listProposalsDetailed("pending");
-      auditStoreDegraded(audit, source, "pending", listing.unreadable, {}, degradedSeen);
+      // `tuner__pending` IS `list(status=pending)` — same query, same rows.
+      // Keying it under its own name put the tool back into a key that is
+      // supposed to describe the QUERY, and produced two records with
+      // byte-identical fingerprints for one degradation.
+      auditStoreDegraded(audit, source, "list:pending", listing.unreadable, {}, degradedSeen);
       return toListResult(listing);
     },
   });
@@ -751,8 +773,10 @@ export function registerWisecronGateTools(
     description:
       "Counts of proposals by lifecycle status (pending/applied/refused), plus 'total' " +
       "and, when present, 'unknown_status' (rows whose status column is outside the " +
-      "lifecycle union) and 'unreadable' (rows whose stored JSON could not be parsed). " +
-      "The buckets always sum to 'total'.",
+      "lifecycle union), 'unknown_status_other' (rows in such a status whose name is not " +
+      "listed individually) and 'unreadable' (rows whose stored JSON could not be parsed). " +
+      "pending + applied + refused + unknown_status values + unknown_status_other + " +
+      "unreadable always equals 'total'.",
     schema: z.object({}),
     handler: (): StatusResult => {
       // Per-row isolation: this walks EVERY row, including terminal ones no
@@ -801,10 +825,21 @@ export function registerWisecronGateTools(
         total: proposals.length + unreadable.length,
       };
       if (unknownTotal > 0) {
+        // Capped by NAME, never by rows. Bounding the response cannot be
+        // allowed to break the one arithmetic this summary promises: the
+        // buckets must still sum to `total`, so whatever is not named
+        // individually is carried in `unknown_status_other` — a row count,
+        // not a key count. Reporting "5 statuses omitted" would hide however
+        // many rows those statuses held, which is the silent loss this whole
+        // change set exists to remove, reintroduced by a cap meant to prevent
+        // a different one.
         const shown = Object.entries(unknownStatus).slice(0, MAX_DEGRADED_IDS_REPORTED);
         result.unknown_status = Object.fromEntries(shown);
-        const dropped = Object.keys(unknownStatus).length - shown.length;
-        if (dropped > 0) result.unknown_status_truncated = dropped;
+        const named = shown.reduce((a, [, n]) => a + n, 0);
+        if (named < unknownTotal) {
+          result.unknown_status_other = unknownTotal - named;
+          result.unknown_status_names_omitted = Object.keys(unknownStatus).length - shown.length;
+        }
       }
       if (unreadable.length > 0) result.unreadable = unreadable.length;
       // Called unconditionally: a healthy read is what CLEARS the remembered

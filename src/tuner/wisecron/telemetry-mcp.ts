@@ -155,18 +155,28 @@ export function registerHostTelemetryTools(
       // Provenance into the tamper-evident chain: which stream, which (clamped)
       // window, how many samples answered the measurement, whether it was
       // truncated, at which schema version.
-      audit?.append({
-        event: "telemetry_query",
-        detail: {
-          stream: args.stream,
-          window_start: range.start.toISOString(),
-          window_end: range.end.toISOString(),
-          ...(args.filters ? { filters: args.filters } : {}),
-          sample_count: samples.length,
-          ...(truncated ? { truncated: true } : {}),
-          contract_version: provider.contractVersion(),
-        },
-      });
+      //
+      // Best-effort. This is a decoration on a READ, and `AuditLog.append`
+      // reads, stats, renames, mkdirs and appends — five throwable syscalls.
+      // Letting one out would mean a full disk takes down a query that
+      // otherwise had every reason to succeed, which is the opposite trade
+      // from the one auditing is here to make.
+      try {
+        audit?.append({
+          event: "telemetry_query",
+          detail: {
+            stream: args.stream,
+            window_start: range.start.toISOString(),
+            window_end: range.end.toISOString(),
+            ...(args.filters ? { filters: args.filters } : {}),
+            sample_count: samples.length,
+            ...(truncated ? { truncated: true } : {}),
+            contract_version: provider.contractVersion(),
+          },
+        });
+      } catch {
+        // Intentionally swallowed: the caller gets its samples.
+      }
       return {
         stream: args.stream,
         contractVersion: provider.contractVersion(),
