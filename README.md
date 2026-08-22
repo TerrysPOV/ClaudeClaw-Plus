@@ -305,7 +305,7 @@ Net effect: you get the per-PTY process explosion the multiplexer was designed t
 ```
 
 - `shared` — server names (must also exist in `mcp-proxy.json`) the multiplexer hosts. Empty list = dormant; PTY claudes fall back to per-PTY stdio spawns (no protection from the explosion).
-- `stateless` — subset of `shared` for servers with no per-session state; one upstream session shared across all PTYs.
+- `stateless` — subset of `shared` for servers with no per-session state; the multiplexer keeps no session binding on disk for them and replays none at restart. It does **not** change client demultiplexing: every PTY still gets its own MCP session against the multiplexer (a session cannot be shared by two clients), and the upstream child is a single shared process for every server either way.
 - `rateLimit` — per-bearer (= per-PTY) sliding-window cap on `/mcp/<server>` requests. Defense-in-depth for a leaked bearer.
 
 #### Surface coverage: tools only (no resources / prompts / completions)

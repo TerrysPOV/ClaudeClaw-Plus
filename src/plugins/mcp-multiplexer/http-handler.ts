@@ -9,10 +9,18 @@
  *
  * Per-PTY isolation:
  *   - Each (server, ptyId) pair gets its own ephemeral SDK `Server` +
- *     transport pair, lazily created on first request.
- *   - For servers in `settings.mcp.stateless`, the (ptyId) dimension is
- *     collapsed — a single `Server` + transport pair is shared across
- *     all PTYs. Per-PTY HMAC verification still gates access.
+ *     transport pair, lazily created on first request. This holds for
+ *     EVERY server, `settings.mcp.stateless` included: a bucket is the
+ *     client-facing MCP session, and an MCP session cannot be shared by
+ *     two clients. The SDK transport rejects a second `initialize` with
+ *     `400 -32600 "Server already initialized"`, which a client reads as
+ *     an unreachable server and drops — so collapsing the (ptyId)
+ *     dimension made a stateless server single-client in practice.
+ *   - `settings.mcp.stateless` therefore scopes DOWNSTREAM state only:
+ *     no session binding is persisted and none is replayed at restart
+ *     (`installResumedBucket` refuses). The upstream child is a single
+ *     shared process for every bucket regardless of the marker, so
+ *     per-PTY buckets add no upstream cost — only the facing transport.
  *   - Identity teardown (`McpMultiplexerPlugin.releaseIdentity(ptyId)`)
  *     calls `releasePty(ptyId)` here to tear down the per-PTY transport.
  *
@@ -30,14 +38,9 @@ import type { McpServerProcess } from "../mcp-proxy/server-process.js";
 import { AUTH_HEADER, PTY_ID_HEADER, PTY_TS_HEADER, verifyBearer } from "./pty-identity.js";
 import type { SessionPersistenceStore } from "./session-persistence.js";
 
-/** Sentinel used when a server is declared stateless: all PTYs collapse
- *  to a single (server, *) bucket so they share one upstream session.
- *  Per-PTY auth verification still happens before any routing. */
-const STATELESS_BUCKET = "__stateless__";
-
 /** Pair of objects making up a live MCP session against this server. */
 interface ServerBucket {
-  /** Owner ptyId or `STATELESS_BUCKET`. */
+  /** Owner ptyId. One bucket per client, stateless servers included. */
   bucketKey: string;
   sdkServer: Server;
   transport: WebStandardStreamableHTTPServerTransport;
@@ -383,7 +386,10 @@ export class McpHttpHandler {
     }
 
     // ── Dispatch to per-(server, pty) bucket ──────────────────────────
-    const bucketKey = this.stateless ? STATELESS_BUCKET : ptyId;
+    // Keyed on ptyId for every server. A `stateless` server used to
+    // collapse to one shared bucket here; that made its SECOND client
+    // fail its `initialize` and drop the server (see the header note).
+    const bucketKey = ptyId;
     let bucket = this.buckets.get(bucketKey);
     const isNewBucket = !bucket;
     if (!bucket) {
@@ -465,16 +471,17 @@ export class McpHttpHandler {
     // (the normal `releaseIdentity` → `issueIdentity` rotation in
     // index.ts), the fresh bearer would otherwise inherit the prior
     // session's timestamps and immediately hit 429s based on traffic
-    // it didn't originate. Cleared unconditionally — stateless handlers
-    // still keyed the window by ptyId (we use `STATELESS_BUCKET` for
-    // the SDK session, but `_checkRateLimit` keys on the actual ptyId).
+    // it didn't originate.
     this._rlWindows.delete(ptyId);
     // Same hygiene for the cost-tracking metrics (issue #68): drop any
     // tuples scoped to this PTY so stale percentiles from the reaped
     // session don't bleed into the next bucket. 5-agent review on
     // PR #cost-metrics flagged this class from PR #91 P2.
     getMetricsRegistry().releasePty(this.serverName, ptyId);
-    if (this.stateless) return; // no per-PTY bucket exists
+    // Stateless servers own a per-PTY bucket like every other server and
+    // must be torn down here too; only their persistence is skipped
+    // (`this.persistence` is undefined for them, so the drop below is a
+    // no-op rather than a special case).
     // Drop the persisted record FIRST so that even if the bucket's
     // already gone (race with transport_error path) the disk state is
     // still cleaned up.

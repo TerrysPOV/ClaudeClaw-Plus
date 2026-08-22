@@ -733,7 +733,7 @@ describe("session-persistence integration — kill-switch", () => {
 // ── 7) Stateless server is not persisted ────────────────────────────────────
 
 describe("session-persistence integration — stateless server skips persistence", () => {
-  it("stateless server creates a collapsed bucket but never writes to disk", {
+  it("stateless server gets a normal per-PTY bucket but never writes to disk", {
     timeout: 10000,
   }, async () => {
     const cfg = writeProxyConfig(tmpDir, ["alpha", "beta"]);
@@ -769,13 +769,16 @@ describe("session-persistence integration — stateless server skips persistence
       // Window for any fire-and-forget.
       await new Promise((r) => setTimeout(r, 100));
 
-      // Beta bucket collapsed to the sentinel.
+      // The `stateless` marker scopes DOWNSTREAM state only: the bucket
+      // is the client-facing MCP session and is keyed per-PTY like any
+      // other server's. What the marker buys is everything below — no
+      // file, no audit, nothing to replay.
       const betaH = plugin._getHandler("beta")?.health() as {
         bucket_keys: string[];
         stateless: boolean;
       };
       expect(betaH.stateless).toBe(true);
-      expect(betaH.bucket_keys).toEqual(["__stateless__"]);
+      expect(betaH.bucket_keys).toEqual(["pty-s"]);
 
       // No persistence file for beta.
       expect(existsSync(join(persistRoot, "beta.json"))).toBe(false);
