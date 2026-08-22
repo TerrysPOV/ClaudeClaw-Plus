@@ -194,13 +194,40 @@ describe("McpHttpHandler — successful auth + RPC dispatch", () => {
     expect(remaining).not.toContain("suzy");
   });
 
-  it("stateless handler does not have per-PTY buckets", async () => {
+  it("stateless handler keys buckets per PTY and releasePty tears them down", async () => {
     await handler!.stop();
     handler = new McpHttpHandler({ serverName: "test", proc: proc!, stateless: true });
-    // releasePty is a no-op for stateless
+    const a = issueIdentity("suzy");
+
+    await handler.handle(
+      rpcRequest(
+        {
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            clientInfo: { name: "test", version: "1.0" },
+          },
+        },
+        { [PTY_ID_HEADER]: "suzy", [AUTH_HEADER]: a.headers[AUTH_HEADER] },
+      ),
+    );
+
+    const before = handler.health();
+    expect(before.stateless).toBe(true);
+    // The marker does not collapse the key space: a stateless server owns a
+    // bucket per PTY like any other.
+    expect(before.bucket_keys as string[]).toEqual(["suzy"]);
+
+    // And that bucket is genuinely reclaimed on identity teardown. This is
+    // the half of the per-PTY fix that an earlier `if (this.stateless)
+    // return` in `releasePty` would silently skip — leaking the transport
+    // and leaving the next identity for this ptyId to collide with a stale
+    // initialized session.
     await handler.releasePty("suzy");
-    const h = handler.health();
-    expect(h.stateless).toBe(true);
+    expect(handler.health().bucket_keys as string[]).toEqual([]);
   });
 });
 

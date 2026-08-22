@@ -257,7 +257,9 @@ async releaseIdentity(ptyId: string): Promise<void> {
 
 `releasePty(ptyId)` (`http-handler.ts:186-199`) deletes the bucket from the map and closes both the SDK server and the transport. Idempotent — safe to call for a never-issued ptyId.
 
-For stateless servers (`http-handler.ts:189`), `releasePty` is a no-op because the bucket is keyed on `STATELESS_BUCKET` not `ptyId`. That's correct (the bucket is shared and survives PTY lifecycle), but means PTY teardown does NOT clean up the upstream session for stateless servers. **This is by design** (per `http-handler.ts:33-36` comment) but worth confirming with the operator: if a stateless server holds per-PTY state inside its own process (e.g. graphiti's group_id), that state will outlive the PTY. The same was already true before this milestone, so it's not a regression — just worth knowing.
+~~For stateless servers, `releasePty` is a no-op because the bucket is keyed on `STATELESS_BUCKET` not `ptyId`.~~ **Superseded.** The bucket collapse this described was removed: a bucket is the client-facing MCP session, and an MCP session cannot be shared by two clients, so a collapsed bucket made a stateless server single-client (the second client's `initialize` drew `400 -32600 "Server already initialized"` and it dropped the server). Buckets are now keyed on `ptyId` for every server, `stateless` included, and `releasePty` tears them down uniformly.
+
+The residual worth knowing is unchanged and unrelated to keying: the upstream child is a single shared process for every bucket either way, so if a shared server holds per-PTY state inside its own process (e.g. graphiti's `group_id`), that state outlives any one PTY.
 
 `stop()` (`index.ts:287-307`) tears down everything in order: stop probe → unregister plugin from bridge → unregister gateway routes → stop handlers → stop server processes → clear caches. **PASS.**
 
