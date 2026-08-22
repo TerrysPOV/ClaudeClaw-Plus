@@ -18,15 +18,6 @@ export interface SlackAdapterConfig {
 }
 
 // Slack Block Kit limits we enforce defensively
-/** Slack caps an `actions` block at 25 elements and rejects the whole message
- *  past it. Refuse and Edit take two, leaving 23 for Apply buttons. */
-const MAX_ACTIONS_ELEMENTS = 25;
-const MAX_APPLY_BUTTONS = MAX_ACTIONS_ELEMENTS - 2;
-
-/** Slack truncates/rejects a section block's text past this. The proposal text
- *  grows with the alternative count, so it is reached before the button cap. */
-const MAX_SECTION_TEXT = 3000;
-
 const MAX_BUTTON_TEXT = 75; // chars
 const MAX_ACTION_VALUE = 2000; // chars
 const MAX_ACTION_ID = 255; // chars
@@ -47,25 +38,13 @@ export class SlackAdapter extends Adapter {
 
   async renderProposal(proposal: Proposal): Promise<void> {
     const baseUrl = this.cfg.baseUrl ?? "https://slack.com/api";
-    // Block Kit actions block — one Apply per alternative + Refuse + Edit.
-    // Slack rejects the message outright past 25 elements in an `actions`
-    // block, and the read path deliberately no longer bounds `alternatives`,
-    // so a legacy row can exceed it. Enforcing the limit here rather than
-    // leaning on the emit guard: that guard does not apply to a row already
-    // on disk, which is precisely the row this code has to render.
-    const shownAlternatives = proposal.alternatives.slice(0, MAX_APPLY_BUTTONS);
-    const hiddenCount = proposal.alternatives.length - shownAlternatives.length;
-    const notice =
-      hiddenCount > 0
-        ? `\n\n_${shownAlternatives.length} of ${proposal.alternatives.length} alternatives have a button here; apply the rest with \`tuner__apply\`._`
-        : "";
-    // Body first, notice last: the sentence explaining the gap must survive
-    // the trim, and the message has to fit at all before either matters.
-    const headerText =
-      truncate(this.formatProposalText(proposal), MAX_SECTION_TEXT - notice.length) + notice;
+    const headerText = this.formatProposalText(proposal);
 
+    // Block Kit actions block — one Apply per alternative + Refuse + Edit.
+    // Slack allows up to 25 buttons per `actions` block; alternatives are
+    // capped at 3 by AlternativeSchema so the whole row always fits.
     const elements = [
-      ...shownAlternatives.map((alt) => ({
+      ...proposal.alternatives.map((alt) => ({
         type: "button",
         text: {
           type: "plain_text",

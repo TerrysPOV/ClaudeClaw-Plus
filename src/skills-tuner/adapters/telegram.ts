@@ -2,18 +2,6 @@ import { Adapter } from "../core/interfaces.js";
 import type { Proposal } from "../core/types.js";
 import type { CallbackHandler } from "./base.js";
 
-/** Buttons per inline-keyboard row — a phone-width compromise. */
-const MAX_BUTTONS_PER_ROW = 2;
-
-/** Telegram rejects the WHOLE sendMessage if any button's `callback_data`
- *  exceeds this, with BUTTON_DATA_INVALID. `alternatives[].id` is an unbounded
- *  string, so this is reachable — and unlike Discord's `custom_id`, truncating
- *  is not an option: the callback handler parses the id back out of it. */
-const MAX_CALLBACK_DATA_BYTES = 64;
-
-/** Telegram's sendMessage text limit. */
-const MAX_TEXT = 4096;
-
 export interface TelegramAdapterConfig {
   botToken: string;
   chatId: string;
@@ -33,40 +21,13 @@ export class TelegramAdapter extends Adapter {
 
   async renderProposal(proposal: Proposal): Promise<void> {
     const baseUrl = this.cfg.baseUrl ?? "https://api.telegram.org";
-    const rawText = this.formatProposalText(proposal);
-    // Chunked rather than one row of everything: the read path no longer
-    // bounds `alternatives`, and a single row of a dozen buttons is unusable
-    // on a phone, which is where these are read.
-    //
-    // A button whose callback payload is over Telegram's limit is left out
-    // rather than allowed to sink the whole message. That is a real
-    // possibility, not a theoretical one — the alternative id is an unbounded
-    // string — and dropping ONE button beats delivering none.
-    const usable = proposal.alternatives.filter(
-      (alt) =>
-        Buffer.byteLength("apply:" + proposal.id + ":" + alt.id, "utf8") <= MAX_CALLBACK_DATA_BYTES,
-    );
-    const droppedCount = proposal.alternatives.length - usable.length;
-    const notice =
-      droppedCount > 0
-        ? `\n\n${usable.length} of ${proposal.alternatives.length} alternatives have a button here; apply the rest with tuner__apply.`
-        : "";
-    // Body trimmed first so the notice survives, and so the message fits at
-    // all: the proposal text grows with the alternative count.
-    const text = rawText.slice(0, MAX_TEXT - notice.length) + notice;
-
-    const applyRows: Array<Array<{ text: string; callback_data: string }>> = [];
-    for (let i = 0; i < usable.length; i += MAX_BUTTONS_PER_ROW) {
-      applyRows.push(
-        usable.slice(i, i + MAX_BUTTONS_PER_ROW).map((alt) => ({
+    const text = this.formatProposalText(proposal);
+    const reply_markup = {
+      inline_keyboard: [
+        proposal.alternatives.map((alt) => ({
           text: "Apply " + alt.id + ": " + alt.label.slice(0, 30),
           callback_data: "apply:" + proposal.id + ":" + alt.id,
         })),
-      );
-    }
-    const reply_markup = {
-      inline_keyboard: [
-        ...applyRows,
         [
           { text: "Refuse", callback_data: "refuse:" + proposal.id },
           { text: "Edit", callback_data: "edit:" + proposal.id },
