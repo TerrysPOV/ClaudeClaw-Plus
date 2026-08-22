@@ -33,6 +33,13 @@ export type AuditEvent =
   | "gate_apply"
   | "gate_refuse"
   | "gate_mature"
+  // Store degradation observed while serving a listing: rows whose stored JSON
+  // no longer parses, or whose status column holds a value outside the
+  // lifecycle union. Those rows are isolated rather than allowed to abort the
+  // query, so without this record a store rotting is discoverable only by a
+  // human happening to read past `count` in a live tool response. detail
+  // carries source, the unreadable ids, and the unknown status values + counts.
+  | "gate_store_degraded"
   // Provenance: the active global + per-subject tuning scope at boot/registration.
   // An auditor reads "the tuner operated at scope=X" from one immutable record.
   | "scope_registration"

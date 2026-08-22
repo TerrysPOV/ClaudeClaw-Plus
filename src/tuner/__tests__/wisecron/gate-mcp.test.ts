@@ -15,8 +15,8 @@ import { join } from "node:path";
 
 import { PluginMcpBridge } from "../../../plugins/mcp-bridge.js";
 import { WisecronStateDB } from "../../wisecron/state-db.js";
-import type { ProposalStatus } from "../../wisecron/state-db.js";
 import type { WisecronBundle } from "../../../skills-tuner/cli/wisecron-bootstrap.js";
+import { MAX_ALTERNATIVES } from "../../../skills-tuner/core/types.js";
 import type { Proposal, UnsignedProposal } from "../../../skills-tuner/core/types.js";
 import {
   registerWisecronGateTools,
@@ -62,11 +62,15 @@ function seedPending(id: number, overrides: Partial<Proposal> = {}): void {
  * a test for read-path tolerance must not lean on the write path tolerating the
  * same thing.
  */
-function seedLegacyRow(
-  id: number,
-  overrides: Partial<Proposal> = {},
-  status: ProposalStatus = "pending",
-): void {
+/**
+ * `status` is a plain `string`, not `ProposalStatus`, deliberately. A
+ * production store holds rows in status `rejected` — a value nothing in this
+ * codebase writes any more and that the union does not contain. Typing this
+ * parameter to the union made the suite structurally incapable of writing the
+ * shape that is actually on disk, which is exactly how the phantom-bucket
+ * defect reached a green build.
+ */
+function seedLegacyRow(id: number, overrides: Partial<Proposal> = {}, status = "pending"): void {
   const proposal = { ...makeUnsigned(id), signature: "valid-sig", ...overrides } as Proposal;
   const raw = new Database(dbPath);
   const now = new Date().toISOString();
@@ -319,7 +323,125 @@ describe("tuner__pending / tuner__list / tuner__status", () => {
     db.setProposalStatus("3", "refused");
     registerWisecronGateTools(bridge, makeBundle());
     const counts = (await bridge.invokeTool(TUNER_STATUS_TOOL, {})) as Record<string, number>;
-    expect(counts).toEqual({ pending: 2, applied: 0, refused: 1 });
+    expect(counts).toEqual({ pending: 2, applied: 0, refused: 1, total: 3 });
+  });
+});
+
+describe("propose — one bad proposal is not the run's problem", () => {
+  /** More alternatives than the runaway guard permits. */
+  const tooMany = Array.from({ length: MAX_ALTERNATIVES + 1 }, (_, i) => ({
+    id: `a${i + 1}`,
+    label: "",
+    diff_or_content: "after",
+    tradeoff: "",
+  }));
+
+  it("persists the good proposals, names the refused one, and still audits the run", async () => {
+    registerWisecronGateTools(
+      bridge,
+      makeBundle({
+        engine: {
+          runCycle: async () => ({
+            proposals: [makeUnsigned(10), makeUnsigned(11, { alternatives: tooMany }), makeUnsigned(12)],
+            observations: 3,
+            clusters: 1,
+          }),
+        },
+      }),
+    );
+
+    const res = (await bridge.invokeTool(TUNER_PROPOSE_TOOL, { sinceHours: 12 })) as {
+      total_proposed: number;
+      subjects: Array<{ subject: string; proposed: number }>;
+      rejected?: Array<{ subject: string; id: number; error: string }>;
+    };
+
+    // The two well-formed proposals landed. Without per-proposal isolation the
+    // throw escapes mid-loop: #10 stays on disk, #12 never gets written, and
+    // the caller sees a bare ZodError.
+    expect(res.total_proposed).toBe(2);
+    expect(db.listProposalsDetailed().proposals.map((p) => p.id).sort()).toEqual(["10", "12"]);
+
+    // The refusal is reported with enough to find the culprit.
+    expect(res.rejected).toHaveLength(1);
+    expect(res.rejected?.[0]?.id).toBe(11);
+    expect(res.rejected?.[0]?.subject).toBe("fake");
+    expect(res.rejected?.[0]?.error ?? "").toContain("alternatives");
+
+    // And the run is in the audit chain. A cycle that refused something still
+    // happened — that is precisely the one an auditor needs to find later.
+    const propose = auditEvents.find((e) => e.event === "gate_propose");
+    expect(propose).toBeDefined();
+    expect(propose?.detail?.rejected).toBe(1);
+  });
+
+  it("a subject whose cycle throws does not take the other subjects down", async () => {
+    registerWisecronGateTools(
+      bridge,
+      makeBundle({
+        registry: {
+          allSubjects: () => [{ name: "boom" }, { name: "fake" }],
+          getSubject: (n: string) => ({ name: n }),
+        },
+        engine: {
+          runCycle: async (name: string) => {
+            if (name === "boom") throw new Error("subject exploded");
+            return { proposals: [makeUnsigned(20)], observations: 1, clusters: 1 };
+          },
+        },
+      }),
+    );
+
+    const res = (await bridge.invokeTool(TUNER_PROPOSE_TOOL, { sinceHours: 12 })) as {
+      total_proposed: number;
+      subjects: Array<{ subject: string; proposed: number; error?: string }>;
+    };
+
+    expect(res.total_proposed).toBe(1);
+    expect(res.subjects.find((sub) => sub.subject === "boom")?.error).toContain("exploded");
+    expect(res.subjects.find((sub) => sub.subject === "fake")?.proposed).toBe(1);
+    expect(auditEvents.find((e) => e.event === "gate_propose")).toBeDefined();
+  });
+});
+
+describe("propose_external — dedup tells apart 'recorded' from 'usable'", () => {
+  it("flags a dedup that matched a row the read path cannot rehydrate", async () => {
+    registerWisecronGateTools(bridge, makeBundle(), { source: "research" });
+
+    const args = {
+      subject: "fake",
+      kind: "noop",
+      target_path: join(tmpDir, "target-ext.txt"),
+      pattern_signature: "research:dup-check",
+      alternatives: [{ id: "a1", label: "", diff_or_content: "after", tradeoff: "" }],
+    };
+
+    const first = (await bridge.invokeTool(TUNER_PROPOSE_EXTERNAL_TOOL, args)) as {
+      id: string;
+      deduped: boolean;
+      existing_unreadable?: boolean;
+    };
+    expect(first.deduped).toBe(false);
+    expect(first.existing_unreadable).toBeUndefined();
+
+    // Corrupt the stored row behind the write path, the way an older binary
+    // would have left it.
+    const raw = new Database(dbPath);
+    raw
+      .prepare("UPDATE proposals SET proposal_json = ? WHERE id = ?")
+      .run(JSON.stringify({ not: "a proposal" }), first.id);
+    raw.close();
+
+    const again = (await bridge.invokeTool(TUNER_PROPOSE_EXTERNAL_TOOL, args)) as {
+      deduped: boolean;
+      existing_unreadable?: boolean;
+    };
+    // Dedup is still right — the row exists. But saying only that would tell
+    // the caller its finding is queued for review when the row cannot be
+    // listed, applied or refused, and the deterministic id means every future
+    // re-injection lands on the same unusable bytes.
+    expect(again.deduped).toBe(true);
+    expect(again.existing_unreadable).toBe(true);
   });
 });
 
@@ -357,7 +479,76 @@ describe("listing surfaces — rows the read path cannot rehydrate", () => {
     registerWisecronGateTools(bridge, makeBundle());
 
     const counts = (await bridge.invokeTool(TUNER_STATUS_TOOL, {})) as Record<string, number>;
-    expect(counts).toEqual({ pending: 1, applied: 0, refused: 2, unreadable: 1 });
+    expect(counts).toEqual({ pending: 1, applied: 0, refused: 2, total: 4, unreadable: 1 });
+  });
+
+  it("buckets a status value outside the lifecycle union instead of dropping it", async () => {
+    seedPending(1);
+    // The real production shape: three rows the daily cron left in `rejected`,
+    // a status this binary no longer writes. They parse fine — so `unreadable`
+    // never fires — and `counts[row.status]++` on a missing key yields NaN,
+    // which crosses the MCP wire as `null`. The rows vanish from every bucket
+    // and nothing in the response says so.
+    seedLegacyRow(2, {}, "rejected");
+    seedLegacyRow(3, {}, "rejected");
+    registerWisecronGateTools(bridge, makeBundle());
+
+    const counts = (await bridge.invokeTool(TUNER_STATUS_TOOL, {})) as Record<string, unknown>;
+    expect(counts).toEqual({
+      pending: 1,
+      applied: 0,
+      refused: 0,
+      total: 3,
+      unknown_status: { rejected: 2 },
+    });
+  });
+
+  it("the buckets always sum to total, whatever the store holds", async () => {
+    seedPending(1);
+    seedPending(2);
+    db.setProposalStatus("2", "applied");
+    seedLegacyRow(3, {}, "rejected");
+    seedLegacyRow(4, { alternatives: legacyAlts }, "refused");
+    seedLegacyRow(5, { signature: "" });
+    registerWisecronGateTools(bridge, makeBundle());
+
+    const c = (await bridge.invokeTool(TUNER_STATUS_TOOL, {})) as {
+      pending: number;
+      applied: number;
+      refused: number;
+      total: number;
+      unknown_status?: Record<string, number>;
+      unreadable?: number;
+    };
+    const bucketed =
+      c.pending +
+      c.applied +
+      c.refused +
+      Object.values(c.unknown_status ?? {}).reduce((a, b) => a + b, 0) +
+      (c.unreadable ?? 0);
+    // The arithmetic is the guarantee. A summary that loses a row stops adding
+    // up instead of looking clean.
+    expect(bucketed).toBe(c.total);
+    expect(c.total).toBe(5);
+  });
+
+  it("does not collapse when EVERY row is unreadable", async () => {
+    // The reported outage in its purest form. A version that throws here —
+    // rather than returning zeros plus a count — passes every other test in
+    // this file.
+    seedLegacyRow(1, { signature: "" });
+    seedLegacyRow(2, { signature: "" });
+    registerWisecronGateTools(bridge, makeBundle());
+
+    const counts = (await bridge.invokeTool(TUNER_STATUS_TOOL, {})) as Record<string, unknown>;
+    expect(counts).toEqual({ pending: 0, applied: 0, refused: 0, total: 2, unreadable: 2 });
+
+    const listing = (await bridge.invokeTool(TUNER_LIST_TOOL, {})) as {
+      count: number;
+      unreadable?: unknown[];
+    };
+    expect(listing.count).toBe(0);
+    expect(listing.unreadable).toHaveLength(2);
   });
 
   it("list and pending return the good rows and name the skipped one", async () => {

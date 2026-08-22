@@ -42,6 +42,7 @@ import type {
   UnreadableProposalRow,
 } from "./state-db.js";
 import type { AppliedBy } from "./types.js";
+import { MAX_ALTERNATIVES } from "../../skills-tuner/core/types.js";
 import type { UnsignedProposal } from "../../skills-tuner/core/types.js";
 
 /** Provenance tag carried in pattern_signature for research-sourced proposals. */
@@ -127,7 +128,10 @@ const ExternalArgs = z.object({
       }),
     )
     .min(1)
-    .max(3),
+    // Same runaway guard as the in-tree emit path — one bound, one meaning.
+    // An external subject that legitimately has five options for a capability
+    // should not be held to a stricter shape than a built-in one.
+    .max(MAX_ALTERNATIVES),
 });
 
 const ListArgs = z.object({
@@ -155,7 +159,28 @@ const MatureArgs = z.object({
 interface ProposeResult {
   window_hours: number;
   total_proposed: number;
-  subjects: Array<{ subject: string; observations: number; clusters: number; proposed: number }>;
+  subjects: Array<{
+    subject: string;
+    observations: number;
+    clusters: number;
+    proposed: number;
+    /** Present when this subject's cycle failed outright; the rest of the run
+     *  continued without it. */
+    error?: string;
+  }>;
+  /** Proposals the emit gate refused, named so an operator can find the
+   *  culprit. A refusal is one subject's bug, not the run's. */
+  rejected?: Array<{ subject: string; id: number; error: string }>;
+}
+
+interface ProposeExternalResult {
+  id: string;
+  subject: string;
+  pattern_signature: string;
+  deduped: boolean;
+  /** Set when the dedup matched a row that no longer rehydrates: the proposal
+   *  is on disk but unusable, so `deduped: true` alone would overstate it. */
+  existing_unreadable?: boolean;
 }
 
 /** A compact view of a stored proposal for the wire (full Proposal omitted). */
@@ -186,6 +211,50 @@ function toView(p: StoredProposal): ProposalView {
  * rehydrate: the good rows still come back, and the rows that were skipped are
  * named here rather than dropped without a trace.
  */
+/**
+ * Summary shape for `tuner__status`.
+ *
+ * Every row on disk lands in exactly one bucket and the buckets sum to
+ * `total`, so a summary that quietly loses rows stops adding up rather than
+ * looking clean. `unknown_status` and `unreadable` are the two ways a row can
+ * fall outside the lifecycle union — a status column value this binary no
+ * longer writes, and stored JSON that no longer parses.
+ */
+interface StatusResult {
+  pending: number;
+  applied: number;
+  refused: number;
+  total: number;
+  unknown_status?: Record<string, number>;
+  unreadable?: number;
+}
+
+/**
+ * Record store degradation in the audit chain.
+ *
+ * Without this, an unreadable or unknown-status row is discoverable only if a
+ * human happens to call a listing tool and happens to read past `count`. Every
+ * other gate event is audited; a store quietly rotting should be too, so there
+ * is a trail to read afterwards instead of a live query to catch in the act.
+ */
+function auditStoreDegraded(
+  audit: WisecronBundle["audit"],
+  source: string,
+  unreadable: readonly UnreadableProposalRow[],
+  unknownStatus: Record<string, number> = {},
+): void {
+  if (unreadable.length === 0 && Object.keys(unknownStatus).length === 0) return;
+  audit?.append({
+    event: "gate_store_degraded",
+    detail: {
+      source,
+      unreadable: unreadable.length,
+      unreadable_ids: unreadable.map((r) => r.id),
+      unknown_status: unknownStatus,
+    },
+  });
+}
+
 interface ListResult {
   count: number;
   proposals: ProposalView[];
@@ -236,27 +305,64 @@ export function registerWisecronGateTools(
       const names = args.subject ? [args.subject] : registry.allSubjects().map((s) => s.name);
       const secret = loadSecret();
       const subjects: ProposeResult["subjects"] = [];
+      const rejected: NonNullable<ProposeResult["rejected"]> = [];
       let total = 0;
+      // Isolation at BOTH loop levels, for the same reason the read path has
+      // it: one subject's bad output must not decide the fate of the run.
+      // Without it a single refusal aborts the cycle mid-flight — subjects
+      // already walked keep their persisted rows, subjects after it never run,
+      // and the `gate_propose` record below never lands, so the audit chain
+      // shows no propose attempt at all despite rows having been written.
       for (const name of names) {
         if (!registry.getSubject(name)) continue;
-        const result = await engine.runCycle(name, since);
-        for (const unsigned of result.proposals) {
-          const signed = { ...unsigned, signature: computeProposalSignature(unsigned, secret) };
-          db.persistProposal(signed);
+        try {
+          const result = await engine.runCycle(name, since);
+          let persisted = 0;
+          for (const unsigned of result.proposals) {
+            const signed = { ...unsigned, signature: computeProposalSignature(unsigned, secret) };
+            try {
+              db.persistProposal(signed);
+              persisted++;
+            } catch (err) {
+              rejected.push({
+                subject: name,
+                id: unsigned.id,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+          total += persisted;
+          subjects.push({
+            subject: name,
+            observations: result.observations,
+            clusters: result.clusters,
+            proposed: persisted,
+          });
+        } catch (err) {
+          subjects.push({
+            subject: name,
+            observations: 0,
+            clusters: 0,
+            proposed: 0,
+            error: err instanceof Error ? err.message : String(err),
+          });
         }
-        total += result.proposals.length;
-        subjects.push({
-          subject: name,
-          observations: result.observations,
-          clusters: result.clusters,
-          proposed: result.proposals.length,
-        });
       }
+      // Appended unconditionally: a run that refused everything still happened,
+      // and that is precisely the run an auditor needs to find later.
       audit?.append({
         event: "gate_propose",
-        detail: { source, window_hours: args.sinceHours, total_proposed: total },
+        detail: {
+          source,
+          window_hours: args.sinceHours,
+          total_proposed: total,
+          rejected: rejected.length,
+          failed_subjects: subjects.filter((sub) => sub.error).map((sub) => sub.subject),
+        },
       });
-      return { window_hours: args.sinceHours, total_proposed: total, subjects };
+      const out: ProposeResult = { window_hours: args.sinceHours, total_proposed: total, subjects };
+      if (rejected.length > 0) out.rejected = rejected;
+      return out;
     },
   });
 
@@ -291,6 +397,12 @@ export function registerWisecronGateTools(
       // Existence only: dedup does not need the row's contents, and a row the
       // read schema cannot parse must not turn a re-injection into a hard error.
       const deduped = db.hasProposal(String(id));
+      // But "already recorded" and "already usable" are not the same claim. If
+      // the existing row no longer rehydrates, a bare `deduped: true` tells the
+      // caller its finding is queued for review when in fact the row cannot be
+      // listed, applied, or refused — and the deterministic id means every
+      // future re-injection dedups against the same unusable bytes. Say so.
+      const existingUnreadable = deduped && !db.isProposalReadable(String(id));
       const unsigned: UnsignedProposal = {
         id,
         cluster_id: sig,
@@ -311,9 +423,17 @@ export function registerWisecronGateTools(
           id: String(id),
           subject: args.subject,
           deduped,
+          existing_unreadable: existingUnreadable,
         },
       });
-      return { id: String(id), subject: args.subject, pattern_signature: sig, deduped };
+      const out: ProposeExternalResult = {
+        id: String(id),
+        subject: args.subject,
+        pattern_signature: sig,
+        deduped,
+      };
+      if (existingUnreadable) out.existing_unreadable = true;
+      return out;
     },
   });
 
@@ -323,7 +443,11 @@ export function registerWisecronGateTools(
       "List persisted proposals awaiting apply (status=pending). Rows that fail to " +
       "parse are reported under 'unreadable' instead of failing the listing.",
     schema: z.object({}),
-    handler: (): ListResult => toListResult(db.listProposalsDetailed("pending")),
+    handler: (): ListResult => {
+      const listing = db.listProposalsDetailed("pending");
+      auditStoreDegraded(audit, source, listing.unreadable);
+      return toListResult(listing);
+    },
   });
 
   bridge.registerPluginTool(GATE_PLUGIN_ID, {
@@ -332,8 +456,11 @@ export function registerWisecronGateTools(
       "List proposals, optionally filtered by status (pending|applied|refused). Rows " +
       "that fail to parse are reported under 'unreadable' instead of failing the listing.",
     schema: ListArgs,
-    handler: (args: z.infer<typeof ListArgs>): ListResult =>
-      toListResult(db.listProposalsDetailed(args.status)),
+    handler: (args: z.infer<typeof ListArgs>): ListResult => {
+      const listing = db.listProposalsDetailed(args.status);
+      auditStoreDegraded(audit, source, listing.unreadable);
+      return toListResult(listing);
+    },
   });
 
   bridge.registerPluginTool(GATE_PLUGIN_ID, {
@@ -476,18 +603,51 @@ export function registerWisecronGateTools(
   bridge.registerPluginTool(GATE_PLUGIN_ID, {
     name: "status",
     description:
-      "Counts of proposals by lifecycle status (pending/applied/refused), plus an " +
-      "'unreadable' count when some stored row could not be parsed.",
+      "Counts of proposals by lifecycle status (pending/applied/refused), plus 'total' " +
+      "and, when present, 'unknown_status' (rows whose status column is outside the " +
+      "lifecycle union) and 'unreadable' (rows whose stored JSON could not be parsed). " +
+      "The buckets always sum to 'total'.",
     schema: z.object({}),
-    handler: (): Record<ProposalStatus, number> & { unreadable?: number } => {
-      const counts: Record<ProposalStatus, number> = { pending: 0, applied: 0, refused: 0 };
+    handler: (): StatusResult => {
       // Per-row isolation: this walks EVERY row, including terminal ones no
       // caller will ever act on again, so one unparseable row must not be able
       // to take the whole summary down with it. Skipped rows are counted out
       // loud rather than folded into a status bucket.
       const { proposals, unreadable } = db.listProposalsDetailed();
-      for (const p of proposals) counts[p.status]++;
-      return unreadable.length > 0 ? { ...counts, unreadable: unreadable.length } : counts;
+
+      const counts = { pending: 0, applied: 0, refused: 0 };
+      // The status COLUMN is legacy drift's other surface, and it is not
+      // covered by the JSON read schema. A production store holds rows in
+      // status 'rejected' — a value nothing in this codebase writes any more
+      // and that `ProposalStatus` does not contain. Incrementing
+      // `counts[row.status]` for it yields `undefined + 1 = NaN`, which
+      // serialises over the MCP wire as `null`: a phantom bucket, three rows
+      // silently missing from the totals, and no `unreadable` entry to hint
+      // at it, because the row parsed perfectly well. Bucket it by name
+      // instead, so an operator sees what the value is and how many.
+      const unknownStatus: Record<string, number> = {};
+      for (const p of proposals) {
+        if (p.status === "pending" || p.status === "applied" || p.status === "refused") {
+          counts[p.status]++;
+        } else {
+          unknownStatus[p.status] = (unknownStatus[p.status] ?? 0) + 1;
+        }
+      }
+
+      const unknownTotal = Object.values(unknownStatus).reduce((a, b) => a + b, 0);
+      const result: StatusResult = {
+        ...counts,
+        // `total` is the arithmetic the caller can check. Every row on disk
+        // lands in exactly one bucket, so a summary that loses rows stops
+        // adding up instead of looking clean.
+        total: proposals.length + unreadable.length,
+      };
+      if (unknownTotal > 0) result.unknown_status = unknownStatus;
+      if (unreadable.length > 0) result.unreadable = unreadable.length;
+      if (unknownTotal > 0 || unreadable.length > 0) {
+        auditStoreDegraded(audit, source, unreadable, unknownStatus);
+      }
+      return result;
     },
   });
 

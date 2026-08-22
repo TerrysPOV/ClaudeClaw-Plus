@@ -24,11 +24,20 @@ import { join } from "node:path";
 import { WisecronStateDB } from "../../wisecron/state-db.js";
 import type { ProposalStatus } from "../../wisecron/state-db.js";
 import {
+  MAX_ALTERNATIVES,
   PersistedProposalSchema,
   ProposalSchema,
   UnsignedProposalSchema,
 } from "../../../skills-tuner/core/types.js";
-import type { Alternative, Proposal } from "../../../skills-tuner/core/types.js";
+import type {
+  Alternative,
+  Proposal,
+  UnsignedProposal,
+} from "../../../skills-tuner/core/types.js";
+import {
+  computeProposalSignature,
+  verifyProposalSignature,
+} from "../../../skills-tuner/core/security.js";
 
 let tmpDir: string;
 let dbPath: string;
@@ -101,13 +110,24 @@ afterEach(() => {
 
 describe("proposal schemas — emit bound vs read bound", () => {
   it("the emit schemas still reject more alternatives than the bound allows", () => {
-    const { signature: _sig, ...unsigned } = makeProposal(1, alts(4));
-    expect(() => UnsignedProposalSchema.parse(unsigned)).toThrow();
-    expect(() => ProposalSchema.parse(makeProposal(1, alts(4)))).toThrow();
+    // Expressed against the constant, not a literal. The bound is a runaway
+    // guard whose value may move; what must hold is that going past it is
+    // refused, and the error says which field.
+    const over = MAX_ALTERNATIVES + 1;
+    const { signature: _sig, ...unsigned } = makeProposal(1, alts(over));
+    expect(() => UnsignedProposalSchema.parse(unsigned)).toThrow(/alternatives/);
+    expect(() => ProposalSchema.parse(makeProposal(1, alts(over)))).toThrow(/alternatives/);
   });
 
-  it("the emit schemas still accept a proposal inside the bound", () => {
-    expect(ProposalSchema.parse(makeProposal(1, alts(3))).alternatives).toHaveLength(3);
+  it("the emit schemas accept the counts real subjects actually emit", () => {
+    // Four is not hypothetical: the `memory` subject emitted four on three
+    // consecutive daily runs in production, and a capability with four
+    // approved plugins produces four. An emit bound that rejects these
+    // rejects honest work.
+    expect(ProposalSchema.parse(makeProposal(1, alts(4))).alternatives).toHaveLength(4);
+    expect(
+      ProposalSchema.parse(makeProposal(1, alts(MAX_ALTERNATIVES))).alternatives,
+    ).toHaveLength(MAX_ALTERNATIVES);
   });
 
   it("the read schema accepts a row written under a looser bound", () => {
@@ -127,13 +147,21 @@ describe("proposal schemas — emit bound vs read bound", () => {
 
 describe("WisecronStateDB — the emit gate at persist time", () => {
   it("refuses a proposal carrying more alternatives than the emit bound allows", () => {
-    expect(() => db.persistProposal(makeProposal(1, alts(4)))).toThrow();
+    expect(() => db.persistProposal(makeProposal(1, alts(MAX_ALTERNATIVES + 1)))).toThrow(
+      /alternatives/,
+    );
     expect(db.listProposalsDetailed().proposals).toEqual([]);
   });
 
+  it("names the proposal in the refusal, not just the failing field", () => {
+    // A bare ZodError dump gives an operator no way to find the culprit among
+    // a whole propose cycle's worth of subjects.
+    expect(() => db.persistProposal(makeProposal(77, alts(MAX_ALTERNATIVES + 1)))).toThrow(/77/);
+  });
+
   it("accepts a proposal inside the bound", () => {
-    db.persistProposal(makeProposal(1, alts(3)));
-    expect(db.getStoredProposal("1")?.proposal.alternatives).toHaveLength(3);
+    db.persistProposal(makeProposal(1, alts(4)));
+    expect(db.getStoredProposal("1")?.proposal.alternatives).toHaveLength(4);
   });
 });
 
@@ -192,5 +220,113 @@ describe("WisecronStateDB — rehydrating persisted proposals", () => {
 
     expect(db.hasProposal("2")).toBe(true);
     expect(db.hasProposal("404")).toBe(false);
+  });
+});
+
+// ── What the read schema must still guarantee ────────────────────────────────
+
+describe("WisecronStateDB — the read schema's remaining strictness", () => {
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "read-schema-strict-"));
+    dbPath = join(tmpDir, "wisecron.db");
+    db = new WisecronStateDB(dbPath);
+  });
+
+  afterEach(() => {
+    db.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /**
+   * Seed behind the write path so a row can be missing a field the emit
+   * schema requires — which is the only way to stand in for bytes an older
+   * binary left on disk.
+   */
+  function seedRaw(id: number, proposalJson: unknown, status = "pending"): void {
+    const raw = new Database(dbPath);
+    const now = new Date().toISOString();
+    raw
+      .prepare(
+        "INSERT INTO proposals(id, subject, status, proposal_json, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+      )
+      .run(String(id), "fake", status, JSON.stringify(proposalJson), now, now);
+    raw.close();
+  }
+
+  // The whole thesis of the relaxation is "one bound goes, everything else
+  // stays strict". Nothing pinned that: the read schema could be loosened on
+  // any of these fields with the entire suite green.
+  const REQUIRED_FIELDS = [
+    "id",
+    "cluster_id",
+    "subject",
+    "kind",
+    "target_path",
+    "pattern_signature",
+    "created_at",
+    "signature",
+    "alternatives",
+  ] as const;
+
+  for (const field of REQUIRED_FIELDS) {
+    it(`still refuses a row missing '${field}'`, () => {
+      const { [field]: _dropped, ...withoutField } = persistedJson(makeProposal(1)) as Record<
+        string,
+        unknown
+      >;
+      seedRaw(1, withoutField);
+      const { proposals, unreadable } = db.listProposalsDetailed();
+      expect(proposals).toEqual([]);
+      expect(unreadable).toHaveLength(1);
+      // The diagnostic has to name the field. "something failed" leaves an
+      // operator with a row they cannot act on and no idea why.
+      expect(unreadable[0]?.error ?? "").toContain(field);
+    });
+  }
+
+  it("keeps created_at a Date through the store, because the signature depends on it", () => {
+    // `proposalCanonical` calls `created_at.toISOString()`, and the apply path
+    // verifies the signature on the REHYDRATED proposal. Drop the coercion and
+    // `created_at` comes back a string: verification throws
+    // "toISOString is not a function" at apply time, far from the cause.
+    db.persistProposal(makeProposal(1));
+    const back = db.getStoredProposal("1");
+    expect(back?.proposal.created_at).toBeInstanceOf(Date);
+  });
+
+  it("a proposal signed on the way in still verifies on the way out", () => {
+    // End-to-end, not against the schema in isolation: sign, persist,
+    // rehydrate, verify. This is the round-trip the apply path performs.
+    const secret = Buffer.from("test-secret-for-round-trip");
+    const { signature: _unused, ...unsigned } = makeProposal(1, alts(4));
+    const signed = {
+      ...unsigned,
+      signature: computeProposalSignature(unsigned as UnsignedProposal, secret),
+    } as Proposal;
+
+    db.persistProposal(signed);
+    const back = db.getStoredProposal("1");
+    if (!back) throw new Error("the row did not round-trip at all");
+    expect(verifyProposalSignature(back.proposal, secret)).toBe(true);
+  });
+
+  it("isolates a structurally alien row, not just a near-miss", () => {
+    // Every other isolation test corrupts by emptying `signature`. A fixture
+    // that shares one shape cannot show the isolation is general — relax that
+    // one field and the fixture silently stops being corrupt.
+    seedRaw(1, { not: "a proposal" });
+    db.persistProposal(makeProposal(2));
+
+    const { proposals, unreadable } = db.listProposalsDetailed();
+    expect(proposals.map((p) => p.id)).toEqual(["2"]);
+    expect(unreadable.map((r) => r.id)).toEqual(["1"]);
+  });
+
+  it("returns an empty listing rather than throwing when EVERY row is unreadable", () => {
+    seedRaw(1, { not: "a proposal" });
+    seedRaw(2, { also: "not one" });
+    const { proposals, unreadable } = db.listProposalsDetailed();
+    expect(proposals).toEqual([]);
+    expect(unreadable).toHaveLength(2);
   });
 });

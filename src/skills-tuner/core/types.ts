@@ -28,13 +28,31 @@ export const AlternativeSchema = z.object({
 });
 export type Alternative = z.infer<typeof AlternativeSchema>;
 
+/**
+ * Upper bound on how many alternatives one proposal may carry.
+ *
+ * This is a RUNAWAY GUARD, not a shape contract. Nothing that consumes a
+ * proposal depends on the count: every consumer either takes
+ * `alternatives[0]` or `.find()`s by id, and the signature hashes the list in
+ * full. The bound exists so a looping or miscomputing subject cannot commit a
+ * proposal with hundreds of entries.
+ *
+ * It was 3, which is below what real subjects legitimately emit — one
+ * alternative per rerouted agentic mode, or per approved plugin for a
+ * capability, both unbounded by construction. The `memory` subject emitted
+ * four on three consecutive daily runs in production. A bound set at the
+ * shape someone imagined rather than the shape producers emit rejects honest
+ * work, so it is set where only a bug can reach it.
+ */
+export const MAX_ALTERNATIVES = 20;
+
 export const UnsignedProposalSchema = z.object({
   id: z.number().int(),
   cluster_id: z.string(),
   subject: z.string(),
   kind: z.string(),
   target_path: z.string(),
-  alternatives: z.array(AlternativeSchema).min(1).max(3),
+  alternatives: z.array(AlternativeSchema).min(1).max(MAX_ALTERNATIVES),
   pattern_signature: z.string(),
   created_at: z.coerce.date(),
 });
@@ -49,16 +67,16 @@ export type Proposal = z.infer<typeof ProposalSchema>;
  * Read-path schema for a proposal rehydrated from the proposal store.
  *
  * Identical to `ProposalSchema` except that the upper bound on `alternatives`
- * is absent. That bound belongs to the EMIT path: it constrains how many
- * alternatives a subject may produce, and `WisecronStateDB.persistProposal`
- * enforces it with `ProposalSchema` at persist time — so it is never relaxed for
- * a proposal entering the store. A row already on disk
- * was written under whatever bound was in force at the time, and nothing on the
- * read path depends on the count — reading a proposal back only needs the
- * fields to be present and well typed. Validating stored rows against the
- * current emit bound would make any future tightening retroactively corrupt
- * history: a proposal that is merely no longer emittable would become
- * unreadable, taking the queries that walk it down with it.
+ * is absent. That bound is a runaway guard on the EMIT path, enforced by
+ * `WisecronStateDB.persistProposal` at persist time — so it is never relaxed
+ * for a proposal entering the store. A row already on disk was written under
+ * whatever bound was in force at the time, and nothing on the read path
+ * depends on the count: reading a proposal back only needs the fields present
+ * and well typed. Validating stored rows against the current emit bound makes
+ * any future tightening retroactively corrupt history — a proposal that is
+ * merely no longer emittable becomes unreadable, taking the queries that walk
+ * it down with it. That is not hypothetical: it is the outage this schema
+ * exists to fix.
  *
  * The lower bound stays: an alternative-less proposal is unusable on both paths
  * (`apply` selects `alternatives[0]` when no alt is named).

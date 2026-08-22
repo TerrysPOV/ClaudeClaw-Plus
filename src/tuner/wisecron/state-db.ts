@@ -381,11 +381,22 @@ export class WisecronStateDB {
    */
   persistProposal(proposal: Proposal): void {
     // Emit gate. The read path deliberately no longer carries the alternatives
-    // upper bound, so this is where a subject that emits more alternatives than
-    // the contract allows is rejected: at the write, loudly, while it is still a
-    // live bug someone can fix — not on the way back out, years later, against a
-    // row nobody can change any more.
-    ProposalSchema.parse(proposal);
+    // upper bound, so this is where a subject that emits past it is rejected:
+    // at the write, loudly, while it is still a live bug someone can fix — not
+    // on the way back out, years later, against a row nobody can change.
+    //
+    // The error names the proposal and its subject. A bare ZodError dump gives
+    // an operator nothing to act on: a propose cycle walks every subject, and
+    // "expected array to have <=20 items" does not say which one produced it.
+    const parsed = ProposalSchema.safeParse(proposal);
+    if (!parsed.success) {
+      const why = parsed.error.issues
+        .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
+        .join("; ");
+      throw new Error(
+        `proposal #${proposal.id} from subject '${proposal.subject}' is not persistable — ${why}`,
+      );
+    }
     const now = new Date().toISOString();
     this.db
       .prepare(`
@@ -435,6 +446,37 @@ export class WisecronStateDB {
    */
   hasProposal(id: string): boolean {
     return this.db.prepare("SELECT 1 FROM proposals WHERE id = ?").get(id) != null;
+  }
+
+  /**
+   * Whether a stored row can still be rehydrated. Separate from
+   * `hasProposal` on purpose: existence answers dedup, readability answers
+   * "is this row still usable", and conflating the two lets a caller be told
+   * its proposal is queued when the bytes on disk cannot be listed or applied.
+   * Returns false for a row that does not exist at all.
+   */
+  isProposalReadable(id: string): boolean {
+    const row = this.db.prepare("SELECT * FROM proposals WHERE id = ?").get(id) as
+      | ProposalRow
+      | undefined;
+    if (!row) return false;
+    try {
+      rowToStoredProposal(row);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Back-compat shim for the pre-isolation signature. `WisecronStateDB` is
+   * public surface of a published plugin, so the rename to
+   * `listProposalsDetailed` should not silently break an out-of-tree caller on
+   * a patch bump. Drops the `unreadable` half — callers that care use the
+   * detailed form.
+   */
+  listProposals(status?: ProposalStatus): StoredProposal[] {
+    return this.listProposalsDetailed(status).proposals;
   }
 
   /**
