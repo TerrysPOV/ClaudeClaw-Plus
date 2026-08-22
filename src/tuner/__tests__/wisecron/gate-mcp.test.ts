@@ -342,7 +342,11 @@ describe("propose — one bad proposal is not the run's problem", () => {
       makeBundle({
         engine: {
           runCycle: async () => ({
-            proposals: [makeUnsigned(10), makeUnsigned(11, { alternatives: tooMany }), makeUnsigned(12)],
+            proposals: [
+              makeUnsigned(10),
+              makeUnsigned(11, { alternatives: tooMany }),
+              makeUnsigned(12),
+            ],
             observations: 3,
             clusters: 1,
           }),
@@ -360,7 +364,12 @@ describe("propose — one bad proposal is not the run's problem", () => {
     // throw escapes mid-loop: #10 stays on disk, #12 never gets written, and
     // the caller sees a bare ZodError.
     expect(res.total_proposed).toBe(2);
-    expect(db.listProposalsDetailed().proposals.map((p) => p.id).sort()).toEqual(["10", "12"]);
+    expect(
+      db
+        .listProposalsDetailed()
+        .proposals.map((p) => p.id)
+        .sort(),
+    ).toEqual(["10", "12"]);
 
     // The refusal is reported with enough to find the culprit.
     expect(res.rejected).toHaveLength(1);

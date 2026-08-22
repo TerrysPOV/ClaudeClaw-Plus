@@ -29,11 +29,7 @@ import {
   ProposalSchema,
   UnsignedProposalSchema,
 } from "../../../skills-tuner/core/types.js";
-import type {
-  Alternative,
-  Proposal,
-  UnsignedProposal,
-} from "../../../skills-tuner/core/types.js";
+import type { Alternative, Proposal, UnsignedProposal } from "../../../skills-tuner/core/types.js";
 import {
   computeProposalSignature,
   verifyProposalSignature,
@@ -125,9 +121,9 @@ describe("proposal schemas — emit bound vs read bound", () => {
     // approved plugins produces four. An emit bound that rejects these
     // rejects honest work.
     expect(ProposalSchema.parse(makeProposal(1, alts(4))).alternatives).toHaveLength(4);
-    expect(
-      ProposalSchema.parse(makeProposal(1, alts(MAX_ALTERNATIVES))).alternatives,
-    ).toHaveLength(MAX_ALTERNATIVES);
+    expect(ProposalSchema.parse(makeProposal(1, alts(MAX_ALTERNATIVES))).alternatives).toHaveLength(
+      MAX_ALTERNATIVES,
+    );
   });
 
   it("the read schema accepts a row written under a looser bound", () => {
