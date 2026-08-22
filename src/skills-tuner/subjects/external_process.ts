@@ -52,10 +52,22 @@ const MAX_STREAM_CHARS = 500;
 /**
  * Truncate on a code-point boundary so a clipped message never ends on half of
  * a surrogate pair (which would become U+FFFD once the message is encoded).
+ *
+ * The scan is bounded: it stops one code point past the cap, so the cost of
+ * describing a failure never scales with how much the failing subject dumped.
+ * `Array.from(text)` would materialise every code point of a multi-megabyte
+ * stream as its own string before throwing all but 500 of them away — turning
+ * a misbehaving subject into a memory spike on the error path.
  */
 function clip(text: string): string {
-  const points = Array.from(text);
-  return points.length <= MAX_STREAM_CHARS ? text : points.slice(0, MAX_STREAM_CHARS).join("");
+  let clipped = "";
+  let points = 0;
+  for (const point of text) {
+    if (points === MAX_STREAM_CHARS) return clipped;
+    clipped += point;
+    points++;
+  }
+  return text;
 }
 
 /**

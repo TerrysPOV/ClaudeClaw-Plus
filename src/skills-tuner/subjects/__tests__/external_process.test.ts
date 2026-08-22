@@ -15,6 +15,19 @@ let dir: string;
 /**
  * Write a fixture script whose body runs once stdin is drained (the subject
  * always writes a request), and return a subject wired to it.
+ *
+ * Fixture bodies set `process.exitCode` rather than calling `process.exit()`:
+ * `exit()` tears the process down without waiting for a pending write to the
+ * stdout/stderr pipe to flush. Measured truncation thresholds are ~219 KB on
+ * bun and ~146 KB on node, so no fixture here is anywhere near losing output
+ * today — this removes a size-dependent footgun for whoever writes the first
+ * fixture that dumps more, not an active flake.
+ *
+ * The trade: `exit()` always exits, `exitCode` exits only once nothing holds
+ * the event loop. Nothing does today. A fixture that later leaves a timer or
+ * handle open will hang instead, and surface as the subject's 15s timeout
+ * rather than as "your fixture leaked a handle" — so keep fixture bodies free
+ * of live handles.
  */
 function subjectRunning(fileName: string, body: string): ExternalProcessSubject {
   const scriptPath = join(dir, fileName);
@@ -48,7 +61,7 @@ describe("ExternalProcessSubject non-zero exit", () => {
     const subject = subjectRunning(
       "stdout-error.js",
       `  process.stdout.write(JSON.stringify({ error: "config file is missing a 'threshold' key" }));
-  process.exit(1);`,
+  process.exitCode = 1;`,
     );
 
     const promise = subject.collectObservations(new Date(0));
@@ -60,7 +73,7 @@ describe("ExternalProcessSubject non-zero exit", () => {
     const subject = subjectRunning(
       "stderr-only.js",
       `  process.stderr.write("Traceback: interpreter blew up");
-  process.exit(3);`,
+  process.exitCode = 3;`,
     );
 
     const promise = subject.collectObservations(new Date(0));
@@ -73,7 +86,7 @@ describe("ExternalProcessSubject non-zero exit", () => {
       "both-streams.js",
       `  process.stderr.write("warning: cache unreadable");
   process.stdout.write(JSON.stringify({ error: "scan aborted" }));
-  process.exit(1);`,
+  process.exitCode = 1;`,
     );
 
     let message = "";
@@ -90,7 +103,7 @@ describe("ExternalProcessSubject non-zero exit", () => {
     const subject = subjectRunning(
       "stdout-not-json.js",
       `  process.stdout.write("segfault while loading model");
-  process.exit(2);`,
+  process.exitCode = 2;`,
     );
 
     await expect(subject.collectObservations(new Date(0))).rejects.toThrow(
@@ -99,7 +112,7 @@ describe("ExternalProcessSubject non-zero exit", () => {
   });
 
   it("says so explicitly when both streams are empty", async () => {
-    const subject = subjectRunning("silent.js", `  process.exit(9);`);
+    const subject = subjectRunning("silent.js", `  process.exitCode = 9;`);
 
     let message = "";
     try {
@@ -114,7 +127,7 @@ describe("ExternalProcessSubject non-zero exit", () => {
     const subject = subjectRunning(
       "huge-stderr.js",
       `  process.stderr.write("x".repeat(5000));
-  process.exit(1);`,
+  process.exitCode = 1;`,
     );
 
     let message = "";
@@ -133,7 +146,7 @@ describe("ExternalProcessSubject zero exit (unchanged)", () => {
     const subject = subjectRunning(
       "ok-result.js",
       `  process.stdout.write(JSON.stringify({ result: [] }));
-  process.exit(0);`,
+  process.exitCode = 0;`,
     );
 
     await expect(subject.collectObservations(new Date(0))).resolves.toEqual([]);
@@ -143,7 +156,7 @@ describe("ExternalProcessSubject zero exit (unchanged)", () => {
     const subject = subjectRunning(
       "ok-error.js",
       `  process.stdout.write(JSON.stringify({ error: "unknown method: collect_observations" }));
-  process.exit(0);`,
+  process.exitCode = 0;`,
     );
 
     await expect(subject.collectObservations(new Date(0))).rejects.toThrow(
@@ -158,7 +171,7 @@ describe("ExternalProcessSubject line-oriented envelope", () => {
       "logs-then-error.js",
       `  process.stdout.write("loading configuration " + ".".repeat(600) + "\\n");
   process.stdout.write(JSON.stringify({ error: "threshold key missing in config" }) + "\\n");
-  process.exit(1);`,
+  process.exitCode = 1;`,
     );
 
     // The protocol prints one JSON object per line, so the envelope is the last
@@ -172,7 +185,7 @@ describe("ExternalProcessSubject line-oriented envelope", () => {
     const subject = subjectRunning(
       "result-then-exit.js",
       `  process.stdout.write(JSON.stringify({ result: ["confidential-record-1", "confidential-record-2"] }));
-  process.exit(3);`,
+  process.exitCode = 3;`,
     );
 
     const promise = subject.collectObservations(new Date(0));
@@ -184,7 +197,7 @@ describe("ExternalProcessSubject line-oriented envelope", () => {
     const subject = subjectRunning(
       "wide-chars.js",
       `  process.stdout.write(JSON.stringify({ error: "x".repeat(499) + "\\u{1F4A5}" + "boom" }));
-  process.exit(1);`,
+  process.exitCode = 1;`,
     );
 
     const message = await subject.collectObservations(new Date(0)).then(
