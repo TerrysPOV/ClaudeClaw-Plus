@@ -33,7 +33,8 @@ interface BinarySource {
   headers?: Record<string, string>;
 }
 
-const BINARY_SOURCES: Record<string, BinarySource> = {
+/** Exported for tests — see `src/__tests__/whisper-binary-source.test.ts`. */
+export const BINARY_SOURCES: Record<string, BinarySource> = {
   "linux-x64": {
     url: "https://github.com/dscripka/whisper.cpp_binaries/releases/download/commit_3d42463/whisper-bin-linux-x64.tar.gz",
     format: "tar.gz",
@@ -48,10 +49,13 @@ const BINARY_SOURCES: Record<string, BinarySource> = {
     format: "tar.gz",
     headers: { Authorization: "Bearer QQ==" },
   },
+  // Upstream's official Linux arm64 build. Previously pointed at a Homebrew
+  // bottle, whose ELF interpreter is a literal "@@HOMEBREW_PREFIX@@/lib/ld.so"
+  // placeholder that only `brew` rewrites on install — extracting the raw
+  // tarball leaves an unrunnable binary that fails with a misleading ENOENT.
   "linux-arm64": {
-    url: "https://ghcr.io/v2/homebrew/core/whisper-cpp/blobs/sha256:684199fd6bec28cddfa086c584a49d236386c109f901a443b577b857fd052f83",
+    url: "https://github.com/ggml-org/whisper.cpp/releases/download/b4938/whisper-bin-ubuntu-arm64.tar.gz",
     format: "tar.gz",
-    headers: { Authorization: "Bearer QQ==" },
   },
   "win32-x64": {
     url: "https://github.com/ggml-org/whisper.cpp/releases/download/v1.7.6/whisper-bin-x64.zip",
@@ -70,6 +74,15 @@ function getWhisperBinaryPath(): string {
   return join(BIN_DIR, `whisper-cli${suffix}`);
 }
 
+/** Runtime lib lookup path for the bundled whisper shared objects. */
+function withLibraryPath(env: NodeJS.ProcessEnv): Record<string, string> {
+  return {
+    ...(env as Record<string, string>),
+    LD_LIBRARY_PATH: [BIN_DIR, LIB_DIR, env.LD_LIBRARY_PATH].filter(Boolean).join(":"),
+    DYLD_LIBRARY_PATH: [BIN_DIR, LIB_DIR, env.DYLD_LIBRARY_PATH].filter(Boolean).join(":"),
+  };
+}
+
 function getModelPath(): string {
   return join(MODEL_FOLDER, `ggml-${getWhisperModel()}.bin`);
 }
@@ -78,6 +91,51 @@ async function fileExists(path: string): Promise<boolean> {
   try {
     await access(path);
     return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Shared objects whisper-cli needs at runtime.
+ *
+ * Matching on "whisper" alone silently drops libggml and leaves the binary
+ * unloadable, which is how the linux-arm64 install stayed broken.
+ */
+export function isWhisperSharedLib(name: string): boolean {
+  const isSharedLib = name.endsWith(".so") || name.endsWith(".dylib") || /\.so\.\d/.test(name);
+  return isSharedLib && (name.includes("whisper") || name.includes("ggml"));
+}
+
+/**
+ * Where a runtime shared object must be written.
+ *
+ * BIN_DIR is not redundant: ggml dlopens its compute backend by searching
+ * alongside the executable, a lookup no library-path variable affects. Drop
+ * BIN_DIR and the binary still loads — `--help` exits 0 — but every
+ * transcription fails with "backends = 0".
+ */
+export function sharedLibTargets(name: string): string[] {
+  return [join(LIB_DIR, name), join(BIN_DIR, name)];
+}
+
+/**
+ * A binary that exists is not necessarily a binary that runs. A partial extract,
+ * a missing `libggml`, or an archive whose ELF interpreter was never relocated
+ * all leave a plausible-looking file on disk that dies at exec time — and an
+ * existence check happily accepts it forever, so every transcription fails while
+ * warmup reports success. Probe it instead: `--help` exits 0 when the loader can
+ * resolve everything, and 127 when it cannot.
+ */
+export async function binaryIsRunnable(binaryPath: string): Promise<boolean> {
+  if (!(await fileExists(binaryPath))) return false;
+  try {
+    const proc = Bun.spawnSync([binaryPath, "--help"], {
+      env: withLibraryPath(process.env),
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    return proc.exitCode === 0;
   } catch {
     return false;
   }
@@ -225,14 +283,18 @@ async function downloadAndExtractBinary(): Promise<void> {
   for (const entry of entries) {
     if (!entry.isFile()) continue;
     const name = entry.name;
-    if (
-      name.includes("whisper") &&
-      (name.endsWith(".so") || name.endsWith(".dylib") || name.match(/\.so\.\d/))
-    ) {
+    if (isWhisperSharedLib(name)) {
       const parentPath = entry.parentPath ?? entry.path ?? "";
       const srcPath = join(parentPath, name);
-      const destPath = join(LIB_DIR, name);
-      await Bun.write(destPath, Bun.file(srcPath));
+      // Written to BOTH dirs on purpose. LIB_DIR is the historical location and
+      // is what LD_LIBRARY_PATH points at; BIN_DIR is required because ggml
+      // dlopens its compute backend (libggml-cpu.so) by searching next to the
+      // executable — a lookup no library path influences. With only LIB_DIR the
+      // binary loads and `--help` succeeds, but every transcription dies with
+      // "backends = 0". Both are rewritten on each download, so they cannot skew.
+      for (const destPath of sharedLibTargets(name)) {
+        await Bun.write(destPath, Bun.file(srcPath));
+      }
     }
   }
 
@@ -260,10 +322,21 @@ async function prepareWhisperAssets(printOutput: boolean): Promise<void> {
   await mkdir(TMP_FOLDER, { recursive: true });
 
   const binaryPath = getWhisperBinaryPath();
-  if (!(await fileExists(binaryPath))) {
-    await downloadAndExtractBinary();
-  } else {
+  if (await binaryIsRunnable(binaryPath)) {
     console.log("whisper warmup: binary exists");
+  } else {
+    if (await fileExists(binaryPath)) {
+      console.log("whisper warmup: existing binary is not runnable, re-downloading");
+    }
+    await downloadAndExtractBinary();
+    // One retry only — if a freshly downloaded binary still will not exec, the
+    // platform source is wrong and silently looping would hide that.
+    if (!(await binaryIsRunnable(binaryPath))) {
+      throw new Error(
+        `whisper: downloaded binary for ${process.platform}-${process.arch} is not runnable ` +
+          `(${binaryPath}). The platform's BINARY_SOURCES entry is likely wrong for this system.`,
+      );
+    }
   }
 
   await downloadModel();
@@ -407,11 +480,7 @@ export async function transcribeAudioToText(
     const proc = Bun.spawnSync([binaryPath, "-m", modelPath, "-f", wavPath, "--no-timestamps"], {
       stdout: "pipe",
       stderr: "pipe",
-      env: {
-        ...process.env,
-        LD_LIBRARY_PATH: [LIB_DIR, process.env.LD_LIBRARY_PATH].filter(Boolean).join(":"),
-        DYLD_LIBRARY_PATH: [LIB_DIR, process.env.DYLD_LIBRARY_PATH].filter(Boolean).join(":"),
-      },
+      env: withLibraryPath(process.env),
     });
 
     if (proc.exitCode !== 0) {
