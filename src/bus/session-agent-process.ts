@@ -119,6 +119,106 @@ export class PtyAgentProcess implements AgentProcess {
   /** ANSI-stripped tail of PTY output, reset after each submit so the
    *  delivery-confirm check only inspects post-submit frames (#wedge). */
   private recentOut = "";
+  /**
+   * Sticky auto-compaction state, maintained on the DATA STREAM rather than
+   * sampled from `recentOut`.
+   *
+   * Why sticky: the delivery-confirm loop clears `recentOut` at the top of every
+   * confirm window, so an in-window `includes("Compacting…")` probe only sees the
+   * banner if the CLI happens to REPAINT that phrase inside that 1.5s slice. The
+   * real CLI paints it once and then renders a bare spinner -- and when the
+   * compaction started BEFORE the prompt arrived (the common case: the inbound
+   * prompt is what pushed the context over the limit) the banner is emitted
+   * before the loop even begins and is wiped by the first reset. The probe then
+   * sees "non-empty output, no idle footer" and declares a turn started that
+   * never existed. Dossier 20260825T071822: compaction at 11:12:35, prompt
+   * written 11:12:36.8, false turn-start stamped 11:12:38.313.
+   */
+  private compacting = false;
+  /** Incremented on every compaction START, so a compaction that begins AND ends
+   *  between the prompt write and the first confirm window is still observable. */
+  private compactionEpoch = 0;
+  /** Small rolling buffer used ONLY for compaction-marker detection. Separate
+   *  from `recentOut` because the confirm loop clears that one, and a marker
+   *  split across two PTY chunks would otherwise be missed -- missing the CLEAR
+   *  would latch `compacting` forever and make every later prompt burn the full
+   *  `maxCompactionWaitMs`. */
+  private markerTail = "";
+  /** The exact text last typed into the PTY. The output stream echoes it back,
+   *  so without excluding it a chat message containing "Compacting conversation"
+   *  would arm the latch below — remote text controlling a process-wide, sticky
+   *  state. The pre-image was window-scoped so poisoning cost ~1.5s; a sticky
+   *  latch costs `maxCompactionWaitMs` (240s) on a write chain that serialises
+   *  EVERY prompt for the agent. The inverse is just as bad: text containing
+   *  "to cycle" would clear a genuine compaction. This is not only an abuse
+   *  case — an agent discussing its own compaction logic reproduces these
+   *  strings in ordinary output. */
+  private lastWritten = "";
+  /** Cap on the text `stripEcho` matches against — see where it is assigned. */
+  private static readonly ECHO_MATCH_MAX = 4096;
+
+  /**
+   * Remove our own echo from a slice of PTY output.
+   *
+   * The CLI renders the prompt we typed in its input box, so the text a chat
+   * user sent comes straight back on the output stream. Every probe in this file
+   * reads that stream, which means remote text can impersonate CLI status lines:
+   * a message containing "Compacting conversation" makes the delivery loop wait
+   * out `maxCompactionWaitMs` (240s by default) on a write chain that serialises
+   * EVERY prompt for the agent, and one containing "to cycle" makes a genuine
+   * compaction look finished.
+   *
+   * SCOPE, precisely: this removes OUR OWN ECHO only — lines that are a
+   * substring of the prompt we just typed. Model OUTPUT containing the same
+   * strings still arms the latch; that path is bounded because the idle footer
+   * repaint clears it at turn end, but it is NOT closed here. Do not read this
+   * helper as covering "an agent that discusses its own compaction logic".
+   *
+   * It also cuts both ways: a prompt that is a pasted CLI transcript containing
+   * "to cycle" makes the genuine footer line a substring of `lastWritten`, so it
+   * is stripped from every window and an idle REPL reads as a started turn. That
+   * is the pre-patch behaviour, not a new regression, but it is a live
+   * false-positive path for a plausible prompt.
+   *
+   * Filter by LINE rather than by exact occurrence: the buffers are rolling, so
+   * the echo is routinely truncated mid-string and an exact match would leave a
+   * fragment that still carries the marker. A line that is itself a substring of
+   * what we typed is our echo; a genuine CLI status line never is.
+   */
+  private stripEcho(s: string): string {
+    if (this.lastWritten.length < 8) return s;
+    return s
+      .split("\n")
+      .filter((l, i) => {
+        // TWO conditions, both required.
+        //
+        // (a) The row must LOOK like the input box: optional border/padding
+        //     glyphs, then the prompt caret `>`. The TUI paints our text as
+        //     `| > <text>  ...padding... |`, while CLI status lines start with a
+        //     letter ("Compacting conversation…") and the idle footer with its
+        //     own glyph and no caret ("> accept edits … to cycle" has no caret
+        //     before "accept"). Without this, a prompt that merely CONTAINS
+        //     "Compacting conversation" or "to cycle" would strip the CLI's own
+        //     status and footer lines, killing detection and reintroducing the
+        //     dropped-prompt wedge — the inverse of the bug this helper fixes.
+        //
+        // (b) The content must be a substring of what we typed. Strip BOTH ends
+        //     first: keeping the trailing border made the match fail and let the
+        //     echo through.
+        // The FIRST line is the only one the rolling buffer can have truncated
+        // mid-way, which strips its caret. Judge that one on content alone; every
+        // other line must show the caret to count as our echo.
+        if (i > 0 && !/^[^A-Za-z0-9]*>/.test(l)) return true;
+        const bare = l
+          .replace(/^[^A-Za-z0-9]*>/, "")
+          .replace(/[^A-Za-z0-9]+$/, "")
+          .trim();
+        return bare.length < 8 || !this.lastWritten.includes(bare);
+      })
+      .join("\n");
+  }
+  /** When the latch was armed, so a missed clear cannot strand it indefinitely. */
+  private compactingSince = 0;
   private readonly submitConfirmMs: number;
   private readonly maxSubmitNudges: number;
   private readonly maxCompactionWaitMs: number;
@@ -177,7 +277,33 @@ export class PtyAgentProcess implements AgentProcess {
       // Keep a small ANSI-stripped tail so send_prompt_stream can tell whether a
       // submit actually started a turn (the idle REPL footer disappears on turn
       // start) -- see the delivery-confirm loop. Observation only.
-      this.recentOut = (this.recentOut + stripAnsiEscapes(chunk)).slice(-2000);
+      const cleanChunk = stripAnsiEscapes(chunk);
+      this.recentOut = (this.recentOut + cleanChunk).slice(-2000);
+      // Sticky compaction latch (see `compacting`): set on the banner, cleared
+      // only on POSITIVE evidence the compaction ended -- the "Compacted"
+      // confirmation or the idle REPL footer coming back. A spinner frame in
+      // between must NOT clear it.
+      this.markerTail = (this.markerTail + cleanChunk).slice(-400);
+      const markerView = this.stripEcho(this.markerTail);
+      // Compare the LAST position of a start marker against the last position of
+      // an end marker, so whichever happened most recently wins. A plain
+      // set-then-else-clear would stay latched whenever both strings are still
+      // in the buffer, and testing a single chunk would miss a marker split
+      // across a chunk boundary.
+      const iStart = Math.max(
+        markerView.lastIndexOf("Compacting conversation"),
+        markerView.lastIndexOf("Compacting at auto"),
+      );
+      const endMatches = [...markerView.matchAll(/Compacted \(|to\s*cycle/g)];
+      const iEnd = endMatches.length ? (endMatches[endMatches.length - 1].index ?? -1) : -1;
+      if (iStart >= 0 || iEnd >= 0) {
+        const nowCompacting = iStart > iEnd;
+        if (nowCompacting && !this.compacting) {
+          this.compactionEpoch++;
+          this.compactingSince = Date.now();
+        }
+        this.compacting = nowCompacting;
+      }
       // Crash-signal observation ONLY (spec §5.3). Never parsed as model output.
       for (const h of this.dataHandlers) {
         try {
@@ -241,6 +367,22 @@ export class PtyAgentProcess implements AgentProcess {
     const text = sanitizePtyPromptText(line);
     const run = this.writeChain.then(async () => {
       if (this._exited) throw new Error(`agent ${this.agent_id} has exited`);
+      // Snapshot the compaction state at write time. A compaction that was
+      // ALREADY running when the prompt arrived (the common case -- the inbound
+      // prompt is what overflowed the context) can also FINISH during the 200ms
+      // settle below, i.e. before the confirm loop ever looks. Both the live
+      // latch and the epoch counter are captured so neither case is missed.
+      // A prompt must not inherit the previous one's markers: the buffer is
+      // rolling and 400 chars of A's output can still be resident when B lands.
+      this.markerTail = "";
+      // Bound what the echo filter scans. `text` is caller-supplied and only
+      // length-bounded by the adapter, while `stripEcho` runs `includes()` per
+      // line on EVERY PTY chunk -- an oversized prompt would make each chunk
+      // cost O(prompt x lines) for the life of the process. The input box only
+      // ever echoes a screenful, so the head is the part that can come back.
+      this.lastWritten = text.slice(0, PtyAgentProcess.ECHO_MATCH_MAX);
+      const compactingAtWrite = this.compacting;
+      const compactionEpochAtWrite = this.compactionEpoch;
       this.pty.write(text);
       await new Promise((r) => setTimeout(r, 200));
       if (this._exited) throw new Error(`agent ${this.agent_id} has exited`);
@@ -273,6 +415,16 @@ export class PtyAgentProcess implements AgentProcess {
       // surfaced, since a silently-dropped prompt is the failure this loop fixes.
       const compactionDeadline = Date.now() + this.maxCompactionWaitMs;
       let outcome: "turn-started" | "stuck-compaction" | "unconfirmed-idle" = "unconfirmed-idle";
+      let sawCompaction = compactingAtWrite || this.compactionEpoch !== compactionEpochAtWrite;
+      let retypedAfterCompaction = false;
+      // Latched as soon as any window shows real output that is neither the idle
+      // footer nor compaction chatter. If the CLI buffered the keystrokes through
+      // the compaction and ran the turn itself, that turn's output lands here --
+      // and a short turn can start AND finish inside one confirm window, so the
+      // same window can hold both the output and the repainted footer. Without
+      // this latch the footer alone would read as "no turn ran" and the retype
+      // would submit the prompt a second time.
+      let turnEvidenceSinceCompaction = false;
       for (let nudge = 0; nudge < this.maxSubmitNudges; ) {
         this.recentOut = "";
         await new Promise((r) => setTimeout(r, this.submitConfirmMs));
@@ -287,16 +439,83 @@ export class PtyAgentProcess implements AgentProcess {
         // streaming that word would otherwise be mistaken for a compaction and
         // stall this loop -- and the serialised writeChain behind it -- up to the
         // deadline.
+        // Every probe below reads this echo-free view, never `recentOut`
+        // directly: our own prompt text must not be able to impersonate a CLI
+        // status line, an idle footer, or turn output.
+        const visible = this.stripEcho(this.recentOut);
+        if (this.compactionEpoch !== compactionEpochAtWrite) sawCompaction = true;
+        // A latch that never saw its clear (marker lost) must not strand the
+        // process: treat it as stale once it outlives the compaction budget.
         if (
-          this.recentOut.includes("Compacting conversation") ||
-          this.recentOut.includes("Compacting at auto")
+          this.compacting &&
+          this.compactingSince > 0 &&
+          Date.now() - this.compactingSince > 2 * this.maxCompactionWaitMs
         ) {
+          this.compacting = false;
+          // Also drop the buffer: leaving the start marker resident means the
+          // next chunk re-evaluates it, sees `!compacting`, and re-arms with a
+          // fresh budget — the escape hatch would never actually fire.
+          this.markerTail = "";
+          // Do not judge THIS window: it still holds the output of the
+          // compaction that is (apparently) still running, and reading it as a
+          // started turn is the exact regression the latch exists to prevent.
+          if (Date.now() > compactionDeadline) {
+            outcome = "stuck-compaction";
+            break;
+          }
+          continue;
+        }
+        if (
+          this.compacting ||
+          visible.includes("Compacting conversation") ||
+          visible.includes("Compacting at auto")
+        ) {
+          sawCompaction = true;
+          // Evidence of a running turn only means anything AFTER the compaction:
+          // before it, the echoed input line (the prompt sitting un-submitted in
+          // the box) is itself non-footer output and would gate the retype off.
+          turnEvidenceSinceCompaction = false;
           if (Date.now() > compactionDeadline) {
             outcome = "stuck-compaction";
             break;
           }
           continue; // compaction in progress -> wait, do not spend a nudge
         }
+        const footerVisible = /to\s*cycle/.test(visible);
+        // Everything in this window that is not a footer repaint and not a
+        // spinner glyph. Printable ASCII only, so box-drawing and braille
+        // spinner frames do not register as output.
+        // Drop footer repaints and compaction chatter LINE BY LINE, not
+        // window-wide: the window in which a short buffered turn finishes also
+        // carries the "Compacted (…)" line, so discarding the whole window on
+        // that basis would throw away the very output that proves a turn ran.
+        const nonFooterOutput = visible
+          .split("\n")
+          .filter((l) => !/to\s*cycle/.test(l) && !/Compact(ing|ed)/.test(l))
+          .join("")
+          // Drop spinner frames and whitespace ONLY. Stripping everything
+          // non-ASCII would erase a turn whose output is emoji or box-drawing
+          // chrome, read the window as "no turn ran", and retype into a live
+          // turn — the one path that submits a prompt twice.
+          .replace(/[\u2800-\u28ff\u2500-\u257f\u25a0-\u25ff\u2022\u00b7\s]/g, "")
+          .trim();
+        if (nonFooterOutput.length > 0) {
+          turnEvidenceSinceCompaction = true;
+        }
+        // The compaction's own tail ("Compacted (ctrl+o …)") is non-empty output
+        // with no idle footer -- i.e. it looks exactly like a streaming turn to
+        // the check below. It is not evidence of anything: stay inconclusive
+        // (bounded by the same deadline) rather than spend a nudge on it.
+        // Only "Compacted (" is reachable here: the two "Compacting…" markers are
+        // already `continue`d by the branch above.
+        if (!footerVisible && visible.includes("Compacted (")) {
+          if (Date.now() > compactionDeadline) {
+            outcome = "stuck-compaction";
+            break;
+          }
+          continue;
+        }
+
         // A turn-start is POSITIVE evidence -- the streaming view replaced the
         // footer. An EMPTY confirm window is NOT that: a long-idle, quiet REPL
         // emits nothing, so `!/to\s*cycle/.test(...)` on an empty buffer falsely
@@ -307,13 +526,32 @@ export class PtyAgentProcess implements AgentProcess {
         // fix stack already active). Require real output before trusting the
         // footer's absence; an empty/whitespace window stays inconclusive and
         // spends a nudge instead of claiming a phantom success.
-        if (this.recentOut.trim().length > 0 && !/to\s*cycle/.test(this.recentOut)) {
+        if (visible.trim().length > 0 && !footerVisible) {
           outcome = "turn-started";
           // A turn confirmed → re-arm the one-shot wedge warning, so a LATER
           // genuine wedge on this long-lived process still surfaces a diagnostic
           // instead of being silenced for the rest of the process lifetime.
           this.warnedUnconfirmedDelivery = false;
           break;
+        }
+        // Only now, with the idle footer positively on screen (so no turn is
+        // running), consider that a compaction wiped the input box. Retyping
+        // without that gate would push a duplicate prompt into a live turn if
+        // the CLI had buffered the keystrokes and submitted them itself.
+        if (
+          sawCompaction &&
+          !retypedAfterCompaction &&
+          footerVisible &&
+          !turnEvidenceSinceCompaction
+        ) {
+          retypedAfterCompaction = true;
+          if (this._exited) throw new Error(`agent ${this.agent_id} has exited`);
+          this.pty.write("\x15"); // clear whatever survived the re-render
+          this.pty.write(text);
+          await new Promise((r) => setTimeout(r, 200));
+          if (this._exited) throw new Error(`agent ${this.agent_id} has exited`);
+          this.pty.write("\r");
+          continue; // the retype is not a nudge
         }
         this.pty.write("\r"); // footer still idle (or silent) -> CR did not submit -> nudge
         nudge++;
@@ -328,6 +566,10 @@ export class PtyAgentProcess implements AgentProcess {
         // clearing on any non-turn-started outcome is safe and symmetric.
         this.pty.write("\x15"); // Ctrl-U: kill the input line
       }
+      // The prompt is no longer in the input box once this resolves, so the echo
+      // filter has nothing left to match. Clearing it keeps the filter from
+      // running against unrelated output for the whole idle period after a turn.
+      this.lastWritten = "";
       if (outcome !== "turn-started" && !this.warnedUnconfirmedDelivery) {
         this.warnedUnconfirmedDelivery = true;
         console.warn(

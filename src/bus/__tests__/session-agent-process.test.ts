@@ -428,3 +428,289 @@ describe("PtyAgentProcess CHA-collapsed REPL footer (#271)", () => {
     expect(writes).toEqual([]); // disengaged -> no key into a live REPL
   });
 });
+
+describe("PtyAgentProcess compaction latch", () => {
+  // The real CLI paints "Compacting conversation…" ONCE and then renders a bare
+  // spinner. The confirm loop clears `recentOut` at the top of every window, so
+  // an in-window probe only sees the banner if the CLI repaints it inside that
+  // slice. When the inbound prompt is what pushed the context over the limit the
+  // compaction starts BEFORE the prompt is written, so the banner is already
+  // gone at the first reset. The window then reads "non-empty output, no idle
+  // footer" and the loop declares a turn that never started.
+  //
+  // These cases assert on PTY writes only, so they hold regardless of how a
+  // turn-start is reported to callers.
+  it("retypes when the compaction leaves the REPL idle (the prompt was swallowed)", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("z", handle, {
+      submitConfirmMs: 30,
+      maxSubmitNudges: 2,
+      maxCompactionWaitMs: 5000,
+    });
+    emit("\nCompacting conversation… (esc to interrupt)"); // painted once, before the prompt
+    const p = proc.send_prompt_stream("hello");
+    let compacting = true;
+    const iv = setInterval(
+      () => emit(compacting ? "\n⠋" : "\n⏵ accept edits on (shift+tab to cycle)"),
+      5,
+    );
+    setTimeout(() => {
+      compacting = false;
+      emit("\nCompacted (ctrl+o to see full summary)");
+    }, 150);
+    await p;
+    clearInterval(iv);
+    // The compaction re-rendered the REPL and left it idle, so the prompt is
+    // gone from the input box: a bare CR would submit nothing. Retype once.
+    expect(writes.filter((w) => w === "hello").length).toBe(2);
+    // The footer never gives way to a streaming turn, so the loop ends on a
+    // give-up and clears the stranded input line LAST. An earlier \x15 belongs
+    // to the retype, so only the final write separates the two outcomes.
+    expect(writes[writes.length - 1]).toBe("\x15");
+  });
+
+  it("does NOT retype when the turn is already streaming after the compaction", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("z", handle, {
+      submitConfirmMs: 30,
+      maxSubmitNudges: 3,
+      maxCompactionWaitMs: 5000,
+    });
+    emit("\nCompacting at auto window");
+    const p = proc.send_prompt_stream("hello");
+    let phase: "compacting" | "streaming" = "compacting";
+    const iv = setInterval(
+      () => emit(phase === "compacting" ? "\n⠙" : "\nassistant is streaming a chunk"),
+      5,
+    );
+    setTimeout(() => {
+      emit("\nCompacted (ctrl+o to see full summary)");
+      phase = "streaming";
+    }, 120);
+    await p;
+    clearInterval(iv);
+    // The CLI buffered the keystrokes through the compaction and submitted them
+    // itself: a turn IS running. Retyping here would push the same prompt into a
+    // live turn and run it twice.
+    expect(writes.filter((w) => w === "hello").length).toBe(1);
+    expect(writes).not.toContain("\x15");
+  });
+
+  it("a spinner frame does not clear the latch once compaction is seen", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("z", handle, {
+      submitConfirmMs: 20,
+      maxSubmitNudges: 2,
+      maxCompactionWaitMs: 300,
+    });
+    emit("\nCompacting conversation…");
+    const p = proc.send_prompt_stream("hello");
+    // Nothing but spinner frames, forever: the latch must hold, so the loop waits
+    // out maxCompactionWaitMs instead of reading the spinner as a live turn.
+    const iv = setInterval(() => emit("\n⠸"), 5);
+    const t0 = Date.now();
+    await p;
+    const elapsed = Date.now() - t0;
+    clearInterval(iv);
+    // 200ms pre-CR settle + the full 300ms compaction deadline. An in-window
+    // probe that misses the banner returns at ~220ms (settle + one 20ms window),
+    // so this threshold discriminates instead of being met by the settle alone.
+    // Headroom below the ~500ms nominal (200ms settle + 300ms budget): a loaded
+    // box only makes real timers fire LATE, so the discriminating gap is against
+    // the ~220ms an early false turn-start would take, not against the ceiling.
+    expect(elapsed).toBeGreaterThanOrEqual(400);
+    expect(writes.filter((w) => w === "\r").length).toBe(1); // no nudge spent
+  });
+
+  it("clears the latch when the end marker is split across PTY chunks", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("z", handle, {
+      submitConfirmMs: 30,
+      maxSubmitNudges: 2,
+      maxCompactionWaitMs: 5000,
+    });
+    emit("\nCompacting conversation…");
+    const p = proc.send_prompt_stream("hello");
+    let compacting = true;
+    const iv = setInterval(
+      () => emit(compacting ? "\n⠋" : "\n⏵ accept edits on (shift+tab to cycle)"),
+      5,
+    );
+    setTimeout(() => {
+      compacting = false;
+      // The marker arrives in two pieces, as a real PTY read boundary would
+      // deliver it. Detecting on a single chunk misses this and leaves the
+      // latch armed for the rest of the process's life.
+      emit("\nCompact");
+      emit("ed (ctrl+o to see full summary)");
+    }, 120);
+    await p;
+    clearInterval(iv);
+    expect(writes.filter((w) => w === "hello").length).toBe(2); // latch cleared -> retype ran
+  });
+
+  it("does not retype when a short buffered turn started and finished in one window", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("z", handle, {
+      submitConfirmMs: 40,
+      maxSubmitNudges: 2,
+      maxCompactionWaitMs: 5000,
+    });
+    emit("\nCompacting conversation…");
+    const p = proc.send_prompt_stream("hello");
+    let phase: "compacting" | "burst" | "idle" = "compacting";
+    const iv = setInterval(() => {
+      if (phase === "compacting") emit("\n⠋");
+      else if (phase === "idle") emit("\n⏵ accept edits on (shift+tab to cycle)");
+    }, 5);
+    setTimeout(() => {
+      emit("\nCompacted (ctrl+o to see full summary)");
+      phase = "burst";
+      // The CLI had buffered the keystrokes and ran the turn itself. It is short
+      // enough that its output AND the repainted idle footer land in the SAME
+      // confirm window — so the footer alone cannot be read as "no turn ran".
+      emit("\nassistant answered already\n⏵ accept edits on (shift+tab to cycle)");
+      phase = "idle";
+      // 260ms: past the 200ms pre-CR settle, so this lands INSIDE a confirm
+      // window rather than before the loop starts.
+    }, 260);
+    await p;
+    clearInterval(iv);
+    expect(writes.filter((w) => w === "hello").length).toBe(1); // no duplicate submit
+  });
+
+  it("retypes even when output appeared BEFORE the compaction started", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("z", handle, {
+      submitConfirmMs: 40,
+      maxSubmitNudges: 2,
+      maxCompactionWaitMs: 5000,
+    });
+    const p = proc.send_prompt_stream("hello");
+    // Window 1: the REPL is idle and repaints its bottom chrome — the input box
+    // still holding the un-submitted prompt, plus the footer. That echoed line is
+    // non-footer output, but it proves nothing about a turn: treating it as
+    // evidence would gate off the retype below and drop the prompt silently.
+    let phase: "echo" | "compacting" | "idle" = "echo";
+    const iv = setInterval(() => {
+      if (phase === "echo") emit("\n> hello\n⏵ accept edits on (shift+tab to cycle)");
+      else if (phase === "compacting") emit("\n⠋");
+      else emit("\n⏵ accept edits on (shift+tab to cycle)");
+    }, 5);
+    setTimeout(() => {
+      phase = "compacting";
+      emit("\nCompacting conversation… (esc to interrupt)");
+    }, 260);
+    setTimeout(() => {
+      phase = "idle";
+      emit("\nCompacted (ctrl+o to see full summary)");
+    }, 420);
+    await p;
+    clearInterval(iv);
+    expect(writes.filter((w) => w === "hello").length).toBe(2); // retype still runs
+  });
+
+  it("counts non-ASCII turn output as evidence (no duplicate submit)", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("z", handle, {
+      submitConfirmMs: 40,
+      maxSubmitNudges: 2,
+      maxCompactionWaitMs: 5000,
+    });
+    emit("\nCompacting conversation…");
+    const p = proc.send_prompt_stream("hello");
+    let phase: "compacting" | "idle" = "compacting";
+    const iv = setInterval(() => {
+      if (phase === "compacting") emit("\n⠋");
+      else emit("\n⏵ accept edits on (shift+tab to cycle)");
+    }, 5);
+    setTimeout(() => {
+      emit("\nCompacted (ctrl+o to see full summary)");
+      // The buffered turn ran and its visible output is entirely non-ASCII —
+      // emoji and box-drawing tool chrome, no Latin text. Filtering the window
+      // down to ASCII would erase it, read "no turn ran", and retype into the
+      // live turn.
+      emit("\n╭──────────╮\n│ ✅ 🎉 📦 │\n╰──────────╯\n⏵ accept edits on (shift+tab to cycle)");
+      phase = "idle";
+    }, 260);
+    await p;
+    clearInterval(iv);
+    expect(writes.filter((w) => w === "hello").length).toBe(1);
+  });
+
+  it("a prompt whose own text contains the banner does not arm the latch", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("z", handle, {
+      submitConfirmMs: 30,
+      maxSubmitNudges: 2,
+      maxCompactionWaitMs: 2000,
+    });
+    const poisoned = "explain what Compacting conversation means";
+    const t0 = Date.now();
+    const p = proc.send_prompt_stream(poisoned);
+    // The CLI echoes the typed text back on the output stream. Matching markers
+    // against that echo lets any chat message arm a sticky, process-wide latch
+    // and stall the serialised write chain for the whole compaction budget.
+    const iv = setInterval(() => {
+      emit("\n> " + poisoned);
+      emit("\nassistant is streaming a chunk");
+    }, 5);
+    await p;
+    const elapsed = Date.now() - t0;
+    clearInterval(iv);
+    // A real turn is streaming, so this must confirm on the first window
+    // (~230ms). If the echo armed the latch the loop would instead wait out
+    // maxCompactionWaitMs and only return after ~2200ms.
+    expect(elapsed).toBeLessThan(1000);
+    expect(writes.filter((w) => w === "\r").length).toBe(1); // confirmed, no nudge
+  });
+
+  it("strips the echo as the TUI actually renders it (bordered input box)", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("z", handle, {
+      submitConfirmMs: 30,
+      maxSubmitNudges: 2,
+      maxCompactionWaitMs: 2000,
+    });
+    const poisoned = "explain what Compacting conversation means";
+    const t0 = Date.now();
+    const p = proc.send_prompt_stream(poisoned);
+    // The real TUI paints the input box with borders and padding. Stripping only
+    // the LEADING glyphs leaves the trailing bar, the echo stops matching what we
+    // typed, and remote text reaches the marker probes again.
+    const iv = setInterval(() => {
+      emit("\n│ > " + poisoned + "        │");
+      emit("\nassistant is streaming a chunk");
+    }, 5);
+    await p;
+    const elapsed = Date.now() - t0;
+    clearInterval(iv);
+    expect(elapsed).toBeLessThan(1000);
+    expect(writes.filter((w) => w === "\r").length).toBe(1);
+  });
+
+  it("keeps the real footer when the prompt quotes it verbatim (Copilot #359)", async () => {
+    const { handle, writes, emit } = bootPty();
+    const proc = new PtyAgentProcess("z", handle, {
+      submitConfirmMs: 30,
+      maxSubmitNudges: 2,
+      maxCompactionWaitMs: 5000,
+    });
+    // A plausible prompt: the user pastes a CLI transcript that contains the
+    // idle footer verbatim. Stripping every line that is merely a substring of
+    // what we typed would erase the CLI's OWN footer, so an idle REPL would read
+    // as a started turn and the prompt would be dropped — the inverse of the
+    // echo-poisoning this filter exists to stop.
+    const quoted = "regarde ce transcript: accept edits on (shift+tab to cycle) — explique-moi";
+    const p = proc.send_prompt_stream(quoted);
+    const iv = setInterval(() => {
+      emit("\n⏵ accept edits on (shift+tab to cycle)");
+      emit("\nassistant is streaming a chunk");
+    }, 5);
+    await p;
+    clearInterval(iv);
+    // Footer preserved ⇒ the REPL is correctly seen as idle ⇒ the loop nudges
+    // instead of declaring a turn. 1 initial submit + 2 nudges.
+    expect(writes.filter((w) => w === "\r").length).toBe(3);
+  });
+});
