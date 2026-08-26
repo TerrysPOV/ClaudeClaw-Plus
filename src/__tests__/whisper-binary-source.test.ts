@@ -2,7 +2,13 @@ import { describe, expect, test } from "bun:test";
 import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BINARY_SOURCES, binaryIsRunnable, isWhisperSharedLib, sharedLibTargets } from "../whisper";
+import {
+  BINARY_SOURCES,
+  binaryIsRunnable,
+  isWhisperSharedLib,
+  sharedLibTargets,
+  decideWarmupAction,
+} from "../whisper";
 
 /**
  * Regression cover for the linux-arm64 whisper install being unrunnable.
@@ -16,13 +22,15 @@ import { BINARY_SOURCES, binaryIsRunnable, isWhisperSharedLib, sharedLibTargets 
  */
 describe("whisper BINARY_SOURCES", () => {
   test("no Linux platform is served a Homebrew bottle", () => {
+    // Linux only, deliberately: the darwin entries are still Homebrew bottles.
+    // Mach-O relocation differs from ELF and does not hit the interpreter bug,
+    // and those URLs are content-addressed. Do not widen this to all platforms.
     const linuxEntries = Object.entries(BINARY_SOURCES).filter(([k]) => k.startsWith("linux-"));
     expect(linuxEntries.length).toBeGreaterThan(0);
 
     for (const [platform, source] of linuxEntries) {
       // Homebrew bottles are relocatable-by-brew only; their ELF interpreter is
       // a placeholder that no plain tar extraction will fix.
-      expect(`${platform}:${source.url}`).not.toContain("ghcr.io/v2/homebrew");
       expect(`${platform}:${source.url}`).not.toContain("homebrew");
     }
   });
@@ -36,19 +44,24 @@ describe("whisper BINARY_SOURCES", () => {
     expect(source?.url).not.toContain("/latest/");
   });
 
-  test("mutable release URLs carry a sha256 pin", () => {
-    // The Homebrew URL this replaced was content-addressed (sha256:... in the
-    // path), so the bytes could not change under us. A GitHub release asset is
-    // name-addressed and re-uploadable, so the digest has to be pinned here
-    // instead — these bytes get chmod 0755'd and executed by the daemon.
-    const source = BINARY_SOURCES["linux-arm64"];
-    expect(source?.sha256).toMatch(/^[0-9a-f]{64}$/);
+  test("every mutable URL carries a sha256 pin", () => {
+    // A URL containing /blobs/sha256: is content-addressed — the registry can
+    // only serve those bytes. Anything else (a GitHub release asset) is
+    // name-addressed and re-uploadable, so it needs its digest pinned here.
+    // These bytes get chmod 0755'd and executed with the daemon's environment.
+    for (const [platform, source] of Object.entries(BINARY_SOURCES)) {
+      const contentAddressed = source.url.includes("/blobs/sha256:");
+      if (contentAddressed) continue;
+      expect(`${platform}: ${source.sha256 ?? "MISSING"}`).toMatch(/^[a-z0-9-]+: [0-9a-f]{64}$/);
+    }
   });
 
-  test("every source is fully specified", () => {
+  test("every source has an https url and a known archive format", () => {
     for (const [platform, source] of Object.entries(BINARY_SOURCES)) {
       expect(`${platform}: ${source.url}`).toStartWith(`${platform}: https://`);
-      expect(["tar.gz", "zip"]).toContain(source.format);
+      // Asserted on source.format, not the literal, so a failure names the
+      // offending platform rather than printing the allowed list.
+      expect(`${platform}: ${source.format}`).toMatch(/^[a-z0-9-]+: (tar\.gz|zip)$/);
     }
   });
 });
@@ -97,5 +110,27 @@ describe("runtime shared libraries", () => {
     expect(targets).toHaveLength(2);
     expect(targets.some((t) => t.endsWith(`/lib/libggml-cpu.so`))).toBe(true);
     expect(targets.some((t) => t.endsWith(`/bin/libggml-cpu.so`))).toBe(true);
+  });
+});
+
+describe("decideWarmupAction", () => {
+  test("installs when nothing is there", async () => {
+    expect(await decideWarmupAction(join(tmpdir(), "no-such-whisper-cli"))).toBe("install");
+  });
+
+  test("REPAIRS a binary that is present but will not run", async () => {
+    // The regression that mattered. Warmup used to branch on existence alone,
+    // so this state was classified "ok": the file was present, warmup reported
+    // success, and every transcription failed. Deciding on runnability is the
+    // fix — if this ever returns "ok" again, linux-arm64 silently breaks.
+    const dir = await mkdtemp(join(tmpdir(), "whisper-warmup-"));
+    const broken = join(dir, "whisper-cli");
+    await writeFile(broken, "not an executable");
+    await chmod(broken, 0o755);
+    expect(await decideWarmupAction(broken)).toBe("repair");
+  });
+
+  test("leaves a working binary alone", async () => {
+    expect(await decideWarmupAction(process.execPath)).toBe("ok");
   });
 });

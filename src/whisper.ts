@@ -41,10 +41,17 @@ interface BinarySource {
 
 /** Exported for tests — see `src/__tests__/whisper-binary-source.test.ts`. */
 export const BINARY_SOURCES: Readonly<Record<string, Readonly<BinarySource>>> = {
+  // Third-party personal repo — the weakest provenance in this table, so the
+  // digest pin matters most here.
   "linux-x64": {
     url: "https://github.com/dscripka/whisper.cpp_binaries/releases/download/commit_3d42463/whisper-bin-linux-x64.tar.gz",
     format: "tar.gz",
+    sha256: "63f69d39d3ec56a1f6828055d56f0625e0c5871c55578a141090a678c0b9383e",
   },
+  // The two darwin entries are content-addressed (the sha256 is in the URL
+  // path), so a conforming registry can only ever serve those exact bytes —
+  // no separate pin needed. They remain Homebrew bottles because Mach-O
+  // relocation differs from ELF and does not hit the interpreter bug above.
   "darwin-arm64": {
     url: "https://ghcr.io/v2/homebrew/core/whisper-cpp/blobs/sha256:f0901568c7babbd3022a043887007400e4b57a22d3a90b9c0824d01fa3a77270",
     format: "tar.gz",
@@ -67,6 +74,7 @@ export const BINARY_SOURCES: Readonly<Record<string, Readonly<BinarySource>>> = 
   "win32-x64": {
     url: "https://github.com/ggml-org/whisper.cpp/releases/download/v1.7.6/whisper-bin-x64.zip",
     format: "zip",
+    sha256: "0d2eca299c248f965bd0341bcb219db4b433c7f0c0ce2200d4df85765e8156a9",
   },
 };
 
@@ -310,10 +318,15 @@ async function downloadAndExtractBinary(): Promise<void> {
   await Bun.write(destBinary, Bun.file(found));
   await chmod(destBinary, 0o755);
 
-  // Copy any shared libraries (for Homebrew bottles)
-  const entries = await readdir(extractDir, { withFileTypes: true, recursive: true }).catch(
-    () => [],
-  );
+  // Copy the runtime shared libraries out of the archive.
+  //
+  // Deliberately NOT wrapped in .catch(() => []). Swallowing a readdir failure
+  // here copies zero libraries while leaving the binary from above in place —
+  // and since `--help` does not exercise ggml's dlopen, the install then passes
+  // every subsequent runnability probe while failing every real transcription
+  // with "backends = 0". A throw is recoverable; a silent empty copy is not.
+  const entries = await readdir(extractDir, { withFileTypes: true, recursive: true });
+  let copied = 0;
   for (const entry of entries) {
     if (!entry.isFile()) continue;
     const name = entry.name;
@@ -324,7 +337,17 @@ async function downloadAndExtractBinary(): Promise<void> {
       for (const destPath of sharedLibTargets(name)) {
         await Bun.write(destPath, Bun.file(srcPath));
       }
+      copied++;
     }
+  }
+
+  // Every supported archive ships its own libwhisper/libggml. Zero matches means
+  // the layout changed and the probe below would certify a broken install.
+  if (copied === 0) {
+    throw new Error(
+      `whisper: no shared libraries found in the ${platformKey} archive — ` +
+        `refusing to install a binary that cannot load its backend.`,
+    );
   }
 
   // Cleanup
@@ -344,6 +367,21 @@ async function downloadModel(): Promise<void> {
   console.log("whisper: model ready");
 }
 
+/**
+ * What warmup must do about the installed binary.
+ *
+ * The distinction that matters is "repair": a binary that is present but will
+ * not run. Deciding on presence alone is the bug that left linux-arm64 silently
+ * broken for months — the file was there, so warmup reported success forever
+ * and every transcription failed.
+ */
+export type WarmupAction = "ok" | "install" | "repair";
+
+export async function decideWarmupAction(binaryPath: string): Promise<WarmupAction> {
+  if (await binaryIsRunnable(binaryPath)) return "ok";
+  return (await fileExists(binaryPath)) ? "repair" : "install";
+}
+
 async function prepareWhisperAssets(printOutput: boolean): Promise<void> {
   const startedAt = Date.now();
   // Fail fast instead of re-downloading a known-bad archive on every message.
@@ -353,10 +391,11 @@ async function prepareWhisperAssets(printOutput: boolean): Promise<void> {
   await mkdir(TMP_FOLDER, { recursive: true });
 
   const binaryPath = getWhisperBinaryPath();
-  if (await binaryIsRunnable(binaryPath)) {
+  const action = await decideWarmupAction(binaryPath);
+  if (action === "ok") {
     console.log("whisper warmup: binary exists");
   } else {
-    if (await fileExists(binaryPath)) {
+    if (action === "repair") {
       console.log("whisper warmup: existing binary is not runnable, re-downloading");
     }
     await downloadAndExtractBinary();
