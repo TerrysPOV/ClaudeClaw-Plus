@@ -105,7 +105,8 @@ describe("runtime shared libraries", () => {
   test("every library is written beside the binary, not only into lib/", () => {
     // Load-bearing: ggml dlopens its compute backend by searching next to the
     // executable. If this collapses back to lib/ only, the binary still loads
-    // and --help still exits 0, but transcription fails with "backends = 0".
+    // and --help still exits 0, but transcription fails, with whisper-cli reporting `backends   = 0`
+    // at runtime (a printf format, so do not expect to grep it out of the binary).
     const targets = sharedLibTargets("libggml-cpu.so");
     expect(targets).toHaveLength(2);
     expect(targets.some((t) => t.endsWith(`/lib/libggml-cpu.so`))).toBe(true);

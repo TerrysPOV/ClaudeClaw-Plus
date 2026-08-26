@@ -136,7 +136,7 @@ export function isWhisperSharedLib(name: string): boolean {
  * BIN_DIR is not redundant: ggml dlopens its compute backend by searching
  * alongside the executable, a lookup no library-path variable affects. Drop
  * BIN_DIR and the binary still loads — `--help` exits 0 — but every
- * transcription fails with "backends = 0".
+ * transcription fails with whisper-cli reporting `backends   = 0` at runtime.
  */
 export function sharedLibTargets(name: string): string[] {
   return [join(LIB_DIR, name), join(BIN_DIR, name)];
@@ -267,14 +267,6 @@ async function downloadAndExtractBinary(): Promise<void> {
   const extractDir = join(TMP_FOLDER, "extract");
   await rm(extractDir, { recursive: true, force: true });
   await mkdir(extractDir, { recursive: true });
-  // Wipe rather than overwrite: a library present in the previous archive but
-  // absent from this one would otherwise survive, and both dirs are on the
-  // loader path (BIN_DIR is also ggml's dlopen search dir). That matters right
-  // now — existing arm64 installs hold objects from the old Homebrew source.
-  await rm(BIN_DIR, { recursive: true, force: true });
-  await rm(LIB_DIR, { recursive: true, force: true });
-  await mkdir(BIN_DIR, { recursive: true });
-  await mkdir(LIB_DIR, { recursive: true });
 
   const archiveExt = source.format === "tar.gz" ? "tar.gz" : "zip";
   const archivePath = join(TMP_FOLDER, `whisper-bin.${archiveExt}`);
@@ -314,40 +306,56 @@ async function downloadAndExtractBinary(): Promise<void> {
     throw new Error("Could not find whisper-cli or main binary in downloaded archive");
   }
 
-  const destBinary = getWhisperBinaryPath();
-  await Bun.write(destBinary, Bun.file(found));
-  await chmod(destBinary, 0o755);
-
-  // Copy the runtime shared libraries out of the archive.
+  // Everything above is staging. Only now, with a verified archive, a located
+  // binary and a non-empty library set in hand, do we touch the live install.
   //
+  // Ordering matters: this runs on the repair path too, and binaryIsRunnable()
+  // cannot distinguish a permanently broken binary from a transient spawn
+  // failure (memory pressure, fd exhaustion). Wiping before the replacement is
+  // proven good would turn a bad probe plus an unreachable download host into a
+  // destroyed install, where previously a failed download was a harmless no-op.
   // Deliberately NOT wrapped in .catch(() => []). Swallowing a readdir failure
-  // here copies zero libraries while leaving the binary from above in place —
-  // and since `--help` does not exercise ggml's dlopen, the install then passes
-  // every subsequent runnability probe while failing every real transcription
-  // with "backends = 0". A throw is recoverable; a silent empty copy is not.
+  // here would stage zero libraries; combined with the binary write below that
+  // yields an install which passes every `--help` probe (which does not
+  // exercise ggml's dlopen) while failing every real transcription. A throw is
+  // recoverable; a silent empty copy is not.
   const entries = await readdir(extractDir, { withFileTypes: true, recursive: true });
-  let copied = 0;
+
+  const stagedLibs: Array<{ name: string; srcPath: string }> = [];
   for (const entry of entries) {
     if (!entry.isFile()) continue;
     const name = entry.name;
-    if (isWhisperSharedLib(name)) {
-      const parentPath = entry.parentPath ?? entry.path ?? "";
-      const srcPath = join(parentPath, name);
-      // Written to BOTH dirs on purpose — see sharedLibTargets().
-      for (const destPath of sharedLibTargets(name)) {
-        await Bun.write(destPath, Bun.file(srcPath));
-      }
-      copied++;
-    }
+    if (!isWhisperSharedLib(name)) continue;
+    stagedLibs.push({ name, srcPath: join(entry.parentPath ?? entry.path ?? "", name) });
   }
 
   // Every supported archive ships its own libwhisper/libggml. Zero matches means
-  // the layout changed and the probe below would certify a broken install.
-  if (copied === 0) {
+  // the layout changed and the probe would otherwise certify a broken install.
+  if (stagedLibs.length === 0) {
     throw new Error(
       `whisper: no shared libraries found in the ${platformKey} archive — ` +
         `refusing to install a binary that cannot load its backend.`,
     );
+  }
+
+  // Replace rather than overwrite: a library present in the previous archive but
+  // absent from this one would otherwise survive, and both dirs are on the
+  // loader path (BIN_DIR is also ggml's dlopen search dir). That matters right
+  // now — existing arm64 installs hold objects from the old Homebrew source.
+  await rm(BIN_DIR, { recursive: true, force: true });
+  await rm(LIB_DIR, { recursive: true, force: true });
+  await mkdir(BIN_DIR, { recursive: true });
+  await mkdir(LIB_DIR, { recursive: true });
+
+  const destBinary = getWhisperBinaryPath();
+  await Bun.write(destBinary, Bun.file(found));
+  await chmod(destBinary, 0o755);
+
+  for (const { name, srcPath } of stagedLibs) {
+    // Written to BOTH dirs on purpose — see sharedLibTargets().
+    for (const destPath of sharedLibTargets(name)) {
+      await Bun.write(destPath, Bun.file(srcPath));
+    }
   }
 
   // Cleanup
