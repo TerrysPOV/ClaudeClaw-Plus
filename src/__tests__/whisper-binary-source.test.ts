@@ -36,6 +36,15 @@ describe("whisper BINARY_SOURCES", () => {
     expect(source?.url).not.toContain("/latest/");
   });
 
+  test("mutable release URLs carry a sha256 pin", () => {
+    // The Homebrew URL this replaced was content-addressed (sha256:... in the
+    // path), so the bytes could not change under us. A GitHub release asset is
+    // name-addressed and re-uploadable, so the digest has to be pinned here
+    // instead — these bytes get chmod 0755'd and executed by the daemon.
+    const source = BINARY_SOURCES["linux-arm64"];
+    expect(source?.sha256).toMatch(/^[0-9a-f]{64}$/);
+  });
+
   test("every source is fully specified", () => {
     for (const [platform, source] of Object.entries(BINARY_SOURCES)) {
       expect(`${platform}: ${source.url}`).toStartWith(`${platform}: https://`);

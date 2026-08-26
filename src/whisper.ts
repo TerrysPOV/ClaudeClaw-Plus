@@ -30,11 +30,17 @@ function getModelUrl(model: string): string {
 interface BinarySource {
   url: string;
   format: "tar.gz" | "zip";
+  /**
+   * Hex sha256 of the archive. Required wherever the URL is not itself
+   * content-addressed: a release asset is name-addressed and mutable, so
+   * without this the bytes we execute are whatever the tag currently points at.
+   */
+  sha256?: string;
   headers?: Record<string, string>;
 }
 
 /** Exported for tests — see `src/__tests__/whisper-binary-source.test.ts`. */
-export const BINARY_SOURCES: Record<string, BinarySource> = {
+export const BINARY_SOURCES: Readonly<Record<string, Readonly<BinarySource>>> = {
   "linux-x64": {
     url: "https://github.com/dscripka/whisper.cpp_binaries/releases/download/commit_3d42463/whisper-bin-linux-x64.tar.gz",
     format: "tar.gz",
@@ -56,6 +62,7 @@ export const BINARY_SOURCES: Record<string, BinarySource> = {
   "linux-arm64": {
     url: "https://github.com/ggml-org/whisper.cpp/releases/download/b4938/whisper-bin-ubuntu-arm64.tar.gz",
     format: "tar.gz",
+    sha256: "94a33318650c57cc3d9a91439e0e3f0b94ba96bacd34203a06db395cf9204e40",
   },
   "win32-x64": {
     url: "https://github.com/ggml-org/whisper.cpp/releases/download/v1.7.6/whisper-bin-x64.zip",
@@ -64,6 +71,14 @@ export const BINARY_SOURCES: Record<string, BinarySource> = {
 };
 
 let warmupPromise: Promise<void> | null = null;
+
+/**
+ * Set when a freshly downloaded binary still will not run — i.e. this
+ * platform's BINARY_SOURCES entry is wrong. warmupPromise is cleared on
+ * failure and re-awaited per voice message, so without this latch every
+ * inbound message would re-download the whole archive before failing again.
+ */
+let unsupportedPlatform: string | null = null;
 
 type WhisperDebugLog = (message: string) => void;
 
@@ -244,6 +259,12 @@ async function downloadAndExtractBinary(): Promise<void> {
   const extractDir = join(TMP_FOLDER, "extract");
   await rm(extractDir, { recursive: true, force: true });
   await mkdir(extractDir, { recursive: true });
+  // Wipe rather than overwrite: a library present in the previous archive but
+  // absent from this one would otherwise survive, and both dirs are on the
+  // loader path (BIN_DIR is also ggml's dlopen search dir). That matters right
+  // now — existing arm64 installs hold objects from the old Homebrew source.
+  await rm(BIN_DIR, { recursive: true, force: true });
+  await rm(LIB_DIR, { recursive: true, force: true });
   await mkdir(BIN_DIR, { recursive: true });
   await mkdir(LIB_DIR, { recursive: true });
 
@@ -253,6 +274,19 @@ async function downloadAndExtractBinary(): Promise<void> {
   console.log(`whisper: downloading binary for ${platformKey}...`);
   await downloadFile(source.url, archivePath, source.headers);
 
+  // These bytes get chmod 0755'd and executed with the daemon's full
+  // environment, so verify them before we ever reach that point.
+  if (source.sha256) {
+    const digest = new Bun.CryptoHasher("sha256")
+      .update(await Bun.file(archivePath).arrayBuffer())
+      .digest("hex");
+    if (digest !== source.sha256) {
+      await rm(archivePath, { force: true });
+      throw new Error(
+        `whisper: archive digest mismatch for ${platformKey} — expected ${source.sha256}, got ${digest}`,
+      );
+    }
+  }
   console.log("whisper: extracting...");
   if (source.format === "tar.gz") {
     const proc = Bun.spawnSync(["tar", "xzf", archivePath, "-C", extractDir]);
@@ -286,12 +320,7 @@ async function downloadAndExtractBinary(): Promise<void> {
     if (isWhisperSharedLib(name)) {
       const parentPath = entry.parentPath ?? entry.path ?? "";
       const srcPath = join(parentPath, name);
-      // Written to BOTH dirs on purpose. LIB_DIR is the historical location and
-      // is what LD_LIBRARY_PATH points at; BIN_DIR is required because ggml
-      // dlopens its compute backend (libggml-cpu.so) by searching next to the
-      // executable — a lookup no library path influences. With only LIB_DIR the
-      // binary loads and `--help` succeeds, but every transcription dies with
-      // "backends = 0". Both are rewritten on each download, so they cannot skew.
+      // Written to BOTH dirs on purpose — see sharedLibTargets().
       for (const destPath of sharedLibTargets(name)) {
         await Bun.write(destPath, Bun.file(srcPath));
       }
@@ -317,6 +346,8 @@ async function downloadModel(): Promise<void> {
 
 async function prepareWhisperAssets(printOutput: boolean): Promise<void> {
   const startedAt = Date.now();
+  // Fail fast instead of re-downloading a known-bad archive on every message.
+  if (unsupportedPlatform) throw new Error(unsupportedPlatform);
   console.log(`whisper warmup: start root=${WHISPER_ROOT} model=${getWhisperModel()}`);
   await mkdir(WHISPER_ROOT, { recursive: true });
   await mkdir(TMP_FOLDER, { recursive: true });
@@ -332,10 +363,10 @@ async function prepareWhisperAssets(printOutput: boolean): Promise<void> {
     // One retry only — if a freshly downloaded binary still will not exec, the
     // platform source is wrong and silently looping would hide that.
     if (!(await binaryIsRunnable(binaryPath))) {
-      throw new Error(
+      unsupportedPlatform =
         `whisper: downloaded binary for ${process.platform}-${process.arch} is not runnable ` +
-          `(${binaryPath}). The platform's BINARY_SOURCES entry is likely wrong for this system.`,
-      );
+        `(${binaryPath}). The platform's BINARY_SOURCES entry is likely wrong for this system.`;
+      throw new Error(unsupportedPlatform);
     }
   }
 
