@@ -27,6 +27,26 @@ Everything from upstream lives here too. Plus has now diverged significantly fro
 
 ---
 
+## Project status
+
+**ClaudeClaw+ is in feature freeze. Fixes and hygiene work continue; new features are not
+currently being merged here.**
+
+What this means in practice:
+
+- **Bug fixes, platform and hygiene PRs are welcome** and will be reviewed as normal.
+- **Large new-feature PRs are unlikely to be merged right now.** Please open an issue to discuss
+  before investing significant time, so nobody spends a weekend on something that cannot land.
+- The project remains MIT licensed and independently runnable. Nothing about the freeze changes
+  what is already here or how you may use it.
+
+For transparency: development effort has shifted to a separate, private commercial product built
+on this daemon. MIT permits that, and it does not affect your rights to this code — but it would
+be discourteous not to say so plainly, particularly to anyone considering a substantial
+contribution.
+
+---
+
 ## Standing on the shoulders of giants
 
 ClaudeClaw+ is built on top of the original [`moazbuilds/claudeclaw`](https://github.com/moazbuilds/claudeclaw), created by [@moazbuilds](https://github.com/moazbuilds). The core daemon, Telegram/Discord adapters, heartbeat, web dashboard, skills system — all of that comes from upstream and the amazing contributors who built it.
