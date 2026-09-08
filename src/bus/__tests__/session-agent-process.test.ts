@@ -311,6 +311,42 @@ describe("PtyAgentProcess boot-dialog watcher (structural / ANSI-resilient)", ()
     expect(writes).toEqual(["\r"]);
   });
 
+  it("answers the trust-folder dialog with Down+Enter when the CLI defaults to \"No, exit\" (2026-09-07 regression)", async () => {
+    // Captured live against claude 2.1.263: the trust-folder dialog now
+    // preselects "No, exit" for a cwd re-entering under a fresh --session-id
+    // even though it was already trusted in a prior session — same shape as
+    // the bypass-permissions dialog's destructive default. Before this fix
+    // the generic branch correctly refused to blind-Enter into exit, but had
+    // no Down+Enter fallback for this dialog, so the agent just wedged and
+    // was later killed — every mcp-reconciler respawn of a live agent hit
+    // this and never came back up.
+    const { handle, writes, emit } = bootPty();
+    new PtyAgentProcess("theta", handle);
+    emit(
+      "Quick safety check: Is this a project you trust?\r\n" +
+        " ❯ 1. No, exit\r\n   2. Yes, I trust this folder\r\n Enter to confirm · Esc to cancel",
+    );
+    expect(writes).toContain("\x1b[B"); // Down
+    await new Promise((r) => setTimeout(r, 250));
+    expect(writes).toEqual(["\x1b[B", "\r"]); // then Enter, exactly once
+  });
+
+  it("does NOT fire a second Enter when the trust-folder dialog re-renders after Down+Enter", async () => {
+    const { handle, writes, emit } = bootPty();
+    new PtyAgentProcess("iota", handle);
+    emit(
+      "Quick safety check: Is this a project you trust?\r\n" +
+        " ❯ 1. No, exit\r\n   2. Yes, I trust this folder\r\n Enter to confirm",
+    );
+    // redraw after Down: selection moved to the trust row, dialog still up.
+    emit(
+      "Quick safety check: Is this a project you trust?\r\n" +
+        "   1. No, exit\r\n ❯ 2. Yes, I trust this folder\r\n Enter to confirm",
+    );
+    await new Promise((r) => setTimeout(r, 250));
+    expect(writes).toEqual(["\x1b[B", "\r"]);
+  });
+
   it("sends one Enter per distinct dialog, not per render chunk", () => {
     const { handle, writes, emit } = bootPty();
     new PtyAgentProcess("gamma", handle);
