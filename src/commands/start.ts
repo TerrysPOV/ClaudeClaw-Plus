@@ -222,7 +222,7 @@ async function setupStatusline() {
   }
   settings.statusLine = {
     type: "command",
-    command: "node .claude/statusline.cjs",
+    command: `node ${STATUSLINE_FILE}`,
   };
   await writeFile(CLAUDE_SETTINGS_FILE, JSON.stringify(settings, null, 2) + "\n");
 }
