@@ -35,8 +35,11 @@ export interface McpReconcilerDeps {
    *  a deaf-but-mid-turn agent so a live turn is not interrupted (#252 stack
    *  ultra) — the turn still delivers via the tailer-based silent-drop net. */
   isTurnActive?(agentId: string): boolean;
-  /** Respawn the agent (Session Manager `restart()` — same session_id, resumes). */
-  restart(agentId: string): Promise<unknown>;
+  /** Respawn the agent (Session Manager `restart()` — same session_id, resumes).
+   *  `reason` is stamped on the post-mortem so a reconciler-triggered restart is
+   *  distinguishable from an operator-initiated one (both otherwise default to
+   *  `SessionManager.restart()`'s "manual" label). */
+  restart(agentId: string, reason: string): Promise<unknown>;
   /** Structured logger. Lands in the daemon log, grep-able. */
   log(msg: string, fields: Record<string, unknown>): void;
   /** Schedule a callback. Injectable for tests. Returns a handle to cancel. */
@@ -160,7 +163,7 @@ export function createMcpReconciler(
     s.restartHistory.push(now());
     const attemptNo = s.restartHistory.length;
     deps.log("reconcile-restart", { agent: agentId, attempt: attemptNo, reason });
-    Promise.resolve(deps.restart(agentId))
+    Promise.resolve(deps.restart(agentId, `mcp-reconcile:${reason}`))
       .then(() => {
         deps.log("reconcile-restart-ok", { agent: agentId, attempt: attemptNo });
       })

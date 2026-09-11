@@ -262,17 +262,18 @@ export class PtyAgentProcess implements AgentProcess {
   private readonly maxSubmitNudges: number;
   private readonly maxCompactionWaitMs: number;
   /** Boot-dialog watcher state (issue #193). Claude shows interactive
-   *  confirmation dialogs at startup (the dev-channels prompt, and the newer
-   *  "Bypass Permissions mode" prompt). We answer them by inspecting early PTY
-   *  output and sending the correct key per dialog. The watcher stays engaged
-   *  until claude actually reaches the REPL (detected via the footer marker) or
-   *  a bounded timeout — NOT until the first prompt. Codex P2 on PR #195: a
-   *  dialog can render AFTER an early heartbeat/scheduler prompt on a slow
-   *  fresh-install boot, so disengaging on first-prompt left late dialogs
-   *  unanswered and the agent stuck at "No, exit". */
+   *  confirmation dialogs at startup (the trust-folder prompt, the dev-channels
+   *  prompt, and the "Bypass Permissions mode" prompt). We answer them by
+   *  inspecting early PTY output and sending the correct key per dialog. The
+   *  watcher stays engaged until claude actually reaches the REPL (detected via
+   *  the footer marker) or a bounded timeout — NOT until the first prompt.
+   *  Codex P2 on PR #195: a dialog can render AFTER an early heartbeat/scheduler
+   *  prompt on a slow fresh-install boot, so disengaging on first-prompt left
+   *  late dialogs unanswered and the agent stuck at "No, exit". */
   private bootDialogActive = true;
   private bootDialogBuffer = "";
   private answeredBypassPrompt = false;
+  private answeredTrustPrompt = false;
   /** Signature of the last generic confirm-dialog we answered, so we send one
    *  Enter per distinct dialog instead of on every render chunk. */
   private lastConfirmSig: string | null = null;
@@ -798,12 +799,14 @@ export class PtyAgentProcess implements AgentProcess {
    *  the "Enter to confirm" affordance — rather than per-title strings.
    *
    *  Default-key safety: a dialog whose selected option is a proceed action
-   *  (trust-folder, dev-channels) is confirmed with Enter. The only known
-   *  dialog whose default is destructive is the bypass-permissions prompt
-   *  ("No, exit" preselected) — handled specifically with Down+Enter. An
-   *  unrecognised dialog whose default looks destructive is NOT auto-answered
-   *  (we log once instead), so a future CLI change degrades to "stuck + a
-   *  warning" rather than "blindly pressed the wrong button". */
+   *  (dev-channels) is confirmed with Enter. Two known dialogs default to a
+   *  destructive "No, exit" instead — the bypass-permissions prompt, and (as of
+   *  a claude CLI update that flipped its default off "Yes, I trust this
+   *  folder" — dossier 20260907, discord-bot stuck in a respawn loop after
+   *  every restart) the trust-folder prompt — both handled specifically with
+   *  Down+Enter. An unrecognised dialog whose default looks destructive is NOT
+   *  auto-answered (we log once instead), so a future CLI change degrades to
+   *  "stuck + a warning" rather than "blindly pressed the wrong button". */
   private handleBootDialog(chunk: string): void {
     this.bootDialogBuffer = (this.bootDialogBuffer + chunk).slice(-4000);
     const buf = stripAnsiEscapes(this.bootDialogBuffer);
@@ -816,6 +819,36 @@ export class PtyAgentProcess implements AgentProcess {
     if (/tab\s*to\s*cycle/.test(buf)) {
       this.endBootDialogPhase();
       return;
+    }
+
+    // Trust-folder dialog ("Quick safety check: Is this a project you
+    // created...") — this agent's cwd is operator-configured (settings.json
+    // `agents[].cwd`), so trusting it here mirrors the operator's own intent,
+    // same as the bypass-permissions and dev-channels dialogs below. Some
+    // claude CLI builds preselect "No, exit" for this dialog (confirmed live
+    // against 2.1.263, cwd already trusted from prior sessions — the trust
+    // grant does not carry over to a fresh --session-id), which used to blind-
+    // Enter into exit and kill the agent before the fail-safe generic branch
+    // was tightened; now it just wedges silently instead. Move the selection
+    // to the trust row first, same pattern as the bypass-permissions dialog.
+    if (buf.includes("Yes, I trust this folder")) {
+      if (this.answeredTrustPrompt) {
+        // Already sent Down+Enter for this dialog — a redraw now shows the
+        // trust row selected, but must NOT fall through to the generic
+        // branch below, which would fire a second, racing blind Enter
+        // (same hazard as the bypass-permissions dialog, Codex F3 on #195).
+        return;
+      }
+      // Some builds still default to the trust row (❯ right next to "Yes, I
+      // trust this folder") — that case is a plain proceed default and the
+      // generic branch below already handles it correctly with a bare Enter.
+      // Only intervene when "No, exit" is the one actually selected.
+      const trustAlreadySelected = /❯\s*\d*[.):]?\s*Yes, I trust this folder/.test(buf);
+      if (!trustAlreadySelected) {
+        this.answeredTrustPrompt = true;
+        this.sendBootKeys("\x1b[B", "\r"); // Down, then Enter
+        return;
+      }
     }
 
     // Bypass-permissions dialog — DEFAULT is "No, exit"; a blind Enter selects
