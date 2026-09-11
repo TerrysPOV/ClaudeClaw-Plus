@@ -50,17 +50,28 @@ jobs:
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Checkout repository
+      # Check out the TRUSTED BASE, never the PR head. This is a
+      # `pull_request_target` job: it runs with the base repo's secrets and hands
+      # an agent with Bash a working tree. Checking out the PR head here puts
+      # code the PR author controls under that trusted context — the "pwn
+      # request" shape — and `actions/checkout@v4` refuses to do it for fork
+      # PRs, which is why every fork PR's review failed in ~4s.
+      #
+      # The review does not need the head tree. `/code-review:code-review` fetches
+      # the PR's diff and metadata through `gh` as DATA and reasons over that;
+      # the checkout only provides repo context (CLAUDE.md, surrounding code).
+      # Reading the base version of a touched file instead of the head version
+      # is the accepted cost — the diff's own context lines carry the rest.
+      #
+      # The previous version pinned `ref` to the head SHA to close a TOCTOU race
+      # on maintainer-labeled external PRs. Checking out the base closes that
+      # race too, and the one it was worried about: no fork code is ever checked
+      # out, so there is nothing for a late push to swap in.
+      - name: Checkout repository (base branch)
         if: steps.token-check.outputs.configured == 'true'
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          # Pin to the immutable commit SHA from the event payload, NOT the
-          # mutable branch ref. For a maintainer-labeled external PR this closes
-          # the TOCTOU race where a fork author pushes a new commit after the
-          # label but before checkout — the privileged job would otherwise run
-          # against code the maintainer never approved.
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 1
 
       - name: Run Claude Code Review
