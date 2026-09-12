@@ -63,15 +63,17 @@ jobs:
       # Reading the base version of a touched file instead of the head version
       # is the accepted cost — the diff's own context lines carry the rest.
       #
-      # The previous version pinned `ref` to the head SHA to close a TOCTOU race
-      # on maintainer-labeled external PRs. Checking out the base closes that
-      # race too, and the one it was worried about: no fork code is ever checked
-      # out, so there is nothing for a late push to swap in.
-      - name: Checkout repository (base branch)
+      # Pin to the PR's BASE SHA from the event payload — the immutable commit
+      # this PR will merge into — not the default branch name. A PR targeting a
+      # non-default branch would otherwise be reviewed against unrelated context
+      # (Codex P2 on #34), and a branch name is a moving ref the base can advance
+      # under. The base SHA is always in the base repo, never a fork, so no fork
+      # code is ever checked out and the old head-SHA TOCTOU race is closed too.
+      - name: Checkout repository (PR base commit)
         if: steps.token-check.outputs.configured == 'true'
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 1
 
       - name: Run Claude Code Review
