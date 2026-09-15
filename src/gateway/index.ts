@@ -530,8 +530,12 @@ export async function processEventWithFallback(
     if (options.legacyHandler) {
       try {
         const legacyResult = await options.legacyHandler();
+        // `success` is the contract; `exitCode` is optional and informational
+        // (a handler that wraps a process reports it, one that does not has
+        // none). Deriving success from it turned `{ success: true }` into a
+        // failure and `{ success: false, exitCode: 0 }` into a success (#377).
         return {
-          success: legacyResult.exitCode === 0,
+          success: legacyResult.success,
           source: "legacy",
           error: legacyResult.error ?? legacyResult.stderr ?? undefined,
           legacyResult,

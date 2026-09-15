@@ -485,6 +485,35 @@ describe("Gateway", () => {
       expect(legacyHandler).toHaveBeenCalled();
     });
 
+    it("trusts LegacyResult.success, not the optional exitCode (#377)", async () => {
+      clearGatewayEnabledCache();
+      setGatewayEnabled(false);
+      const event: NormalizedEvent = {
+        id: randomUUID(),
+        channel: "telegram",
+        channelId: "telegram:123",
+        threadId: "default",
+        userId: "456",
+        text: "Hello",
+        attachments: [],
+        timestamp: Date.now(),
+        metadata: {},
+      };
+
+      // A handler that does not wrap a process reports no exit code at all.
+      const noExitCode = await processEventWithFallback(event, {
+        legacyHandler: vi.fn().mockResolvedValue({ success: true }),
+      });
+      expect(noExitCode.success).toBe(true);
+
+      // And an exit code of 0 is not a verdict when the handler says it failed.
+      const zeroButFailed = await processEventWithFallback(event, {
+        legacyHandler: vi.fn().mockResolvedValue({ success: false, exitCode: 0, error: "nope" }),
+      });
+      expect(zeroButFailed.success).toBe(false);
+      expect(zeroButFailed.error).toBe("nope");
+    });
+
     it("should return error when gateway disabled and no legacy handler", async () => {
       clearGatewayEnabledCache();
       setGatewayEnabled(false);
