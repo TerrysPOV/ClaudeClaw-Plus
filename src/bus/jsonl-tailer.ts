@@ -109,6 +109,15 @@ export interface JsonlTailerOptions {
   /** Surfaced via schema-probe cache (Sprint 2 Agent B). */
   schemaVersion?: string;
   /**
+   * Which tailer this is for the agent, in order of construction (the session
+   * manager counts per agent). Carried on `bus.events.replay_done` and
+   * `session.compact` so bus core can tell a marker from a replaced tailer's
+   * last reads apart from the live one — the transcript's `session_id` cannot
+   * serve: it is the stable Claude UUID and survives a `--resume` restart
+   * (#402). Omitted (tests, other wiring) → the bus treats ordering as unknown.
+   */
+  generation?: number;
+  /**
    * Where to begin tailing when the session file already exists.
    * `"begin"` (default) replays from byte 0 — used by tests and any
    * consumer that wants historical events. `"end"` seeks to EOF and
@@ -171,6 +180,7 @@ export class JsonlTailer {
   private readonly bus: BusCore;
   private readonly agent_id: string;
   private readonly session_id: string;
+  private readonly generation: number | undefined;
   private readonly cwd: string;
   private readonly projectsDir: string;
   private readonly schemaVersion: string;
@@ -209,6 +219,7 @@ export class JsonlTailer {
     this.bus = opts.bus;
     this.agent_id = opts.agent_id;
     this.session_id = opts.session_id;
+    this.generation = opts.generation;
     this.cwd = opts.cwd;
     this.projectsDir = opts.projectsDir ?? join(homedir(), ".claude", "projects");
     this.schemaVersion = opts.schemaVersion ?? SCHEMA_VERSION;
@@ -718,6 +729,7 @@ export class JsonlTailer {
           preTokens: m.preTokens,
           postTokens: m.postTokens,
           durationMs: m.durationMs,
+          ...(this.generation !== undefined ? { generation: this.generation } : {}),
         },
         line,
       );
@@ -782,6 +794,7 @@ export class JsonlTailer {
         offset: this.offset,
         schema_version: this.schemaVersion,
         path: this.filePath,
+        ...(this.generation !== undefined ? { generation: this.generation } : {}),
       },
     };
     try {

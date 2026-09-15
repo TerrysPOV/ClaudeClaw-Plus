@@ -176,6 +176,11 @@ export interface BusCoreOptions {
   /** Grace (ms) after a delivery handler settles before a verify re-delivers,
    *  to let the asynchronous turn-start tailer event land first. Default 1500. */
   flushVerifyGraceMs?: number;
+  /** #402: how long a prompt whose PTY delivery gave up on `stuck-compaction`
+   *  is held for the compaction to end (`session.compact` from the tailer)
+   *  before the same verify-then-re-deliver rule is applied anyway. Defaults to
+   *  600000 (10 min, ≫ the PTY layer's own compaction budget). Lowered in tests. */
+  stuckCompactionResolveMs?: number;
   /** Slash-command delegate (Agent C wires this). */
   slashCommandHandler?: SlashCommandHandler;
   /** REPL prompt delegate for PTY-stdin agents. Wired by the Session Manager. */
@@ -417,6 +422,14 @@ export class BusCoreImpl implements BusCore {
    * must not re-arm a hold on a session that is already running.
    */
   private readonly agentLiveSession = new Map<string, string>();
+  /** #402: the live tailer generation per agent (`payload.generation` on
+   *  `replay_done` / `session.compact`, numbered by the session manager). A
+   *  marker from an OLDER generation is a lagged read from a tailer being
+   *  replaced — `SessionManager` does not await `tailer.stop()` — and must not
+   *  move state or release a hold taken under the live one. The transcript's
+   *  `session_id` cannot play this role: it is the stable Claude UUID and
+   *  survives a `--resume` restart. */
+  private readonly agentTailerGeneration = new Map<string, number>();
   private readonly deliveryBackstopMs: number;
   /**
    * Pending turn-start verification for a BACKSTOP-flushed prompt. The backstop
@@ -435,7 +448,17 @@ export class BusCoreImpl implements BusCore {
    */
   private readonly flushVerify = new Map<
     string,
-    Map<string, { wrapped: string; graced: boolean; timer: ReturnType<typeof setTimeout> }>
+    Map<
+      string,
+      {
+        wrapped: string;
+        graced: boolean;
+        timer: ReturnType<typeof setTimeout>;
+        /** Set once the entry's one re-delivery has been spent: the entry is
+         *  then a marker that enforces at-most-once, not an active verify. */
+        redelivered?: boolean;
+      }
+    >
   >();
   private readonly flushVerifyMs: number;
   /**
@@ -463,7 +486,44 @@ export class BusCoreImpl implements BusCore {
    *  so without this a proof that arrived mid-loop would already have
    *  cancelled its verify and left nothing for the give-up to find — it would
    *  re-arm a prompt the model already handled (adversarial finding 2). */
-  private readonly inFlightProof = new Map<string, Map<string, boolean>>();
+  private readonly inFlightProof = new Map<
+    string,
+    Map<string, { proven: boolean; token: number }>
+  >();
+  /** Per-delivery token counter (see `inFlightProof`): a verdict or cleanup
+   *  from a delivery that has been superseded — the same text re-delivered
+   *  after a socket close carried it over while the old handler was still
+   *  deciding — must not read or mutate the newer delivery's entry. */
+  private deliveryToken = 0;
+  /** Per-agent epoch of the in-flight counter, bumped when a socket close
+   *  resets it, so a late `finally` from before the reset does not decrement
+   *  the counter of deliveries started after it. */
+  private readonly inFlightEpoch = new Map<string, number>();
+  /** The wrapped text behind each `inFlightProof` key, so a socket close can
+   *  carry an in-flight (unproven) prompt over to the fresh session like it
+   *  carries the held queue and the pending verifies (#402 review). */
+  private readonly inFlightWrapped = new Map<string, Map<string, string>>();
+  /**
+   * #402: prompts whose PTY delivery gave up on `stuck-compaction`, held until
+   * the compaction is positively over. The CLI can buffer the keystrokes
+   * through an auto-compaction and submit them itself when it ends, so
+   * re-typing DURING the compaction would land a second copy in the same
+   * buffer; the pre-#402 answer was to never re-deliver, which left this the
+   * last lost-prompt path from #361. The positive signal is the tailer's
+   * `session.compact` (the `compact_boundary` line the CLI writes when the
+   * compaction ends) — or a new session generation, which cannot still be
+   * compacting. On either, the held prompt goes through the SAME at-most-once
+   * verify the other give-ups use: if the CLI did submit the buffered
+   * keystrokes, the transcript's `prompt` line attributes and cancels it; if
+   * not, it is re-delivered once. A deadline bounds a compaction that never
+   * reports its end. Keyed like `flushVerify` (sanitized text) so the
+   * at-most-once rule spans both maps.
+   */
+  private readonly compactionHeld = new Map<
+    string,
+    Map<string, { wrapped: string; timer: ReturnType<typeof setTimeout>; generation?: number }>
+  >();
+  private readonly stuckCompactionResolveMs: number;
   /**
    * Agents with a turn currently streaming (tailer `prompt` seen, no
    * `response.turn_end` yet). A prompt delivered while a neighbor turn is in
@@ -547,6 +607,7 @@ export class BusCoreImpl implements BusCore {
     this.ringbufferCapacity = opts.ringbufferCapacity ?? DEFAULT_RINGBUFFER_CAPACITY;
     this.deliveryBackstopMs = opts.deliveryBackstopMs ?? 4000;
     this.flushVerifyMs = opts.flushVerifyMs ?? 8000;
+    this.stuckCompactionResolveMs = opts.stuckCompactionResolveMs ?? 600_000;
     this.flushVerifyGraceMs =
       opts.flushVerifyGraceMs ?? Math.min(1500, Math.ceil(this.flushVerifyMs / 4));
     this.eventLogAppend = opts.eventLogAppend ?? eventLogAppend;
@@ -628,12 +689,31 @@ export class BusCoreImpl implements BusCore {
           const pendingVerify = this.flushVerify.get(agentId);
           if (pendingVerify)
             for (const entry of pendingVerify.values()) carryOver.add(entry.wrapped);
+          // #402: a prompt held through a compaction is outstanding too — the
+          // session it was waiting on is gone, so it rides the same carry-over.
+          const heldCompaction = this.compactionHeld.get(agentId);
+          if (heldCompaction)
+            for (const entry of heldCompaction.values()) carryOver.add(entry.wrapped);
+          // A delivery whose handler is still deciding is outstanding too. Its
+          // verdict may resolve AFTER this teardown (an IPC-only drop leaves the
+          // process alive): carry the unproven text over now and forget its
+          // proof, so the late verdict arms nothing on the dead generation
+          // instead of holding/verifying a prompt the snapshot never saw.
+          const inFlight = this.inFlightWrapped.get(agentId);
+          const proofs = this.inFlightProof.get(agentId);
+          if (inFlight)
+            for (const [k, wrapped] of inFlight)
+              if (proofs?.get(k)?.proven === false) carryOver.add(wrapped);
+          this.inFlightProof.delete(agentId);
+          this.inFlightWrapped.delete(agentId);
+          this.inFlightEpoch.set(agentId, (this.inFlightEpoch.get(agentId) ?? 0) + 1);
           if (carryOver.size > 0) this.pendingRedelivery.set(agentId, [...carryOver]);
           this.deliveryQueue.delete(agentId);
           // Same hazard for a pending flush-verify timer: if it fired after a
           // restart that reused this agent_id it would type a stale keystroke
           // into the fresh session (#252 HIGH).
           this.clearFlushVerify(agentId);
+          this.clearCompactionHold(agentId);
           this.inFlightDeliveries.delete(agentId);
           this.agentTurnActive.delete(agentId);
           this.logIpc("close", {
@@ -668,6 +748,12 @@ export class BusCoreImpl implements BusCore {
     this.flushVerify.clear();
     this.inFlightDeliveries.clear();
     this.inFlightProof.clear();
+    this.inFlightWrapped.clear();
+    this.inFlightEpoch.clear();
+    for (const held of this.compactionHeld.values())
+      for (const entry of held.values()) clearTimeout(entry.timer);
+    this.compactionHeld.clear();
+    this.agentTailerGeneration.clear();
     this.agentTurnActive.clear();
     this.lastTurnEndMessageId.clear();
     this.originAmbiguous.clear();
@@ -876,13 +962,24 @@ export class BusCoreImpl implements BusCore {
     // that is legitimately being processed (e.g. holding through compaction)
     // from one that was silently swallowed (#252).
     this.inFlightDeliveries.set(agent_id, (this.inFlightDeliveries.get(agent_id) ?? 0) + 1);
+    const epoch = this.inFlightEpoch.get(agent_id) ?? 0;
     const key = sanitizePtyPromptText(wrapped);
+    const token = ++this.deliveryToken;
     let proofs = this.inFlightProof.get(agent_id);
     if (!proofs) {
       proofs = new Map();
       this.inFlightProof.set(agent_id, proofs);
     }
-    proofs.set(key, false);
+    proofs.set(key, { proven: false, token });
+    let wrappedByKey = this.inFlightWrapped.get(agent_id);
+    if (!wrappedByKey) {
+      wrappedByKey = new Map();
+      this.inFlightWrapped.set(agent_id, wrappedByKey);
+    }
+    wrappedByKey.set(key, wrapped);
+    // Only the delivery that owns the key may act on its entry: a superseded
+    // one (see `deliveryToken`) resolves into nothing.
+    const owns = () => this.inFlightProof.get(agent_id)?.get(key)?.token === token;
     void this.streamPromptHandler(agent_id, wrapped)
       .then((outcome) => {
         // Issue #361: the PTY confirm loop gave up — an auto-compaction (or a
@@ -899,40 +996,56 @@ export class BusCoreImpl implements BusCore {
         // at-most-once verify the backstop flush uses. `void` (a handler that
         // cannot judge) and `turn-started` arm nothing, exactly as before.
         //
-        // Two give-ups are deliberately NOT re-delivered:
-        //  - `stuck-compaction`: the CLI can buffer the keystrokes through an
-        //    auto-compaction and submit them itself when it ends. The bus has
-        //    no "still compacting" signal to defer on (the tailer only reports
-        //    the compaction boundary once it is over), so re-typing here would
-        //    land a second copy in the same buffer — two runs. That verdict
-        //    keeps the pre-#361 behaviour (a log line, `delivery_outcome` on
-        //    the receipt) rather than trading a possible loss for a sure double.
-        //  - a bus-injected `<system-reminder>` (the reply nudge): the
-        //    synthesized fallback already backs it, and a stale nudge re-typed
-        //    ten seconds later would open a fresh turn whose `reply` is not
-        //    deduplicated against that fallback.
+        // `stuck-compaction` is not re-delivered NOW: the CLI can buffer the
+        // keystrokes through an auto-compaction and submit them itself when it
+        // ends, so re-typing while it runs would land a second copy in the
+        // same buffer — two runs. Until #402 that verdict was simply dropped
+        // (a log line, `delivery_outcome` on the receipt) — the last lost-
+        // prompt path from #361. It is now HELD until the compaction is
+        // positively over (`session.compact`, or a new session generation),
+        // then put through the same verify: see `compactionHeld`. The
+        // deadline exit is the one place the old hazard survives: a compaction
+        // that outlives it (> 14 min with the PTY budget) while `agentTurnActive`
+        // has been cleared would let the verify type into a still-compacting
+        // REPL — bounded to one re-delivery by the at-most-once rule, and
+        // preferred to losing the prompt outright.
+        // Never re-delivered: a bus-injected `<system-reminder>` (the reply
+        // nudge) — the synthesized fallback already backs it, and a stale
+        // nudge re-typed ten seconds later would open a fresh turn whose
+        // `reply` is not deduplicated against that fallback.
         // The in-flight record must still be there and unproven: `stop()`
         // clears it, so a handler that resolves after shutdown arms no timer
         // on a bus that has already torn its verifies down.
         if (
           typeof outcome === "string" &&
           outcome !== "turn-started" &&
-          outcome !== "stuck-compaction" &&
-          this.inFlightProof.get(agent_id)?.get(key) === false &&
+          owns() &&
+          this.inFlightProof.get(agent_id)?.get(key)?.proven === false &&
           !wrapped.startsWith("<system-reminder>")
         ) {
-          this.armFlushVerify(agent_id, [wrapped]);
+          if (outcome === "stuck-compaction") this.holdThroughCompaction(agent_id, wrapped);
+          else this.armFlushVerify(agent_id, [wrapped]);
         }
       })
       .catch((err) => this.onError(err, { ctx: "streamPromptHandler", agent_id }))
       .finally(() => {
-        const n = (this.inFlightDeliveries.get(agent_id) ?? 1) - 1;
-        if (n <= 0) this.inFlightDeliveries.delete(agent_id);
-        else this.inFlightDeliveries.set(agent_id, n);
+        // A socket close reset this agent's in-flight accounting since this
+        // delivery began: it is not ours to decrement any more.
+        if ((this.inFlightEpoch.get(agent_id) ?? 0) === epoch) {
+          const n = (this.inFlightDeliveries.get(agent_id) ?? 1) - 1;
+          if (n <= 0) this.inFlightDeliveries.delete(agent_id);
+          else this.inFlightDeliveries.set(agent_id, n);
+        }
+        if (!owns()) return; // a newer delivery of the same text owns the key
         const p = this.inFlightProof.get(agent_id);
         if (p) {
           p.delete(key);
           if (p.size === 0) this.inFlightProof.delete(agent_id);
+        }
+        const w = this.inFlightWrapped.get(agent_id);
+        if (w) {
+          w.delete(key);
+          if (w.size === 0) this.inFlightWrapped.delete(agent_id);
         }
       });
   }
@@ -970,7 +1083,29 @@ export class BusCoreImpl implements BusCore {
    *  (so a late `session.init` for it can't re-arm a hold), clear any pending
    *  hold, and flush held prompts in order. Called unconditionally on
    *  `replay_done`, which the tailer emits for every session generation. */
-  private markAgentReady(agent_id: string, session_id?: string, viaBackstop = false): void {
+  private markAgentReady(
+    agent_id: string,
+    session_id?: string,
+    viaBackstop = false,
+    generation?: number,
+  ): void {
+    // #402: a marker from a tailer generation OLDER than the live one is the
+    // tailer being replaced finishing its last read after the replacement
+    // published. It must not move the live pointer back, clear the
+    // replacement's init hold, flush the queue into a session that has not
+    // said it is ready, nor release a compaction hold — a no-op, logged so a
+    // rotation storm shows. Ordering is only known when the marker carries a
+    // generation (session-manager wiring); without one, behaviour is as before.
+    const liveGeneration = this.agentTailerGeneration.get(agent_id);
+    if (generation !== undefined && liveGeneration !== undefined && generation < liveGeneration) {
+      console.warn(
+        `[bus] ignoring stale replay_done for agent=${agent_id} (tailer generation ${generation} < live ${liveGeneration})`,
+      );
+      return;
+    }
+    const newGeneration =
+      generation !== undefined && (liveGeneration === undefined || generation > liveGeneration);
+    if (generation !== undefined) this.agentTailerGeneration.set(agent_id, generation);
     if (session_id) this.agentLiveSession.set(agent_id, session_id);
     const timer = this.agentInitializing.get(agent_id);
     if (timer) clearTimeout(timer);
@@ -983,6 +1118,14 @@ export class BusCoreImpl implements BusCore {
     // forever for this agent and leak a lingering entry per prompt (#252 stack
     // ultra HIGH).
     this.agentTurnActive.delete(agent_id);
+    // #402: a NEW tailer generation cannot still be running the compaction a
+    // held prompt was waiting on; verify it now. Neither a marker for the
+    // generation the hold was taken in (a re-emitted `replay_done`, or a
+    // `--resume` restart that keeps the session id) nor the init backstop —
+    // a readiness fallback that can fire while the compaction continues — is
+    // that signal; those leave the hold to its end signal or its deadline.
+    if (newGeneration && !viaBackstop)
+      this.releaseCompactionHold(agent_id, { notGeneration: generation });
     // Re-deliver prompts carried over from a prior socket close (e.g. a #222
     // reconciler restart of a deaf agent): the fresh session is now ready, so
     // push them through the gate. Independent of the held-queue below, and done
@@ -1009,6 +1152,94 @@ export class BusCoreImpl implements BusCore {
    *  is left untouched (a second flush ADDS to the set, never discards pending
    *  ones — #252). The timer is cancelled by `noteFlushTurnStart` when the
    *  matching `prompt` lands, and re-delivers exactly that prompt otherwise. */
+  /** #402: park a prompt whose delivery gave up on `stuck-compaction` until the
+   *  compaction is positively over, then verify-then-re-deliver it. At most
+   *  once per prompt across holds and verifies: a prompt already verified (or
+   *  already held) is never armed again. */
+  private holdThroughCompaction(agent_id: string, wrapped: string): void {
+    const key = sanitizePtyPromptText(wrapped);
+    const pending = this.flushVerify.get(agent_id);
+    const verifying = pending?.get(key);
+    if (verifying) {
+      // The one re-delivery is spent: this verdict is the re-delivery's own,
+      // and at-most-once says stop here.
+      if (verifying.redelivered) return;
+      // Otherwise it is a verify `sendPrompt` pre-armed for this delivery (IPC
+      // send failed, or a neighbor turn was active) — still live, and it would
+      // fire on its ordinary clock while the compaction runs, retyping into it.
+      // The hold replaces it: same prompt, same at-most-once, later clock.
+      clearTimeout(verifying.timer);
+      pending?.delete(key);
+      if (pending && pending.size === 0) this.flushVerify.delete(agent_id);
+    }
+    // Known latency, accepted on purpose: two of the PTY layer's three
+    // `stuck-compaction` sources fire AFTER the boundary was written (the
+    // post-compaction tail with no footer, a compaction latch whose clear
+    // marker was lost), so their `session.compact` has already passed and this
+    // hold runs to the deadline. Verifying "right away when a boundary was seen
+    // since the delivery began" was tried and is unsafe: the PTY layer
+    // serialises writes, so a prompt can sit behind an earlier delivery while
+    // an EARLIER compaction ends, and that boundary cannot be told apart from
+    // this prompt's own — the shortcut would retype into a compaction that is
+    // still running, the very double #400 refused. Binding a boundary to one
+    // delivery needs the PTY layer to say which compaction it gave up on.
+    let held = this.compactionHeld.get(agent_id);
+    if (!held) {
+      held = new Map();
+      this.compactionHeld.set(agent_id, held);
+    }
+    if (held.has(key)) return;
+    held.set(key, {
+      wrapped,
+      // The tailer generation this hold belongs to: only its own generation's
+      // `session.compact`, or a NEWER generation's `replay_done`, releases it.
+      generation: this.agentTailerGeneration.get(agent_id),
+      timer: setTimeout(() => {
+        this.onError(
+          new Error(
+            `compaction never reported its end within ${this.stuckCompactionResolveMs}ms; verifying the held prompt anyway for agent_id=${agent_id}`,
+          ),
+          { ctx: "compactionHold", agent_id },
+        );
+        // Only THIS entry: a later prompt held behind a longer compaction keeps
+        // its own deadline instead of being verified on the first one's clock.
+        this.releaseCompactionHold(agent_id, { key });
+      }, this.stuckCompactionResolveMs),
+    });
+  }
+
+  /** #402: the compaction is over (or the session generation changed, which
+   *  cannot still be compacting) — every held prompt now goes through the
+   *  at-most-once verify. If the CLI submitted the buffered keystrokes when the
+   *  compaction ended, the transcript's `prompt` line attributes and cancels
+   *  it; otherwise it is re-delivered once. */
+  private releaseCompactionHold(
+    agent_id: string,
+    only?: { key?: string; notGeneration?: number; generation?: number },
+  ): void {
+    const held = this.compactionHeld.get(agent_id);
+    if (!held) return;
+    const prompts: string[] = [];
+    for (const [key, entry] of held) {
+      if (only?.key !== undefined && key !== only.key) continue;
+      // A new generation's marker releases holds taken under OLDER ones only.
+      if (only?.notGeneration !== undefined && entry.generation === only.notGeneration) continue;
+      // A compaction boundary releases holds of ITS generation only (a hold
+      // taken before any generation was known has nothing to compare).
+      if (
+        only?.generation !== undefined &&
+        entry.generation !== undefined &&
+        entry.generation !== only.generation
+      )
+        continue;
+      clearTimeout(entry.timer);
+      held.delete(key);
+      prompts.push(entry.wrapped);
+    }
+    if (held.size === 0) this.compactionHeld.delete(agent_id);
+    if (prompts.length > 0) this.armFlushVerify(agent_id, prompts);
+  }
+
   private armFlushVerify(agent_id: string, prompts: string[]): void {
     let pending = this.flushVerify.get(agent_id);
     if (!pending) {
@@ -1081,6 +1312,7 @@ export class BusCoreImpl implements BusCore {
         ),
         { ctx: "flushVerify", agent_id },
       );
+      entry.redelivered = true;
       this.deliverOrQueuePrompt(agent_id, entry.wrapped);
     }, delayMs);
   }
@@ -1100,7 +1332,20 @@ export class BusCoreImpl implements BusCore {
     // Proof for a delivery whose handler is still deciding (#361): remember
     // it, so a later give-up verdict for that same prompt arms nothing.
     const proofs = this.inFlightProof.get(agent_id);
-    if (proofs?.has(key)) proofs.set(key, true);
+    const proof = proofs?.get(key);
+    if (proof) proof.proven = true;
+    // #402: a prompt held through a compaction that the transcript records
+    // anyway (the CLI processed the buffered input, or the compaction aborted
+    // — no `compact_boundary` is written on failure) is proven: drop the hold
+    // so the release never arms a verify for a prompt the model already has.
+    const held = this.compactionHeld.get(agent_id);
+    const heldEntry = held?.get(key);
+    if (held && heldEntry) {
+      clearTimeout(heldEntry.timer);
+      held.delete(key);
+      if (held.size === 0) this.compactionHeld.delete(agent_id);
+      return true;
+    }
     const pending = this.flushVerify.get(agent_id);
     if (!pending) return false;
     const entry = pending.get(key);
@@ -1148,6 +1393,16 @@ export class BusCoreImpl implements BusCore {
     if (!pending) return;
     for (const entry of pending.values()) clearTimeout(entry.timer);
     this.flushVerify.delete(agent_id);
+  }
+
+  /** #402: drop an agent's compaction holds without verifying them (socket
+   *  close: the text has been carried over, the timers must not outlive the
+   *  session they were armed for). */
+  private clearCompactionHold(agent_id: string): void {
+    const held = this.compactionHeld.get(agent_id);
+    if (!held) return;
+    for (const entry of held.values()) clearTimeout(entry.timer);
+    this.compactionHeld.delete(agent_id);
   }
 
   async invokeSlashCommand(agent_id: string, cmd: string): Promise<void> {
@@ -1504,7 +1759,28 @@ export class BusCoreImpl implements BusCore {
     // and release them once it's live.
     if (e.agent_id) {
       if (e.topic === "session.init") this.markAgentInitializing(e.agent_id, e.session_id);
-      else if (e.topic === "bus.events.replay_done") this.markAgentReady(e.agent_id, e.session_id);
+      else if (e.topic === "bus.events.replay_done") {
+        const gen = (e.payload as { generation?: unknown } | undefined)?.generation;
+        this.markAgentReady(
+          e.agent_id,
+          e.session_id,
+          false,
+          typeof gen === "number" ? gen : undefined,
+        );
+      }
+      // #402: the compaction the PTY layer gave up on has ended — the CLI wrote
+      // its `compact_boundary`. Whatever it buffered is submitted by now (or
+      // never will be), so the held prompt can be verified.
+      else if (e.topic === "session.compact") {
+        // Only holds taken under the tailer generation that compacted: a
+        // boundary the tailer being replaced publishes late belongs to the old
+        // transcript and says nothing about a compaction in the replacement.
+        const gen = (e.payload as { generation?: unknown } | undefined)?.generation;
+        this.releaseCompactionHold(
+          e.agent_id,
+          typeof gen === "number" ? { generation: gen } : undefined,
+        );
+      }
       // Turn-start proof for a pending backstop-flush verification. ONLY the
       // tailer `prompt` topic qualifies — it carries the ingested user line
       // (= the wrapped string we delivered), so we can attribute the turn to the
