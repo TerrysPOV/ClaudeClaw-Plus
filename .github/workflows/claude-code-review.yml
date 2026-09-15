@@ -39,10 +39,26 @@ jobs:
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Checkout repository
+      # issue_comment carries no PR object, only the issue/PR number — resolve
+      # the PR to get its actual base commit. A plain default-branch checkout
+      # would silently drift for a PR targeting a non-default branch, or one
+      # whose base has advanced since the PR opened: the review command's own
+      # diff (fetched separately via `gh`) would then be read against a
+      # different commit than the repo context checked out here.
+      - name: Resolve PR base commit
+        if: steps.token-check.outputs.configured == 'true'
+        id: pr-info
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BASE_SHA=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}" --jq .base.sha)
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout repository (PR base commit)
         if: steps.token-check.outputs.configured == 'true'
         uses: actions/checkout@v4
         with:
+          ref: ${{ steps.pr-info.outputs.base_sha }}
           fetch-depth: 1
 
       - name: Run Claude Code Review
