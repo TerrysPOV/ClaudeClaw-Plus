@@ -1020,6 +1020,68 @@ describe("BusCore IPC", () => {
     expect(delivered).toHaveLength(1); // verify torn down → NOT re-delivered
   });
 
+  it("carries an in-flight delivery over a socket close, and its late stuck-compaction verdict arms nothing (#402)", async () => {
+    // An IPC-only drop leaves the process alive, so the PTY handler can still
+    // resolve its verdict AFTER onClose tore the agent down. The prompt must
+    // ride the carry-over like the held queue does, and the late verdict must
+    // not park a hold (or a verify) on the dead generation.
+    const sockPath = join(tempDir, "bus.sock");
+    const delivered: string[] = [];
+    let resolveVerdict: (v: "stuck-compaction") => void = () => {};
+    bus = createBusCore({
+      eventLogAppend: createMockEventLog().append,
+      socketPath: sockPath,
+      flushVerifyMs: 30,
+      stuckCompactionResolveMs: 40,
+      onError: () => {},
+      streamPromptHandler: (_a, text) =>
+        new Promise((resolve) => {
+          delivered.push(text);
+          if (delivered.length === 1) resolveVerdict = resolve;
+          else resolve("turn-started");
+        }),
+    });
+    await bus.start();
+    const client = await connectIpcClient(sockPath);
+    client.send({
+      type: "hello",
+      agent_id: "alpha",
+      capabilities: ["claude/channel", "claude/channel/permission"],
+    } as IpcHello);
+    await new Promise((r) => setTimeout(r, 20));
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "bus.events.replay_done",
+      payload: {},
+    });
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "i",
+      user_id: "u",
+      text: "inflight",
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(delivered).toHaveLength(1); // handler still deciding
+    client.close(); // onClose → the unproven in-flight prompt is carried over, its proof forgotten
+    await new Promise((r) => setTimeout(r, 30));
+    resolveVerdict("stuck-compaction"); // late verdict on the dead generation
+    await new Promise((r) => setTimeout(r, 120)); // > hold deadline + verify: nothing armed
+    expect(delivered).toHaveLength(1);
+    bus.ingestSessionEvent({
+      ts: 1,
+      agent_id: "alpha",
+      session_id: "s2",
+      topic: "bus.events.replay_done",
+      payload: {},
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(delivered).toHaveLength(2); // carried over → re-delivered once the fresh session is ready
+    expect(delivered[1]).toBe(delivered[0]);
+  });
+
   it("re-delivers a prompt held at socket close once the fresh session is ready (#252 stack ultra B1)", async () => {
     // A reconciler restart of an alive-but-deaf agent closes the socket while a
     // prompt is still held (or awaiting verify). onClose snapshots it; the fresh
@@ -2258,10 +2320,11 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
       expect(delivered).toHaveLength(2);
     });
 
-    it("arms nothing on turn-started, nothing on stuck-compaction, and nothing when the handler has no verdict", async () => {
+    it("arms nothing on turn-started, holds (does not re-deliver yet) on stuck-compaction, and nothing when the handler has no verdict", async () => {
       // stuck-compaction: the CLI may have buffered the keystrokes through the
-      // compaction and will submit them itself; the bus has no "still
-      // compacting" signal to defer on, so re-typing would double-submit.
+      // compaction and will submit them itself when it ends; re-typing WHILE it
+      // runs would double-submit. The prompt is held for the end signal (#402),
+      // so nothing is re-delivered inside the ordinary verify window.
       const delivered = verdictBus(["turn-started", "stuck-compaction", undefined]);
       await prompt("alpha", "confirmed");
       await prompt("alpha", "buffered by the compaction");
@@ -2269,6 +2332,166 @@ describe("BusCore delivery gate (session.init / replay_done)", () => {
       expect(delivered).toHaveLength(3);
       await new Promise((r) => setTimeout(r, 90));
       expect(delivered).toHaveLength(3); // none was re-delivered
+    });
+
+    describe("a prompt lost in a stuck compaction (issue #402)", () => {
+      const compactEvt = (agent: string): BusEvent => ({
+        ts: 1,
+        agent_id: agent,
+        session_id: "s",
+        topic: "session.compact",
+        payload: { trigger: "auto" },
+      });
+      const heldBus = (
+        verdicts: Array<"stuck-compaction" | "turn-started">,
+        resolveMs = 100_000,
+      ) => {
+        bus = createBusCore({
+          eventLogAppend: createMockEventLog().append,
+          flushVerifyMs: 30,
+          stuckCompactionResolveMs: resolveMs,
+          onError: () => {},
+        });
+        const delivered: string[] = [];
+        bus.setStreamPromptHandler(async (_a, text) => {
+          delivered.push(text);
+          return verdicts[delivered.length - 1];
+        });
+        return delivered;
+      };
+
+      it("re-delivers once when the compaction ends and the transcript never recorded the prompt", async () => {
+        const delivered = heldBus(["stuck-compaction", "turn-started"]);
+        await prompt("alpha", "swallowed for good");
+        expect(delivered).toHaveLength(1);
+        await new Promise((r) => setTimeout(r, 90)); // held: no verify runs while the compaction is on
+        expect(delivered).toHaveLength(1);
+        bus.ingestSessionEvent(compactEvt("alpha")); // compact_boundary: it ended
+        await new Promise((r) => setTimeout(r, 90)); // verify: no prompt line → re-deliver
+        expect(delivered).toHaveLength(2);
+        expect(delivered[1]).toBe(delivered[0]);
+      });
+
+      it("does NOT re-deliver when the CLI submits the buffered keystrokes itself at the end of the compaction", async () => {
+        const delivered = heldBus(["stuck-compaction"]);
+        await prompt("alpha", "buffered, then submitted");
+        bus.ingestSessionEvent(compactEvt("alpha"));
+        bus.ingestSessionEvent(turnEvt("alpha", delivered[0] as string)); // the CLI typed it for us
+        bus.ingestSessionEvent(turnEndEvt("alpha"));
+        await new Promise((r) => setTimeout(r, 120));
+        expect(delivered).toHaveLength(1);
+      });
+
+      it("does NOT re-deliver when the transcript records the held prompt BEFORE any end signal (aborted compaction, or the user line first)", async () => {
+        const delivered = heldBus(["stuck-compaction"], 50);
+        await prompt("alpha", "recorded while held");
+        bus.ingestSessionEvent(turnEvt("alpha", delivered[0] as string)); // proof lands during the hold
+        bus.ingestSessionEvent(turnEndEvt("alpha"));
+        await new Promise((r) => setTimeout(r, 150)); // past the deadline: the hold was cancelled, no verify
+        expect(delivered).toHaveLength(1);
+      });
+
+      it("verifies anyway after the resolve deadline when the compaction never reports its end", async () => {
+        const delivered = heldBus(["stuck-compaction", "turn-started"], 50);
+        await prompt("alpha", "compaction that never ends");
+        await new Promise((r) => setTimeout(r, 30));
+        expect(delivered).toHaveLength(1); // still held
+        await new Promise((r) => setTimeout(r, 120)); // deadline → verify → re-deliver once
+        expect(delivered).toHaveLength(2);
+      });
+
+      it("re-delivers at most once even if the re-delivery hits a stuck compaction again", async () => {
+        const delivered = heldBus(["stuck-compaction", "stuck-compaction", "stuck-compaction"], 40);
+        await prompt("alpha", "twice unlucky");
+        await new Promise((r) => setTimeout(r, 130)); // deadline → re-delivery #1 → stuck again
+        expect(delivered).toHaveLength(2);
+        bus.ingestSessionEvent(compactEvt("alpha")); // even a real end signal must not arm a 2nd re-delivery
+        await new Promise((r) => setTimeout(r, 130));
+        expect(delivered).toHaveLength(2);
+      });
+
+      it("releases the hold on a NEW session generation (replay_done), which cannot still be compacting", async () => {
+        const delivered = heldBus(["stuck-compaction", "turn-started"]);
+        bus.ingestSessionEvent({ ...replayEvt("alpha"), session_id: "gen-1" }); // live generation at hold time
+        await prompt("alpha", "held across a restart");
+        bus.ingestSessionEvent({ ...replayEvt("alpha"), session_id: "gen-2" }); // a different generation
+        await new Promise((r) => setTimeout(r, 90));
+        expect(delivered).toHaveLength(2);
+      });
+
+      it("does NOT release the hold on a lagged replay_done for the generation it was taken in", async () => {
+        // The tailer being replaced can finish an in-flight read after the
+        // replacement session started; its marker names the OLD generation and
+        // must not verify a prompt into a replacement that may still compact.
+        const delivered = heldBus(["stuck-compaction", "turn-started"]);
+        bus.ingestSessionEvent({ ...replayEvt("alpha"), session_id: "gen-1" });
+        await prompt("alpha", "held across a stale marker");
+        bus.ingestSessionEvent({ ...replayEvt("alpha"), session_id: "gen-1" }); // same generation, lagged
+        await new Promise((r) => setTimeout(r, 90));
+        expect(delivered).toHaveLength(1); // still held
+      });
+
+      it("does NOT release the hold on an out-of-order replay_done for an OLDER generation than the live one", async () => {
+        // gen-1 → gen-2 live, prompt held in gen-2; the replaced tailer's last
+        // read publishes gen-1's marker AFTER gen-2's. "Different from the
+        // live one" is not "newer": the hold must stay.
+        const delivered = heldBus(["stuck-compaction", "turn-started"]);
+        bus.ingestSessionEvent({ ...replayEvt("alpha"), session_id: "gen-1" });
+        bus.ingestSessionEvent({ ...replayEvt("alpha"), session_id: "gen-2" });
+        await prompt("alpha", "held in gen-2");
+        bus.ingestSessionEvent({ ...replayEvt("alpha"), session_id: "gen-1" }); // lagged, older
+        await new Promise((r) => setTimeout(r, 90));
+        expect(delivered).toHaveLength(1); // still held
+        bus.ingestSessionEvent({ ...replayEvt("alpha"), session_id: "gen-3" }); // a genuinely new one
+        await new Promise((r) => setTimeout(r, 90));
+        expect(delivered).toHaveLength(2);
+      });
+
+      it("releases on a session.compact of the hold's own generation only", async () => {
+        const delivered = heldBus(["stuck-compaction", "turn-started"]);
+        bus.ingestSessionEvent({ ...replayEvt("alpha"), session_id: "gen-2" });
+        await prompt("alpha", "held in gen-2");
+        bus.ingestSessionEvent({ ...compactEvt("alpha"), session_id: "gen-1" }); // old transcript's late boundary
+        await new Promise((r) => setTimeout(r, 90));
+        expect(delivered).toHaveLength(1); // not released
+        bus.ingestSessionEvent({ ...compactEvt("alpha"), session_id: "gen-2" }); // this generation compacted
+        await new Promise((r) => setTimeout(r, 90));
+        expect(delivered).toHaveLength(2);
+      });
+
+      it("absorbs a verify sendPrompt pre-armed for the same delivery, so it cannot fire during the compaction", async () => {
+        // A neighbor turn active at submit pre-arms a verify (#250). If that
+        // delivery then gives up on stuck-compaction, the pre-armed verify must
+        // not run on its own clock (it would retype into the compaction): the
+        // hold replaces it, and the prompt is still re-delivered at most once.
+        const delivered = heldBus(["stuck-compaction", "turn-started"], 120);
+        bus.ingestSessionEvent(turnEvt("alpha", "<channel>neighbor</channel>")); // neighbor turn streaming
+        await prompt("alpha", "queued behind a neighbor, then compaction");
+        expect(delivered).toHaveLength(1);
+        bus.ingestSessionEvent(turnEndEvt("alpha")); // neighbor ends: the pre-armed verify would now fire
+        await new Promise((r) => setTimeout(r, 90)); // > verify + grace: nothing, the hold owns it
+        expect(delivered).toHaveLength(1);
+        await new Promise((r) => setTimeout(r, 120)); // hold deadline (120) + verify → once
+        expect(delivered).toHaveLength(2);
+        await new Promise((r) => setTimeout(r, 120));
+        expect(delivered).toHaveLength(2); // and never a third time
+      });
+
+      it("a hold's deadline releases that hold only, not a later prompt held behind a longer compaction", async () => {
+        const delivered = heldBus(
+          ["stuck-compaction", "stuck-compaction", "turn-started", "turn-started"],
+          60,
+        );
+        await prompt("alpha", "first");
+        await new Promise((r) => setTimeout(r, 35));
+        await prompt("alpha", "second"); // held 35 ms later → its own deadline is 35 ms later
+        await new Promise((r) => setTimeout(r, 80)); // first deadline (60) + verify (30) + grace…
+        expect(delivered).toHaveLength(3); // …only "first" was re-delivered
+        expect(delivered[2]).toBe(delivered[0]);
+        await new Promise((r) => setTimeout(r, 100)); // second deadline (35+60) + verify + grace
+        expect(delivered).toHaveLength(4);
+        expect(delivered[3]).toBe(delivered[1]);
+      });
     });
 
     it("does NOT re-deliver when the transcript records the prompt after all (late user line)", async () => {
