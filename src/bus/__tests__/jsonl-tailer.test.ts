@@ -578,6 +578,45 @@ describe("JsonlTailer — assistant lines", () => {
     expect(events.find((e) => e.topic === "response.text")).toBeDefined();
   });
 
+  it("carries the tailer generation on replay_done and session.compact when given one (#402)", async () => {
+    writeFileSync(
+      sessionPath,
+      jsonl({
+        type: "system",
+        subtype: "compact_boundary",
+        compactMetadata: { trigger: "auto", preTokens: 10, postTokens: 5, durationMs: 1 },
+        timestamp: "2026-06-02T10:00:09.000Z",
+        sessionId: SESSION_ID,
+      }),
+    );
+    const { bus, events } = createMockBus();
+    tailer = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      generation: 7,
+      onError: () => {},
+    });
+    await tailer.start();
+
+    const replay = events.find((e) => e.topic === "bus.events.replay_done");
+    expect((replay?.payload as { generation?: number }).generation).toBe(7);
+    const compact = events.find((e) => e.topic === "session.compact");
+    expect((compact?.payload as { generation?: number }).generation).toBe(7);
+  });
+
+  it("omits the generation when none was given (older wiring stays unchanged)", async () => {
+    writeFileSync(sessionPath, "");
+    const { bus, events } = createMockBus();
+    tailer = makeTailer(bus);
+    await tailer.start();
+    const replay = events.find((e) => e.topic === "bus.events.replay_done");
+    expect(replay).toBeDefined();
+    expect("generation" in (replay?.payload as object)).toBe(false);
+  });
+
   it("surfaces api_error fields as system.api_error", async () => {
     writeFileSync(
       sessionPath,

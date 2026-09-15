@@ -650,6 +650,8 @@ export class SessionManager {
    * respawns have their own backpressure and bypass this budget entirely.
    */
   private readonly restartHistory = new Map<string, number[]>();
+  /** #402: tailers constructed per agent, in order — see JsonlTailerOptions.generation. */
+  private readonly tailerGeneration = new Map<string, number>();
   /**
    * Per-agent in-flight `restart()` promises. The three triggers
    * (control-plane wedge, data-plane model-hang, rotation) are independent
@@ -899,6 +901,9 @@ export class SessionManager {
       // it. Both implement `AgentProcess`, so the transcript hooks are reached
       // through it — and a runtime without them stays a no-op via `?.`.
       const confirmable: AgentProcess = proc;
+      // #402: number the tailers per agent so the bus can order their markers.
+      const generation = (this.tailerGeneration.get(agent.id) ?? 0) + 1;
+      this.tailerGeneration.set(agent.id, generation);
       const tailer = new JsonlTailer({
         bus: this.options.bus,
         agent_id: agent.id,
@@ -906,6 +911,7 @@ export class SessionManager {
         cwd: realCwd,
         startAt: "end",
         projectsDir: this.options.projectsDir,
+        generation,
         // Issue #362: feed the transcript's prompt-ingestion fact back to the
         // PTY delivery-confirm loop, which otherwise has only the rendered
         // terminal to judge by and cannot distinguish a submitted prompt from
