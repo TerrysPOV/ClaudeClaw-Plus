@@ -176,6 +176,8 @@ export async function loadJobs(): Promise<Job[]> {
     const content = await Bun.file(join(getJobsDir(), file)).text();
     const job = parseJobFile(file.replace(/\.md$/, ""), content);
     if (!job) continue;
+    // The file stem is the label, as it is for agent-scoped jobs below (#409).
+    job.label = job.name;
     const bad = invalidJobModel(job);
     if (bad) {
       console.error(`Skipping job ${job.name}: ${bad}`);
