@@ -145,6 +145,22 @@ function parseJobFile(name: string, content: string): Job | null {
   };
 }
 
+/**
+ * A job file's `model:` is checked at load time with the same rule the other
+ * three paths use (agent defaults, `fire`, `schedule_task`), so a typo'd or
+ * retired model name is reported next to the file that carries it instead of
+ * failing on a schedule (#378). The job is skipped, not the load: one bad file
+ * must not take its siblings down. Returns the error message, or null.
+ */
+function invalidJobModel(job: Job): string | null {
+  try {
+    validateModelString(job.model, "job file");
+    return null;
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
+}
+
 export async function loadJobs(): Promise<Job[]> {
   const jobs: Job[] = [];
 
@@ -160,6 +176,11 @@ export async function loadJobs(): Promise<Job[]> {
     const content = await Bun.file(join(getJobsDir(), file)).text();
     const job = parseJobFile(file.replace(/\.md$/, ""), content);
     if (!job) continue;
+    const bad = invalidJobModel(job);
+    if (bad) {
+      console.error(`Skipping job ${job.name}: ${bad}`);
+      continue;
+    }
     if (job.enabled !== false) jobs.push(job);
   }
 
@@ -188,6 +209,11 @@ export async function loadJobs(): Promise<Job[]> {
       // Directory location is authoritative.
       job.agent = agentName;
       job.label = labelFromFile;
+      const bad = invalidJobModel(job);
+      if (bad) {
+        console.error(`Skipping job ${agentName}:${labelFromFile}: ${bad}`);
+        continue;
+      }
       if (job.enabled !== false) jobs.push(job);
     }
   }
