@@ -1,31 +1,20 @@
 name: Claude Code Review
 
+# Comment-triggered only. Previously ran on every push to a PR (pull_request_target:
+# synchronize) for OWNER/MEMBER/COLLABORATOR authors — including Terry's own pushes to
+# his own PRs — burning a full review's worth of usage per commit. Changed 2026-09-15:
+# now runs only when a trusted user explicitly asks for it.
+
 on:
-  pull_request_target:
-    # `labeled` lets a maintainer opt an EXTERNAL PR in for review by adding the
-    # `claude-review` label (adding labels requires triage/write, so only
-    # maintainers can trigger it). Trusted-author PRs auto-run on the other types.
-    types: [opened, synchronize, ready_for_review, reopened, labeled]
+  issue_comment:
+    types: [created]
 
 jobs:
   claude-review:
-    # SECURITY GATE. This is a `pull_request_target` job: it runs in the base
-    # repo's context with repo secrets (CLAUDE_CODE_OAUTH_TOKEN) and a
-    # write-capable GITHUB_TOKEN, and it checks out the (untrusted) PR head.
-    # The job-level `if` is the real trust control — it must NOT start for an
-    # arbitrary external contributor:
-    #   * Auto-run only for OWNER / MEMBER / COLLABORATOR authors (your own +
-    #     org/collaborator PRs).
-    #   * External authors (CONTRIBUTOR / FIRST_TIME_CONTRIBUTOR / NONE) never
-    #     auto-run — a maintainer must add the `claude-review` label, which fires
-    #     the `labeled` event. (Re-label to re-review after new commits.)
     if: >-
-      github.event.pull_request.user.login != 'github-actions[bot]'
-      && !startsWith(github.head_ref, 'sync/')
-      && (
-        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
-        || (github.event.action == 'labeled' && github.event.label.name == 'claude-review')
-      )
+      github.event.issue.pull_request
+      && contains(github.event.comment.body, '@claude review')
+      && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
 
     runs-on: ubuntu-latest
     # Informational only — transient action infrastructure errors shouldn't block PRs.
@@ -44,7 +33,7 @@ jobs:
           TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
           if [ -z "$TOKEN" ]; then
-            echo "::warning::CLAUDE_CODE_OAUTH_TOKEN secret is not configured — skipping auto-review."
+            echo "::warning::CLAUDE_CODE_OAUTH_TOKEN secret is not configured — skipping review."
             echo "configured=false" >> "$GITHUB_OUTPUT"
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
@@ -54,13 +43,6 @@ jobs:
         if: steps.token-check.outputs.configured == 'true'
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          # Pin to the immutable commit SHA from the event payload, NOT the
-          # mutable branch ref. For a maintainer-labeled external PR this closes
-          # the TOCTOU race where a fork author pushes a new commit after the
-          # label but before checkout — the privileged job would otherwise run
-          # against code the maintainer never approved.
-          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 1
 
       - name: Run Claude Code Review
@@ -70,10 +52,6 @@ jobs:
         with:
           github_token: ${{ github.token }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # The job-level `if` is the trust gate. `'*'` here only lets Claude
-          # proceed on a maintainer-labeled external PR (whose author is non-write);
-          # the job would never have started without a trusted author or a label.
-          allowed_non_write_users: '*'
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
-          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
+          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.issue.number }}'
