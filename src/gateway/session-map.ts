@@ -260,6 +260,31 @@ export async function incrementTurnCount(channelId: string, threadId: string): P
  * Attach a real Claude session ID to a mapping.
  * Will not overwrite an existing non-null Claude session ID unless forced.
  */
+/**
+ * #376: record the id a turn reported, atomically with the lookup. Runs as one
+ * queued write so two turns finishing together cannot both see an empty
+ * mapping and race their attaches. Keeps the first id recorded (the documented
+ * contract); reports what happened so the caller can log once.
+ */
+export async function recordClaudeSessionIdAtomic(
+  channelId: string,
+  threadId: string,
+  claudeSessionId: string,
+): Promise<"recorded" | "unchanged" | "kept-first" | "no-mapping"> {
+  await initSessionMap();
+  return enqueueWrite(async () => {
+    const existing = sessionMap?.[channelId]?.[threadId] ?? null;
+    if (!existing) return "no-mapping";
+    if (existing.claudeSessionId === claudeSessionId) return "unchanged";
+    if (existing.claudeSessionId !== null) return "kept-first";
+    existing.claudeSessionId = claudeSessionId;
+    existing.status = "active";
+    existing.updatedAt = new Date().toISOString();
+    await saveMap(sessionMap!);
+    return "recorded";
+  });
+}
+
 export async function attachClaudeSessionId(
   channelId: string,
   threadId: string,

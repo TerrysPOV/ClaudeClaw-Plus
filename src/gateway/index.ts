@@ -98,6 +98,8 @@ export class Gateway {
   private config: GatewayConfig;
   private deps: GatewayDependencies;
   private running = false;
+  /** #376: conversations already warned about a missing session id. */
+  private readonly warnedNoSessionId = new Set<string>();
 
   constructor(config: GatewayConfig = {}, deps?: GatewayDependencies) {
     this.config = config;
@@ -313,14 +315,31 @@ export class Gateway {
         );
       }
 
-      // Step 6: Record real Claude session ID if available in processor result
-      // This is transitional - the processor should expose a seam for session ID extraction
+      // Step 6: Record the real Claude session id the processor surfaced
+      // (#376: the runner reads it off the CLI's `system/init` / `result`
+      // events and it travels `RunResult` → `ProcessingResult`). Before #376
+      // nothing populated it, so every mapping stayed `claudeSessionId: null`
+      // and `resumeArgs` was always empty. Note what this does NOT change: the
+      // runner resumes by its own session store (`sessions.ts`, keyed by the
+      // `threadId` the processor passes — none today, so the global session),
+      // and `resumeArgs` has no consumer yet; the mapping is now truthful, the
+      // spawn is unchanged. Say so, once per conversation, when a successful
+      // turn brings no id.
       if (processorResult.success && processorResult.claudeSessionId) {
         if (this.deps.resume.recordClaudeSessionId) {
           await this.deps.resume.recordClaudeSessionId(
             event.channelId,
             event.threadId,
             processorResult.claudeSessionId,
+          );
+        }
+      } else if (processorResult.success) {
+        const key = `${event.channelId}\u0000${event.threadId}`;
+        if (!this.warnedNoSessionId.has(key)) {
+          this.warnedNoSessionId.add(key);
+          console.warn(
+            `[gateway] no Claude session id came back for channel=${event.channelId} thread=${event.threadId} — ` +
+              "the runner reported none for this turn; the mapping keeps no id until a turn reports one (logged once per conversation)",
           );
         }
       }
@@ -451,7 +470,7 @@ export function setGatewayEnabled(enabled: boolean): void {
 // --- Extended Processor Result ---
 
 export interface ProcessorResult extends ProcessingResult {
-  /** Real Claude session ID if available (extracted from first successful run) */
+  /** Real Claude session ID if available (#376: populated by the event processor from `RunResult.sessionId`) */
   claudeSessionId?: string;
 }
 

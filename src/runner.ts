@@ -405,6 +405,14 @@ export interface RunResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+  /**
+   * #376: the Claude session this run used or created — taken from the CLI's
+   * own `system/init` / `result` events on the stream, the documented source
+   * (never from the transcript file, whose format is internal). Absent when the
+   * stream carried no id (a rate-limit fallback, an exec that died before
+   * `init`). The gateway records it so `--resume` can be emitted.
+   */
+  sessionId?: string;
 }
 
 export interface AgentStreamEvent {
@@ -1799,7 +1807,12 @@ async function execClaude(
           type: "budget-blocked",
           message: `Budget state: ${routing.budgetState}`,
         });
-        return { stdout: "", stderr: "Execution blocked: budget limit exceeded", exitCode: 0 };
+        return {
+          stdout: "",
+          stderr: "Execution blocked: budget limit exceeded",
+          exitCode: 0,
+          ...(existing?.sessionId ? { sessionId: existing.sessionId } : {}),
+        };
       }
       console.log(
         `[${new Date().toLocaleTimeString()}] Agentic routing: ${routing.selectedModel} (${routing.reason})`,
@@ -2268,6 +2281,12 @@ async function execClaude(
       stdout,
       stderr,
       exitCode,
+      // The id of the exec that produced THIS response: on a rate-limit
+      // fallback that is the fallback session, not the primary (#376).
+      ...(() => {
+        const reported = usedFallback ? exec.sessionId : sessionId;
+        return reported && reported !== "unknown" ? { sessionId: reported } : {};
+      })(),
     };
 
     // Record successful completion WITH the real token usage + cost so the
@@ -2473,6 +2492,9 @@ async function execClaude(
           stdout: retryExec.rawStdout,
           stderr: retryExec.stderr,
           exitCode: retryExec.exitCode,
+          ...(retryExec.sessionId || existing?.sessionId
+            ? { sessionId: retryExec.sessionId || existing?.sessionId }
+            : {}),
         };
         emitCompactEvent({
           type: "auto-compact-retry",

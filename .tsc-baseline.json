@@ -1,5 +1,5 @@
 {
-  "total": 151,
+  "total": 149,
   "files": {
     "docs/spikes/probes/clear-with-history-probe.ts": 1,
     "docs/spikes/probes/lifecycle-markers-probe.ts": 1,
@@ -34,7 +34,7 @@
     "src/bus/__tests__/scheduler.test.ts": 1,
     "src/bus/__tests__/schema-probe.test.ts": 1,
     "src/bus/__tests__/wiring.test.ts": 2,
-    "src/gateway/index.ts": 3,
+    "src/gateway/index.ts": 1,
     "src/governance/client.ts": 1,
     "src/memory.ts": 3,
     "src/orchestrator/executor.ts": 3,

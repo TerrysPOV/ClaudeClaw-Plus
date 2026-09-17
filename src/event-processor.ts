@@ -62,6 +62,8 @@ export interface ProcessingResult {
   success: boolean;
   error?: string;
   shouldRetry?: boolean;
+  /** #376: the Claude session id the run reported, when the runner surfaced one. */
+  claudeSessionId?: string;
 }
 
 let dedupeState: DedupeState | null = null;
@@ -505,7 +507,7 @@ export async function initGatewayProcessor(
   processFn: (
     source: string,
     prompt: string,
-  ) => Promise<{ exitCode: number; stdout: string; stderr: string }>,
+  ) => Promise<{ exitCode: number; stdout: string; stderr: string; sessionId?: string }>,
 ): Promise<void> {
   await initProcessor({
     retentionDays: 7,
@@ -541,6 +543,9 @@ export async function initGatewayProcessor(
         return {
           success: result.exitCode === 0,
           error: result.exitCode !== 0 ? result.stderr : undefined,
+          // #376: hand the session id the runner read off the CLI stream to
+          // the gateway, which records it on the channel/thread mapping.
+          ...(result.sessionId ? { claudeSessionId: result.sessionId } : {}),
         };
       } catch (err) {
         return {
