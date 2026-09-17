@@ -22,6 +22,14 @@ import { createTelegramApi } from "./api";
 import { extractReactionDirectives } from "./directives";
 import { markdownToTelegramHtml, isTelegramHtmlParseError } from "./format";
 import { buildPromptMetadata } from "./metadata";
+import {
+  ackForResolution,
+  decisionStripsKeyboard,
+  describeResolverFailure,
+  parseResolverVerdict,
+  redactResolverDiagnostics,
+  runPendingResolver,
+} from "./pending-resolver";
 import type {
   TelegramApi,
   TelegramCallbackQuery,
@@ -998,8 +1006,10 @@ export class TelegramAdapter {
   }
 
   /**
-   * Handle `perm:<allow|deny>:<id>` (the only pattern this adapter emits).
-   * Legacy file's `btn:`, `pending:`, `sec_yes_` patterns are out of scope.
+   * Handle the two button shapes that reach a Bus deployment:
+   * `perm:<allow|deny>:<id>` (emitted by this adapter) and
+   * `pending:<id>:<value>` (emitted by the operator's `pending.py`, the same
+   * contract the legacy path honours). Any other shape is acked and dropped.
    */
   private async handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> {
     const data = query.data ?? "";
@@ -1012,6 +1022,18 @@ export class TelegramAdapter {
       await this.safeAnswerCallback({
         callback_query_id: query.id,
         text: "Unauthorized.",
+      });
+      return;
+    }
+
+    const pendingMatch = data.match(/^pending:(\d+):(.+)$/);
+    if (pendingMatch) {
+      // Not awaited: the resolver is a subprocess with a 5 s budget that may
+      // itself call the Bot API. Awaiting it here would pin the poll loop —
+      // every other update in the batch, and every later tap, would queue
+      // behind it. The legacy path fires and forgets too.
+      void this.handlePendingCallback(query, pendingMatch[1]!, pendingMatch[2]!).catch((err) => {
+        this.logger.error("[telegram-adapter] pending callback failed", err);
       });
       return;
     }
@@ -1049,6 +1071,64 @@ export class TelegramAdapter {
       callback_query_id: query.id,
       text: behavior === "allow" ? "✅ Allowed" : "❌ Denied",
     });
+  }
+
+  /**
+   * A `pending:<id>:<value>` tap. The verdict comes from the operator's
+   * resolver; the ack and the message edit follow it. Mirrors the legacy path
+   * (`commands/telegram.ts`) so a deployment that moved to the Bus keeps its
+   * pending-action buttons working — before this, every tap was acked and
+   * silently dropped, and the operator's queue never saw a decision.
+   */
+  private async handlePendingCallback(
+    query: TelegramCallbackQuery,
+    actionId: string,
+    decision: string,
+  ): Promise<void> {
+    const pendingLibPath = process.env.CLAUDECLAW_PENDING_LIB_PATH;
+    if (!pendingLibPath) {
+      this.logger.warn(
+        "[Telegram] CLAUDECLAW_PENDING_LIB_PATH not set; cannot resolve pending action. " +
+          "Set it to the directory containing pending.py (e.g. export CLAUDECLAW_PENDING_LIB_PATH=/path/to/agent/lib).",
+      );
+      await this.safeAnswerCallback({
+        callback_query_id: query.id,
+        text: "⚠️ Pending action handler not configured",
+      });
+      return;
+    }
+
+    const result = await runPendingResolver(pendingLibPath, actionId, decision);
+    const { verdict } = parseResolverVerdict(result.stdout);
+    const ackText = ackForResolution(result.stdout, decision);
+    if (verdict === "no_answer") {
+      // No verdict: the ack cannot say whether the decision was applied, so
+      // the operator needs the reason it failed.
+      const how = describeResolverFailure(result);
+      const why = redactResolverDiagnostics(result.stderr).trim().slice(0, 200) || "no stderr";
+      this.logger.warn(
+        `[Telegram] pending resolver reported no verdict for action ${actionId} (${how}): ${why}`,
+      );
+    }
+
+    // Record the decision on the message — but only once the action is no
+    // longer waiting on the operator (#375). Editing strips the keyboard: an
+    // ack that asks the user to retry must not delete the buttons it points
+    // them at, and neither must `details` (the action stays pending) or `skip`
+    // (the resolver re-sent its own keyboard).
+    if (query.message && decisionStripsKeyboard(verdict, decision)) {
+      const originalText = query.message.text ?? "";
+      await this.safe("editMessageText", () =>
+        this.api.editMessageText({
+          chat_id: query.message!.chat.id,
+          message_id: query.message!.message_id,
+          text: `${originalText}\n\n› ${ackText}`,
+          reply_markup: { inline_keyboard: [] },
+        }),
+      );
+    }
+
+    await this.safeAnswerCallback({ callback_query_id: query.id, text: ackText });
   }
 
   private resolveAgent(chatId: number): string | undefined {
