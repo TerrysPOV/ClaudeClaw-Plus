@@ -13,6 +13,7 @@ import {
   processNext,
   processPending,
   processPersistedEvent,
+  initGatewayProcessor,
   getPendingCount,
   getLastProcessedSeq,
   getDedupeStats,
@@ -184,6 +185,37 @@ describe("Event Processor", () => {
     await processPending();
 
     expect(processCount).toBe(1);
+  });
+
+  it("initGatewayProcessor passes the runner's session id through as claudeSessionId (#376)", async () => {
+    await initGatewayProcessor(async () => ({
+      exitCode: 0,
+      stdout: "ok",
+      stderr: "",
+      sessionId: "sess-42",
+    }));
+    const rec = await append(
+      createTestEntry({
+        payload: { normalizedEvent: { channel: "telegram", text: "hi", metadata: {} } },
+        dedupeKey: "",
+      }),
+    );
+    const result = await processPersistedEvent(rec.id);
+    expect(result.success).toBe(true);
+    expect(result.claudeSessionId).toBe("sess-42");
+  });
+
+  it("initGatewayProcessor leaves claudeSessionId absent when the runner surfaced none (#376)", async () => {
+    await initGatewayProcessor(async () => ({ exitCode: 0, stdout: "ok", stderr: "" }));
+    const rec = await append(
+      createTestEntry({
+        payload: { normalizedEvent: { channel: "telegram", text: "hi", metadata: {} } },
+        dedupeKey: "",
+      }),
+    );
+    const result = await processPersistedEvent(rec.id);
+    expect(result.success).toBe(true);
+    expect(result.claudeSessionId).toBeUndefined();
   });
 
   it("should handle event failure with retry", async () => {
