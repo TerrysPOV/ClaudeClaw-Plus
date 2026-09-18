@@ -139,6 +139,8 @@ export interface TelegramApi {
     message_id: number;
     text: string;
     parse_mode?: "HTML";
+    /** An empty keyboard strips the buttons once a decision is recorded. */
+    reply_markup?: { inline_keyboard: TelegramInlineKeyboardButton[][] };
   }): Promise<{ ok: boolean; result?: { message_id: number } | true }>;
   /** Show a chat action (e.g. typing) — expires after ~5s. */
   sendChatAction(params: { chat_id: number; action: "typing" }): Promise<{ ok: boolean }>;

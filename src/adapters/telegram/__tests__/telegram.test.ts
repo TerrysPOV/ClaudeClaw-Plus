@@ -22,7 +22,7 @@ import type {
   SubscriptionHandler,
 } from "../../../bus/core-subscription";
 import { type BusEvent, TAILER_EVENT_SOURCE } from "../../../bus/types";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -157,6 +157,7 @@ class FakeTelegramApi implements TelegramApi {
     message_id: number;
     text: string;
     parse_mode?: "HTML";
+    reply_markup?: { inline_keyboard: TelegramInlineKeyboardButton[][] };
   }> = [];
   public readonly reactions: SetReactionCall[] = [];
   public readonly callbackAcks: AnswerCallbackCall[] = [];
@@ -209,6 +210,7 @@ class FakeTelegramApi implements TelegramApi {
     message_id: number;
     text: string;
     parse_mode?: "HTML";
+    reply_markup?: { inline_keyboard: TelegramInlineKeyboardButton[][] };
   }): Promise<{ ok: boolean; result?: { message_id: number } | true }> {
     this.editMessages.push(params);
     return { ok: true, result: true };
@@ -1080,6 +1082,165 @@ describe("TelegramAdapter — permission flow", () => {
     await waitFor(() => api.callbackAcks.length > 0);
     expect(api.callbackAcks[0]?.text).toBe("Unauthorized.");
     expect(bus.permissionDecisions).toHaveLength(0);
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* pending-action buttons (pending:<id>:<value> from the operator's pending.py) */
+/* ────────────────────────────────────────────────────────────────────── */
+
+describe("TelegramAdapter — pending-action buttons", () => {
+  let libDir: string;
+  let savedLibPath: string | undefined;
+
+  beforeEach(() => {
+    savedLibPath = process.env.CLAUDECLAW_PENDING_LIB_PATH;
+    libDir = mkdtempSync(join(tmpdir(), "cc-pending-lib-"));
+    // A stand-in for the operator's pending.py: records the call, answers "ok".
+    writeFileSync(
+      join(libDir, "pending.py"),
+      [
+        "import os, sys",
+        "def resolve_pending_ex(action_id, decision):",
+        "    with open(os.path.join(os.path.dirname(__file__), 'calls.txt'), 'a') as f:",
+        "        f.write(f'{action_id} {decision}\\n')",
+        "    return 'ok'",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  afterEach(() => {
+    if (savedLibPath === undefined) delete process.env.CLAUDECLAW_PENDING_LIB_PATH;
+    else process.env.CLAUDECLAW_PENDING_LIB_PATH = savedLibPath;
+    rmSync(libDir, { recursive: true, force: true });
+  });
+
+  it("hands a pending:<id>:<value> tap to the resolver, acks, and strips the keyboard", async () => {
+    process.env.CLAUDECLAW_PENDING_LIB_PATH = libDir;
+    adapter = await startAdapter();
+    api.enqueueUpdates([
+      {
+        callback_query: {
+          id: "cb-pending",
+          from: { id: 42 },
+          data: "pending:2623:pay",
+          message: {
+            message_id: 19090,
+            chat: { id: 100, type: "private" },
+            text: "Avis de jugement — 154 $",
+          },
+        },
+      },
+    ]);
+    await waitFor(() => api.callbackAcks.length > 0);
+
+    // The operator's resolver saw exactly the id and value from the button.
+    const calls = readFileSync(join(libDir, "calls.txt"), "utf8").trim();
+    expect(calls).toBe("2623 pay");
+
+    // The ack names the decision instead of a spinner-only silent drop.
+    expect(api.callbackAcks[0]?.callback_query_id).toBe("cb-pending");
+    expect(api.callbackAcks[0]?.text).toBe("↩︎ Décision enregistrée — pay");
+
+    // The message records the decision and loses its buttons.
+    const edit = api.editMessages[0];
+    expect(edit?.message_id).toBe(19090);
+    expect(edit?.text).toBe("Avis de jugement — 154 $\n\n› ↩︎ Décision enregistrée — pay");
+    expect(edit?.reply_markup?.inline_keyboard).toEqual([]);
+    // And it never masquerades as a permission decision.
+    expect(bus.permissionDecisions).toHaveLength(0);
+  });
+
+  it("acks `not_found` and strips the keyboard — the buttons point at nothing", async () => {
+    writeFileSync(
+      join(libDir, "pending.py"),
+      "def resolve_pending_ex(action_id, decision):\n    return 'not_found'\n",
+    );
+    process.env.CLAUDECLAW_PENDING_LIB_PATH = libDir;
+    adapter = await startAdapter();
+    api.enqueueUpdates([
+      {
+        callback_query: {
+          id: "cb-gone",
+          from: { id: 42 },
+          data: "pending:99999:approve",
+          message: { message_id: 7, chat: { id: 100, type: "private" }, text: "old" },
+        },
+      },
+    ]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("⚠️ Action introuvable");
+    expect(api.editMessages[0]?.text).toBe("old\n\n› ⚠️ Action introuvable");
+    expect(api.editMessages[0]?.reply_markup?.inline_keyboard).toEqual([]);
+  });
+
+  it("asks for a retry and keeps the buttons when the resolver crashes (no verdict)", async () => {
+    writeFileSync(
+      join(libDir, "pending.py"),
+      "def resolve_pending_ex(action_id, decision):\n    raise RuntimeError('database is locked')\n",
+    );
+    process.env.CLAUDECLAW_PENDING_LIB_PATH = libDir;
+    adapter = await startAdapter();
+    api.enqueueUpdates([
+      {
+        callback_query: {
+          id: "cb-crash",
+          from: { id: 42 },
+          data: "pending:2623:approve",
+          message: { message_id: 7, chat: { id: 100, type: "private" }, text: "x" },
+        },
+      },
+    ]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("⚠️ Erreur — réessaie");
+    // No verdict → no edit: the retry ack must not delete the buttons it points at.
+    expect(api.editMessages).toHaveLength(0);
+  });
+
+  it("keeps the keyboard on a `details` tap — the action stays pending (#375)", async () => {
+    process.env.CLAUDECLAW_PENDING_LIB_PATH = libDir;
+    adapter = await startAdapter();
+    api.enqueueUpdates([
+      {
+        callback_query: {
+          id: "cb-details",
+          from: { id: 42 },
+          data: "pending:2623:details",
+          message: {
+            message_id: 19090,
+            chat: { id: 100, type: "private" },
+            text: "Avis de jugement — 154 $",
+          },
+        },
+      },
+    ]);
+    await waitFor(() => api.callbackAcks.length > 0);
+
+    // The resolver still ran and answered ok …
+    expect(readFileSync(join(libDir, "calls.txt"), "utf8").trim()).toBe("2623 details");
+    expect(api.callbackAcks[0]?.text).toBe("👀 Consulté");
+    // … but the message is not edited: editing would strip the buttons and
+    // strand an action the resolver deliberately left pending.
+    expect(api.editMessages).toHaveLength(0);
+  });
+
+  it("acks with a configuration error and keeps the buttons when no resolver is configured", async () => {
+    delete process.env.CLAUDECLAW_PENDING_LIB_PATH;
+    adapter = await startAdapter();
+    api.enqueueUpdates([
+      {
+        callback_query: {
+          id: "cb-noconf",
+          from: { id: 42 },
+          data: "pending:1:approve",
+          message: { message_id: 5, chat: { id: 100, type: "private" }, text: "x" },
+        },
+      },
+    ]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("⚠️ Pending action handler not configured");
+    expect(api.editMessages).toHaveLength(0);
   });
 });
 
