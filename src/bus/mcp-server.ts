@@ -260,20 +260,37 @@ const PermissionRequestNotificationSchema = NotificationSchema.extend({
 /* Tool input schemas                                                    */
 /* ───────────────────────────────────────────────────────────────────── */
 
-const ReplyArgsSchema = z.object({
-  message: z.string(),
-  metadata: z
-    .object({
-      intent: z.enum(["final", "progress", "tool_status"]).optional(),
-      // #224: the chat_id of the <channel> block this reply answers.
-      in_reply_to: z
-        .union([z.string(), z.number()])
-        .transform(String)
-        .pipe(z.string().max(200))
-        .optional(),
-    })
-    .optional(),
-});
+const ReplyIntentSchema = z.enum(["final", "progress", "tool_status"]);
+// #224: the chat_id of the <channel> block this reply answers.
+const ReplyInReplyToSchema = z
+  .union([z.string(), z.number()])
+  .transform(String)
+  // An empty string would be dropped as "unnamed" further down and the reply
+  // would fall back to whichever chat wrote last — refuse it here instead.
+  .pipe(z.string().min(1).max(200));
+
+// `intent` / `in_reply_to` are accepted at the top level AND under `metadata`
+// (the historical form). Both objects are strict: an unknown key — a typo, or a
+// field placed at the wrong level — is refused with a message naming it. `null`
+// on any optional means "not set", as a model routinely writes it. Before
+// this, a top-level `intent: "final"` (the form the tool description itself
+// showed) was dropped by the non-strict parse and the reply went out as
+// `progress`: the surface kept editing one live message in place, no final ever
+// landed, and the turn was nudged and synthesized on top of it.
+const ReplyArgsSchema = z
+  .object({
+    message: z.string(),
+    intent: ReplyIntentSchema.nullish(),
+    in_reply_to: ReplyInReplyToSchema.nullish(),
+    metadata: z
+      .object({
+        intent: ReplyIntentSchema.nullish(),
+        in_reply_to: ReplyInReplyToSchema.nullish(),
+      })
+      .strict()
+      .nullish(),
+  })
+  .strict();
 
 const AskArgsSchema = z.object({
   question: z.string(),
@@ -677,13 +694,34 @@ export class BusMcpServer {
   /* ── Tool handlers ──────────────────────────────────────────────── */
 
   private handleReply(raw: unknown) {
-    const args = ReplyArgsSchema.parse(raw ?? {});
+    const parsed = ReplyArgsSchema.safeParse(raw ?? {});
+    if (!parsed.success) {
+      // Refuse loudly: a reply the agent believes is final must not be
+      // delivered as something else because one of its keys was not read.
+      const issues = parsed.error.issues
+        .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
+        .join("; ");
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `reply refused — ${issues}. Accepted: { message, intent?, in_reply_to?, ` +
+              `metadata?: { intent?, in_reply_to? } }`,
+          },
+        ],
+        isError: true,
+      };
+    }
+    const args = parsed.data;
+    const intent = args.metadata?.intent ?? args.intent ?? "progress";
+    const inReplyTo = args.metadata?.in_reply_to ?? args.in_reply_to;
     const ipcMsg: IpcReply = {
       type: "reply",
       agent_id: this.agentId,
       text: args.message,
-      intent: args.metadata?.intent ?? "progress",
-      ...(args.metadata?.in_reply_to ? { in_reply_to: args.metadata.in_reply_to } : {}),
+      intent,
+      ...(inReplyTo ? { in_reply_to: inReplyTo } : {}),
     };
     this.ipc.send(ipcMsg);
     return {

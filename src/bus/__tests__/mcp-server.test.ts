@@ -303,6 +303,99 @@ describe("BusMcpServer — outbound tools", () => {
     expect(reply.intent).toBe("progress");
   });
 
+  it("`reply` tool honours a top-level `intent` (the form its description shows)", async () => {
+    const result = await h.client.callTool({
+      name: "reply",
+      arguments: { message: "done", intent: "final" },
+    });
+    expect(result.isError).toBeFalsy();
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.intent).toBe("final");
+  });
+
+  it("`reply` tool honours a top-level `in_reply_to` like metadata.in_reply_to", async () => {
+    await h.client.callTool({
+      name: "reply",
+      arguments: { message: "for chat A", intent: "final", in_reply_to: 100 },
+    });
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.in_reply_to).toBe("100");
+  });
+
+  it("`reply` tool lets metadata.in_reply_to win when both forms are given", async () => {
+    await h.client.callTool({
+      name: "reply",
+      arguments: { message: "x", in_reply_to: 1, metadata: { in_reply_to: 2 } },
+    });
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.in_reply_to).toBe("2");
+  });
+
+  it("`reply` tool refuses an empty `in_reply_to` instead of routing it as unnamed", async () => {
+    const result = await h.client.callTool({
+      name: "reply",
+      arguments: { message: "x", intent: "final", in_reply_to: "" },
+    });
+    expect(result.isError).toBe(true);
+    expect(h.ipc.sent).toHaveLength(0);
+  });
+
+  it("`reply` tool lets metadata.intent win when both forms are given", async () => {
+    await h.client.callTool({
+      name: "reply",
+      arguments: { message: "x", intent: "progress", metadata: { intent: "final" } },
+    });
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.intent).toBe("final");
+  });
+
+  it("`reply` tool treats null optionals as unset (models write null for 'not applicable')", async () => {
+    const result = await h.client.callTool({
+      name: "reply",
+      arguments: { message: "done", intent: "final", in_reply_to: null, metadata: null },
+    });
+    expect(result.isError).toBeFalsy();
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.intent).toBe("final");
+    expect("in_reply_to" in reply).toBe(false);
+  });
+
+  it("`reply` tool: a null metadata.intent does not shadow a top-level intent", async () => {
+    const result = await h.client.callTool({
+      name: "reply",
+      arguments: { message: "done", intent: "final", metadata: { intent: null } },
+    });
+    expect(result.isError).toBeFalsy();
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.intent).toBe("final");
+  });
+
+  it("`reply` tool rejects an unknown key inside metadata too", async () => {
+    const result = await h.client.callTool({
+      name: "reply",
+      arguments: { message: "x", metadata: { intent: "final", chat_id: "100" } },
+    });
+    expect(result.isError).toBe(true);
+    expect(String((result.content as Array<{ text?: string }>)[0]?.text)).toContain("chat_id");
+    expect(h.ipc.sent.length).toBe(0);
+  });
+
+  it("`reply` tool rejects an unknown argument instead of delivering it as progress", async () => {
+    const result = await h.client.callTool({
+      name: "reply",
+      arguments: { message: "x", intnet: "final" },
+    });
+    expect(result.isError).toBe(true);
+    expect(String((result.content as Array<{ text?: string }>)[0]?.text)).toContain("intnet");
+    expect(h.ipc.sent.length).toBe(0);
+  });
+
   it("`reply` tool forwards metadata.in_reply_to on the IpcReply (#224)", async () => {
     await h.client.callTool({
       name: "reply",
