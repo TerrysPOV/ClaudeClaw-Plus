@@ -180,6 +180,9 @@ export function createTelegramApi(token: string, options: TelegramApiOptions = {
     async editMessageText(params) {
       return call("editMessageText", params as unknown as Record<string, unknown>);
     },
+    async deleteMessage(params) {
+      return call("deleteMessage", params as unknown as Record<string, unknown>);
+    },
     async sendChatAction(params) {
       return call("sendChatAction", params as unknown as Record<string, unknown>);
     },

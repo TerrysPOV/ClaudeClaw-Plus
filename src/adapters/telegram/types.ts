@@ -142,6 +142,12 @@ export interface TelegramApi {
     /** An empty keyboard strips the buttons once a decision is recorded. */
     reply_markup?: { inline_keyboard: TelegramInlineKeyboardButton[][] };
   }): Promise<{ ok: boolean; result?: { message_id: number } | true }>;
+  /**
+   * Delete a message the bot previously sent. Used to clean up the per-turn
+   * placeholder/progress message once the final reply went out as a new
+   * message.
+   */
+  deleteMessage(params: { chat_id: number; message_id: number }): Promise<{ ok: boolean }>;
   /** Show a chat action (e.g. typing) — expires after ~5s. */
   sendChatAction(params: { chat_id: number; action: "typing" }): Promise<{ ok: boolean }>;
   /** Sets a single emoji reaction on a message (mirrors §5.5.2 reaction model). */

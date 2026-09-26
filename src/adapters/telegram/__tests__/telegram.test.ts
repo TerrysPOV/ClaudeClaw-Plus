@@ -159,6 +159,7 @@ class FakeTelegramApi implements TelegramApi {
     parse_mode?: "HTML";
     reply_markup?: { inline_keyboard: TelegramInlineKeyboardButton[][] };
   }> = [];
+  public readonly deletes: Array<{ chat_id: number; message_id: number }> = [];
   public readonly reactions: SetReactionCall[] = [];
   public readonly callbackAcks: AnswerCallbackCall[] = [];
   /** #201: count inbound polls so send-only configs can assert zero. */
@@ -214,6 +215,11 @@ class FakeTelegramApi implements TelegramApi {
   }): Promise<{ ok: boolean; result?: { message_id: number } | true }> {
     this.editMessages.push(params);
     return { ok: true, result: true };
+  }
+
+  async deleteMessage(params: { chat_id: number; message_id: number }): Promise<{ ok: boolean }> {
+    this.deletes.push(params);
+    return { ok: true };
   }
 
   async setMessageReaction(params: SetReactionCall): Promise<{ ok: boolean }> {
@@ -647,11 +653,12 @@ describe("TelegramAdapter — response.text outbound", () => {
     );
   });
 
-  it("converts markdown on an in-place edit too (progress → final)", async () => {
+  it("converts markdown on a final that follows a progress reply too", async () => {
     adapter = await startAdapter();
     await feedInbound();
 
-    // Progress opens a live turn (fresh send); final edits it in place.
+    // Progress opens a live turn (fresh send); the final goes out as a new
+    // message (so it notifies) and the progress message is deleted.
     bus.emit({
       ts: Date.now(),
       agent_id: "triage",
@@ -667,9 +674,9 @@ describe("TelegramAdapter — response.text outbound", () => {
       topic: "response.text",
       payload: { text: "**done**", intent: "final" },
     });
-    await waitFor(() => api.editMessages.some((e) => e.text === "<b>done</b>"));
-    const edit = api.editMessages.find((e) => e.text === "<b>done</b>");
-    expect(edit?.parse_mode).toBe("HTML");
+    await waitFor(() => api.sendMessages.length === 2);
+    expect(api.sendMessages[1]?.text).toBe("<b>done</b>");
+    expect(api.sendMessages[1]?.parse_mode).toBe("HTML");
   });
 
   it("prefixes a synthesized (safety-net) final with the uncurated-output notice (#240)", async () => {
@@ -706,13 +713,13 @@ describe("TelegramAdapter — response.text outbound", () => {
     expect(api.sendMessages[0]?.text).toBe("curated answer");
   });
 
-  it("prefixes the notice on the edit-in-place path when a turn is live (#240)", async () => {
+  it("prefixes the notice on a final that closes a live turn (#240)", async () => {
     adapter = await startAdapter();
     await feedInbound();
 
-    // Progress reply opens a live turn (fresh message + spinner) so the
-    // following final edits in place instead of sending fresh — the dominant
-    // path for a normal prompted turn, distinct from the send-fresh tests above.
+    // Progress reply opens a live turn (fresh message + spinner); the final
+    // then replaces it as a new message — the dominant path for a normal
+    // prompted turn, distinct from the no-live-turn tests above.
     bus.emit({
       ts: Date.now(),
       agent_id: "triage",
@@ -729,10 +736,11 @@ describe("TelegramAdapter — response.text outbound", () => {
       topic: "response.text",
       payload: { text: "raw turn output", intent: "final", synthesized: true },
     });
-    await waitFor(() => api.editMessages.some((e) => e.text.startsWith("⚠️")));
-    const edit = api.editMessages.find((e) => e.text.startsWith("⚠️"));
-    expect(edit?.text).toContain("without sending a reply");
-    expect(edit?.text).toContain("raw turn output");
+    await waitFor(() => api.sendMessages.length === 2);
+    const sent = api.sendMessages[1];
+    expect(sent?.text.startsWith("⚠️")).toBe(true);
+    expect(sent?.text).toContain("without sending a reply");
+    expect(sent?.text).toContain("raw turn output");
   });
 
   it("does not emit a lone notice for a reaction-only synthesized final (#240)", async () => {
@@ -834,7 +842,7 @@ describe("TelegramAdapter — response.text outbound", () => {
     });
     await waitFor(() => api.sendMessages.length === 1);
 
-    // Final reply edits the live message in place, then evicts the entry.
+    // Final reply goes out as a new message and evicts the live entry.
     bus.emit({
       ts: Date.now(),
       agent_id: "triage",
@@ -842,7 +850,7 @@ describe("TelegramAdapter — response.text outbound", () => {
       topic: "response.text",
       payload: { text: "done", intent: "final" },
     });
-    await waitFor(() => api.editMessages.some((e) => e.text === "done"));
+    await waitFor(() => api.sendMessages.length === 2 && api.deletes.length === 1);
     const editsAfterFinal = api.editMessages.length;
 
     // edit_message now: the entry was evicted, so it must NOT edit a stale
@@ -854,9 +862,9 @@ describe("TelegramAdapter — response.text outbound", () => {
       topic: "response.edit_text",
       payload: { text: "afterthought" },
     });
-    await waitFor(() => api.sendMessages.length === 2);
+    await waitFor(() => api.sendMessages.length === 3);
     expect(api.editMessages.length).toBe(editsAfterFinal);
-    expect(api.sendMessages[1]?.text).toBe("afterthought");
+    expect(api.sendMessages[2]?.text).toBe("afterthought");
   });
 
   it("routes response.text to origin_id when origin is telegram (issue #139)", async () => {
@@ -1703,6 +1711,7 @@ describe("TelegramAdapter — poll loop recovers from a timed-out getUpdates", (
       },
       sendMessage: (p) => inner.sendMessage(p),
       editMessageText: (p) => inner.editMessageText(p),
+      deleteMessage: (p) => inner.deleteMessage(p),
       setMessageReaction: (p) => inner.setMessageReaction(p),
       answerCallbackQuery: (p) => inner.answerCallbackQuery(p),
     };
@@ -1900,5 +1909,345 @@ describe("TelegramAdapter — inbound receipts (#211)", () => {
     expect(closedReceipts().find((r) => r.message_id === "tg-1")?.final_state).toBe(
       "turn_observed",
     );
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* Final reply after a live turn message: new message, not an edit          */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/**
+ * The base fake has no `sendChatAction`, so `handleMessage` throws before it
+ * posts the per-turn placeholder and every older test runs without one. This
+ * subclass completes the real interface (still nothing beyond it) so the
+ * production flow — placeholder → progress edit → final — runs end to end, and
+ * lets a test make one API method reject for chosen calls.
+ */
+class TurnApi extends FakeTelegramApi {
+  failSend: ((p: SendMessageCall) => Error | undefined) | null = null;
+  failEdit: ((p: { message_id: number; text: string }) => Error | undefined) | null = null;
+  failDelete: Error | null = null;
+  /** While set, every editMessageText waits on it — holds an edit in flight. */
+  gateEdit: Promise<void> | null = null;
+
+  async sendChatAction(_p: { chat_id: number; action: "typing" }): Promise<{ ok: boolean }> {
+    return { ok: true };
+  }
+
+  override async sendMessage(
+    params: SendMessageCall,
+  ): Promise<{ ok: boolean; result?: { message_id: number } }> {
+    const err = this.failSend?.(params);
+    if (err) throw err;
+    return super.sendMessage(params);
+  }
+
+  override async editMessageText(params: {
+    chat_id: number;
+    message_id: number;
+    text: string;
+    parse_mode?: "HTML";
+    reply_markup?: { inline_keyboard: TelegramInlineKeyboardButton[][] };
+  }): Promise<{ ok: boolean; result?: { message_id: number } | true }> {
+    if (this.gateEdit) await this.gateEdit;
+    const err = this.failEdit?.(params);
+    if (err) throw err;
+    return super.editMessageText(params);
+  }
+
+  override async deleteMessage(params: {
+    chat_id: number;
+    message_id: number;
+  }): Promise<{ ok: boolean }> {
+    if (this.failDelete) throw this.failDelete;
+    return super.deleteMessage(params);
+  }
+}
+
+describe("TelegramAdapter — final reply is a new message (notifies), placeholder cleaned up", () => {
+  let turnApi: TurnApi;
+  let logs: { warn: string[]; error: string[] };
+
+  function recordingLogger() {
+    return {
+      info: () => {},
+      warn: (...a: unknown[]) => void logs.warn.push(a.map(String).join(" ")),
+      error: (...a: unknown[]) => void logs.error.push(a.map(String).join(" ")),
+    };
+  }
+
+  function emitReply(text: string, intent: "progress" | "final"): void {
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text, intent, origin: "telegram", origin_id: "100" },
+    });
+  }
+
+  /** Inbound in forum topic 7 → the adapter posts its placeholder (id 1001). */
+  async function startTurn(): Promise<number> {
+    turnApi = new TurnApi();
+    api = turnApi;
+    logs = { warn: [], error: [] };
+    adapter = await startAdapter({ api: turnApi, logger: recordingLogger() });
+    turnApi.enqueueUpdates([
+      {
+        message: {
+          message_id: 50,
+          from: { id: 42 },
+          chat: { id: 100, type: "supergroup" },
+          message_thread_id: 7,
+          text: "check my mail",
+        },
+      },
+    ]);
+    await waitFor(() => turnApi.sendMessages.length === 1);
+    const placeholder = turnApi.sendMessages[0];
+    expect(placeholder?.text.endsWith("...")).toBe(true);
+    // Let handleMessage finish its post-send bookkeeping (turnActive + spinner).
+    await new Promise((r) => setTimeout(r, 10));
+    return 1001;
+  }
+
+  const parseError = () =>
+    new Error("Telegram API sendMessage: 400 Bad Request: can't parse entities: unsupported tag");
+
+  it("progress edits the placeholder; the final is SENT as a new message in the thread, placeholder deleted", async () => {
+    const placeholderId = await startTurn();
+
+    emitReply("Looking at your mail…", "progress");
+    await waitFor(() => turnApi.editMessages.length === 1);
+    expect(turnApi.editMessages[0]?.message_id).toBe(placeholderId);
+
+    emitReply("**3 new mails**", "final");
+    await waitFor(() => turnApi.deletes.length === 1);
+
+    expect(turnApi.sendMessages).toHaveLength(2);
+    const final = turnApi.sendMessages[1];
+    expect(final?.text).toBe("<b>3 new mails</b>");
+    expect(final?.parse_mode).toBe("HTML");
+    expect(final?.chat_id).toBe(100);
+    expect(final?.message_thread_id).toBe(7);
+    // The final never went through an edit.
+    expect(turnApi.editMessages.some((e) => e.text.includes("3 new mails"))).toBe(false);
+    expect(turnApi.deletes[0]).toEqual({ chat_id: 100, message_id: placeholderId });
+    expect(logs.error).toHaveLength(0);
+  });
+
+  it("a DIRECT final (no progress) also goes out as a new message and deletes the placeholder", async () => {
+    const placeholderId = await startTurn();
+
+    emitReply("done", "final");
+    await waitFor(() => turnApi.deletes.length === 1);
+
+    expect(turnApi.sendMessages[1]?.text).toBe("done");
+    expect(turnApi.editMessages).toHaveLength(0);
+    expect(turnApi.deletes[0]?.message_id).toBe(placeholderId);
+  });
+
+  it("a failed placeholder delete still delivers the final, and is logged", async () => {
+    await startTurn();
+    turnApi.failDelete = new Error(
+      "Telegram API deleteMessage: 400 Bad Request: message can't be deleted",
+    );
+
+    emitReply("the answer", "final");
+    await waitFor(() => logs.warn.length > 0);
+
+    expect(turnApi.sendMessages[1]?.text).toBe("the answer");
+    expect(logs.warn.some((l) => l.includes("could not delete the turn placeholder"))).toBe(true);
+    expect(logs.error).toHaveLength(0);
+  });
+
+  it("a failed final send is logged and falls back to editing the placeholder", async () => {
+    const placeholderId = await startTurn();
+    turnApi.failSend = (p) =>
+      p.text.includes("the answer")
+        ? new Error("Telegram API sendMessage: 429 Too Many Requests (retry_after 3s)")
+        : undefined;
+
+    emitReply("the answer", "final");
+    await waitFor(() => turnApi.editMessages.length === 1);
+
+    expect(turnApi.editMessages[0]?.message_id).toBe(placeholderId);
+    expect(turnApi.editMessages[0]?.text).toBe("the answer");
+    // Not sent, so the placeholder now carrying the answer must NOT be deleted.
+    expect(turnApi.deletes).toHaveLength(0);
+    expect(logs.error.some((l) => l.includes("final sendMessage failed"))).toBe(true);
+  });
+
+  it("when both the final send and the edit fallback fail, the loss is logged", async () => {
+    await startTurn();
+    turnApi.failSend = (p) =>
+      p.text.includes("the answer")
+        ? new Error("Telegram API sendMessage: 502 Bad Gateway")
+        : undefined;
+    turnApi.failEdit = () => new Error("Telegram API editMessageText: 502 Bad Gateway");
+
+    emitReply("the answer", "final");
+    await waitFor(() => logs.error.length === 2);
+
+    expect(logs.error[1]).toContain("final reply lost");
+    expect(turnApi.deletes).toHaveLength(0);
+  });
+
+  it("a malformed-HTML final is re-sent as plain text (new message), not edited", async () => {
+    await startTurn();
+    turnApi.failSend = (p) =>
+      p.parse_mode === "HTML" && p.text.includes("answer") ? parseError() : undefined;
+
+    emitReply("the answer", "final");
+    await waitFor(() => turnApi.deletes.length === 1);
+
+    const final = turnApi.sendMessages[1];
+    expect(final?.text).toBe("the answer");
+    expect(final?.parse_mode).toBeUndefined();
+    expect(final?.message_thread_id).toBe(7);
+    expect(turnApi.editMessages).toHaveLength(0);
+  });
+
+  it("progress alone still edits in place: no new message, no delete", async () => {
+    const placeholderId = await startTurn();
+
+    emitReply("step 1", "progress");
+    await waitFor(() => turnApi.editMessages.length === 1);
+    emitReply("step 2", "progress");
+    await waitFor(() => turnApi.editMessages.length === 2);
+
+    expect(turnApi.sendMessages).toHaveLength(1);
+    expect(turnApi.deletes).toHaveLength(0);
+    expect(turnApi.editMessages.every((e) => e.message_id === placeholderId)).toBe(true);
+    expect(turnApi.editMessages[1]?.text.endsWith("step 2")).toBe(true);
+  });
+
+  it("a non-format progress edit failure is logged instead of swallowed", async () => {
+    await startTurn();
+    turnApi.failEdit = () =>
+      new Error("Telegram API editMessageText: 400 Bad Request: message to edit not found");
+
+    emitReply("step 1", "progress");
+    await waitFor(() => logs.warn.length > 0);
+
+    expect(logs.warn.some((l) => l.includes("progress edit failed"))).toBe(true);
+    // Not a parse error → no plain-text re-edit, no resend.
+    expect(turnApi.sendMessages).toHaveLength(1);
+  });
+
+  it("a final landing while a progress edit is in flight does not re-arm the spinner", async () => {
+    await startTurn();
+
+    // Back-to-back: the progress handler is suspended on its edit when the
+    // final runs. Once the edit settles it must not restart the spinner on the
+    // (now deleted) turn message.
+    emitReply("working", "progress");
+    emitReply("done", "final");
+    await waitFor(() => turnApi.deletes.length === 1);
+    await new Promise((r) => setTimeout(r, 10));
+
+    const spinners = (adapter as unknown as { spinnerState: Map<string, unknown> }).spinnerState;
+    expect(spinners.size).toBe(0);
+    expect(turnApi.sendMessages[1]?.text).toBe("done");
+  });
+
+  function emitEdit(text: string): void {
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.edit_text",
+      payload: { text },
+    });
+  }
+
+  function spinnerFor(): { message_id: number } | undefined {
+    const spinners = (adapter as unknown as { spinnerState: Map<string, { message_id: number }> })
+      .spinnerState;
+    return Array.from(spinners.values())[0];
+  }
+
+  function hold(): () => void {
+    let release: () => void = () => {};
+    turnApi.gateEdit = new Promise<void>((r) => {
+      release = r;
+    });
+    return () => {
+      turnApi.gateEdit = null;
+      release();
+    };
+  }
+
+  it("a stale progress edit settling after the next turn started does not take over its spinner", async () => {
+    await startTurn();
+    const release = hold();
+
+    // Progress edit on placeholder 1001 is held in flight; the final lands
+    // (new message 1002, 1001 deleted) and the next inbound posts placeholder
+    // 1003, which is now the live turn message with its own spinner.
+    emitReply("working", "progress");
+    emitReply("done", "final");
+    await waitFor(() => turnApi.deletes.length === 1);
+    turnApi.enqueueUpdates([
+      {
+        message: {
+          message_id: 51,
+          from: { id: 42 },
+          chat: { id: 100, type: "supergroup" },
+          message_thread_id: 7,
+          text: "and now?",
+        },
+      },
+    ]);
+    await waitFor(() => turnApi.sendMessages.length === 3);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(spinnerFor()?.message_id).toBe(1003);
+
+    release();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(spinnerFor()?.message_id).toBe(1003);
+  });
+
+  it("a final after the turn is closed does not delete an edit_message fallback message", async () => {
+    await startTurn();
+    emitReply("done", "final");
+    await waitFor(() => turnApi.deletes.length === 1);
+
+    // No live message any more: edit_message sends fresh (1003) and keeps it
+    // for later edits, but it carries real content and is not a turn message.
+    emitEdit("afterthought");
+    await waitFor(() => turnApi.sendMessages.length === 3);
+    // Let the edit_message handler record 1003 before the next final runs.
+    await new Promise((r) => setTimeout(r, 10));
+
+    emitReply("scheduled report", "final");
+    await waitFor(() => turnApi.sendMessages.length === 4);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(turnApi.deletes).toHaveLength(1);
+  });
+
+  it("a final landing while an edit_message edit is in flight does not re-arm the spinner", async () => {
+    await startTurn();
+    const release = hold();
+
+    emitEdit("reading mail");
+    emitReply("done", "final");
+    await waitFor(() => turnApi.deletes.length === 1);
+    release();
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(spinnerFor()).toBeUndefined();
+  });
+
+  it("a non-format edit_message edit failure is logged instead of swallowed", async () => {
+    await startTurn();
+    turnApi.failEdit = () =>
+      new Error("Telegram API editMessageText: 400 Bad Request: message to edit not found");
+
+    emitEdit("reading mail");
+    await waitFor(() => logs.warn.length > 0);
+
+    expect(logs.warn.some((l) => l.includes("edit_message edit failed"))).toBe(true);
+    expect(turnApi.sendMessages).toHaveLength(1);
   });
 });
