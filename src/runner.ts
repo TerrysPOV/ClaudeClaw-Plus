@@ -17,7 +17,7 @@ import {
   backupSession,
 } from "./sessions";
 import { needsRotation, rotateSession, loadLatestSummary } from "./rotation";
-import { actOnSession } from "./runner/live-session-actions";
+import { actOnSession, saveMemoryBeforeCompact } from "./runner/live-session-actions";
 import {
   getThreadSession,
   createThreadSession,
@@ -2485,13 +2485,12 @@ async function execClaude(
         console.log(
           `[${new Date().toLocaleTimeString()}] Pre-compact: saving memory to ${memPath}`,
         );
-        const saved = await actOnSession({
-          route: "memory.save.precompact",
+        const saved = await saveMemoryBeforeCompact({
+          memPath,
           prompt: `Session is about to compact. Save your current memory to ${memPath} now. Include: current status, what was accomplished, key context for next session. Keep it concise.`,
           sessionKey: ptySessionKey,
           sessionId: existing.sessionId,
           skipLive: exitCode === 124,
-          allowedTools: ["Write"],
           model: primaryConfig.model,
           cwd: spawnCwd,
           timeoutMs: 30_000,

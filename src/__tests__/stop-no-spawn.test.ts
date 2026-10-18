@@ -38,6 +38,8 @@ beforeEach(async () => {
     },
     teardownStatusline: async () => {},
     removeHeartbeatState: async () => {},
+    // the stand-in daemon is a `sleep`; make it look like one
+    readProcessCommand: () => "bun run src/index.ts start",
   };
   spawns = [];
   realSpawn = Bun.spawn;

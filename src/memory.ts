@@ -5,7 +5,7 @@
  * Memory is injected into --append-system-prompt on every invocation.
  */
 
-import { join } from "path";
+import { isAbsolute, join, resolve } from "path";
 import { existsSync } from "fs";
 import { spawnSync, spawn } from "child_process";
 import { readFile, writeFile, mkdir } from "fs/promises";
@@ -42,6 +42,31 @@ export function getMemoryPath(agentName?: string): string {
     return join(AGENTS_MEMORY_DIR, agentName, "MEMORY.md");
   }
   return MEMORY_FILE;
+}
+
+/**
+ * The tool grant for a one-shot that must write ONE memory file and nothing else (#549):
+ * `tools` are the bare built-in tools to make available (`--tools`), `allowedTools` the
+ * permission rules to pre-approve (`--allowedTools`), pinned to `memPath`.
+ *
+ * Syntax (code.claude.com/docs/en/permissions): `//path` is an absolute path from the
+ * filesystem root, whereas `/path` anchors at the settings source. File rules are
+ * checked as `Edit(path)` / `Read(path)` only: "Edit rules apply to all built-in tools
+ * that edit files" (Write included), and a `Write(path)` rule is accepted but never
+ * consulted. `Read` is granted too because the Write tool refuses to overwrite an
+ * existing file the session has not read.
+ *
+ * Throws when the path holds characters the rule syntax would read as a glob or
+ * separator: the rule could then match more than the one file, so no grant is better
+ * than a wider one.
+ */
+export function memoryFileGrant(memPath: string): { tools: string[]; allowedTools: string[] } {
+  const abs = resolve(memPath);
+  if (!isAbsolute(abs) || !abs.startsWith("/") || /[()*?[\]{},\r\n]/.test(abs)) {
+    throw new Error(`memory path ${JSON.stringify(abs)} cannot be scoped in a permission rule`);
+  }
+  const rulePath = `/${abs}`; // "/" + "/abs/path" = "//abs/path"
+  return { tools: ["Read", "Write"], allowedTools: [`Edit(${rulePath})`, `Read(${rulePath})`] };
 }
 
 export async function ensureMemoryFile(agentName?: string): Promise<void> {

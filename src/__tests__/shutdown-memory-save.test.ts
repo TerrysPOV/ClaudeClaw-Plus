@@ -79,9 +79,9 @@ describe("saveMemoryAtShutdown", () => {
     ]);
   });
 
-  it("records busy / failed / throwing sessions without throwing itself", async () => {
+  it("records not-live / failed / throwing sessions without throwing itself", async () => {
     const send: Send = async (key) => {
-      if (key === "global") return { status: "not-live", reason: "busy" };
+      if (key === "global") return { status: "not-live", reason: "no-process" };
       if (key === "agent:a")
         return { status: "failed", error: "boom", timedOut: false, aborted: false };
       throw new Error("kaboom");
@@ -93,7 +93,7 @@ describe("saveMemoryAtShutdown", () => {
     );
 
     expect(out.saved).toEqual([]);
-    expect(out.skipped).toEqual([{ key: "global", reason: "not-live: busy" }]);
+    expect(out.skipped).toEqual([{ key: "global", reason: "not-live: no-process" }]);
     expect(out.failed.map((f) => f.key).sort()).toEqual(["agent:a", "agent:b"]);
   });
 

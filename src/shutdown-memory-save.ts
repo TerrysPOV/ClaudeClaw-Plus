@@ -11,8 +11,8 @@
  * save together stay inside the window `claudeclaw stop` waits for (`stopGraceMs`).
  */
 import { loadSettings } from "./config";
-import { getMemoryPath } from "./memory";
-import { runOneShot } from "./oneshot/engine";
+import { getMemoryPath, memoryFileGrant } from "./memory";
+import { type OneShotRequest, runOneShot } from "./oneshot/engine";
 import type { LiveSendResult } from "./runner/pty-supervisor";
 import { getSession } from "./sessions";
 
@@ -202,6 +202,37 @@ export async function saveMemoryAtShutdown(
 }
 
 /**
+ * The one-shot that saves a memory file by resuming `sessionId`: Read and Write
+ * available, and only `memPath` pre-approved (see `memoryFileGrant`). The resumed
+ * transcript can hold untrusted channel text, so the grant must not reach any other path.
+ * Throws if `memPath` cannot be scoped; callers treat that as a failed save.
+ */
+export function memorySaveRequest(opts: {
+  route: "memory.save.stop" | "memory.save.precompact";
+  prompt: string;
+  memPath: string;
+  sessionId: string;
+  model?: string;
+  cwd?: string;
+  timeoutMs: number;
+  signal?: AbortSignal;
+}): OneShotRequest {
+  const grant = memoryFileGrant(opts.memPath);
+  return {
+    route: opts.route,
+    prompt: opts.prompt,
+    isolation: "trusted-session",
+    resumeSessionId: opts.sessionId,
+    tools: grant.tools,
+    allowedTools: grant.allowedTools,
+    ...(opts.model ? { model: opts.model } : {}),
+    ...(opts.cwd ? { cwd: opts.cwd } : {}),
+    timeoutMs: opts.timeoutMs,
+    ...(opts.signal ? { signal: opts.signal } : {}),
+  };
+}
+
+/**
  * Save the global session's memory through a one-shot resume (`memory.save.stop`).
  * For the two cases with no live PTY to ask: the legacy `-p` runtime inside the
  * daemon, and `claudeclaw stop` when no daemon is running. Never while a live PTY
@@ -217,18 +248,17 @@ export async function saveGlobalMemoryOneShot(opts: {
   const memPath = getMemoryPath();
   console.log(`[shutdown] Saving memory to ${memPath}...`);
   try {
-    const r = await runOneShot({
-      route: "memory.save.stop",
-      prompt: memorySavePrompt(memPath),
-      isolation: "trusted-session",
-      resumeSessionId: session.sessionId,
-      // The write the save needs, asked for outright: the old `-p` call forced
-      // --dangerously-skip-permissions so it could not be refused.
-      allowedTools: ["Write"],
-      model: settings.model || "haiku",
-      timeoutMs: opts.timeoutMs,
-      signal: opts.signal,
-    });
+    const r = await runOneShot(
+      memorySaveRequest({
+        route: "memory.save.stop",
+        prompt: memorySavePrompt(memPath),
+        memPath,
+        sessionId: session.sessionId,
+        model: settings.model || "haiku",
+        timeoutMs: opts.timeoutMs,
+        signal: opts.signal,
+      }),
+    );
     if (r.exitCode !== 0) return "failed";
     console.log("[shutdown] Memory saved.");
     return "saved";

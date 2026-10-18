@@ -8,6 +8,9 @@ import {
   waitForPidExit,
   stopGraceMs,
   readConfiguredDrainMs,
+  decideStopTarget,
+  parseDaemonPid,
+  readProcessCommand,
 } from "../pid";
 import { removeStatuslineSetting } from "../statusline-settings";
 import { saveGlobalMemoryOneShot } from "../shutdown-memory-save";
@@ -41,6 +44,8 @@ export interface StopDeps {
   saveMemoryOneShot: () => Promise<unknown>;
   teardownStatusline: () => Promise<void>;
   removeHeartbeatState: () => Promise<void>;
+  /** `ps -o command= -p <pid>`; null when unreadable. Injectable for tests. */
+  readProcessCommand?: (pid: number) => string | null;
 }
 
 function defaultStopDeps(): StopDeps {
@@ -60,20 +65,55 @@ function defaultStopDeps(): StopDeps {
 
 export async function stop(deps: StopDeps = defaultStopDeps()) {
   const pidFile = deps.pidFile;
-  let pid: string;
+  let raw: string;
   try {
-    pid = (await Bun.file(pidFile).text()).trim();
+    raw = (await Bun.file(pidFile).text()).trim();
   } catch {
     console.log("No daemon is running (PID file not found).");
     process.exit(0);
+  }
+
+  // Never signal what the PID file merely claims: `kill(0)` / `kill(-1)` address whole
+  // process groups, and a recycled PID names some unrelated program.
+  const target = decideStopTarget(raw, deps.readProcessCommand ?? readProcessCommand);
+  if (target.kind === "invalid") {
+    console.log(
+      `${pidFile} does not hold a valid PID (${JSON.stringify(raw.slice(0, 40))}) — refusing to signal anything; fix or remove it.`,
+    );
+    process.exit(1);
+  }
+  if (target.kind === "refuse-pid1") {
+    console.log(
+      `${pidFile} names PID 1 and its command line is not readable — refusing to signal init. If this is a container whose daemon is PID 1, stop it with the container.`,
+    );
+    process.exit(1);
+  }
+  const pid = String(target.pid);
+
+  // A live process that is not the daemon (a recycled PID) means no daemon is running.
+  const reused = target.kind === "not-daemon";
+  if (reused) {
+    console.log(
+      `PID ${pid} is alive but is not a ClaudeClaw daemon (${JSON.stringify(target.command.slice(0, 80))}) — treating the PID file as stale; not signalling it.`,
+    );
   }
 
   // #549: with a daemon running, the daemon saves memory itself when it gets the
   // SIGTERM, by asking its live sessions — a `claude -p` resumed here would be a
   // second process writing the transcript the live PTY owns. Only when no daemon is
   // running (a stale PID file) is there nobody else to do it.
-  if (!isPidAlive(Number(pid))) {
+  if (reused || !isPidAlive(Number(pid))) {
     await deps.saveMemoryOneShot();
+  }
+
+  if (reused) {
+    const cleanup = await cleanupPidFileIf(Number(pid), pidFile);
+    if (cleanup === "locked") {
+      console.log("PID lock busy or unavailable in this directory — PID file left in place.");
+    }
+    await deps.teardownStatusline();
+    await deps.removeHeartbeatState();
+    process.exit(0);
   }
 
   try {
@@ -163,7 +203,20 @@ export async function stopAll() {
     } catch {
       continue;
     }
-    if (!isPidAlive(Number(pid))) continue;
+    // Same rule as `stop`: only a plain, signalable PID that still looks like a daemon.
+    const parsed = parseDaemonPid(pid);
+    if (parsed === null) {
+      console.log(`\x1b[31m✗ Ignoring\x1b[0m ${pidFile}: not a valid PID`);
+      continue;
+    }
+    if (!isPidAlive(parsed)) continue;
+    const verdict = decideStopTarget(pid);
+    if (verdict.kind !== "ok") {
+      console.log(
+        `\x1b[33m■ Skipped\x1b[0m PID ${parsed} — ${projectPath} (${verdict.kind === "not-daemon" ? "not a ClaudeClaw daemon" : "refusing PID 1"})`,
+      );
+      continue;
+    }
     found++;
     try {
       process.kill(Number(pid), "SIGTERM");

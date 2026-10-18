@@ -1,5 +1,6 @@
 import { writeFile, unlink, readFile } from "fs/promises";
 import { linkSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
+import { spawnSync } from "child_process";
 import { dirname, join } from "path";
 
 const PID_FILE = join(process.cwd(), ".claude", "claudeclaw", "daemon.pid");
@@ -95,6 +96,9 @@ export async function waitForPidExit(pid: number, maxMs: number, pollMs = 100): 
  * `--replace-existing` remove its file and start another daemon over it.
  */
 export function isPidAlive(pid: number): boolean {
+  // kill(0, …) probes the caller's process group and kill(-1, …) every process it may
+  // signal: both "succeed", so neither may be mistaken for "a daemon is alive".
+  if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;
@@ -396,4 +400,60 @@ export async function readConfiguredDrainMs(projectDir: string): Promise<number 
   } catch {
     return undefined;
   }
+}
+
+/**
+ * A PID from a PID file, strictly: plain decimal digits, an integer in [1, 2^22].
+ * `Number()` would accept "", "0x10", "1e3" and " "; `kill(0)` / `kill(-1)` address
+ * process groups. Anything else is `null`.
+ */
+export function parseDaemonPid(raw: string): number | null {
+  const t = raw.trim();
+  if (!/^\d{1,8}$/.test(t)) return null;
+  const n = Number(t);
+  return Number.isSafeInteger(n) && n >= 1 && n <= 4_194_304 ? n : null;
+}
+
+/** The command line of `pid` (`ps -o command=`), or null if it cannot be read. */
+export function readProcessCommand(pid: number): string | null {
+  try {
+    const r = spawnSync("ps", ["-o", "command=", "-p", String(pid)], {
+      encoding: "utf-8",
+      timeout: 2_000,
+    });
+    if (r.error || r.status !== 0) return null;
+    const out = String(r.stdout).trim();
+    return out === "" ? null : out;
+  } catch {
+    return null;
+  }
+}
+
+/** What a daemon's command line looks like: `bun run src/index.ts start`, `claudeclaw …`. */
+const DAEMON_COMMAND = /claudeclaw|\bbun\b|index\.ts/i;
+
+export type StopTarget =
+  | { kind: "ok"; pid: number }
+  /** The PID file does not hold a usable PID. Nothing may be probed or signalled. */
+  | { kind: "invalid" }
+  /** Alive, but its command line is some other program: a recycled PID, not our daemon. */
+  | { kind: "not-daemon"; pid: number; command: string }
+  /** PID 1 with nothing confirming it is ours: init / the service manager. */
+  | { kind: "refuse-pid1"; pid: 1 };
+
+/**
+ * Decide whether a PID file's contents may be treated as the daemon to stop. Where
+ * the command line cannot be read (no `ps`, process gone) this falls back to trusting
+ * the PID file, as before. PID 1 is the exception: in a container the daemon really is
+ * PID 1 (#526), on a host it is init, so it needs the command line to say so.
+ */
+export function decideStopTarget(
+  raw: string,
+  readCommand: (pid: number) => string | null = readProcessCommand,
+): StopTarget {
+  const pid = parseDaemonPid(raw);
+  if (pid === null) return { kind: "invalid" };
+  const command = readCommand(pid);
+  if (command === null) return pid === 1 ? { kind: "refuse-pid1", pid: 1 } : { kind: "ok", pid };
+  return DAEMON_COMMAND.test(command) ? { kind: "ok", pid } : { kind: "not-daemon", pid, command };
 }

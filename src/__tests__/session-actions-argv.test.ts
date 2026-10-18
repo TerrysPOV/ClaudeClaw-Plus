@@ -10,9 +10,10 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initConfig, loadSettings, reloadSettings } from "../config";
+import { runOneShot } from "../oneshot/engine";
 import { withPrintRuntime } from "../oneshot/print";
 import { runCompact } from "../runner";
-import { injectOneShotForTests } from "../runner/live-session-actions";
+import { injectOneShotForTests, saveMemoryBeforeCompact } from "../runner/live-session-actions";
 import { __resetSupervisorForTests, shutdownSupervisor } from "../runner/pty-supervisor";
 import { generateSummary } from "../rotation";
 
@@ -98,5 +99,60 @@ describe("rotation summary fallback argv", () => {
     expect(args).not.toContain("Write");
     expect(args).not.toContain("--dangerously-skip-permissions");
     expect(args).not.toContain("--permission-mode");
+  });
+});
+
+describe("print engine with an explicit tool list only", () => {
+  it("does not fall back to the default permission profile (which can carry the bypass flag)", async () => {
+    const { argv } = await captureArgv(() =>
+      runOneShot({
+        route: "compact",
+        prompt: "/compact",
+        isolation: "trusted-session",
+        resumeSessionId: "sid",
+        tools: ["Read"],
+        timeoutMs: 5000,
+      }),
+    );
+
+    expect(flagValue(argv[0], "--tools")).toBe("Read");
+    expect(argv[0]).not.toContain("--dangerously-skip-permissions");
+    expect(argv[0]).not.toContain("--permission-mode");
+  });
+});
+
+describe("pre-compact memory save fallback argv", () => {
+  const save = (memPath: string, over: Record<string, unknown> = {}) =>
+    saveMemoryBeforeCompact({
+      memPath,
+      prompt: "save it",
+      sessionKey: "global",
+      sessionId: "sid-9",
+      skipLive: true,
+      model: "sonnet",
+      timeoutMs: 5000,
+      ...over,
+    });
+
+  it("resumes with Read,Write available and only the memory file pre-approved", async () => {
+    const { argv, result } = await captureArgv(() => save("/work/proj/MEMORY.md"));
+
+    expect(result.ok).toBe(true);
+    expect(argv.length).toBe(1);
+    const args = argv[0];
+    expect(flagValue(args, "--resume")).toBe("sid-9");
+    expect(flagValue(args, "--tools")).toBe("Read,Write");
+    expect(flagValue(args, "--allowedTools")).toBe(
+      "Edit(//work/proj/MEMORY.md),Read(//work/proj/MEMORY.md)",
+    );
+    expect(args).not.toContain("--dangerously-skip-permissions");
+  });
+
+  it("a memory path that cannot be scoped fails the save and spawns nothing", async () => {
+    const { argv, result } = await captureArgv(() => save("/work/pr*oj/MEMORY.md"));
+
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain("cannot be scoped");
+    expect(argv).toEqual([]);
   });
 });

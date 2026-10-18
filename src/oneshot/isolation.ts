@@ -22,10 +22,13 @@ export function validateIsolation(req: import("./engine.js").OneShotRequest): vo
   }
   if (
     req.isolation === "untrusted" &&
-    (req.resumeSessionId !== undefined || req.allowedTools !== undefined || req.cwd !== undefined)
+    (req.resumeSessionId !== undefined ||
+      req.allowedTools !== undefined ||
+      req.tools !== undefined ||
+      req.cwd !== undefined)
   ) {
     throw new Error(
-      "oneShot untrusted calls cannot specify resumeSessionId or allowedTools or cwd",
+      "oneShot untrusted calls cannot specify resumeSessionId or allowedTools or tools or cwd",
     );
   }
   if (!Number.isFinite(req.timeoutMs) || req.timeoutMs <= 0)

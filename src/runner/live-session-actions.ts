@@ -28,6 +28,7 @@ import {
   type OneShotResult,
   runOneShot as realRunOneShot,
 } from "../oneshot/engine.js";
+import { memoryFileGrant } from "../memory.js";
 import { retirePtySession, sendToLiveSession } from "./pty-supervisor.js";
 
 type OneShotFn = (req: OneShotRequest) => Promise<OneShotResult>;
@@ -55,6 +56,8 @@ export interface SessionActionRequest {
    * `[]` means no tools; leave it out to get the default permission profile.
    */
   allowedTools?: string[];
+  /** Bare tool names for `--tools` of the one-shot (see `OneShotRequest.tools`). */
+  tools?: string[];
   /** The session is wedged (its last turn timed out): do not queue more on it. */
   skipLive?: boolean;
 }
@@ -116,6 +119,7 @@ export async function actOnSession(req: SessionActionRequest): Promise<SessionAc
       ...(req.cwd ? { cwd: req.cwd } : {}),
       ...(req.model ? { model: req.model } : {}),
       ...(req.allowedTools ? { allowedTools: req.allowedTools } : {}),
+      ...(req.tools ? { tools: req.tools } : {}),
       timeoutMs: req.timeoutMs,
     });
     return {
@@ -127,4 +131,41 @@ export async function actOnSession(req: SessionActionRequest): Promise<SessionAc
   } catch (err) {
     return { ok: false, via: "oneshot", text: "", detail: (err as Error).message };
   }
+}
+
+/**
+ * The memory save before an auto-compact (`memory.save.precompact`). Live session
+ * first, one-shot fallback otherwise; the fallback may Read and Write `memPath` and
+ * nothing else (`memoryFileGrant`). A path that cannot be scoped fails the save: the
+ * live session is not asked either, so the outcome does not depend on which path ran.
+ */
+export async function saveMemoryBeforeCompact(opts: {
+  memPath: string;
+  prompt: string;
+  sessionKey?: string;
+  sessionId: string;
+  /** The turn timed out, so the session is wedged: retire it, then resume one-shot. */
+  skipLive?: boolean;
+  model?: string;
+  cwd?: string;
+  timeoutMs: number;
+}): Promise<SessionActionResult> {
+  let grant: ReturnType<typeof memoryFileGrant>;
+  try {
+    grant = memoryFileGrant(opts.memPath);
+  } catch (err) {
+    return { ok: false, via: "oneshot", text: "", detail: (err as Error).message };
+  }
+  return actOnSession({
+    route: "memory.save.precompact",
+    prompt: opts.prompt,
+    sessionKey: opts.sessionKey,
+    sessionId: opts.sessionId,
+    skipLive: opts.skipLive,
+    model: opts.model,
+    cwd: opts.cwd,
+    timeoutMs: opts.timeoutMs,
+    tools: grant.tools,
+    allowedTools: grant.allowedTools,
+  });
 }

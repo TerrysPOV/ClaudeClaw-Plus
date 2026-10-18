@@ -12,7 +12,17 @@ export interface OneShotRequest {
   isolation: "untrusted" | "trusted-session";
   resumeSessionId?: string;
   cwd?: string;
+  /**
+   * Permission rules to pre-approve, `--allowedTools` syntax: bare names or scoped
+   * rules such as `Edit(//abs/path)`. `[]` means no tools. Trusted-session only.
+   */
   allowedTools?: string[];
+  /**
+   * Bare built-in tool names to make available (`--tools`). Optional: when absent the
+   * unique bare names of `allowedTools` are used. Needed when the rule name differs
+   * from the tool, e.g. `Edit(//p)` governs the Write tool too. Trusted-session only.
+   */
+  tools?: string[];
   maxTokens?: number;
   timeoutMs: number;
   signal?: AbortSignal;
@@ -55,7 +65,7 @@ export async function runOneShot(req: OneShotRequest): Promise<OneShotResult> {
     req.resumeSessionId !== undefined,
   );
   const engine = engines.get(id)!;
-  if (req.allowedTools !== undefined && !engine.caps.tools)
+  if ((req.allowedTools !== undefined || req.tools !== undefined) && !engine.caps.tools)
     throw new Error(`oneShot engine '${id}' does not support tools`);
   const started = Date.now();
   const request =
