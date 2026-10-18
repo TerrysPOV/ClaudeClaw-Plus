@@ -11,8 +11,8 @@ The README describes the legacy `runtime: "pty"` path in several places as if it
 6. Web UI: The dashboard (`web.host:web.port`, default `127.0.0.1:4632`, `--web` or `web.enabled`, token in `.claude/claudeclaw/web.token`) is distinct from the bus web adapter (`web.bus.bind`, default `127.0.0.1:7878`, `/health`, `/prompt`, `/ws`). `web.bind` does not exist in settings.
 7. Slash commands: `/heartbeat`, `/agents`, `/help` are not implemented. `/mode` is legacy Telegram only. Under the bus runtime, adapters handle no slash commands.
 8. Model and fallback: Default `model` and `fallback.model` are empty strings `""` in code. In the setup wizard, default model offered is `opus` (with `glm`, `sonnet`, `haiku` options). Fallback kicks in on rate-limit text patterns in output (`you've hit your limit`, `out of extra usage`) only and has no effect on bus agents. Kimi goes through `https://api.kimi.com/coding/` (not OpenRouter).
-9. First start: The plugin name is `claudeclaw-plus` (`.claude-plugin/plugin.json`), so the start command is `/claudeclaw-plus:start`. Discord under bus requires `busRouting` (`channels`, `threads`, `dmAgentId`, `primaryChannelByAgent`; `guilds` is not supported). An empty `allowedUserIds` list refuses everyone (issue #519).
-10. Orchestrator, memory, gateway, MCP: Remove "survive restarts" claim for orchestrator workflows. Memory, governance, and gateway run on the `runner.ts` / legacy path only. Dead links: `.planning/pty-migration/SPEC.md` and `.planning/mcp-multiplexer/SPEC.md` must be removed or fixed. Note that MCP multiplexer requires `web.enabled: true` in `settings.json` (`--web` CLI flag alone is insufficient because startup evaluates settings before reconciling flags).
+9. First start: The plugin name is `claudeclaw-plus` (`.claude-plugin/plugin.json`), so the start command is `/claudeclaw-plus:start`. Discord under bus requires `busRouting` (at least one of `channels`, `threads`, `dmAgentId`, `primaryChannelByAgent`; `guilds` is not supported). An empty `allowedUserIds` list refuses everyone unless `allowAllUsers: true` is configured for a public bot.
+10. Orchestrator, memory, gateway, MCP: Accurately specify orchestrator restart recovery (workflows are resumed on daemon startup under both runtimes via `initializeJobSystem()`, with interrupted tasks reclassified per retry policy). Memory, governance, and gateway run on the `runner.ts` / legacy path only. Dead links: `.planning/pty-migration/SPEC.md` and `.planning/mcp-multiplexer/SPEC.md` must be removed or fixed. Note that MCP multiplexer requires `web.enabled: true` in `settings.json` (`--web` CLI flag alone is insufficient because startup evaluates settings before reconciling flags).
 
 ## Current Behaviour (file:line)
 
@@ -48,10 +48,11 @@ The README describes the legacy `runtime: "pty"` path in several places as if it
   - `src/runner.ts:2131-2135`: Fallback triggers on rate-limit text patterns only and is in `runner.ts` (legacy / PTY turn path), not bus.
 - First start:
   - `.claude-plugin/plugin.json:2`: `"name": "claudeclaw-plus"`. Command is `/claudeclaw-plus:start`.
-  - `src/allowlist.ts`, `src/adapters/discord/index.ts:247`: Empty `allowedUserIds` refuses everyone.
-  - `src/config.ts:1568-1591`, `src/adapters/discord/index.ts:266-270`: Discord under bus requires `busRouting` (`channels`, `threads`, `dmAgentId`, `primaryChannelByAgent`; ignores `guilds`).
+  - `src/allowlist.ts`, `src/adapters/discord/index.ts:247`: Empty `allowedUserIds` refuses everyone unless `allowAllUsers: true`.
+  - `src/config.ts:1568-1591`, `src/bus/adapter-wiring.ts:197`, `src/adapters/discord/index.ts:266-270`: Discord under bus requires `busRouting` (at least one of `channels`, `threads`, `dmAgentId`, `primaryChannelByAgent`; ignores `guilds`).
 - Links, orchestrator, memory, gateway, MCP:
   - `.planning/pty-migration/SPEC.md` and `.planning/mcp-multiplexer/SPEC.md` do not exist.
+  - `src/commands/start.ts:527-528`, `src/orchestrator/resumable-jobs.ts:174-210`, `src/orchestrator/workflow-state.ts:282-315`: On daemon startup under both runtimes, `initializeJobSystem()` resumes pending workflows, reclassifying interrupted tasks per `maxRetries`.
   - `src/commands/start.ts:1053, 1111-1120, 1481`: MCP multiplexer requires `web.enabled: true` in `settings.json` (`--web` CLI flag alone is insufficient because startup evaluates settings before reconciling flags).
   - `src/runner.ts:39-69`: Governance and memory are wired into `runner.ts`.
 
@@ -68,8 +69,8 @@ Update `README.md` to:
    - Web UI: Distinguish dashboard (`web.host:web.port`, default `127.0.0.1:4632`, token in `.claude/claudeclaw/web.token`) from bus web adapter (`web.bus.bind`, default `127.0.0.1:7878`). Note `web.bind` does not exist.
    - Slash commands: Accurately document slash commands (note `/mode` is legacy Telegram only; `/heartbeat`, `/agents`, `/help` are not implemented; bus adapters do not handle slash commands).
    - Model and fallback: Document defaults (`""`), wizard choices (opus/GLM/sonnet/haiku), Kimi URL (`https://api.kimi.com/coding/`), and that fallback triggers on rate-limit text patterns in output only and does not affect bus agents.
-   - First start: Command is `/claudeclaw-plus:start`, Discord under bus needs `busRouting` (`channels`, `threads`, `dmAgentId`, `primaryChannelByAgent`), empty `allowedUserIds` refuses everyone.
-   - Orchestrator, memory, gateway, MCP: Remove "survive restarts" claim for orchestrator workflows. Clarify that memory, governance, and gateway run on the `runner.ts` path only. Remove dead `.planning/*` links. Note multiplexer requires `web.enabled: true` in `settings.json`.
+   - First start: Command is `/claudeclaw-plus:start`, Discord under bus needs `busRouting` (at least one of `channels`, `threads`, `dmAgentId`, `primaryChannelByAgent`), empty `allowedUserIds` refuses everyone unless `allowAllUsers: true`.
+   - Orchestrator, memory, gateway, MCP: Accurately document orchestrator restart recovery (resuming pending jobs on startup via `initializeJobSystem()`, retrying interrupted tasks per retry budget). Clarify that memory, governance, and gateway run on the `runner.ts` path only. Remove dead `.planning/*` links. Note multiplexer requires `web.enabled: true` in `settings.json`.
 4. Ensure all internal links resolve.
 5. Pass `bun run lint` and maintain typescript typecheck ratchet.
 

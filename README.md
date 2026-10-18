@@ -53,12 +53,12 @@ There is no guaranteed turnaround on upstream changes landing here. If you need 
 | API Overhead | Directly uses your Claude Code subscription | Same | Nightmare |
 | Setup & Installation | ~5 minutes | ~5 minutes | Nightmare |
 | Isolation | Folder-based and isolated as needed | Folder-based + per-agent scope | Nightmare |
-| Reliability | Simple reliable system | Simple + multi-step workflows with topological DAGs | Nightmare |
+| Reliability | Simple reliable system | Simple + multi-step workflows with topological DAGs and restart recovery (legacy runner) | Nightmare |
 | Feature Scope | Lightweight features you actually use | Everything in ClaudeClaw, plus governance and orchestration | 600k+ LOC nightmare |
 | Security | Average Claude Code usage | Policy engine, audit log, CSRF protection | Nightmare |
 | Cost Control | Manual | Automatic token budgets + model routing per task type | Nightmare |
 | Memory | Claude internal memory + `CLAUDE.md` | Persistent cross-session `MEMORY.md` with dual-layer write guarantee (legacy runner) | Nightmare |
-| Multi-step Jobs | Cron + heartbeat | DAG orchestrator with dependency resolution (legacy runner) | Nightmare |
+| Multi-step Jobs | Cron + heartbeat | DAG orchestrator with dependency resolution and resumable state (legacy runner) | Nightmare |
 
 ---
 
@@ -108,13 +108,13 @@ Pick the surfaces you want the daemon to listen on. Multiple adapters can run at
 
 | Adapter | Status | Where to enable |
 |---|---|---|
-| **Discord** | Production-tested | `discord.token`, `discord.busRouting.channels` (required under bus; non-empty `discord.allowedUserIds` required) |
+| **Discord** | Production-tested | `discord.token`, `discord.busRouting` (at least one of `channels`, `threads`, `dmAgentId`, or `primaryChannelByAgent` required under bus; non-empty `discord.allowedUserIds` required unless `discord.allowAllUsers: true`) |
 | **Telegram** | Production-tested | `telegram.token`, `telegram.busRouting.chats` |
 | **Slack** | ⚠️ Less tested than Discord/Telegram — see [Adapters](#adapters) | `slack.botToken`, `slack.busRouting.channels` |
 | **Web UI (Dashboard)** | Production-tested | `web.enabled: true`, `web.host:web.port` (default `127.0.0.1:4632`) |
 | **Web UI (Bus Adapter)** | Production-tested | `web.bus.bind` (default `127.0.0.1:7878`) |
 
-> ⚠ **Discord Note:** Under the event-bus runtime, `discord.busRouting` (`channels`, `threads`, `dmAgentId`, or `primaryChannelByAgent`) must be configured (`src/config.ts:1568-1591`, `src/adapters/discord/index.ts:266-270`). Note that `guilds` is not a supported routing key. In addition, `discord.allowedUserIds` must not be empty; an empty allowlist refuses all incoming messages (`src/adapters/discord/index.ts:247`, `src/allowlist.ts`).
+> ⚠ **Discord Note:** Under the event-bus runtime, `discord.busRouting` must configure at least one routing destination (`channels`, `threads`, `dmAgentId`, or `primaryChannelByAgent`) to mount the adapter (`src/config.ts:1568-1591`, `src/bus/adapter-wiring.ts:197`, `src/adapters/discord/index.ts:266-270`). Note that `guilds` is not a supported routing key. In addition, an empty `allowedUserIds` fails closed and refuses all incoming messages unless intentionally configured as a public bot with `discord.allowAllUsers: true` (`src/allowlist.ts:13-21, 33-35`, `src/adapters/discord/index.ts:247`).
 
 ### 2. Primary model + fallback
 
@@ -383,11 +383,11 @@ Unified message ingestion pipeline normalises Discord/Telegram messages to a com
 
 **[PR #74 — closed upstream — lives here](https://github.com/moazbuilds/claudeclaw/pull/74)**
 
-> **Note:** The DAG Orchestrator operates on the legacy `runner.ts` execution pipeline and does not govern bus agent turns. Workflows do not persist across daemon restarts mid-execution.
+> **Note:** The DAG Orchestrator operates on the legacy `runner.ts` execution pipeline and does not govern bus agent turns. On daemon startup under both runtimes, `initializeJobSystem()` automatically resumes pending workflows (`src/commands/start.ts:527-528`, `src/orchestrator/resumable-jobs.ts:174-210`, `src/orchestrator/executor.ts:378-411`). Tasks interrupted mid-execution are evaluated against their retry policy: tasks with remaining attempts re-queue as `ready`/`pending`, while exhausted tasks fail with "Task interrupted by restart" (`src/orchestrator/workflow-state.ts:282-315`).
 
 Multi-step task execution via dependency graph with topological sort. Durable workflow state with atomic writes during active execution. Governance-integrated executor with configurable parallelism.
 
-**Why:** Complex requests decompose into dependent subtasks that run in parallel where possible.
+**Why:** Complex requests decompose into dependent subtasks that run in parallel where possible and resume execution across daemon restarts.
 
 ---
 

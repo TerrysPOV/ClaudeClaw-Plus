@@ -1,15 +1,15 @@
 # Issue #547 Completion Report: README Accuracy
 
 ## Executive Summary
-This task resolved all ten accuracy issues in `README.md` documented in issue #547 and aligned documentation with the official engine policy (#553, where interactive PTY is the official engine, `claude -p` remains a supported option, current defaults are `pty.enabled: false`, and a future release flips them via #550). Outdated claims regarding billing credit pools, hot-reload capabilities, web UI bind settings, Discord allowlists, slash commands, security levels under the bus runtime, and workflow restart persistence were updated and backed by verified code locations. Dead links into `.planning/*` were eliminated.
+This task resolved all ten accuracy issues in `README.md` documented in issue #547, addressed all feedback across two rounds of Codex review on PR #558, and aligned documentation with the official engine policy (#553, where interactive PTY is the official engine, `claude -p` remains a supported option, current defaults are `pty.enabled: false`, and a future release flips them via #550). Outdated claims regarding billing credit pools, hot-reload capabilities, web UI bind settings, Discord routing and allowlists, slash commands, security levels under the bus runtime, and workflow restart recovery were updated and backed by verified code locations. Dead links into `.planning/*` were eliminated.
 
 ---
 
 ## What Changed
 
 1. **Comparison Table (L56, L60-61):**
-   - Corrected reliability claim: changed "survive restarts" to "multi-step workflows with topological DAGs".
-   - Clarified that `MEMORY.md` dual-layer write guarantee and DAG task orchestrator operate on the legacy runner path.
+   - Corrected reliability claim: "Simple + multi-step workflows with topological DAGs and restart recovery (legacy runner)".
+   - Clarified that `MEMORY.md` dual-layer write guarantee and DAG task orchestrator resumable state operate on the legacy runner path.
 2. **What's New in v2.0 (L65-80):**
    - Articulated the engine policy (#553): PTY is the official engine, `claude -p` remains a permanent option.
    - Removed unbacked claims about Anthropic credit pools ("Subscription billing covers daemon work; the Agent SDK credit pool stays untouched").
@@ -19,7 +19,7 @@ This task resolved all ten accuracy issues in `README.md` documented in issue #5
    - Corrected `/claudeclaw:start` to `/claudeclaw-plus:start` per plugin manifest (`.claude-plugin/plugin.json`).
 4. **Setup Choices at First Run (L103-172):**
    - Distinguished hot-reload-safe settings (~30s polling) from structural settings requiring daemon restart.
-   - Updated adapter table to list `discord.busRouting.channels` requirement and warned that an empty `allowedUserIds` refuses all incoming messages. Clarified that `parseDiscordBusRouting` recognizes `channels`, `threads`, `dmAgentId`, and `primaryChannelByAgent` (`src/config.ts:1568-1591`), and `guilds` is not supported.
+   - Updated adapter table to list `discord.busRouting` requirement (any of `channels`, `threads`, `dmAgentId`, or `primaryChannelByAgent`), and warned that an empty `allowedUserIds` refuses all incoming messages unless `allowAllUsers: true` is configured for a public bot. Clarified that `parseDiscordBusRouting` recognizes `channels`, `threads`, `dmAgentId`, and `primaryChannelByAgent` (`src/config.ts:1568-1591`), and `guilds` is not supported.
    - Split Web UI into Dashboard (`web.enabled: true`, `web.host:web.port`, default `127.0.0.1:4632`) and Bus Web Adapter (`web.bus.bind`, default `127.0.0.1:7878`).
    - Corrected model and fallback defaults (empty strings `""` in `settings.json`, wizard options `opus`, `sonnet`, `haiku`, `glm`).
    - Clarified fallback triggers on rate-limit text patterns detected in output (`you've hit your limit`, `out of extra usage`; `src/runner.ts:400, 586-593`) for legacy runner tasks, and Kimi routes to `https://api.kimi.com/coding/` rather than OpenRouter.
@@ -44,13 +44,15 @@ This task resolved all ten accuracy issues in `README.md` documented in issue #5
    - Removed dead link `.planning/mcp-multiplexer/SPEC.md`.
 8. **Legacy Subsystems Scope (L342-420):**
    - Explicitly noted that Policy Engine, Governance Layer, Gateway & Escalation, Orchestrator, and Persistent Memory operate on the legacy runner pipeline and do not govern event-bus agents.
-   - Removed claim that orchestrator workflows survive daemon restarts mid-execution.
+   - Accurately described Orchestrator restart recovery: `initializeJobSystem()` on daemon startup automatically resumes pending workflows across both runtimes (`src/commands/start.ts:527-528`, `src/orchestrator/resumable-jobs.ts:174-210`), and interrupted tasks are reclassified based on `maxRetries` (`src/orchestrator/workflow-state.ts:282-315`).
 9. **All the Things from Upstream (L441):**
    - Listed correct security level names (`locked`, `strict`, `moderate`, `unrestricted`) for the legacy runner.
 
 ---
 
 ## Codex PR #558 Review Findings & Verdicts
+
+### Round 1 Review Findings
 
 | Finding | Evidence File:Line | Verdict | Resolution |
 |---|---|---|---|
@@ -60,20 +62,28 @@ This task resolved all ten accuracy issues in `README.md` documented in issue #5
 | **4. `pty.enabled` hot-reload:** `pty.enabled` claimed to require a daemon restart in README:192, 276. | `src/runner/pty-supervisor.ts:36-39, 567, 909, 1124`, `src/runner.ts:742`, `src/commands/start.ts:1695` | **True** | Moved `pty.enabled` from restart-required to hot-reload-safe. Settings are polled every 30s and `pty.enabled` is checked per invocation. Clarified that only `runtime` switching requires daemon restart. |
 | **5. MCP multiplexer activation:** Claimed multiplexer is activated by `--web` CLI flag in README:291. | `src/commands/start.ts:1053, 1481` | **True** | Documented that `web.enabled: true` must be persisted in `settings.json`. The startup check (`if (settings.mcp.shared.length > 0 && settings.web.enabled)`) evaluates settings before the `--web` CLI flag is reconciled at line 1481. |
 
+### Round 2 Review Findings
+
+| Finding | Evidence File:Line | Verdict | Resolution |
+|---|---|---|---|
+| **6. Workflow restart recovery:** Claimed in README:386 that workflows do not persist across daemon restarts mid-execution. | `src/commands/start.ts:527-528`, `src/orchestrator/resumable-jobs.ts:174-210`, `src/orchestrator/executor.ts:378-411`, `src/orchestrator/workflow-state.ts:282-315` | **True** | Corrected README lines 56, 61, and 386-390: `initializeJobSystem()` runs unconditionally on daemon startup before runtime branching and invokes `resumePending()` -> `resumeWorkflow()` to resume workflows. Interrupted running tasks are re-queued to `ready`/`pending` if attempts remain under `maxRetries`, or marked `failed` with "Task interrupted by restart" if exhausted. |
+| **7. Discord bus routing required keys:** Adapter table in README:111 claimed `discord.busRouting.channels` is required under bus. | `src/config.ts:1568-1591`, `src/bus/adapter-wiring.ts:197`, `src/adapters/discord/index.ts:266-270` | **True** | Corrected line 111: `discord.busRouting` requires at least one nonempty routing destination among `channels`, `threads`, `dmAgentId`, or `primaryChannelByAgent`; `channels` specifically is not mandatory if another routing target is supplied. |
+| **8. Discord allowAllUsers alternative:** Claimed in README:111 & 117 that empty `discord.allowedUserIds` unconditionally refuses all messages without noting `allowAllUsers: true`. | `src/allowlist.ts:13-21, 33-35`, `src/adapters/discord/index.ts:247` | **True** | Qualified lines 111 and 117: empty `allowedUserIds` fails closed and refuses all incoming messages unless intentionally configured as a public bot with `discord.allowAllUsers: true`. |
+
 ---
 
 ## Verified Evidence Table
 
 | README Line(s) | Claim / Statement | Evidence File:Line |
 |---|---|---|
-| L56 | Workflows use DAGs; mid-execution restart survival removed | `src/orchestrator/index.ts:1-25`, `src/orchestrator/task-graph.ts:1-40` |
-| L60-61 | `MEMORY.md` dual-layer write guarantee & DAG orchestrator run on legacy runner | `src/runner.ts:69`, `src/runner.ts:39-62` |
+| L56 | Workflows use DAGs with crash recovery (legacy runner) | `src/commands/start.ts:527-528`, `src/orchestrator/resumable-jobs.ts:174-210`, `src/orchestrator/workflow-state.ts:282-315` |
+| L60-61 | `MEMORY.md` dual-layer write guarantee & DAG orchestrator resumable state run on legacy runner | `src/runner.ts:69`, `src/commands/start.ts:527-528`, `src/orchestrator/resumable-jobs.ts:174-210` |
 | L67, L230-236 | Engine policy (#553): PTY official engine, `claude -p` supported; current default `pty.enabled: false` | `src/runner.ts:740-743`, `src/config.ts:140-148` |
 | L71, L170 | Cron & agent jobs route through `runner.ts` and follow `pty.enabled` (`claude -p` when false, PTY supervisor when true) | `src/runner.ts:732-742, 2015, 2690` |
 | L75, L129, L136 | Bus agents default to `bypassPermissions`; `security.level` does not restrict bus agents | `src/bus/agent-resolver.ts:73`, `src/bus/session-manager.ts:686-697`, `src/runner.ts:1501, 1512, 1999` |
 | L94 | Slash command is `/claudeclaw-plus:start` | `.claude-plugin/plugin.json:2` |
 | L103, L183-195 | Hot-reload polls every 30s for heartbeat, legacy security, MCP bridge, jobs, and `pty.enabled`; restarts required for adapters, agents, runtime, tokens, binds | `src/commands/start.ts:1693-1789`, `src/runner/pty-supervisor.ts:36-39`, `src/runner.ts:742`, `src/config.ts:734-735` |
-| L111, L117 | Discord bus routing supports `channels`, `threads`, `dmAgentId`, `primaryChannelByAgent` (not `guilds`); empty allowedUserIds refuses all messages | `src/config.ts:1568-1591`, `src/adapters/discord/index.ts:247, 266-270`, `src/allowlist.ts:25-35` |
+| L111, L117 | Discord bus routing requires at least one of `channels`, `threads`, `dmAgentId`, `primaryChannelByAgent` (not `guilds`); empty allowedUserIds refuses all messages unless `allowAllUsers: true` | `src/config.ts:1568-1591`, `src/bus/adapter-wiring.ts:197`, `src/adapters/discord/index.ts:247, 266-270`, `src/allowlist.ts:13-21, 33-35` |
 | L114-115, L206-208 | Dashboard at `web.host:web.port` (4632); bus web adapter at `web.bus.bind` (7878); `web.bind` does not exist | `src/config.ts:203, 911-915`, `src/commands/start.ts:535-536, 1481-1501`, `src/adapters/webui/index.ts:8-12, 66, 495` |
 | L121-125 | `model` and `fallback.model` default to `""`; wizard offers opus/sonnet/haiku/glm; fallback on rate-limit text patterns; Kimi endpoint | `src/config.ts:86-90`, `commands/start.md:61`, `src/runner.ts:400, 586-593, 643-644, 2125-2135` |
 | L171, L441 | Security level names: `locked`, `strict`, `moderate`, `unrestricted` | `src/config.ts:454` |
@@ -86,7 +96,7 @@ This task resolved all ten accuracy issues in `README.md` documented in issue #5
 | L347 | Policy Engine runs on legacy runner | `src/runner.ts:39-62` |
 | L359 | Governance Layer runs on legacy runner | `src/runner.ts:39-62` |
 | L371 | Gateway and escalation framework run on legacy adapter pipeline | `src/commands/telegram.ts:31, 1742`, `src/commands/discord.ts:1333` |
-| L383 | DAG Orchestrator runs on legacy runner; does not persist across restarts | `src/runner.ts:39-62`, `src/orchestrator/index.ts:1-35` |
+| L383-388 | DAG Orchestrator runs on legacy runner; resumes workflows across restarts via `initializeJobSystem()`; interrupted tasks reclassified per retry budget | `src/commands/start.ts:527-528`, `src/orchestrator/resumable-jobs.ts:174-210`, `src/orchestrator/executor.ts:378-411`, `src/orchestrator/workflow-state.ts:282-315` |
 | L405 | Memory dual-layer write guarantee runs on legacy runner | `src/runner.ts:69` |
 
 ---
