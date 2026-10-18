@@ -112,15 +112,17 @@ export async function generateSummary(
   }
 
   // Live session first when the caller knows one (`sessionKey`); otherwise a
-  // one-shot resume of `sessionId`, with only the Write tool instead of the full
-  // default set (#549).
+  // one-shot resume of `sessionId` with no tools instead of the full default set (#549).
   const result = await actOnSession({
     route: "rotation.summary",
     prompt: summaryPrompt,
     sessionKey: opts.sessionKey,
     sessionId,
     timeoutMs: SUMMARY_TIMEOUT_MS,
-    allowedTools: ["Write"],
+    // No tools: the summary comes back as text and THIS function writes the file.
+    // (#549 asked for ["Write"]; the narrower grant is deliberate. A resumed session's
+    // transcript holds untrusted channel text, so it must not hold a write grant.)
+    allowedTools: [],
   });
   const stdout = result.text;
 

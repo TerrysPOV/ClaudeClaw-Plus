@@ -5,18 +5,30 @@
  * They used to resume the session in a separate `claude -p` even when the PTY
  * supervisor held the same conversation live — two processes on one transcript, and
  * the live session never saw what it had been asked to do. Now the live session is
- * asked first (`sendToLiveSession`); only with no live, idle session for the key does
- * the call go to `runOneShot` as a `trusted-session` resume.
+ * asked first (`sendToLiveSession`), and the one-shot resume is taken ONLY when no
+ * process holds the session:
  *
- * A live attempt that FAILED does not fall back: the turn may still be running in the
- * PTY, and a resumed process beside it is exactly the race this module removes.
+ *   - `sent`      -> done in the live session.
+ *   - `not-live`  -> nothing alive (no entry, dead process, one-shot stand-in): resume
+ *                    it one-shot.
+ *   - `failed`    -> the live session is busy past our budget, being torn down, or the
+ *                    turn failed. NO fallback: a process may still be writing the
+ *                    transcript, and a second one beside it is the race this removes.
+ *   - `skipLive`  -> the caller says the session is wedged. The live process is retired
+ *                    (disposed, awaited) BEFORE the one-shot starts, so the two never
+ *                    overlap.
+ *
+ * Permissions: `allowedTools` restricts the ONE-SHOT only. The live path runs inside
+ * the live session, which keeps whatever permissions it was spawned with (the
+ * operator's permission mode and security level); a per-call tool grant cannot be
+ * applied to a running PTY, and this module does not try to change it.
  */
 import {
   type OneShotRequest,
   type OneShotResult,
   runOneShot as realRunOneShot,
 } from "../oneshot/engine.js";
-import { sendToLiveSession } from "./pty-supervisor.js";
+import { retirePtySession, sendToLiveSession } from "./pty-supervisor.js";
 
 type OneShotFn = (req: OneShotRequest) => Promise<OneShotResult>;
 let _runOneShot: OneShotFn = realRunOneShot;
@@ -38,6 +50,10 @@ export interface SessionActionRequest {
   model?: string;
   /** Working directory the session was created in; `--resume` finds it by this. */
   cwd?: string;
+  /**
+   * Tool grant for the one-shot fallback ONLY (see the note on permissions above).
+   * `[]` means no tools; leave it out to get the default permission profile.
+   */
   allowedTools?: string[];
   /** The session is wedged (its last turn timed out): do not queue more on it. */
   skipLive?: boolean;
@@ -62,6 +78,18 @@ export function looksLikeCommandError(text: string): boolean {
 const stamp = (): string => new Date().toLocaleTimeString();
 
 export async function actOnSession(req: SessionActionRequest): Promise<SessionActionResult> {
+  if (req.sessionKey && req.skipLive) {
+    try {
+      await retirePtySession(req.sessionKey);
+    } catch (err) {
+      return {
+        ok: false,
+        via: "live",
+        text: "",
+        detail: `could not retire the wedged session ${req.sessionKey}: ${(err as Error).message}`,
+      };
+    }
+  }
   if (req.sessionKey && !req.skipLive) {
     const sent = await sendToLiveSession(req.sessionKey, req.prompt, { timeoutMs: req.timeoutMs });
     if (sent.status === "sent") {

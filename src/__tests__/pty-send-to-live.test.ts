@@ -14,6 +14,7 @@ import {
   injectSleep,
   injectSpawnPty,
   liveSessionKeys,
+  retirePtySession,
   runOnPty,
   sendToLiveSession,
   shutdownSupervisor,
@@ -153,7 +154,37 @@ describe("sendToLiveSession", () => {
     expect(spawned.length).toBe(0);
   });
 
-  it("returns not-live (busy) while a turn is running and does not write", async () => {
+  it("busy: queues behind the running turn, then sends live; never reports not-live", async () => {
+    await seed("global");
+    const gate = deferred<PtyTurnResult>();
+    spawned[0].runTurn = ((p: string) => {
+      spawned[0].prompts.push(p);
+      return p === "long turn"
+        ? gate.promise
+        : Promise.resolve({
+            text: "ok",
+            bytesCaptured: 1,
+            cleanBoundary: true,
+            sessionId: "sess-1",
+          });
+    }) as PtyProcess["runTurn"];
+    const running = runOnPty("global", "long turn", { timeoutMs: 5000, ...scope() });
+    await Bun.sleep(5);
+
+    const sending = sendToLiveSession("global", "/compact", { timeoutMs: 5000 });
+    await Bun.sleep(30);
+    // nothing written on top of the user's turn while it runs
+    expect(spawned[0].prompts).toEqual(["seed", "long turn"]);
+
+    gate.resolve({ text: "done", bytesCaptured: 1, cleanBoundary: true, sessionId: "sess-1" });
+    await running;
+    const r = await sending;
+    expect(r.status).toBe("sent");
+    expect(spawned[0].prompts).toEqual(["seed", "long turn", "/compact"]);
+    expect(spawned.length).toBe(1);
+  });
+
+  it("busy past the timeout: failed (no not-live), and the abandoned send is never written later", async () => {
     await seed("global");
     const gate = deferred<PtyTurnResult>();
     spawned[0].runTurn = ((p: string) => {
@@ -163,12 +194,197 @@ describe("sendToLiveSession", () => {
     const running = runOnPty("global", "long turn", { timeoutMs: 5000, ...scope() });
     await Bun.sleep(5);
 
-    const r = await sendToLiveSession("global", "/compact", { timeoutMs: 5000 });
+    const r = await sendToLiveSession("global", "/compact", { timeoutMs: 40 });
 
-    expect(r).toEqual({ status: "not-live", reason: "busy" });
+    expect(r.status).toBe("failed");
+    if (r.status !== "failed") throw new Error("unreachable");
+    expect(r.timedOut).toBe(true);
+    expect(r.error).toContain("waited");
+    // the user's turn is left alone: not retired, not disposed
+    expect(spawned[0].disposed).toBe(false);
+    // the abandoned send must not open the lock early: a later turn still queues
+    // behind the one that is running
+    const later = runOnPty("global", "later user message", { timeoutMs: 5000, ...scope() });
+    await Bun.sleep(30);
     expect(spawned[0].prompts).toEqual(["seed", "long turn"]);
+    spawned[0].runTurn = (async (p: string) => {
+      spawned[0].prompts.push(p);
+      return { text: "x", bytesCaptured: 1, cleanBoundary: true, sessionId: "sess-1" };
+    }) as PtyProcess["runTurn"];
     gate.resolve({ text: "done", bytesCaptured: 1, cleanBoundary: true, sessionId: "sess-1" });
     await running;
+    await later;
+    await Bun.sleep(20);
+    // /compact never ran; the later user message did, after the long turn
+    expect(spawned[0].prompts).toEqual(["seed", "long turn", "later user message"]);
+    // and the lock chain is intact: a later send goes through
+    expect((await sendToLiveSession("global", "/later", { timeoutMs: 5000 })).status).toBe("sent");
+  });
+
+  it("a spawn still in flight: waits for it and sends live, not not-live", async () => {
+    const spawnGate = deferred<void>();
+    injectSpawnPty(async (o) => {
+      await spawnGate.promise;
+      const f = nextFake();
+      spawned.push(f);
+      spawnOpts.push(o);
+      return f;
+    });
+    const first = runOnPty("global", "first", { timeoutMs: 5000, ...scope() });
+    await Bun.sleep(10);
+
+    const sending = sendToLiveSession("global", "/compact", { timeoutMs: 5000 });
+    await Bun.sleep(20);
+    expect(spawned.length).toBe(0);
+
+    spawnGate.resolve();
+    expect((await first).exitCode).toBe(0);
+    const r = await sending;
+    expect(r.status).toBe("sent");
+    expect(spawned[0].prompts).toEqual(["first", "/compact"]);
+  });
+
+  it("a spawn whose caller gave up is still in flight: waits for it, never not-live", async () => {
+    const spawnGate = deferred<void>();
+    injectSpawnPty(async (o) => {
+      await spawnGate.promise;
+      const f = nextFake();
+      spawned.push(f);
+      spawnOpts.push(o);
+      return f;
+    });
+    // the first caller's own deadline passes during the spawn; the spawn goes on
+    const gaveUp = await runOnPty("global", "first", { timeoutMs: 30, ...scope() });
+    expect(gaveUp.exitCode).toBe(1);
+
+    const sending = sendToLiveSession("global", "/compact", { timeoutMs: 5000 });
+    await Bun.sleep(20);
+    spawnGate.resolve();
+
+    const r = await sending;
+    expect(r.status).toBe("sent");
+    expect(spawned.length).toBe(1);
+    expect(spawned[0].prompts).toEqual(["/compact"]);
+  });
+
+  it("the process dies while the send is queued: not-live, nothing written to the dead PTY", async () => {
+    await seed("global");
+    const gate = deferred<PtyTurnResult>();
+    spawned[0].runTurn = ((p: string) => {
+      spawned[0].prompts.push(p);
+      return gate.promise;
+    }) as PtyProcess["runTurn"];
+    const running = runOnPty("global", "long turn", { timeoutMs: 5000, ...scope() });
+    await Bun.sleep(5);
+    const sending = sendToLiveSession("global", "/compact", { timeoutMs: 5000 });
+    await Bun.sleep(10);
+
+    await spawned[0].dispose(); // the process exits mid-turn
+    gate.resolve({ text: "done", bytesCaptured: 1, cleanBoundary: true, sessionId: "sess-1" });
+    await running;
+
+    expect(await sending).toEqual({ status: "not-live", reason: "no-process" });
+    expect(spawned[0].prompts).toEqual(["seed", "long turn"]);
+  });
+
+  it("the wait and the turn share ONE budget: the turn gets only what the wait left", async () => {
+    await seed("global");
+    const gate = deferred<PtyTurnResult>();
+    const seen: number[] = [];
+    spawned[0].runTurn = ((p: string, o: { timeoutMs: number }) => {
+      spawned[0].prompts.push(p);
+      if (p === "long turn") return gate.promise;
+      seen.push(o.timeoutMs);
+      return Promise.resolve({
+        text: "ok",
+        bytesCaptured: 1,
+        cleanBoundary: true,
+        sessionId: "sess-1",
+      });
+    }) as PtyProcess["runTurn"];
+    const running = runOnPty("global", "long turn", { timeoutMs: 5000, ...scope() });
+    await Bun.sleep(5);
+
+    const sending = sendToLiveSession("global", "/compact", { timeoutMs: 5000 });
+    await Bun.sleep(60);
+    gate.resolve({ text: "done", bytesCaptured: 1, cleanBoundary: true, sessionId: "sess-1" });
+    await running;
+    await sending;
+
+    expect(seen.length).toBe(1);
+    expect(seen[0]).toBeLessThan(5000 - 40);
+    expect(seen[0]).toBeGreaterThan(0);
+  });
+
+  it("an entry being retired: waits until its process is gone; then no-entry (safe to fall back)", async () => {
+    await seed("global");
+    const disposeGate = deferred<void>();
+    const realDispose = spawned[0].dispose.bind(spawned[0]);
+    spawned[0].dispose = async () => {
+      await disposeGate.promise;
+      await realDispose();
+    };
+    const retiring = retirePtySession("global");
+    await Bun.sleep(5);
+
+    let settled = false;
+    const sending = sendToLiveSession("global", "/compact", { timeoutMs: 5000 }).then((r) => {
+      settled = true;
+      return r;
+    });
+    await Bun.sleep(30);
+    expect(settled).toBe(false); // the old process may still be alive: no verdict yet
+
+    disposeGate.resolve();
+    await retiring;
+    expect(await sending).toEqual({ status: "not-live", reason: "no-entry" });
+  });
+
+  it("an entry being retired that never finishes: failed within the timeout, never not-live", async () => {
+    await seed("global");
+    const disposeGate = deferred<void>();
+    spawned[0].dispose = async () => {
+      await disposeGate.promise;
+    };
+    const retiring = retirePtySession("global");
+    await Bun.sleep(5);
+
+    const r = await sendToLiveSession("global", "/compact", { timeoutMs: 40 });
+
+    expect(r.status).toBe("failed");
+    disposeGate.resolve();
+    await retiring;
+  });
+
+  it("shutting down with the process still there: failed, not not-live", async () => {
+    await seed("global");
+    const disposeGate = deferred<void>();
+    spawned[0].dispose = async () => {
+      await disposeGate.promise;
+    };
+    const shutting = shutdownSupervisor();
+    await Bun.sleep(5);
+
+    const r = await sendToLiveSession("global", "/compact", { timeoutMs: 40 });
+
+    expect(r.status).toBe("failed");
+    disposeGate.resolve();
+    await shutting;
+    // once the process is gone there is nothing left to race
+    expect(await sendToLiveSession("global", "/compact", { timeoutMs: 40 })).toEqual({
+      status: "not-live",
+      reason: "no-entry",
+    });
+  });
+
+  it("an entry whose process has died: not-live (nothing alive to race)", async () => {
+    await seed("global");
+    await spawned[0].dispose();
+
+    expect(await sendToLiveSession("global", "/compact", { timeoutMs: 5000 })).toEqual({
+      status: "not-live",
+      reason: "no-process",
+    });
   });
 
   it("holds the per-key lock: a runOnPty issued mid-send waits for the send to end", async () => {
@@ -257,8 +473,8 @@ describe("sendToLiveSession", () => {
     if (r.status !== "failed") throw new Error("unreachable");
     expect(r.aborted).toBe(true);
     // the PTY is still mid-turn: a second send must not be written on top of it
-    const again = await sendToLiveSession("global", "/again", { timeoutMs: 5000 });
-    expect(again).toEqual({ status: "not-live", reason: "busy" });
+    const again = await sendToLiveSession("global", "/again", { timeoutMs: 40 });
+    expect(again.status).toBe("failed");
     expect(spawned[0].prompts).toEqual(["seed", "/compact"]);
     gate.resolve({ text: "late", bytesCaptured: 1, cleanBoundary: true, sessionId: "sess-1" });
   });

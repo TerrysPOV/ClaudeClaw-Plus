@@ -155,6 +155,7 @@ describe("runCompact", () => {
         resumeSessionId: "sid-2",
         cwd: "/work/agents/suzy",
         model: "sonnet",
+        allowedTools: [],
         timeoutMs: 7000,
       },
     ]);
@@ -181,7 +182,41 @@ describe("runCompact", () => {
 });
 
 describe("actOnSession", () => {
-  it("falls back to the one-shot when the live session is busy (mid-turn)", async () => {
+  it("busy session: waits for the user's turn, runs the action in the live session, spawns NO one-shot", async () => {
+    await seedLive("global");
+    let release!: (r: PtyTurnResult) => void;
+    reply = (p) =>
+      p === "long"
+        ? new Promise<PtyTurnResult>((r) => {
+            release = r;
+          })
+        : ok(`echo:${p}`);
+    const running = runOnPty("global", "long", { timeoutMs: 5000, ...scope() });
+    await Bun.sleep(5);
+
+    const acting = actOnSession({
+      route: "compact",
+      prompt: "/compact",
+      sessionKey: "global",
+      sessionId: "sid",
+      timeoutMs: 5000,
+    });
+    await Bun.sleep(30);
+    // nothing written on top of the turn, and no second process on the transcript
+    expect(fakes[0].prompts).toEqual(["seed", "long"]);
+    expect(oneShotCalls).toEqual([]);
+
+    release(ok("done"));
+    await running;
+    const r = await acting;
+
+    expect(r.ok).toBe(true);
+    expect(r.via).toBe("live");
+    expect(fakes[0].prompts).toEqual(["seed", "long", "/compact"]); // after the user turn ended
+    expect(oneShotCalls).toEqual([]);
+  });
+
+  it("busy past the timeout: ok:false with a clear detail and ZERO one-shot calls", async () => {
     await seedLive("global");
     let release!: (r: PtyTurnResult) => void;
     reply = () =>
@@ -196,14 +231,29 @@ describe("actOnSession", () => {
       prompt: "/compact",
       sessionKey: "global",
       sessionId: "sid",
+      timeoutMs: 40,
+    });
+
+    expect(r.ok).toBe(false);
+    expect(r.via).toBe("live");
+    expect(r.detail).toContain("waited");
+    expect(oneShotCalls).toEqual([]);
+    expect(fakes[0].prompts).toEqual(["seed", "long"]);
+    release(ok("done"));
+    await running;
+  });
+
+  it("no process at all (entry gone): resumes one-shot", async () => {
+    const r = await actOnSession({
+      route: "compact",
+      prompt: "/compact",
+      sessionKey: "global",
+      sessionId: "sid",
       timeoutMs: 1000,
     });
 
     expect(r.via).toBe("oneshot");
     expect(oneShotCalls.length).toBe(1);
-    expect(fakes[0].prompts).toEqual(["seed", "long"]); // nothing written on top of the turn
-    release(ok("done"));
-    await running;
   });
 
   it("does NOT fall back after a live attempt failed: a second process would race the session", async () => {
@@ -225,8 +275,20 @@ describe("actOnSession", () => {
     expect(oneShotCalls).toEqual([]);
   });
 
-  it("memory.save.precompact: a wedged (timed-out) session skips the live path", async () => {
+  it("memory.save.precompact: a wedged (timed-out) session skips the live path, and its process is gone BEFORE the one-shot", async () => {
     await seedLive("global");
+    let disposedAtOneShot: boolean | null = null;
+    injectOneShotForTests(async (req) => {
+      disposedAtOneShot = (fakes[0] as unknown as { disposed: boolean }).disposed;
+      oneShotCalls.push(req);
+      return done("ok");
+    });
+    (fakes[0] as unknown as { disposed: boolean }).disposed = false;
+    const realDispose = fakes[0].dispose.bind(fakes[0]);
+    fakes[0].dispose = async () => {
+      (fakes[0] as unknown as { disposed: boolean }).disposed = true;
+      await realDispose();
+    };
 
     const r = await actOnSession({
       route: "memory.save.precompact",
@@ -240,6 +302,7 @@ describe("actOnSession", () => {
 
     expect(r.via).toBe("oneshot");
     expect(fakes[0].prompts).toEqual(["seed"]);
+    expect(disposedAtOneShot).toBe(true);
     expect(oneShotCalls[0]).toMatchObject({
       route: "memory.save.precompact",
       allowedTools: ["Write"],
@@ -299,7 +362,7 @@ describe("generateSummary (rotation.summary)", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('the one-shot fallback carries allowedTools: ["Write"] and resumes the old session', async () => {
+  it("the one-shot fallback grants NO tools (allowedTools: []) and resumes the old session", async () => {
     oneShotResult = async () => done("  the summary  ");
 
     const text = await generateSummary("old-sid", dir);
@@ -310,7 +373,7 @@ describe("generateSummary (rotation.summary)", () => {
       route: "rotation.summary",
       isolation: "trusted-session",
       resumeSessionId: "old-sid",
-      allowedTools: ["Write"],
+      allowedTools: [],
     });
     const files = await readdir(dir);
     expect(files.length).toBe(1);

@@ -1537,6 +1537,9 @@ export async function runCompact(opts: {
     timeoutMs: opts.timeoutMs,
     model: opts.model,
     cwd: opts.cwd,
+    // /compact needs no tools. An empty grant (not an absent one) keeps the one-shot
+    // off the default permission profile, which can include the bypass flag.
+    allowedTools: [],
   });
   console.log(
     `[${new Date().toLocaleTimeString()}] Compact ${result.ok ? `succeeded (${result.via})` : `failed (${result.detail ?? result.via})`}`,
