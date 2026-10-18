@@ -40,6 +40,7 @@ beforeEach(async () => {
     removeHeartbeatState: async () => {},
     // the stand-in daemon is a `sleep`; make it look like one
     readProcessCommand: () => "bun run src/index.ts start",
+    readProcessCwd: () => process.cwd(),
   };
   spawns = [];
   realSpawn = Bun.spawn;

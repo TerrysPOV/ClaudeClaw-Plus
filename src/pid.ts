@@ -1,5 +1,14 @@
 import { writeFile, unlink, readFile } from "fs/promises";
-import { linkSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
+import {
+  linkSync,
+  mkdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "fs";
 import { spawnSync } from "child_process";
 import { dirname, join } from "path";
 
@@ -429,31 +438,84 @@ export function readProcessCommand(pid: number): string | null {
   }
 }
 
-/** What a daemon's command line looks like: `bun run src/index.ts start`, `claudeclaw …`. */
-const DAEMON_COMMAND = /claudeclaw|\bbun\b|index\.ts/i;
+/**
+ * What the daemon's command line looks like. The daemon is the `start` subcommand of
+ * the entry script `src/index.ts` (`bun run /opt/claudeclaw/src/index.ts start --web`,
+ * `bun --watch src/index.ts start ...`, docs/deploy-systemd-hardening.md) or of the
+ * `claudeclaw` shim (`claudeclaw start`). A bare `bun` is NOT enough: any unrelated Bun
+ * app that inherits a stale PID would otherwise be signalled. `src` must be a whole path
+ * component (so `fake-src/index.ts` does not match) and `start` must directly follow the
+ * entry (`src/index.ts serve`, `src/index.tsx start` do not match).
+ */
+const DAEMON_ENTRY = /(?:^|[\s/])src\/index\.ts\s+start(?:\s|$)/;
+const DAEMON_SHIM = /^(?:\S*\/)?claudeclaw\s+start(?:\s|$)/;
+
+/** The working directory of `pid` (Linux `/proc`, else `lsof`), or null if unreadable. */
+export function readProcessCwd(pid: number): string | null {
+  try {
+    return readlinkSync(`/proc/${pid}/cwd`);
+  } catch {
+    // no /proc (macOS) or not ours: fall through to lsof
+  }
+  try {
+    const r = spawnSync("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], {
+      encoding: "utf-8",
+      timeout: 2_000,
+    });
+    if (r.error || r.status !== 0) return null;
+    const line = String(r.stdout)
+      .split("\n")
+      .find((l) => l.startsWith("n"));
+    return line ? line.slice(1) : null;
+  } catch {
+    return null;
+  }
+}
+
+function sameDir(a: string, b: string): boolean {
+  if (a === b) return true;
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return false;
+  }
+}
 
 export type StopTarget =
   | { kind: "ok"; pid: number }
   /** The PID file does not hold a usable PID. Nothing may be probed or signalled. */
   | { kind: "invalid" }
-  /** Alive, but its command line is some other program: a recycled PID, not our daemon. */
+  /** Alive, but not this project's daemon: a recycled PID. */
   | { kind: "not-daemon"; pid: number; command: string }
   /** PID 1 with nothing confirming it is ours: init / the service manager. */
   | { kind: "refuse-pid1"; pid: 1 };
 
 /**
- * Decide whether a PID file's contents may be treated as the daemon to stop. Where
- * the command line cannot be read (no `ps`, process gone) this falls back to trusting
- * the PID file, as before. PID 1 is the exception: in a container the daemon really is
- * PID 1 (#526), on a host it is init, so it needs the command line to say so.
+ * Decide whether a PID file's contents may be treated as the daemon to stop.
+ *
+ * The command line must have the daemon's shape (`DAEMON_ENTRY` / `DAEMON_SHIM`), and,
+ * when the process's working directory can be read, that directory must be `projectDir`:
+ * the PID file lives under the project and the daemon never changes directory, so the
+ * same entry script running elsewhere is another project's app. Where the command line
+ * cannot be read (no `ps`, process gone) this falls back to trusting the PID file, as
+ * before; where only the cwd cannot be read, the command shape alone decides. PID 1 is
+ * the exception: in a container the daemon really is PID 1 (#526), on a host it is init,
+ * so it needs the command line to say so.
  */
 export function decideStopTarget(
   raw: string,
   readCommand: (pid: number) => string | null = readProcessCommand,
+  readCwd: (pid: number) => string | null = readProcessCwd,
+  projectDir: string = process.cwd(),
 ): StopTarget {
   const pid = parseDaemonPid(raw);
   if (pid === null) return { kind: "invalid" };
   const command = readCommand(pid);
   if (command === null) return pid === 1 ? { kind: "refuse-pid1", pid: 1 } : { kind: "ok", pid };
-  return DAEMON_COMMAND.test(command) ? { kind: "ok", pid } : { kind: "not-daemon", pid, command };
+  if (!DAEMON_ENTRY.test(command) && !DAEMON_SHIM.test(command)) {
+    return { kind: "not-daemon", pid, command };
+  }
+  const cwd = readCwd(pid);
+  if (cwd !== null && !sameDir(cwd, projectDir)) return { kind: "not-daemon", pid, command };
+  return { kind: "ok", pid };
 }

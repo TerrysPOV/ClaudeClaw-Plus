@@ -11,6 +11,7 @@ import {
   decideStopTarget,
   parseDaemonPid,
   readProcessCommand,
+  readProcessCwd,
 } from "../pid";
 import { removeStatuslineSetting } from "../statusline-settings";
 import { saveGlobalMemoryOneShot } from "../shutdown-memory-save";
@@ -46,6 +47,8 @@ export interface StopDeps {
   removeHeartbeatState: () => Promise<void>;
   /** `ps -o command= -p <pid>`; null when unreadable. Injectable for tests. */
   readProcessCommand?: (pid: number) => string | null;
+  /** The process's working directory; null when unreadable. Injectable for tests. */
+  readProcessCwd?: (pid: number) => string | null;
 }
 
 function defaultStopDeps(): StopDeps {
@@ -75,7 +78,11 @@ export async function stop(deps: StopDeps = defaultStopDeps()) {
 
   // Never signal what the PID file merely claims: `kill(0)` / `kill(-1)` address whole
   // process groups, and a recycled PID names some unrelated program.
-  const target = decideStopTarget(raw, deps.readProcessCommand ?? readProcessCommand);
+  const target = decideStopTarget(
+    raw,
+    deps.readProcessCommand ?? readProcessCommand,
+    deps.readProcessCwd ?? readProcessCwd,
+  );
   if (target.kind === "invalid") {
     console.log(
       `${pidFile} does not hold a valid PID (${JSON.stringify(raw.slice(0, 40))}) — refusing to signal anything; fix or remove it.`,
@@ -210,7 +217,7 @@ export async function stopAll() {
       continue;
     }
     if (!isPidAlive(parsed)) continue;
-    const verdict = decideStopTarget(pid);
+    const verdict = decideStopTarget(pid, readProcessCommand, readProcessCwd, projectPath);
     if (verdict.kind !== "ok") {
       console.log(
         `\x1b[33m■ Skipped\x1b[0m PID ${parsed} — ${projectPath} (${verdict.kind === "not-daemon" ? "not a ClaudeClaw daemon" : "refusing PID 1"})`,
