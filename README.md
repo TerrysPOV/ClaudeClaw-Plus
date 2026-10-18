@@ -114,13 +114,13 @@ Pick the surfaces you want the daemon to listen on. Multiple adapters can run at
 | **Web UI (Dashboard)** | Production-tested | `web.enabled: true`, `web.host:web.port` (default `127.0.0.1:4632`) |
 | **Web UI (Bus Adapter)** | Production-tested | `web.bus.bind` (default `127.0.0.1:7878`) |
 
-> ⚠ **Discord Note:** Under the event-bus runtime, `discord.busRouting` (`channels` or `guilds`) must be configured (`src/adapters/discord/index.ts:266-270`). In addition, `discord.allowedUserIds` must not be empty; an empty allowlist refuses all incoming messages (`src/adapters/discord/index.ts:247`, `src/allowlist.ts`).
+> ⚠ **Discord Note:** Under the event-bus runtime, `discord.busRouting` (`channels`, `threads`, `dmAgentId`, or `primaryChannelByAgent`) must be configured (`src/config.ts:1568-1591`, `src/adapters/discord/index.ts:266-270`). Note that `guilds` is not a supported routing key. In addition, `discord.allowedUserIds` must not be empty; an empty allowlist refuses all incoming messages (`src/adapters/discord/index.ts:247`, `src/allowlist.ts`).
 
 ### 2. Primary model + fallback
 
 In `settings.json`, `model` and `fallback.model` default to empty strings `""` (`src/config.ts:86-90`), inheriting Claude Code's active model. The setup wizard offers `opus` (default), `sonnet`, `haiku`, and `glm`.
 
-When configured, `fallback.model` triggers on rate-limit HTTP 429 errors only, executing via `runner.ts` (`src/runner.ts:2125-2135`) for legacy tasks (fallback routing does not apply to bus agents). `kimi-k2p6` routes directly to Kimi's Coding API at `https://api.kimi.com/coding/` (`src/runner.ts:643-644`), not OpenRouter.
+When configured, `fallback.model` triggers on rate-limit messages detected in output (`you've hit your limit`, `out of extra usage`; `src/runner.ts:400, 586-593`), executing via `runner.ts` (`src/runner.ts:2125-2135`) for legacy tasks (fallback routing does not apply to bus agents). `kimi-k2p6` routes directly to Kimi's Coding API at `https://api.kimi.com/coding/` (`src/runner.ts:643-644`), not OpenRouter.
 
 ### 3. Permission mode per agent
 
@@ -185,11 +185,12 @@ Located at `<project>/.claude/claudeclaw/settings.json` (per-project configurati
 - Security level for legacy runner (`src/commands/start.ts:1709-1715`)
 - MCP bridge tool policy (`src/commands/start.ts:1717-1723`)
 - Scheduled job list (`src/commands/start.ts:1725-1748`)
+- PTY execution mode toggle (`pty.enabled`) for `runner.ts` paths (`src/runner/pty-supervisor.ts:36-39`, `src/runner.ts:742`)
 
 **Restart-required changes (require restarting the daemon):**
 - Adapter routing (`discord.busRouting`, `telegram.busRouting`, `slack.busRouting`, `web.bus`)
 - Agent declarations (`agents[]`) and agent `permission_mode`
-- Runtime mode (`runtime`, `pty.enabled`)
+- Runtime mode (`runtime`) — switching between `"bus"` and `"pty"` (`src/commands/start.ts:606-607`)
 - Authentication tokens (`discord.token`, `telegram.token`, `slack.botToken`)
 - Web UI bind addresses (`web.host`, `web.port`, `web.bus.bind`)
 - MCP shared and stateless server processes
@@ -234,18 +235,18 @@ ClaudeClaw+ supports two distinct runtimes (`runtime: "bus"` and `runtime: "pty"
 - **Interactive PTY** is the official execution engine of ClaudeClaw+.
 - **`claude -p`** remains a permanently supported option for programmatic execution, scriptable environments, or headless subprocess tasks (`pty.enabled: false`, `supervision: "process-stream-json"`).
 - **Bus Supervision vs. `pty.enabled`:** Bus agent turns do not consult `pty.enabled`. Under `runtime: "bus"`, declared agents receive `entry.supervision ?? "pty-stdin"` (`src/bus/agent-resolver.ts:73`). Undeclared spawns fall back to `defaultSupervisionFor(origin)` (`pty-stdin` for channel-driven origins, `process-stream-json` for others; `src/bus/types.ts:54-56, 77-85`). The valid `SupervisionMode` values are `pty-stdin`, `process-stream-json`, `tmux`, and `process` (`src/bus/types.ts:48-52`).
-- **Scope of `pty.enabled`:** `pty.enabled` governs `runner.ts` paths only (`src/runner.ts:732-742, 2015, 2070`): agent turns under `runtime: "pty"`, plus cron jobs (`job-loop.ts`), agent jobs, rate-limit fallback, dashboard chat, and forks under either runtime.
+- **Scope of `pty.enabled`:** `pty.enabled` governs `runner.ts` paths only (`src/runner.ts:732-742, 2015, 2070`): agent turns and dashboard chat under `runtime: "pty"`, plus cron jobs (`job-loop.ts`), agent jobs, rate-limit fallback, and forks under either runtime. Under `runtime: "bus"`, dashboard chat routes directly through `streamBusPrompt()` to the default bus agent (`src/commands/start.ts:1415-1439`) and does not consult `pty.enabled`.
 - **Current Defaults:** In the current release, `pty.enabled` defaults to `false` (meaning `runner.ts` paths fall back to `claude -p`). A future release ([#550](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues/550)) will flip the default to `pty.enabled: true`.
 - **Runtime Isolation:** Switching between `runtime: "bus"` and `runtime: "pty"` requires a full daemon restart (`src/commands/start.ts:606-607`). The two runtimes share neither IPC nor runtime state.
 
 #### Execution Modes Matrix
 
-| Runtime | `pty.enabled` | Bus Agent Turns (Supervision) | `runner.ts` Paths (Cron, Agent Jobs, Fallback, Dashboard Chat, Forks) | Details & Architecture |
+| Runtime | `pty.enabled` | Bus Agent Turns (Supervision) | `runner.ts` Paths (Cron, Agent Jobs, Fallback, Forks; Dashboard Chat under legacy pty runtime) | Details & Architecture |
 |---|---|---|---|---|
-| `runtime: "bus"` (default) | `false` (current default) | `pty-stdin` (or declared `supervision`) | `claude -p` (`process-stream-json`) | Bus agents run with `pty-stdin` (or per-agent `supervision`); undeclared spawns follow `defaultSupervisionFor(origin)`. `pty.enabled` does not change bus agent supervision. Cron jobs (`job-loop.ts:21-30`), agent jobs, fallback, and chat route through `runner.ts` and run as `claude -p` (`src/runner.ts:732-742, 2015, 2070, 2690`). |
-| `runtime: "bus"` | `true` (upcoming default) | `pty-stdin` (or declared `supervision`) | Interactive PTY supervisor | Bus agents run with `pty-stdin` (or per-agent `supervision`). Cron jobs, agent jobs, fallback, and dashboard chat route through `runner.ts` and run on the PTY supervisor (`src/runner.ts:732-742, 2015, 2070, 2690`). |
-| `runtime: "pty"` | `false` (current default) | N/A (bus runtime not mounted) | `claude -p` (`process-stream-json`) | Legacy runner spawns a fresh `claude -p` subprocess per inbound event, cron job, agent job, or chat (`src/runner.ts:732-742, 2015, 2070`). |
-| `runtime: "pty"` | `true` (upcoming default) | N/A (bus runtime not mounted) | Interactive PTY supervisor | Legacy runner routes agent turns, cron jobs, agent jobs, fallback, and chat to the interactive PTY supervisor (`src/runner.ts:732-742, 2015, 2070`). |
+| `runtime: "bus"` (default) | `false` (current default) | `pty-stdin` (or declared `supervision`) | `claude -p` (`process-stream-json`) | Bus agents run with `pty-stdin` (or per-agent `supervision`); undeclared spawns follow `defaultSupervisionFor(origin)`. `pty.enabled` does not change bus agent supervision. Dashboard chat routes through `streamBusPrompt()` to the default bus agent (`src/commands/start.ts:1415-1439`). Cron jobs (`job-loop.ts:21-30`), agent jobs, fallback, and forks route through `runner.ts` and run as `claude -p` (`src/runner.ts:732-742, 2015, 2070, 2690`). |
+| `runtime: "bus"` | `true` (upcoming default) | `pty-stdin` (or declared `supervision`) | Interactive PTY supervisor | Bus agents run with `pty-stdin` (or per-agent `supervision`). Dashboard chat routes through `streamBusPrompt()` to the default bus agent (`src/commands/start.ts:1415-1439`). Cron jobs, agent jobs, fallback, and forks route through `runner.ts` and run on the PTY supervisor (`src/runner.ts:732-742, 2015, 2070, 2690`). |
+| `runtime: "pty"` | `false` (current default) | N/A (bus runtime not mounted) | `claude -p` (`process-stream-json`) | Legacy runner spawns a fresh `claude -p` subprocess per inbound event, cron job, agent job, fallback, or dashboard chat (`src/commands/start.ts:1432-1438`, `src/runner.ts:732-742, 2015, 2070`). |
+| `runtime: "pty"` | `true` (upcoming default) | N/A (bus runtime not mounted) | Interactive PTY supervisor | Legacy runner routes agent turns, cron jobs, agent jobs, fallback, and dashboard chat to the interactive PTY supervisor (`src/commands/start.ts:1432-1438`, `src/runner.ts:732-742, 2015, 2070`). |
 
 #### When to pick `claude -p` vs. PTY / Bus
 
@@ -273,7 +274,7 @@ ClaudeClaw+ supports two distinct runtimes (`runtime: "bus"` and `runtime: "pty"
 }
 ```
 
-> **Note on hot-reload:** Flipping `runtime` or `pty.enabled` requires restarting the daemon; hot-reload does not re-bootstrap the runtime execution engine (`src/config.ts:734-735`).
+> **Note on hot-reload:** Switching `runtime` between `"bus"` and `"pty"` requires restarting the daemon (`src/commands/start.ts:606-607`). In contrast, `pty.enabled` is hot-reload-safe: changes in `settings.json` take effect on the next invocation within ~30s (`src/runner/pty-supervisor.ts:36-39`, `src/runner.ts:742`).
 
 #### References
 
@@ -288,7 +289,7 @@ ClaudeClaw+ supports two distinct runtimes (`runtime: "bus"` and `runtime: "pty"
 
 The multiplexer hosts each shared MCP server child **once** and demultiplexes per-PTY traffic over a loopback HTTP route (`/mcp/<server>`). Each PTY claude gets a synthesized `--mcp-config` JSON pointing at that route with a per-PTY bearer + identity headers. Without this, every PTY would spawn its own copy of every MCP server — N × M subprocesses for N PTYs × M servers — which OOMs even a modest Hetzner box at moderate concurrency.
 
-> **Requirement:** The MCP multiplexer requires the web dashboard to be enabled (`web.enabled: true` or `--web`), as its proxy endpoints (`/mcp/<server>`) are registered on the dashboard HTTP server (`src/commands/start.ts:1053, 1111-1120`).
+> **Requirement:** The MCP multiplexer requires `web.enabled: true` to be persisted in `settings.json` (`src/commands/start.ts:1053`), as its proxy endpoints (`/mcp/<server>`) are registered on the dashboard HTTP server (`src/commands/start.ts:1111-1120`). Note that passing the `--web` CLI flag alone is not sufficient to activate the multiplexer at startup because the daemon evaluates `settings.web.enabled` before reconciling CLI flags (`src/commands/start.ts:1053, 1481`).
 
 #### Operator footgun: `mcp-proxy.json` ↔ `~/.claude/mcp.json` collisions
 
