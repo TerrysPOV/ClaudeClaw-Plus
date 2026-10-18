@@ -187,6 +187,13 @@ read-only "is this key live and idle" accessor. PTY session keys are `thread:<id
     still be writing the transcript), agent keys never use it (they have no one-shot save), and with no
     `fallbackSave` (bus runtime) it is recorded as skipped, as before. The result is reported as
     `global (one-shot)`.
+23. **`--permission-mode dontAsk` lives in `trustedToolFlags` (rebase onto #548 `e8d09870`).** #548's
+    production pass added `dontAsk` to the `pty` one-shot only. Decision 17 already made
+    `trustedToolFlags` the single place both engines build their grant, so `dontAsk` moved there: any
+    explicit grant (including `allowedTools: []`) emits `--permission-mode dontAsk` ahead of
+    `--tools` / `--allowedTools`, in `print` and `pty` alike (a tool outside the grant is denied instead
+    of waiting at a prompt nobody answers). No grant still emits nothing, so the default permission
+    profile is unchanged. `runOnceOnPty` otherwise keeps #548's body (`runEphemeralWithDeadline`).
 
 ## Key files
 

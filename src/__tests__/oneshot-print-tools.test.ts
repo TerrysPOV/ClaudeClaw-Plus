@@ -32,6 +32,7 @@ describe("buildPrintArgs tool flags (trusted-session)", () => {
     });
 
     expect(flagValue(args, "--tools")).toBe("Read,Write");
+    expect(flagValue(args, "--permission-mode")).toBe("dontAsk"); // same as the pty engine
     expect(flagValue(args, "--allowedTools")).toBe("Edit(//proj/MEMORY.md),Read(//proj/MEMORY.md)");
   });
 
@@ -60,6 +61,7 @@ describe("buildPrintArgs tool flags (trusted-session)", () => {
 
     expect(args).not.toContain("--tools");
     expect(args).not.toContain("--allowedTools");
+    expect(args).not.toContain("--permission-mode"); // dontAsk only comes with a grant
   });
 });
 

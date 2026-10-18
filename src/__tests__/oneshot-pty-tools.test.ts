@@ -88,7 +88,7 @@ describe("pty engine tool flags", () => {
     expect(flagValue(args, "--tools")).toBe("");
     expect(args).not.toContain("--allowedTools");
     expect(args).not.toContain("--dangerously-skip-permissions");
-    expect(args).not.toContain("--permission-mode");
+    expect(flagValue(args, "--permission-mode")).toBe("dontAsk"); // denies, never prompts
   });
 
   it("a rule list without explicit tools derives unique bare names", async () => {

@@ -71,7 +71,7 @@ describe("compact fallback argv", () => {
     expect(flagValue(args, "--resume")).toBe("sid-1");
     expect(flagValue(args, "--tools")).toBe(""); // no tools at all
     expect(args).not.toContain("--dangerously-skip-permissions");
-    expect(args).not.toContain("--permission-mode");
+    expect(flagValue(args, "--permission-mode")).toBe("dontAsk"); // denies, never prompts
     expect(args).not.toContain("--disallowedTools");
   });
 });
@@ -98,7 +98,7 @@ describe("rotation summary fallback argv", () => {
     expect(flagValue(args, "--tools")).toBe("");
     expect(args).not.toContain("Write");
     expect(args).not.toContain("--dangerously-skip-permissions");
-    expect(args).not.toContain("--permission-mode");
+    expect(flagValue(args, "--permission-mode")).toBe("dontAsk"); // denies, never prompts
   });
 });
 
@@ -117,7 +117,7 @@ describe("print engine with an explicit tool list only", () => {
 
     expect(flagValue(argv[0], "--tools")).toBe("Read");
     expect(argv[0]).not.toContain("--dangerously-skip-permissions");
-    expect(argv[0]).not.toContain("--permission-mode");
+    expect(flagValue(argv[0], "--permission-mode")).toBe("dontAsk"); // denies, never prompts
   });
 });
 

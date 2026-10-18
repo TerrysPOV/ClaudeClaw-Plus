@@ -3,6 +3,61 @@
 Branch `feat/549-live-session-compact`, stacked on `povai/feat/548-oneshot-module` @ 0d636b6a
 (which is on `povai/main` d81bd579). Spec: `.planning/549-live-session/SPEC.md`.
 
+## Rebase onto #548 e8d09870 (third pass)
+
+#561 (was `acf95f13`) rebased onto the new head of `feat/548-oneshot-module` (`e8d09870`). Twelve commits replayed; two
+conflicts, both in the commit that introduced the shared `trustedToolFlags`.
+
+**Conflict resolutions**
+
+| File | Conflict | Resolution |
+|---|---|---|
+| `src/oneshot/print.ts` | imports: #548 added `cliModelFlag`, #561 added `trustedToolFlags` | both kept. `buildPrintArgs` still takes the grant from `trustedToolFlags(req)`. |
+| `src/runner/pty-supervisor.ts` `runOnceOnPty` | #548 delegated to `runEphemeralWithDeadline` (shared spawn path, ephemeral entry, exit parity); #561 had a hand-built `PtyProcessOptions` / `spawn` / `runTurn` with its own `trustedToolFlags` call | #548's body kept whole; its inline `req.allowedTools ? ["--permission-mode","dontAsk","--tools",...] : buildSecurityArgs` replaced by `trustedToolFlags(req) ?? helpers.buildSecurityArgs(settings.security)`. |
+| `src/oneshot/isolation.ts` (no textual conflict) | #548's `dontAsk` lived only in the pty path, so print and pty would have diverged | `--permission-mode dontAsk` moved INTO `trustedToolFlags`, so both engines emit it from one place. |
+
+The result keeps #561's bare-names-in-`--tools` / scoped-rules-in-`--allowedTools` split, its busy-session rule (never resume
+a session a live process holds), scoped memory-save grants, no tools for rotation and compact, PID validation and the
+shutdown fallback; and #548's shared spawn path, ephemeral scope, exit parity and `dontAsk`.
+
+**Flags now emitted** (print and pty, identical): a grant gives `--permission-mode dontAsk --tools <bare names>` plus
+`--allowedTools <rules>` when there are any; `allowedTools: []` gives `--permission-mode dontAsk --tools ""`; no grant gives
+none of them (the default permission profile, as before).
+
+**Test changes.** Four #561 assertions said `expect(args).not.toContain("--permission-mode")`. They guarded "no default
+permission profile (which can carry the bypass flag)". With `dontAsk` the flag is present by design, so they now assert
+`flagValue(args, "--permission-mode") === "dontAsk"` (still red if the default profile were used, and the bypass assertion is
+untouched). Files: `session-actions-argv.test.ts` (3), `oneshot-pty-tools.test.ts` (1). `oneshot-print-tools.test.ts` gained
+two assertions so print and pty are pinned to the same behaviour: `dontAsk` with a grant, no `--permission-mode` without one.
+
+**Version.** #560 is 2.2.338, so both bump scripts were run: plugin and marketplace now 2.2.339 (> #560).
+
+**Tests** (one `bun test` run, 17 files: `src/oneshot/`, `live-session-actions`, `pty-send-to-live`, `shutdown-memory-save`,
+`shutdown-sequence`, `stop-no-spawn`, `stop-pid-validation`, `memory-save-grant`, `oneshot-print-tools`, `oneshot-pty-tools`,
+`session-actions-argv`, `discord-classifier-isolation`, `skills-tuner/core/__tests__/llm`, `pty-process`, `pty-supervisor`,
+`config-shutdown-drain`, `pty-supervisor-mcp`): first run 340 pass / 5 fail. Four were the assertions above (fixed). The
+fifth, `pty-supervisor.test.ts` "non-glm model with no api leaves ANTHROPIC_AUTH_TOKEN unset", sees
+`ANTHROPIC_BASE_URL=http://127.0.0.1:8787` inherited from this shell; the file is 76 pass / 0 fail with the variable unset, and
+it failed the same way on its own before the assertion edits, so it is environmental. After the fixes the four edited files are
+21 pass / 0 fail, and `pty-supervisor.test.ts` is 76 / 0 with `env -u ANTHROPIC_BASE_URL`.
+Final run at the committed HEAD, same 17 targets with `env -u ANTHROPIC_BASE_URL`: exit 0, 345 pass / 0 fail
+(346 tests across 19 files; the one not counted as a pass is a skip, not a failure).
+
+**Lint / typecheck.** `bun run lint` (whole repo): exit 0, 1261 warnings (the 7 in the files I touched are all pre-existing
+`noNonNullAssertion` / `useOptionalChain` / `noUnusedVariables` lines that #548 already has). `bun run typecheck` ratchet:
+149 errors, baseline 149 (unchanged).
+
+**Fault injections after the rebase** (one site each; file restored from a backup and `cmp`-checked; first `(fail)` lines verbatim,
+timing dropped):
+
+| Rule | Fault | RED |
+|---|---|---|
+| busy-session (never resume a session a live process holds) | `actOnSession`: a `failed` live attempt falls through to the one-shot resume instead of returning | `(fail) actOnSession > does NOT fall back after a live attempt failed: a second process would race the session` and `(fail) actOnSession > busy past the timeout: ok:false with a clear detail and ZERO one-shot calls` (`Expected: false` / `Received: true`) |
+| bare-names vs scoped-rules split | `trustedToolFlags` puts the rules in `--tools` (`req.tools ?? req.allowedTools`) instead of the bare names | `(fail) buildPrintArgs tool flags (trusted-session) > without explicit tools, --tools is the unique bare names of the allowed entries` and `(fail) pty engine tool flags > a rule list without explicit tools derives unique bare names` |
+| `dontAsk` in the shared helper (new) | drop `--permission-mode dontAsk` from `trustedToolFlags` | `(fail) print engine with an explicit tool list only > does not fall back to the default permission profile (which can carry the bypass flag)`, `(fail) pty engine tool flags > allowedTools [] means no tools and NO default permission profile (no bypass flag)`, and 3 more |
+
+The older RED tables below were recorded before the rebase and refer to the same sites.
+
 ## Codex review of PR #561 (second review-fix pass)
 
 Two findings, both valid. Commits `70040f2a` and `3c25db40` on top of b5f5d282 (the tip pushed last time). #548 had no new commits, so no rebase was
