@@ -3,6 +3,50 @@
 Branch `feat/549-live-session-compact`, stacked on `povai/feat/548-oneshot-module` @ 0d636b6a
 (which is on `povai/main` d81bd579). Spec: `.planning/549-live-session/SPEC.md`.
 
+## Codex review of PR #561 (second review-fix pass)
+
+Two findings, both valid. Commits `70040f2a` and `3c25db40` on top of b5f5d282 (the tip pushed last time). #548 had no new commits, so no rebase was
+needed and the push is a plain fast-forward (no force). Version stays 2.2.338 (`povai/main` is 2.2.336, #548 is 2.2.337).
+
+Verification after this pass: the same 29 scoped files as the previous pass, `env -u ANTHROPIC_BASE_URL bun test ...`: **552 pass, 1 skip (opt-in e2e), 0 fail**
+(was 527). Whole-repo `bun run lint`: exit 0. Typecheck ratchet: `149 error(s), baseline 149`, unchanged.
+
+| Finding | Fix | Tests |
+|---|---|---|
+| **P1** `pid.ts`: `bun` anywhere in the command line made any unrelated Bun app look like the daemon, so `stop()` could SIGTERM/SIGKILL it | The daemon is identified by its entry point and subcommand: `.../src/index.ts start` (`src` a whole path component; `bun run /opt/claudeclaw/src/index.ts start --web`, `bun --watch src/index.ts start ...`) or `claudeclaw start`. When the process cwd is readable (`/proc`, else `lsof`) it must also equal the project directory after `realpath`: the daemon never `chdir`s and the PID file lives under the project. cwd unreadable -> the command shape alone decides; command unreadable -> trust the PID file, as before. `stopAll` passes each project's directory. SPEC decision 21 | `stop-pid-validation.test.ts`: `bun some-other-app.ts`, `bun run dev`, `bun run /srv/app/src/server.ts`, `src/index.ts serve`, no subcommand, `fake-src/index.ts start`, `index.tsx`, `claudeclaw-helper start` are NOT the daemon; six real daemon forms are; the right entry in another directory is not; a symlinked cwd is |
+| **P2** `shutdown-memory-save.ts`: the global PTY exits between the `liveKeys()` snapshot and the send -> `not-live` -> the save was recorded as skipped and lost | `not-live` on the global key runs `fallbackSave` once (no process holds the session, so no race); `failed` never falls back; agent keys never use it; no fallback available (bus runtime) -> skipped as before. SPEC decision 22 | `shutdown-memory-save.test.ts`, 7 new cases |
+
+The brief's second finding arrived garbled; I worked from the Codex comment text on the PR (`src/shutdown-memory-save.ts:109`), which matches the
+brief's test description (snapshot has global, send returns `not-live` -> fallback once; `failed` -> none).
+
+The real readers were also checked against a live child process, not only fakes: `ps -o command=` returned `sleep 20`, `lsof` returned the true cwd,
+and `decideStopTarget` classified it as not the daemon.
+
+**Fault injections** (one site each; file restored from a backup and `cmp`-checked; first `(fail)` shown)
+
+| Fault | RED |
+|---|---|
+| C1 command match back to `claudeclaw\|bun\|index.ts` | `(fail) decideStopTarget > what is NOT the daemon (a recycled PID) > "bun some-other-app.ts"` (10 failing) |
+| C2 drop the `start` requirement | `(fail) ... > "bun run src/index.ts serve"` and `... > "bun run src/index.ts"` |
+| C3 `src` need not be a whole path component | `(fail) ... > "node /srv/fake-src/index.ts start"` |
+| C4 no cwd check | `(fail) ... > the daemon's entry shape in a DIFFERENT directory is another project's app, not this daemon` (+1) |
+| C5 refuse when cwd is unreadable | `(fail) decideStopTarget > what IS the daemon > when the process cwd cannot be read, the command shape alone decides` |
+| C6 compare directories as strings only | `(fail) ... > a different string for the same directory (symlink) is still this project's daemon` |
+| C7 shim matches any `claudeclaw*` name | `(fail) ... > "claudeclaw-helper start"` |
+| D1 no fallback on `not-live` | `(fail) the global PTY disappears between the snapshot and the send (Codex P2) > snapshot has global, send says not-live -> the fallback runs exactly once` (+2) |
+| D2 fallback for any key | `(fail) ... > an AGENT session that is not-live never uses the global fallback` |
+| D3 `failed` also falls back | `(fail) ... > send says failed (the live turn was attempted) -> NO fallback: a process may still hold the session` |
+| D4 fallback gets twice the budget | `(fail) ... > the fallback gets only the time that is left, never more than the budget` |
+| D5 fallback runs twice | `(fail) ... > snapshot has global, send says not-live -> the fallback runs exactly once` (+1) |
+| D6 also recorded as skipped | same test |
+
+Two honest notes. My first C-series run was a harness bug (arguments off by one, so every injection was refused by its own safety assert and nothing was
+modified); I discarded it and re-ran. C6 first survived, because my "resolves symlinks" test used directories that do not exist and so could not reach
+the `realpath` branch; I replaced it with a real symlink test and re-injected, and it now goes red.
+
+**Residual risk.** A stale PID recycled by an unrelated process launched as `.../src/index.ts start` from this very project directory is
+indistinguishable from the daemon by command line and cwd and would still pass. With the cwd unreadable, any `.../src/index.ts start` passes.
+
 ## Review-fix pass (Codex deep review + security review; no CRITICAL)
 
 Rebased onto the **final** #548 (`povai/feat/548-oneshot-module` @ 7898a063, PR #560), which already had stdin-only untrusted prompts and
@@ -18,7 +62,7 @@ The old tip stays recoverable from this machine's reflog. `git log povai/feat/54
 | 2 | MEDIUM | `allowedTools: ["Write"]` was unscoped | `memoryFileGrant`: `--tools Read,Write`, `--allowedTools Edit(//<abs memPath>),Read(//<abs memPath>)`. **The brief's `Write(//path)` is wrong**: the docs say path rules are checked as `Edit(path)`/`Read(path)` only and a `Write(path)` rule is accepted but never consulted (verified at code.claude.com/docs/en/permissions.md, 2026-10-18). A path with glob/paren/comma/newline characters fails the save closed | `memory-save-grant.test.ts`, `session-actions-argv.test.ts` |
 | 3 | MEDIUM | Rotation summary did not need Write (the daemon writes the file) | `allowedTools: []`. **Deliberate deviation from the issue text (`["Write"]`); narrower and safer** | `session-actions-argv.test.ts`, `live-session-actions.test.ts` |
 | 4 | MEDIUM | The live path keeps the live session's full permissions | Not changed, as instructed. Documented at `actOnSession` and in SPEC decision 20: `allowedTools`/`tools` restrict the one-shot fallback only | comment only |
-| 5 | LOW | `stop` could signal pid 0 / -1 / a recycled PID | `parseDaemonPid` (digits only, 1..2^22), `isPidAlive` false for `<= 0`/non-integers, `decideStopTarget` checks `ps -o command= -p` for `claudeclaw`/`bun`/`index.ts`; a non-daemon is treated as "no daemon" and never signalled; unreadable command line -> old behaviour. `stopAll` likewise | `stop-pid-validation.test.ts` (21) |
+| 5 | LOW | `stop` could signal pid 0 / -1 / a recycled PID | `parseDaemonPid` (digits only, 1..2^22), `isPidAlive` false for `<= 0`/non-integers, `decideStopTarget` checks `ps -o command= -p` for the daemon's entry point and cwd (it first matched any `bun`; see the Codex section above); a non-daemon is treated as "no daemon" and never signalled; unreadable command line -> old behaviour. `stopAll` likewise | `stop-pid-validation.test.ts` (21) |
 | 6 | LOW | Compact fallback could run with the bypass flag | `allowedTools: []` | `session-actions-argv.test.ts` |
 | sec | MEDIUM | Automated security review of the pushed commit: #548's `pty` engine (`runOnceOnPty`) still joined `allowedTools` into `--tools` and treated `[]` as a grant of one empty entry, so scoped rules would break (or fail open) when a route is mapped to `pty`; `docs/oneshot-engines.md` maps `memory.save.stop` to `pty` | One shared `trustedToolFlags` in `isolation.ts`, used by `print` **and** `pty`; `[]` there now also means no tools and no default profile | `oneshot-pty-tools.test.ts` (5), incl. "matches the print engine flag for flag" |
 

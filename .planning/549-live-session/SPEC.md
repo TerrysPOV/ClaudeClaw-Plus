@@ -174,13 +174,19 @@ read-only "is this key live and idle" accessor. PTY session keys are `thread:<id
     `parseDaemonPid`: plain decimal digits, an integer in [1, 2^22]; `0`, `-1`, `1.5`, `1e3`,
     hex, garbage and empty are rejected with exit 1, the file left alone and nothing signalled.
     `isPidAlive` is false for non-integers and `<= 0` (`kill(0, 0)` / `kill(-1, 0)` otherwise
-    "succeed"). `decideStopTarget` then reads `ps -o command= -p <pid>`: a live process whose
-    command is not `claudeclaw` / `bun` / `index.ts` is a recycled PID and is treated as "no
-    daemon" (stale-file path, one-shot save, never signalled). Unreadable command line -> trust
+    "succeed"). `decideStopTarget` then reads `ps -o command= -p <pid>` and requires the daemon's shape: `<anything>/src/index.ts start ...` (`src` a whole path component, `start` directly after the entry; `bun run /opt/claudeclaw/src/index.ts start --web`, `bun --watch src/index.ts start ...`) or `claudeclaw start`. A bare `bun` is not enough (Codex P1 on PR #561: any unrelated Bun app inheriting a stale PID would have been signalled). When the process's cwd is readable (`/proc/<pid>/cwd`, else `lsof`), it must also be this project's directory, compared after `realpath`: the PID file lives under the project and the daemon never calls `chdir`, so the same entry script running elsewhere is another project's app. cwd unreadable -> the command shape alone decides. A live process that fails either test is a recycled PID and is treated as "no daemon" (stale-file path, one-shot save, never signalled). Unreadable command line -> trust
     the PID file, as before. **PID 1** (brief: reject pid <= 1) is refused unless the command
     line positively looks like the daemon, because #526 documents that in a container the
     daemon is PID 1; on a host PID 1 is init, whose command line fails the check. `stopAll`
     applies the same rules per project.
+22. **Global memory save falls back when the PTY is gone at send time (Codex P2 on PR #561).**
+    `saveMemoryAtShutdown` snapshots `liveKeys()` and sends later; the global process can exit or finish
+    retiring in between. `sendToLiveSession` then returns `not-live`, which by decision 1 means no process
+    holds the session, so the one-shot resume cannot race it: the global job now runs `fallbackSave` (once,
+    with the time left) instead of recording a lost save. `failed` still never falls back (a process may
+    still be writing the transcript), agent keys never use it (they have no one-shot save), and with no
+    `fallbackSave` (bus runtime) it is recorded as skipped, as before. The result is reported as
+    `global (one-shot)`.
 
 ## Key files
 
