@@ -99,6 +99,10 @@ describe("decideStopTarget", () => {
       "bun run src/index.ts", // package.json "start"
       "bun run src/index.ts ", // trailing whitespace from ps
       "bun run src/index.ts serve", // not a subcommand, so it starts the daemon too
+      "/opt/claudeclaw/src/index.ts --web", // shebang exec: the entry is argv0
+      "src/index.ts",
+      "bun --watch src/index.ts start --web --replace-existing",
+      "/usr/local/bin/bun run /opt/claudeclaw/src/index.ts --web",
       "bun run src/index.ts start --prompt hi", // unchanged
       "bun /usr/local/bin/claudeclaw start", // shim behind an interpreter
       "/usr/bin/env bun /usr/local/bin/claudeclaw start --web",
@@ -121,6 +125,12 @@ describe("decideStopTarget", () => {
       "bun run /srv/app/src/server.ts",
       "bun run dev",
       "/usr/bin/vim notes.txt",
+      "vim src/index.ts", // the path merely appears in the command line
+      "cat /opt/claudeclaw/src/index.ts",
+      "rg foo src/index.ts",
+      "/usr/bin/vim /opt/claudeclaw/src/index.ts", // a space in argv0's path is not allowed
+      "/usr/bin/env vim /opt/claudeclaw/src/index.ts",
+      "bun test src/index.ts", // an interpreter, but not the entry's argv
       "bun run src/index.ts --stop", // right entry, a subcommand that is not the daemon
       "bun run src/index.ts --stop-all",
       "bun run src/index.ts status",

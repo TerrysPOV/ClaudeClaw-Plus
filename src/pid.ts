@@ -482,17 +482,26 @@ function readProcCmdlineFile(pid: number): string | null {
  *
  * So the entry (or shim) must be followed by the end of the line or by a first argument
  * that is NOT a non-daemon subcommand (`NON_DAEMON_SUBCOMMANDS`, mirroring src/index.ts).
- * A bare `bun` is NOT enough: any unrelated Bun app that inherits a stale PID would
- * otherwise be signalled. `src` must be a whole path component (so `fake-src/index.ts`
- * does not match) and the entry must be exactly `index.ts` (`src/index.tsx start` does
- * not match). `(?=\S)` makes `\s+` take the whole gap, so extra spaces cannot be
+ * Both are anchored at the start of the command line: the entry/shim is argv0 (a shebang
+ * exec) or follows `bun` / `node` / `env` (with flags, or `run`). A bare `bun` is NOT
+ * enough, and neither is the mere appearance of the path: `vim src/index.ts`,
+ * `cat /opt/claudeclaw/src/index.ts` and `rg foo src/index.ts` in the project's cwd are
+ * not the daemon, and an unrelated process that inherits a stale PID must not be
+ * signalled. `src` must be a whole path component (so `fake-src/index.ts` does not
+ * match) and the entry must be exactly `index.ts` (`src/index.tsx start` does not
+ * match). `(?=\S)` makes `\s+` take the whole gap, so extra spaces cannot be
  * backtracked into to hide a subcommand.
  */
 const NON_DAEMON_SUBCOMMANDS =
   "(?:--help|-h|help|--stop-all|--stop|--clear|status|telegram|discord|slack|send|fire)(?:\\s|$)";
 const DAEMON_ARGS = `(?:\\s*$|\\s+(?=\\S)(?!${NON_DAEMON_SUBCOMMANDS}))`;
 const INTERPRETER = "(?:\\S*\\/)?(?:env|bun|node)(?:\\s+(?:-\\S+|run))*\\s+";
-const DAEMON_ENTRY = new RegExp(`(?:^|[\\s/])src\\/index\\.ts${DAEMON_ARGS}`);
+// Run directly (a shebang exec, argv0), or behind an interpreter. Only behind one may the
+// absolute path hold spaces (`bun run /opt/my claw/src/index.ts start`): argv0 is a single
+// token, and letting `/usr/bin/vim /x/src/index.ts` span its space would match it.
+const DAEMON_ENTRY = new RegExp(
+  `^(?:(?:${INTERPRETER})+(?:\\/[^\\n]*\\/|\\S*\\/)?|(?:\\S*\\/)?)src\\/index\\.ts${DAEMON_ARGS}`,
+);
 const DAEMON_SHIM = new RegExp(`^(?:${INTERPRETER})*(?:\\S*\\/)?claudeclaw${DAEMON_ARGS}`);
 
 /** The working directory of `pid` (Linux `/proc`, else `lsof`), or null if unreadable. */
