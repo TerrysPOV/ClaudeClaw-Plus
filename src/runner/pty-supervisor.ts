@@ -506,6 +506,10 @@ interface PtyEntry {
   lastSpawnedAt: number;
   /** #546: see `PtyRunScope`. Fixed at entry creation. */
   scope: PtyRunScope;
+  /** Callers currently holding or queued on `lock` (#549). The lock is a promise
+   *  chain and cannot be inspected synchronously; `sendToLiveSession` needs to
+   *  know "idle" without queueing behind a turn. Moves only through `installLock`. */
+  activeTurns: number;
 }
 
 interface SupervisorState {
@@ -877,11 +881,7 @@ async function runOnAdmittedEntry(
   opts: Parameters<typeof runOnPty>[2],
   supervisorOpts: SupervisorOptions,
 ): Promise<RunOnPtyResult> {
-  const previousLock = entry.lock;
-  let release: () => void = () => {};
-  entry.lock = new Promise<void>((resolve) => {
-    release = resolve;
-  });
+  const { previousLock, release } = installLock(entry);
   // The lock is a chain: each caller captures its predecessor, installs its own,
   // awaits the predecessor, and releases in `finally`. Giving up on the wait is
   // therefore delicate — releasing immediately would hand the chain to the next
@@ -920,6 +920,163 @@ async function runOnAdmittedEntry(
   } finally {
     if (releaseOnExit) release();
   }
+}
+
+/**
+ * Take the per-key serial lock: returns the predecessor to wait on and a
+ * `release` that frees the lock exactly once (a second call is a no-op), keeping
+ * `entry.activeTurns` in step with the chain.
+ */
+function installLock(entry: PtyEntry): { previousLock: Promise<void>; release: () => void } {
+  const previousLock = entry.lock;
+  let resolveLock: () => void = () => {};
+  entry.lock = new Promise<void>((resolve) => {
+    resolveLock = resolve;
+  });
+  entry.activeTurns += 1;
+  let released = false;
+  return {
+    previousLock,
+    release: () => {
+      if (released) return;
+      released = true;
+      entry.activeTurns -= 1;
+      resolveLock();
+    },
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Live-session send (#549).
+
+/** Why `sendToLiveSession` did not write anything. */
+export type NotLiveReason =
+  | "no-entry"
+  | "no-process"
+  | "busy"
+  | "retiring"
+  | "ephemeral"
+  | "shutting-down";
+
+/**
+ * Outcome of `sendToLiveSession`. `not-live` means nothing was written and the
+ * caller may fall back to a one-shot; `failed` means the turn WAS attempted, so a
+ * fallback process on the same transcript would race a session that may still be
+ * writing it.
+ */
+export type LiveSendResult =
+  | { status: "sent"; text: string; sessionId: string; cleanBoundary: boolean }
+  | { status: "not-live"; reason: NotLiveReason }
+  | { status: "failed"; error: string; timedOut: boolean; aborted: boolean };
+
+class LiveSendAborted extends Error {
+  constructor() {
+    super("live send aborted");
+    this.name = "LiveSendAborted";
+  }
+}
+
+function liveRefusal(entry: PtyEntry | undefined): NotLiveReason | null {
+  if (state.shuttingDown) return "shutting-down";
+  if (!entry) return "no-entry";
+  if (entry.retiring) return "retiring";
+  if (entry.scope.ephemeral) return "ephemeral";
+  if (!entry.pty || entry.spawnInFlight || !entry.pty.isAlive()) return "no-process";
+  if (entry.activeTurns > 0) return "busy";
+  return null;
+}
+
+/** Resolve with `p`, or reject with `LiveSendAborted` as soon as `signal` fires. */
+function raceAbort<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return p;
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(new LiveSendAborted());
+    signal.addEventListener("abort", onAbort, { once: true });
+    p.then(
+      (v) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(v);
+      },
+      (e) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(e);
+      },
+    );
+  });
+}
+
+/**
+ * Write `text` as one turn into the live, idle PTY for `sessionKey` and wait for
+ * its end of turn (#549). Used for `/compact`, memory saves and the rotation
+ * summary, which used to resume the same session in a second `claude -p`.
+ *
+ * Never spawns and never queues: no entry, no process, a turn already running, an
+ * entry being retired or a one-shot entry all return `not-live`. While the turn
+ * runs the entry's lock is held, so a user message arriving meanwhile waits behind
+ * it instead of interleaving on the PTY. An abort stops the WAIT only; the lock is
+ * kept until the turn really ends. A turn timeout retires the entry (the sentinel
+ * may be left in claude's input buffer); the next `runOnPty` on the key resumes
+ * from disk.
+ */
+export async function sendToLiveSession(
+  sessionKey: string,
+  text: string,
+  opts: { timeoutMs: number; signal?: AbortSignal },
+): Promise<LiveSendResult> {
+  const entry = state.ptys.get(sessionKey);
+  const refusal = liveRefusal(entry);
+  if (refusal || !entry?.pty) return { status: "not-live", reason: refusal ?? "no-process" };
+  if (opts.signal?.aborted) {
+    return { status: "failed", error: "aborted before send", timedOut: false, aborted: true };
+  }
+
+  const pty = entry.pty;
+  const { release } = installLock(entry);
+  entry.lastAccessedAt = _clock();
+  let turn: Promise<PtyTurnResult>;
+  try {
+    turn = pty.runTurn(text, { timeoutMs: opts.timeoutMs });
+  } catch (err) {
+    release();
+    return { status: "failed", error: (err as Error).message, timedOut: false, aborted: false };
+  }
+  // Released when the turn settles, whoever stopped waiting for it.
+  turn.then(release, release);
+
+  try {
+    const result = await raceAbort(turn, opts.signal);
+    try {
+      await persistSessionId(entry, result.sessionId);
+    } catch {
+      // Best-effort, as on the `runOnPty` path: the turn itself succeeded.
+    }
+    return {
+      status: "sent",
+      text: result.text,
+      sessionId: result.sessionId,
+      cleanBoundary: result.cleanBoundary,
+    };
+  } catch (err) {
+    if (err instanceof LiveSendAborted) {
+      return { status: "failed", error: "aborted", timedOut: false, aborted: true };
+    }
+    const timedOut = err instanceof PtyTurnTimeoutError;
+    if (timedOut) await retireEntry(entry);
+    return { status: "failed", error: (err as Error).message, timedOut, aborted: false };
+  }
+}
+
+/**
+ * Keys of the live, non-ephemeral entries (sorted): the sessions a shutdown
+ * should ask to save their memory (#549).
+ */
+export function liveSessionKeys(): string[] {
+  const keys: string[] = [];
+  for (const entry of state.ptys.values()) {
+    if (entry.scope.ephemeral || entry.retiring || !entry.pty?.isAlive()) continue;
+    keys.push(entry.sessionKey);
+  }
+  return keys.sort();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -975,6 +1132,7 @@ function getOrCreateEntry(
     // Stamped at every (re)spawn site below. 0 until the first spawn lands —
     // `reapIdle` treats that as "still admitting, leave alone".
     lastSpawnedAt: 0,
+    activeTurns: 0,
     scope: {
       sessionStore: opts.sessionStore,
       ephemeral: opts.ephemeral,
