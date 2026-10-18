@@ -6,9 +6,6 @@ export interface OneShotSettings {
   routes: Record<string, string>;
 }
 
-// No user-facing override: only a reviewed interactive isolation spike can
-// enable this. HTTP engines can advertise isolation without this restriction.
-export const PTY_ISOLATION_SPIKE_GREEN = false;
 export const RESUME_ROUTES = [
   "compact",
   "memory.save.precompact",
@@ -21,6 +18,11 @@ export const UNTRUSTED_ROUTES = [
   "tuner.judge",
   "memory.recall",
 ];
+
+/** Routes whose prompt carries text from outside the operator's trust boundary. */
+export function isUntrustedRoute(route: string): boolean {
+  return route.startsWith("tuner.") || UNTRUSTED_ROUTES.includes(route);
+}
 
 export function resolveOneShotEngine(settings: OneShotSettings, route: string): string {
   return settings.routes[route] ?? settings.routes[`${route.split(".")[0]}.*`] ?? settings.default;
@@ -36,9 +38,9 @@ export function validateRouteEngine(
   if (!engine) throw new Error(`Unknown oneShot engine '${id}' for route '${route}'`);
   if (resume && !engine.caps.resume)
     throw new Error(`oneShot route '${route}' requires resume; engine '${id}' cannot resume`);
-  if (untrusted && (!engine.caps.isolation || (id === "pty" && !PTY_ISOLATION_SPIKE_GREEN))) {
+  if (untrusted && !engine.caps.isolation) {
     throw new Error(
-      `oneShot untrusted route '${route}' cannot use '${id}': isolation spike is not green`,
+      `oneShot untrusted route '${route}' cannot use '${id}': engine does not advertise isolation (spike is not green)`,
     );
   }
 }
@@ -62,12 +64,7 @@ export function parseOneShotSettings(raw: unknown): OneShotSettings {
   }
   for (const [route, id] of Object.entries(routes)) {
     if (typeof id !== "string") throw new Error(`oneShot.routes.${route} must be an engine id`);
-    validateRouteEngine(
-      id,
-      route,
-      route.startsWith("tuner.") || UNTRUSTED_ROUTES.includes(route),
-      RESUME_ROUTES.includes(route),
-    );
+    validateRouteEngine(id, route, isUntrustedRoute(route), RESUME_ROUTES.includes(route));
   }
   const settings: OneShotSettings = {
     default: defaultId,

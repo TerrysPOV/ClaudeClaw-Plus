@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { _setSettingsFileForTests, loadSettings, reloadSettings } from "../config.js";
 import { runOneShot, type OneShotRequest } from "./engine.js";
 import { engines } from "./registry.js";
-import { parseOneShotSettings } from "./config.js";
+import { UNTRUSTED_ROUTES, parseOneShotSettings } from "./config.js";
 import { UNTRUSTED_CLAUDE_ARGS } from "./isolation.js";
 import { buildPrintArgs, withPrintRuntime } from "./print.js";
 import { __buildClaudeArgsForTests } from "../runner/pty-process.js";
@@ -25,6 +25,46 @@ const req: OneShotRequest = {
   isolation: "untrusted",
   timeoutMs: 1000,
 };
+// Trusted calls must use a route that does not carry untrusted text.
+const trustedReq: OneShotRequest = { ...req, route: "compact", isolation: "trusted-session" };
+const UNTRUSTED_SAMPLE_ROUTES = [...UNTRUSTED_ROUTES, "tuner.propose"];
+const throwingSpawn = (() => {
+  throw new Error("unexpected spawn");
+}) as typeof spawn;
+
+/** A print child that records argv, cwd and stdin, then closes 0 with stdout "ok". */
+function recordingSpawn(record: { args: string[]; input: string; cwd: string }): typeof spawn {
+  return ((_cmd: string, args: string[], opts: { cwd: string }) => {
+    record.args = args;
+    record.cwd = opts.cwd;
+    const child = Object.assign(new EventEmitter(), {
+      stdin: Object.assign(new EventEmitter(), {
+        end: (text: string) => {
+          record.input = text;
+        },
+      }),
+      stdout: new EventEmitter(),
+      stderr: new EventEmitter(),
+    });
+    queueMicrotask(() => {
+      child.stdout.emit("data", Buffer.from("ok"));
+      child.emit("close", 0);
+    });
+    return child;
+  }) as unknown as typeof spawn;
+}
+
+/** The PTY engine cannot take untrusted calls; open it only to exercise cleanup. */
+async function withPtyIsolation<T>(call: () => Promise<T>): Promise<T> {
+  const caps = engines.get("pty")!.caps;
+  const previous = caps.isolation;
+  caps.isolation = true;
+  try {
+    return await call();
+  } finally {
+    caps.isolation = previous;
+  }
+}
 const security = { level: "moderate" as const, allowedTools: [], disallowedTools: [] };
 let configDir: string;
 beforeEach(async () => {
@@ -46,20 +86,6 @@ afterEach(() => {
 });
 
 describe("one-shot isolation contract", () => {
-  it("rejects cwd on untrusted calls", async () => {
-    await withPrintRuntime(
-      {
-        spawn: (() => {
-          throw new Error("unexpected spawn");
-        }) as typeof spawn,
-      },
-      async () => {
-        await expect(runOneShot({ ...req, cwd: configDir } as OneShotRequest)).rejects.toThrow(
-          "untrusted calls cannot specify",
-        );
-      },
-    );
-  });
   it("trusted print honours the requested cwd", async () => {
     let actualCwd = "";
     const spawnFn = ((_cmd: string, _args: string[], opts: { cwd: string }) => {
@@ -72,7 +98,7 @@ describe("one-shot isolation contract", () => {
       return child;
     }) as unknown as typeof spawn;
     await withPrintRuntime({ spawn: spawnFn }, () =>
-      runOneShot({ ...req, isolation: "trusted-session", cwd: configDir } as OneShotRequest),
+      runOneShot({ ...trustedReq, cwd: configDir } as OneShotRequest),
     );
     expect(actualCwd).toBe(configDir);
     expect(existsSync(configDir)).toBe(true);
@@ -93,7 +119,7 @@ describe("one-shot isolation contract", () => {
     });
     await engines
       .get("pty")!
-      .run({ ...req, isolation: "trusted-session", cwd: configDir } as OneShotRequest);
+      .run({ ...trustedReq, cwd: configDir } as OneShotRequest);
     expect(actualCwd).toBe(configDir);
     expect(existsSync(configDir)).toBe(true);
   });
@@ -113,12 +139,47 @@ describe("one-shot isolation contract", () => {
         },
       );
     });
-    it(`${engine.id}: rejects an already aborted request`, async () => {
+    it(`${engine.id}: rejects an already aborted request with AbortError before spawning`, async () => {
       const controller = new AbortController();
       controller.abort();
-      await expect(
-        engine.run({ ...req, isolation: "trusted-session", signal: controller.signal }),
-      ).rejects.toThrow();
+      let spawned = 0;
+      // Both engines get a spawn that would succeed, so a dropped abort check
+      // shows up as a resolved call instead of an unrelated "unexpected spawn".
+      injectSpawnPty(async () => {
+        spawned++;
+        return {
+          runTurn: async () => ({ text: "ok", sessionId: "s", bytesCaptured: 2, cleanBoundary: true }),
+          dispose: async () => {},
+        } as never;
+      });
+      const printSpawn = recordingSpawn({ args: [], input: "", cwd: "" });
+      const countingSpawn = ((...args: Parameters<typeof spawn>) => {
+        spawned++;
+        return printSpawn(...args);
+      }) as typeof spawn;
+      const error = await withPrintRuntime({ spawn: countingSpawn }, () =>
+        engine.run({ ...trustedReq, signal: controller.signal }),
+      ).then(
+        () => undefined,
+        (caught: unknown) => caught,
+      );
+      expect((error as { name?: string } | undefined)?.name).toBe("AbortError");
+      expect(spawned).toBe(0);
+    });
+    it(`${engine.id}: rejects cwd on untrusted calls`, async () => {
+      await withPrintRuntime({ spawn: throwingSpawn }, async () => {
+        await expect(engine.run({ ...req, cwd: configDir } as OneShotRequest)).rejects.toThrow(
+          "untrusted calls cannot specify",
+        );
+      });
+    });
+    it(`${engine.id}: rejects trusted-session calls on routes carrying untrusted text`, async () => {
+      await withPrintRuntime({ spawn: throwingSpawn }, async () => {
+        for (const route of UNTRUSTED_SAMPLE_ROUTES)
+          await expect(engine.run({ ...trustedReq, route })).rejects.toThrow(
+            'requires isolation "untrusted"',
+          );
+      });
     });
     it(`${engine.id}: rejects untrusted resume and tools before executing`, async () => {
       for (const extra of [{ resumeSessionId: "x" }, { allowedTools: [] }]) {
@@ -135,6 +196,12 @@ describe("one-shot isolation contract", () => {
       }
     });
   }
+  it("dispatcher rejects trusted-session on untrusted-text routes before routing", async () => {
+    for (const route of UNTRUSTED_SAMPLE_ROUTES)
+      await expect(runOneShot({ ...trustedReq, route })).rejects.toThrow(
+        'requires isolation "untrusted"',
+      );
+  });
   it("dispatcher rejects missing isolation and untrusted session privileges", async () => {
     await expect(
       runOneShot({ ...req, isolation: undefined } as unknown as OneShotRequest),
@@ -155,21 +222,27 @@ describe("one-shot isolation contract", () => {
       },
     );
   });
-  for (const id of ["print", "pty"]) {
-    it(`${id}: argv contains canonical isolation sequence without privileged flags`, () => {
-      const args =
-        id === "print"
-          ? buildPrintArgs(req)
-          : __buildClaudeArgsForTests({
-              sessionId: "hostile-session",
-              cwd: "/tmp",
-              env: {},
-              security,
-              isolation: "untrusted",
-              securityArgs: ["--dangerously-skip-permissions"],
-              mcpConfigPath: "/secret",
-              appendSystemPrompt: "persona",
-            });
+  // One argv builder per registered engine; an engine without one fails below,
+  // so a new engine cannot join the registry without isolation-argv coverage.
+  const argvBuilders: Record<string, () => string[]> = {
+    print: () => buildPrintArgs(req),
+    pty: () =>
+      __buildClaudeArgsForTests({
+        sessionId: "hostile-session",
+        cwd: "/tmp",
+        env: {},
+        security,
+        isolation: "untrusted",
+        securityArgs: ["--dangerously-skip-permissions"],
+        mcpConfigPath: "/secret",
+        appendSystemPrompt: "persona",
+      }),
+  };
+  for (const engine of engines.values()) {
+    it(`${engine.id}: argv contains canonical isolation sequence without privileged flags`, () => {
+      const build = argvBuilders[engine.id];
+      expect(build).toBeDefined();
+      const args = build!();
       const start = args.indexOf("--tools");
       expect(args.slice(start, start + UNTRUSTED_CLAUDE_ARGS.length)).toEqual([
         ...UNTRUSTED_CLAUDE_ARGS,
@@ -184,6 +257,19 @@ describe("one-shot isolation contract", () => {
         expect(args).not.toContain(flag);
     });
   }
+  it("untrusted prompts go to stdin, never argv, even when a flag-shaped prompt asks for one", async () => {
+    const prompt = '--settings={"x":1}';
+    const hostile = { ...req, prompt };
+    const direct = buildPrintArgs(hostile);
+    expect(direct).not.toContain(prompt);
+    expect(direct.some((arg) => arg.startsWith("--settings"))).toBe(false);
+    expect(direct.slice(0, 3)).toEqual(["--print", "--output-format", "text"]);
+    const record = { args: [] as string[], input: "", cwd: "" };
+    await withPrintRuntime({ spawn: recordingSpawn(record) }, () => runOneShot(hostile));
+    expect(record.args).not.toContain(prompt);
+    expect(record.args.some((arg) => arg.includes("--settings"))).toBe(false);
+    expect(record.input).toBe(prompt);
+  });
   it("keeps the Python recall isolation flags in parity", () => {
     const source = readFileSync(
       new URL("../../tools/memory-search/memory_search/recall.py", import.meta.url),
@@ -199,6 +285,7 @@ describe("one-shot isolation contract", () => {
         cwd = opts.cwd;
         expect(readdirSync(cwd)).toEqual([]);
         const child = Object.assign(new EventEmitter(), {
+          stdin: Object.assign(new EventEmitter(), { end: () => {} }),
           stdout: new EventEmitter(),
           stderr: new EventEmitter(),
         });
@@ -237,7 +324,7 @@ describe("one-shot isolation contract", () => {
     });
     const result = await engines
       .get("pty")!
-      .run({ ...req, prompt: "hello", isolation: "trusted-session", resumeSessionId: "resume-me" });
+      .run({ ...trustedReq, prompt: "hello", resumeSessionId: "resume-me" });
     expect(result.text).toBe("done");
     expect(disposed).toBe(1);
     expect(snapshotSupervisor().ptys.length).toBe(before);
@@ -258,7 +345,7 @@ describe("one-shot isolation contract", () => {
         }) as never,
     );
     await expect(
-      engines.get("pty")!.run({ ...req, isolation: "trusted-session", timeoutMs: 30 }),
+      engines.get("pty")!.run({ ...trustedReq, timeoutMs: 30 }),
     ).rejects.toThrow("timed out");
     expect(started).toBe(true);
     expect(disposed).toBe(1);
@@ -274,7 +361,7 @@ describe("one-shot isolation contract", () => {
       });
     });
     await expect(
-      engines.get("pty")!.run({ ...req, isolation: "trusted-session", timeoutMs: 30 }),
+      engines.get("pty")!.run({ ...trustedReq, timeoutMs: 30 }),
     ).rejects.toThrow("timed out");
     expect(spawned).toBe(true);
     release({
@@ -288,12 +375,53 @@ describe("one-shot isolation contract", () => {
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(disposed).toBe(1);
   });
+  describe("untrusted PTY temporary cwd", () => {
+    it("is removed when the turn never settles", async () => {
+      let cwd = "";
+      injectSpawnPty(async (opts) => {
+        cwd = opts.cwd;
+        expect(existsSync(cwd)).toBe(true);
+        return { runTurn: () => new Promise(() => {}), dispose: async () => {} } as never;
+      });
+      await withPtyIsolation(() =>
+        expect(engines.get("pty")!.run({ ...req, timeoutMs: 30 })).rejects.toThrow("timed out"),
+      );
+      expect(cwd).not.toBe("");
+      expect(existsSync(cwd)).toBe(false);
+    });
+    it("is removed when the spawn never lands", async () => {
+      let cwd = "";
+      injectSpawnPty((opts) => {
+        cwd = opts.cwd;
+        return new Promise(() => {});
+      });
+      await withPtyIsolation(() =>
+        expect(engines.get("pty")!.run({ ...req, timeoutMs: 30 })).rejects.toThrow("timed out"),
+      );
+      expect(cwd).not.toBe("");
+      expect(existsSync(cwd)).toBe(false);
+    });
+    it("is removed after a normal turn", async () => {
+      let cwd = "";
+      injectSpawnPty(async (opts) => {
+        cwd = opts.cwd;
+        return {
+          runTurn: async () => ({ text: "ok", sessionId: "s", bytesCaptured: 2, cleanBoundary: true }),
+          dispose: async () => {},
+        } as never;
+      });
+      const result = await withPtyIsolation(() => engines.get("pty")!.run(req));
+      expect(result.text).toBe("ok");
+      expect(existsSync(cwd)).toBe(false);
+    });
+  });
   it("print deadline terminates the child and removes cwd", async () => {
     let cwd = "";
     let killed = false;
     const spawnFn = ((_cmd: string, _args: string[], opts: { cwd: string }) => {
       cwd = opts.cwd;
       const child = Object.assign(new EventEmitter(), {
+        stdin: Object.assign(new EventEmitter(), { end: () => {} }),
         stdout: new EventEmitter(),
         stderr: new EventEmitter(),
         kill: () => {
@@ -356,6 +484,7 @@ describe("one-shot configuration", () => {
       const spawnFn = (() => {
         spawned++;
         const child = Object.assign(new EventEmitter(), {
+          stdin: Object.assign(new EventEmitter(), { end: () => {} }),
           stdout: new EventEmitter(),
           stderr: new EventEmitter(),
         });
@@ -455,6 +584,27 @@ describe("one-shot configuration", () => {
     it(`rejects untrusted PTY before the isolation spike: ${JSON.stringify(settings)}`, () =>
       expect(() => parseOneShotSettings(settings)).toThrow("spike"));
   }
+  it("the PTY engine does not advertise isolation until the spike is green", () =>
+    expect(engines.get("pty")!.caps.isolation).toBe(false));
+  it("rejects untrusted routes on any engine without the isolation capability", () => {
+    engines.set("noiso", {
+      id: "noiso",
+      caps: { resume: true, tools: true, isolation: false },
+      run: async () => {
+        throw new Error("unused");
+      },
+    });
+    try {
+      expect(() => parseOneShotSettings({ routes: { "memory.recall": "noiso" } })).toThrow(
+        "isolation",
+      );
+      expect(() => parseOneShotSettings({ default: "noiso" })).toThrow("isolation");
+      // Trusted routes are unaffected by the capability.
+      expect(parseOneShotSettings({ routes: { compact: "noiso" } }).routes.compact).toBe("noiso");
+    } finally {
+      engines.delete("noiso");
+    }
+  });
   it("rejects unknown engines", () =>
     expect(() => parseOneShotSettings({ default: "missing" })).toThrow("Unknown"));
   it("accepts a PTY default with explicit print overrides for untrusted routes", () => {

@@ -4,13 +4,12 @@ import { readdirSync } from "node:fs";
 import { runOneShot } from "./engine.js";
 import { withPrintRuntime } from "./print.js";
 import { engines } from "./registry.js";
-import { PTY_ISOLATION_SPIKE_GREEN } from "./config.js";
 
 // Explicit opt-in: consumes the operator's Claude subscription. PTY remains
 // excluded until the separate interactive isolation spike is reviewed green.
 describe.skipIf(process.env.ONESHOT_E2E !== "1")("one-shot adversarial e2e", () => {
   for (const engine of engines.values()) {
-    if (engine.id === "pty" && !PTY_ISOLATION_SPIKE_GREEN) continue;
+    if (!engine.caps.isolation) continue;
     it(`${engine.id}: cannot create a canary or invoke tools`, async () => {
       expect(engine.id).toBe("print");
       const before = new Set(

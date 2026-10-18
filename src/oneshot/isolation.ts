@@ -1,3 +1,5 @@
+import { isUntrustedRoute } from "./config.js";
+
 /** Single Claude CLI isolation policy for calls containing untrusted text. */
 export const UNTRUSTED_CLAUDE_ARGS = [
   "--tools",
@@ -13,6 +15,11 @@ export const UNTRUSTED_CLAUDE_ARGS = [
 export function validateIsolation(req: import("./engine.js").OneShotRequest): void {
   if (req.isolation !== "untrusted" && req.isolation !== "trusted-session")
     throw new Error("oneShot isolation is required");
+  if (isUntrustedRoute(req.route) && req.isolation !== "untrusted") {
+    throw new Error(
+      `oneShot route '${req.route}' carries untrusted text and requires isolation "untrusted"`,
+    );
+  }
   if (
     req.isolation === "untrusted" &&
     (req.resumeSessionId !== undefined || req.allowedTools !== undefined || req.cwd !== undefined)

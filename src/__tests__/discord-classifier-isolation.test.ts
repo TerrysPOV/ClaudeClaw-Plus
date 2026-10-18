@@ -7,7 +7,18 @@
  */
 import { describe, expect, it } from "bun:test";
 import { homedir } from "node:os";
-import { CLASSIFIER_ARGS, classifierSpawnEnv } from "../commands/discord";
+import { classifierSpawnEnv } from "../commands/discord";
+import { buildPrintArgs } from "../oneshot/print";
+
+// The argv `classifyThreadIntent` executes: runOneShot builds it with
+// buildPrintArgs for the discord.classifier route, untrusted, prompt on stdin.
+const CLASSIFIER_ARGS = buildPrintArgs({
+  route: "discord.classifier",
+  prompt: "private message",
+  model: "claude-sonnet-4-20250514",
+  isolation: "untrusted",
+  timeoutMs: 15000,
+});
 
 describe("classifyThreadIntent isolation", () => {
   it("disables every built-in tool and every MCP server", () => {
@@ -17,6 +28,11 @@ describe("classifyThreadIntent isolation", () => {
     expect(CLASSIFIER_ARGS).toContain("--strict-mcp-config");
     expect(CLASSIFIER_ARGS).not.toContain("--mcp-config");
     expect(CLASSIFIER_ARGS).toContain("--print");
+  });
+
+  it("keeps the message out of argv (it is delivered on stdin)", () => {
+    expect(CLASSIFIER_ARGS).not.toContain("private message");
+    expect(CLASSIFIER_ARGS).not.toContain("-p");
   });
 
   it("loads no settings file (hooks, user plugins) and no skills", () => {

@@ -6,13 +6,17 @@ import { join } from "node:path";
 import { cleanSpawnEnv } from "../runner/spawn-env.js";
 import type { OneShotRequest, OneShotResult } from "./engine.js";
 import { UNTRUSTED_CLAUDE_ARGS, validateIsolation } from "./isolation.js";
+import { stderrExcerpt } from "./redact.js";
 
 interface PrintRuntime {
   spawn?: typeof spawn;
   env?: Record<string, string>;
   forcePrint?: boolean;
   stdinPrompt?: boolean;
+  /** Receives a bounded, credential-masked stderr excerpt once the child exits. */
+  onStderr?: (excerpt: string) => void;
 }
+const STDERR_CAPTURE_LIMIT = 8192;
 // Preserve the tuner's per-instance spawn seam without expanding the frozen
 // request API or introducing mutable process-wide overrides.
 const runtime = new AsyncLocalStorage<PrintRuntime>();
@@ -23,7 +27,10 @@ export function withPrintRuntime<T>(options: PrintRuntime, call: () => T): T {
 
 export function buildPrintArgs(req: OneShotRequest, stdinPrompt = false): string[] {
   validateIsolation(req);
-  const args = stdinPrompt ? ["--print", "--output-format", "text"] : ["-p", req.prompt];
+  // Untrusted text never goes in argv: a prompt such as `--settings=...` would
+  // be parsed as a flag. Trusted callers may opt in to stdin delivery.
+  const viaStdin = stdinPrompt || req.isolation === "untrusted";
+  const args = viaStdin ? ["--print", "--output-format", "text"] : ["-p", req.prompt];
   const model = req.model?.trim();
   if (
     model &&
@@ -53,7 +60,8 @@ export async function runPrint(req: OneShotRequest): Promise<OneShotResult> {
   req.signal?.throwIfAborted();
   const overrides = printRuntime();
   let env = overrides?.env ?? cleanSpawnEnv();
-  const args = buildPrintArgs(req, overrides?.stdinPrompt);
+  const stdinPrompt = overrides?.stdinPrompt === true || req.isolation === "untrusted";
+  const args = buildPrintArgs(req, stdinPrompt);
   if (req.isolation === "trusted-session") {
     const { getSettings } = await import("../config.js");
     let settings: ReturnType<typeof getSettings> | undefined;
@@ -76,11 +84,12 @@ export async function runPrint(req: OneShotRequest): Promise<OneShotResult> {
   try {
     return await new Promise<OneShotResult>((resolve, reject) => {
       const child = (overrides?.spawn ?? spawn)("claude", args, {
-        stdio: [overrides?.stdinPrompt ? "pipe" : "ignore", "pipe", "pipe"],
+        stdio: [stdinPrompt ? "pipe" : "ignore", "pipe", "pipe"],
         env,
         cwd,
       });
       let text = "";
+      let stderr = "";
       let stopped = false;
       let killTimer: ReturnType<typeof setTimeout> | undefined;
       const stop = (): void => {
@@ -98,14 +107,18 @@ export async function runPrint(req: OneShotRequest): Promise<OneShotResult> {
         if (text.length + data.length > 16 * 1024 * 1024) stop();
         else text += data.toString();
       });
-      // Drain stderr without copying potentially sensitive model output into logs.
-      child.stderr!.on("data", () => {});
+      // Keep a bounded head for the caller's error message; it is masked and cut
+      // before leaving this module, and never logged here.
+      child.stderr!.on("data", (data: Buffer) => {
+        if (stderr.length < STDERR_CAPTURE_LIMIT) stderr += data.toString();
+      });
       child.on("error", (error) => {
         cleanup();
         reject(error);
       });
       child.on("close", (code) => {
         cleanup();
+        overrides?.onStderr?.(stderrExcerpt(stderr));
         resolve({
           text: text.trim(),
           engine: "print",
@@ -114,7 +127,7 @@ export async function runPrint(req: OneShotRequest): Promise<OneShotResult> {
           ...(req.resumeSessionId ? { sessionId: req.resumeSessionId } : {}),
         });
       });
-      if (overrides?.stdinPrompt) {
+      if (stdinPrompt) {
         child.stdin!.on("error", () => {}); // EPIPE is reported by child exit.
         child.stdin!.end(req.prompt);
       }

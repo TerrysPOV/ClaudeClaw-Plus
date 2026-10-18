@@ -14,7 +14,9 @@ export const engines = new Map<string, OneShotEngine>([
     "pty",
     {
       id: "pty",
-      caps: { resume: true, tools: true, isolation: true },
+      // No untrusted routing until the interactive isolation spike is reviewed
+      // green; flipping this is the only switch, so it needs that review.
+      caps: { resume: true, tools: true, isolation: false },
       run: async (req) => (await import("../runner/pty-supervisor.js")).runOnceOnPty(req),
     },
   ],

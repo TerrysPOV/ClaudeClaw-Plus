@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { runOneShot } from "../../oneshot/engine.js";
-import { buildPrintArgs, withPrintRuntime } from "../../oneshot/print.js";
-import type { TunerConfig } from "./config.js";
+import { withPrintRuntime } from "../../oneshot/print.js";
+import { DEFAULT_LLM_TIMEOUT_MS, type TunerConfig } from "./config.js";
 
 export type Role = "intent_classifier" | "detector" | "proposer" | "proposer_high_stakes" | "judge";
 
@@ -24,32 +24,25 @@ function buildPrompt(system: string, messages: Message[]): string {
 }
 
 /**
- * Arguments for a one-shot `claude -p` call. The prompt carries untrusted text
- * (conversation turns, skill bodies), so the call runs with no built-in tools,
- * no MCP servers, no settings file (`--setting-sources ""`: no hooks, no user
- * plugins), no saved session and no slash commands — the same set as the
- * Discord classifier's `CLASSIFIER_ARGS`. With no configured model, or the
- * env-routed "glm" alias, --model is left out and the CLI's default applies
- * (same rule as the runner's spawn sites).
+ * One-shot `claude -p` calls carry untrusted text (conversation turns, skill
+ * bodies), so they run through `runOneShot` as `untrusted`: no built-in tools,
+ * no MCP servers, no settings file (no hooks, no user plugins), no saved session
+ * and no slash commands, with the prompt on stdin. The flags live in
+ * `oneshot/isolation.ts`. With no configured model, or the env-routed "glm"
+ * alias, --model is left out and the CLI's default applies (same rule as the
+ * runner's spawn sites).
  */
-export function cliArgs(prompt: string, model: string | undefined): string[] {
-  return buildPrintArgs({
-    route: "tuner.propose",
-    prompt,
-    model,
-    isolation: "untrusted",
-    timeoutMs: 60000,
-  });
-}
-
 export class ClaudeCliBackend implements LLMClient {
   private readonly models: TunerConfig["models"];
+  private readonly timeoutMs: number;
 
   constructor(
     config: TunerConfig,
     private readonly spawnFn: typeof spawn = spawn,
   ) {
     this.models = config.models;
+    // `llm` can be `{}` when a nested default is not applied, so fall back here too.
+    this.timeoutMs = config.llm?.timeout_ms ?? DEFAULT_LLM_TIMEOUT_MS;
   }
 
   modelFor(role: Role): string {
@@ -69,19 +62,27 @@ export class ClaudeCliBackend implements LLMClient {
   // interface compatibility but not forwarded.
   async call(role: Role, system: string, messages: Message[], maxTokens?: number): Promise<string> {
     const prompt = buildPrompt(system, messages);
+    let stderr = "";
     const result = await withPrintRuntime(
-      { spawn: this.spawnFn, forcePrint: this.forcePrint },
+      {
+        spawn: this.spawnFn,
+        forcePrint: this.forcePrint,
+        onStderr: (excerpt) => {
+          stderr = excerpt;
+        },
+      },
       () =>
         runOneShot({
           route: role === "judge" ? "tuner.judge" : "tuner.propose",
           prompt,
           model: this.modelFor(role),
           isolation: "untrusted",
-          timeoutMs: 60000,
+          timeoutMs: this.timeoutMs,
           maxTokens,
         }),
     );
-    if (result.exitCode !== 0) throw new Error(`claude CLI exited ${result.exitCode}`);
+    if (result.exitCode !== 0)
+      throw new Error(`claude CLI exited ${result.exitCode}: ${stderr}`);
     return result.text.trim();
   }
 

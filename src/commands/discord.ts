@@ -15,7 +15,6 @@ import { listThreadSessions, removeThreadSession, peekThreadSession } from "../s
 import { readFile } from "node:fs/promises";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { UNTRUSTED_CLAUDE_ARGS } from "../oneshot/isolation.js";
 import { runOneShot } from "../oneshot/engine.js";
 import { withPrintRuntime } from "../oneshot/print.js";
 import { transcribeAudioToText } from "../whisper";
@@ -582,22 +581,15 @@ interface ThreadIntent {
 
 /**
  * The classifier reads a message from any allowed guild member. It only has
- * to answer with JSON, so it runs with no tools at all (`--tools ""`), no MCP
- * server (`--strict-mcp-config` with no `--mcp-config`) and no saved session:
+ * to answer with JSON, so `runOneShot` runs it as an untrusted call: no tools at
+ * all (`--tools ""`), no MCP server (`--strict-mcp-config` with no `--mcp-config`)
+ * and no saved session, with the prompt on stdin (the argv comes from
+ * `buildPrintArgs`, the single source of the isolation flags):
  * an instruction hidden in the message has nothing to act with. It also loads
  * no settings file (`--setting-sources ""`: no hooks, no user plugins) and no
  * skills, and runs from an empty temp dir so no CLAUDE.md is in its context —
  * otherwise a message can ask for that context back as "thread names".
  */
-export const CLASSIFIER_ARGS = [
-  "--model",
-  "claude-sonnet-4-20250514",
-  "--print",
-  "--output-format",
-  "text",
-  ...UNTRUSTED_CLAUDE_ARGS,
-];
-
 /** Exact keys the classifier's `claude` keeps from the daemon env. */
 const CLASSIFIER_ENV_KEYS = new Set([
   "PATH",

@@ -1397,24 +1397,7 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
   const helpers = await getRunnerHelpers();
   const spawn = await ensureSpawnPty();
   const untrusted = req.isolation === "untrusted";
-  const cwd = untrusted
-    ? mkdtempSync(join(tmpdir(), "claudeclaw-oneshot-pty-"))
-    : (req.cwd ?? process.cwd());
-  const options: PtyProcessOptions = {
-    sessionId: req.resumeSessionId ?? "",
-    newSessionId: req.resumeSessionId ? undefined : randomUUID(),
-    isolation: req.isolation,
-    cwd,
-    modelOverride: req.model,
-    security: settings.security,
-    securityArgs: untrusted
-      ? undefined
-      : req.allowedTools
-        ? ["--tools", req.allowedTools.join(","), "--allowedTools", req.allowedTools.join(",")]
-        : helpers.buildSecurityArgs(settings.security),
-    appendSystemPrompt: untrusted ? undefined : req.system,
-    env: helpers.buildChildEnv(helpers.cleanSpawnEnv(), req.model ?? settings.model, settings.api),
-  };
+  let tempCwd: string | undefined;
   let pty: PtyProcess | undefined;
   let disposal: Promise<void> | undefined;
   const disposeOnce = (): Promise<void> | undefined => {
@@ -1424,28 +1407,53 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
   let cancelled = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let abort: () => void = () => {};
-  const cancelledPromise = new Promise<never>((_, reject) => {
-    abort = () => {
-      cancelled = true;
-      void disposeOnce()?.catch(() => {});
-      reject(new Error("oneShot PTY aborted or timed out"));
-    };
-    timer = setTimeout(abort, req.timeoutMs);
-    req.signal?.addEventListener("abort", abort, { once: true });
-    if (req.signal?.aborted) abort();
-  });
-  const work = (async () => {
-    // Trust handling remains the supervisor's existing path for trusted cwd.
-    if (!untrusted) await ensureOneShotTrust(options.cwd);
-    if (cancelled) throw new Error("oneShot PTY aborted");
-    pty = await spawn(options);
-    if (cancelled) {
-      await disposeOnce();
-      throw new Error("oneShot PTY aborted");
-    }
-    return pty.runTurn(req.prompt, { timeoutMs: req.timeoutMs });
-  })();
+  // The temp dir is created inside the try and removed in the finally, so it
+  // never depends on `work` settling (a hung turn or a spawn that never lands).
   try {
+    const cwd = untrusted
+      ? (tempCwd = mkdtempSync(join(tmpdir(), "claudeclaw-oneshot-pty-")))
+      : (req.cwd ?? process.cwd());
+    const options: PtyProcessOptions = {
+      sessionId: req.resumeSessionId ?? "",
+      newSessionId: req.resumeSessionId ? undefined : randomUUID(),
+      isolation: req.isolation,
+      cwd,
+      modelOverride: req.model,
+      security: settings.security,
+      securityArgs: untrusted
+        ? undefined
+        : req.allowedTools
+          ? ["--tools", req.allowedTools.join(","), "--allowedTools", req.allowedTools.join(",")]
+          : helpers.buildSecurityArgs(settings.security),
+      appendSystemPrompt: untrusted ? undefined : req.system,
+      env: helpers.buildChildEnv(
+        helpers.cleanSpawnEnv(),
+        req.model ?? settings.model,
+        settings.api,
+      ),
+    };
+    const cancelledPromise = new Promise<never>((_, reject) => {
+      abort = () => {
+        cancelled = true;
+        void disposeOnce()?.catch(() => {});
+        reject(new Error("oneShot PTY aborted or timed out"));
+      };
+      timer = setTimeout(abort, req.timeoutMs);
+      req.signal?.addEventListener("abort", abort, { once: true });
+      if (req.signal?.aborted) abort();
+    });
+    const work = (async () => {
+      // Trust handling remains the supervisor's existing path for trusted cwd.
+      if (!untrusted) await ensureOneShotTrust(options.cwd);
+      if (cancelled) throw new Error("oneShot PTY aborted");
+      pty = await spawn(options);
+      if (cancelled) {
+        await disposeOnce();
+        throw new Error("oneShot PTY aborted");
+      }
+      return pty.runTurn(req.prompt, { timeoutMs: req.timeoutMs });
+    })();
+    work.catch(() => {});
     const result = await Promise.race([work, cancelledPromise]);
     return {
       text: result.text,
@@ -1457,19 +1465,17 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
   } finally {
     if (timer) clearTimeout(timer);
     req.signal?.removeEventListener("abort", abort);
-    await disposeOnce();
-    // Work owns cleanup if spawn lands after cancellation.
-    void work
-      .finally(() => {
-        if (untrusted) {
-          try {
-            rmSync(cwd, { recursive: true, force: true });
-          } catch {
-            /* best effort */
-          }
+    try {
+      await disposeOnce();
+    } finally {
+      if (tempCwd) {
+        try {
+          rmSync(tempCwd, { recursive: true, force: true });
+        } catch {
+          /* best effort */
         }
-      })
-      .catch(() => {});
+      }
+    }
   }
 }
 
