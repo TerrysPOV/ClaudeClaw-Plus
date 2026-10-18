@@ -178,7 +178,12 @@ describe("sendToLiveSession", () => {
       spawned[0].prompts.push(p);
       return p === "/compact"
         ? gate.promise
-        : Promise.resolve({ text: "ok", bytesCaptured: 1, cleanBoundary: true, sessionId: "sess-1" });
+        : Promise.resolve({
+            text: "ok",
+            bytesCaptured: 1,
+            cleanBoundary: true,
+            sessionId: "sess-1",
+          });
     }) as PtyProcess["runTurn"];
 
     const sending = sendToLiveSession("global", "/compact", { timeoutMs: 5000 });
