@@ -1108,16 +1108,27 @@ export async function sendToLiveSession(
       release();
       return { status: "failed", error: (err as Error).message, timedOut: false, aborted: false };
     }
-    // Released when the turn settles, whoever stopped waiting for it.
-    turn.then(release, release);
+    // The session id is persisted UNDER the lock, as `runTurnWithRetries` does, and only
+    // while `entry` is still the live entry for its key: once it was retired or replaced
+    // (/kill, reap, /compact) a late write would overwrite the replacement's stored id
+    // (#391). The lock is released when the turn settles and that write is done, whoever
+    // stopped waiting for it. `persisted` never rejects.
+    const persisted: Promise<void> = turn.then(
+      async (result) => {
+        if (!isCurrentEntry(entry)) return;
+        try {
+          await persistSessionId(entry, result.sessionId);
+        } catch {
+          // Best-effort, as on the `runOnPty` path: the turn itself succeeded.
+        }
+      },
+      () => undefined,
+    );
+    persisted.then(release, release);
 
     try {
       const result = await raceAbort(turn, opts.signal);
-      try {
-        await persistSessionId(entry, result.sessionId);
-      } catch {
-        // Best-effort, as on the `runOnPty` path: the turn itself succeeded.
-      }
+      await persisted;
       return {
         status: "sent",
         text: result.text,

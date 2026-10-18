@@ -11,11 +11,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initConfig, loadSettings, reloadSettings } from "../config";
 import type { OneShotRequest, OneShotResult } from "../oneshot/engine";
+import { readFileSync } from "node:fs";
 import { runCompact } from "../runner";
+import { memoryFileGrant } from "../memory";
 import {
   actOnSession,
   injectOneShotForTests,
   looksLikeCommandError,
+  saveMemoryBeforeCompact,
 } from "../runner/live-session-actions";
 import type { PtyProcess, PtyTurnResult } from "../runner/pty-process";
 import {
@@ -24,6 +27,7 @@ import {
   injectMaxRetriesForTests,
   injectSleep,
   injectSpawnPty,
+  liveSessionKeys,
   runOnPty,
   shutdownSupervisor,
 } from "../runner/pty-supervisor";
@@ -178,6 +182,60 @@ describe("runCompact", () => {
 
     expect(fakes[0].prompts).toEqual(["seed"]);
     expect(oneShotCalls.length).toBe(1);
+  });
+
+  it("skipLive: a wedged session is retired and NOT sent /compact; the one-shot resumes it (exit-124 auto-compact)", async () => {
+    await seedLive("global");
+
+    const okCompact = await runCompact({
+      sessionId: "sid-wedged",
+      sessionKey: "global",
+      skipLive: true,
+      model: "sonnet",
+      timeoutMs: 5000,
+    });
+
+    expect(okCompact).toBe(true);
+    expect(fakes[0].prompts).toEqual(["seed"]); // nothing queued on the wedged PTY
+    expect(liveSessionKeys()).toEqual([]);
+    expect(oneShotCalls.length).toBe(1);
+    expect(oneShotCalls[0].resumeSessionId).toBe("sid-wedged");
+  });
+
+  it("a memory path memoryFileGrant cannot scope fails the save WITHOUT retiring, so the compact has to skip the wedged session itself", async () => {
+    await seedLive("global");
+    const memPath = "/work/agents/(x)/MEMORY.md";
+    expect(() => memoryFileGrant(memPath)).toThrow();
+
+    const saved = await saveMemoryBeforeCompact({
+      memPath,
+      prompt: "save",
+      sessionKey: "global",
+      sessionId: "sid-w",
+      skipLive: true,
+      timeoutMs: 5000,
+    });
+    expect(saved.ok).toBe(false);
+    expect(liveSessionKeys()).toEqual(["global"]); // the save returned before retiring
+
+    expect(
+      await runCompact({
+        sessionId: "sid-w",
+        sessionKey: "global",
+        skipLive: true,
+        model: "m",
+        timeoutMs: 5000,
+      }),
+    ).toBe(true);
+    expect(fakes[0].prompts).toEqual(["seed"]);
+    expect(liveSessionKeys()).toEqual([]);
+  });
+
+  it("the exit-124 auto-compact in runner.ts passes skipLive to runCompact", () => {
+    // The auto-compact sits inside `run()`, which has no seam for a fake PTY; pin it.
+    const src = readFileSync(join(import.meta.dir, "../runner.ts"), "utf-8");
+    const call = src.slice(src.indexOf('emitCompactEvent({ type: "auto-compact-start" })'));
+    expect(call.slice(0, call.indexOf("auto-compact-done"))).toMatch(/skipLive:\s*true/);
   });
 });
 

@@ -45,6 +45,7 @@ import {
   waitForPidExit,
   stopGraceMs,
   readConfiguredDrainMs,
+  SHUTDOWN_MEMORY_SAVE_MS,
 } from "../pid";
 import {
   getSettings,
@@ -732,7 +733,6 @@ export async function start(args: string[] = []) {
     // drain and the memory save below so the first one proceeds at once (Ctrl-C
     // twice in a terminal, or an operator who does not want to wait).
     if (shutdownCtl.request() === "abort") return;
-    const shutdownStartedAt = performance.now();
     // `getSettings()` follows the hot reload and is safe before
     // `currentSettings` is initialised (a SIGTERM during boot).
     let drainMs = DEFAULT_DRAIN_TURNS_MS;
@@ -765,11 +765,11 @@ export async function start(args: string[] = []) {
         }
       },
       // #549: ask each live session to save its memory — here, in the daemon, from
-      // the session it already has. What is left of the drain window bounds it, so
-      // drain plus save stay inside what `claudeclaw stop` waits for.
+      // the session it already has. The save has its own SHUTDOWN_MEMORY_SAVE_MS slot,
+      // independent of the drain: a turn that ate the whole drain window (#315), or
+      // `drainTurnsMs: 0`, must not cost the save. `stopGraceMs` waits for drain + save.
       saveMemory: async () => {
-        const leftMs = Math.max(0, drainMs - (performance.now() - shutdownStartedAt));
-        await saveMemoryAtShutdown(leftMs, {
+        await saveMemoryAtShutdown(SHUTDOWN_MEMORY_SAVE_MS, {
           liveKeys: liveSessionKeys,
           send: sendToLiveSession,
           memoryPathFor: memoryPathForSessionKey,

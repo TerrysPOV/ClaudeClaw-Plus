@@ -480,6 +480,61 @@ describe("sendToLiveSession", () => {
     gate.resolve({ text: "late", bytesCaptured: 1, cleanBoundary: true, sessionId: "sess-1" });
   });
 
+  it("persists the session id under the lock: an entry retired and replaced before its turn settled leaves the replacement's stored id alone", async () => {
+    // One store shared by both entries, as the real per-key store is.
+    const store = memStore();
+    const sc = () => ({
+      sessionStore: store,
+      cwd: "/tmp/fake-cwd",
+      mcpConfig: { path: undefined },
+    });
+    expect((await runOnPty("global", "seed", { timeoutMs: 5000, ...sc() })).exitCode).toBe(0);
+    const gate = deferred<PtyTurnResult>();
+    spawned[0].runTurn = ((p: string) => {
+      spawned[0].prompts.push(p);
+      return gate.promise;
+    }) as PtyProcess["runTurn"];
+
+    const sending = sendToLiveSession("global", "/compact", { timeoutMs: 5000 });
+    await Bun.sleep(5);
+    // /kill, then a fresh entry for the same key that stores its own id
+    void retirePtySession("global");
+    await Bun.sleep(5);
+    nextFake = () =>
+      makeFake({
+        onPrompt: async () => ({
+          text: "new",
+          bytesCaptured: 1,
+          cleanBoundary: true,
+          sessionId: "sess-NEW",
+        }),
+      });
+    expect((await runOnPty("global", "again", { timeoutMs: 5000, ...sc() })).exitCode).toBe(0);
+    expect(await store.load()).toBe("sess-NEW");
+
+    gate.resolve({ text: "late", bytesCaptured: 1, cleanBoundary: true, sessionId: "sess-OLD" });
+    await sending;
+
+    expect(await store.load()).toBe("sess-NEW");
+  });
+
+  it("persists the id of a live send while the entry is still current", async () => {
+    const store = memStore();
+    const sc = { sessionStore: store, cwd: "/tmp/fake-cwd", mcpConfig: { path: undefined } };
+    expect((await runOnPty("global", "seed", { timeoutMs: 5000, ...sc })).exitCode).toBe(0);
+    spawned[0].runTurn = (async () => ({
+      text: "ok",
+      bytesCaptured: 1,
+      cleanBoundary: true,
+      sessionId: "sess-2",
+    })) as PtyProcess["runTurn"];
+
+    const r = await sendToLiveSession("global", "/compact", { timeoutMs: 5000 });
+
+    expect(r.status).toBe("sent");
+    expect(await store.load()).toBe("sess-2");
+  });
+
   it("an already-aborted signal writes nothing", async () => {
     await seed("global");
     const ac = new AbortController();

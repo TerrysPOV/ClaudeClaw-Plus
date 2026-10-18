@@ -9,7 +9,13 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type StopDeps, stop } from "../commands/stop";
-import { decideStopTarget, isPidAlive, parseDaemonPid } from "../pid";
+import {
+  decideStopTarget,
+  isPidAlive,
+  parseDaemonPid,
+  parseProcCmdline,
+  readProcessCommand,
+} from "../pid";
 
 describe("parseDaemonPid", () => {
   it("accepts a plain positive integer, with surrounding whitespace", () => {
@@ -87,6 +93,17 @@ describe("decideStopTarget", () => {
       "bun run /opt/my claw/src/index.ts start",
       "/usr/local/bin/claudeclaw start",
       "claudeclaw start --web",
+      // the real launches carry no `start` token: index.ts falls through to start()
+      "bun run src/index.ts --web", // commands/start.md
+      "/usr/local/bin/bun run /opt/claudeclaw/src/index.ts --web", // docs/deploy-systemd-hardening.md
+      "bun run src/index.ts", // package.json "start"
+      "bun run src/index.ts ", // trailing whitespace from ps
+      "bun run src/index.ts serve", // not a subcommand, so it starts the daemon too
+      "bun run src/index.ts start --prompt hi", // unchanged
+      "bun /usr/local/bin/claudeclaw start", // shim behind an interpreter
+      "/usr/bin/env bun /usr/local/bin/claudeclaw start --web",
+      "/usr/bin/env bun run /usr/local/bin/claudeclaw --web",
+      "claudeclaw", // bare shim also starts the daemon
     ]) {
       it(JSON.stringify(command), () => {
         expect(decide("4242", command)).toEqual({ kind: "ok", pid: 4242 });
@@ -104,8 +121,17 @@ describe("decideStopTarget", () => {
       "bun run /srv/app/src/server.ts",
       "bun run dev",
       "/usr/bin/vim notes.txt",
-      "bun run src/index.ts serve", // right entry name, wrong subcommand
-      "bun run src/index.ts", // no subcommand
+      "bun run src/index.ts --stop", // right entry, a subcommand that is not the daemon
+      "bun run src/index.ts --stop-all",
+      "bun run src/index.ts status",
+      "bun run src/index.ts  status --json", // extra spaces must not hide the subcommand
+      "bun run src/index.ts send hello",
+      "bun run src/index.ts fire reg:topic",
+      "bun run src/index.ts --help",
+      "bun run src/index.ts telegram",
+      "claudeclaw --stop",
+      "claudeclaw status",
+      "bun /usr/local/bin/claudeclaw send hi",
       "node /srv/fake-src/index.ts start", // not a `src/` path component
       "bun run src/index.tsx start",
       "claudeclaw-helper start",
@@ -156,6 +182,44 @@ describe("decideStopTarget", () => {
     expect(decide("1", null)).toEqual({ kind: "refuse-pid1", pid: 1 });
     expect(decide("1", "bun run /app/src/index.ts start")).toEqual({ kind: "ok", pid: 1 });
     expect(decide("1", "bun some-other-app.ts")).toMatchObject({ kind: "not-daemon", pid: 1 });
+  });
+});
+
+describe("readProcessCommand without ps (slim containers, #526/#527)", () => {
+  // A pid `ps` cannot find (above the 2^22 pid ceiling), so only the fallback can answer.
+  const NO_SUCH_PID = 4_194_999;
+
+  it("falls back to /proc/<pid>/cmdline when ps cannot read the process", () => {
+    const asked: number[] = [];
+    const cmd = readProcessCommand(NO_SUCH_PID, (pid) => {
+      asked.push(pid);
+      return "bun run /app/src/index.ts --web";
+    });
+    expect(cmd).toBe("bun run /app/src/index.ts --web");
+    expect(asked).toEqual([NO_SUCH_PID]);
+  });
+
+  it("does not consult the fallback when ps answered", () => {
+    let asked = 0;
+    const cmd = readProcessCommand(process.pid, () => {
+      asked++;
+      return "fallback";
+    });
+    expect(cmd).not.toBe("fallback");
+    expect(cmd).not.toBeNull();
+    expect(asked).toBe(0);
+  });
+
+  it("null when neither ps nor the fallback can read it", () => {
+    expect(readProcessCommand(NO_SUCH_PID, () => null)).toBeNull();
+  });
+
+  it("joins /proc's NUL-separated arguments with spaces, null for an empty file", () => {
+    expect(parseProcCmdline("bun\0run\0/app/src/index.ts\0--web\0")).toBe(
+      "bun run /app/src/index.ts --web",
+    );
+    expect(parseProcCmdline("")).toBeNull();
+    expect(parseProcCmdline("\0\0")).toBeNull();
   });
 });
 

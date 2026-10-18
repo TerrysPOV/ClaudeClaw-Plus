@@ -7,8 +7,9 @@
  * live session to save through the session it already has (`sendToLiveSession`),
  * after the turn drain and before the bus goes away.
  *
- * The caller passes the time that is left of `shutdown.drainTurnsMs`, so drain plus
- * save together stay inside the window `claudeclaw stop` waits for (`stopGraceMs`).
+ * The save has its own time slot (`SHUTDOWN_MEMORY_SAVE_MS`), independent of the drain,
+ * so a turn that used up `shutdown.drainTurnsMs` (or `drainTurnsMs: 0`) does not cost
+ * it; drain plus save stay inside the window `claudeclaw stop` waits for (`stopGraceMs`).
  */
 import { loadSettings } from "./config";
 import { getMemoryPath, memoryFileGrant } from "./memory";
@@ -46,8 +47,9 @@ export interface MemorySaveDeps {
   memoryPathFor: (sessionKey: string) => string | null;
   /**
    * Save the global session when it has no live PTY (the legacy `-p` runtime keeps
-   * none). Only called when `liveKeys()` has no `global`: a live one would make this
-   * a second writer on its transcript.
+   * none). Called when `liveKeys()` has no `global`, or when the global live send
+   * returns `not-live` (no process holds the session). Never after `failed`: a live
+   * process may still be writing the transcript, and this would be a second writer.
    */
   fallbackSave?: (opts: {
     timeoutMs: number;
@@ -139,9 +141,9 @@ export async function saveMemoryAtShutdown(
   }
   if (budgetMs <= 0) {
     for (const j of jobs) {
-      out.skipped.push({ key: j.key, reason: "no time left in shutdown.drainTurnsMs" });
+      out.skipped.push({ key: j.key, reason: "no time left in the memory-save budget" });
     }
-    log("[shutdown] memory save skipped: no time left in shutdown.drainTurnsMs");
+    log("[shutdown] memory save skipped: no time left in the memory-save budget");
     out.waitedMs = now() - startedAt;
     return out;
   }
@@ -186,7 +188,7 @@ export async function saveMemoryAtShutdown(
   for (const job of queue) {
     out.skipped.push({
       key: job.key,
-      reason: out.aborted ? "aborted by a second signal" : "no time left in shutdown.drainTurnsMs",
+      reason: out.aborted ? "aborted by a second signal" : "no time left in the memory-save budget",
     });
   }
   out.waitedMs = now() - startedAt;

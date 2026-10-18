@@ -382,12 +382,21 @@ function installExitHook(): void {
 }
 
 /**
+ * The shutdown memory save's own time slot (#549). It is NOT carved out of the drain
+ * window: a turn still running at SIGTERM (the #315 restart case) can use the whole
+ * drain, and `shutdown.drainTurnsMs: 0` ("stop at once") has no drain at all, yet the
+ * save must still run. `claudeclaw stop` used to always run a 30s save of its own.
+ */
+export const SHUTDOWN_MEMORY_SAVE_MS = 30_000;
+
+/**
  * How long `stop` / `--replace-existing` give a daemon to exit after SIGTERM:
- * its drain window plus a margin for the teardown itself. Settings may not be
- * loaded (or may belong to another project's daemon), hence the default.
+ * its drain window, plus the memory save's own slot, plus a margin for the teardown
+ * itself. Settings may not be loaded (or may belong to another project's daemon),
+ * hence the default.
  */
 export function stopGraceMs(drainTurnsMs?: number): number {
-  return (drainTurnsMs ?? 30_000) + 5_000;
+  return (drainTurnsMs ?? 30_000) + SHUTDOWN_MEMORY_SAVE_MS + 5_000;
 }
 
 /**
@@ -423,32 +432,68 @@ export function parseDaemonPid(raw: string): number | null {
   return Number.isSafeInteger(n) && n >= 1 && n <= 4_194_304 ? n : null;
 }
 
-/** The command line of `pid` (`ps -o command=`), or null if it cannot be read. */
-export function readProcessCommand(pid: number): string | null {
+/**
+ * The command line of `pid` (`ps -o command=`), or null if it cannot be read. Slim
+ * containers (ubuntu:24.04, #526/#527) have no `ps`, so fall back to
+ * `/proc/<pid>/cmdline` (NUL-separated arguments, joined by spaces).
+ */
+export function readProcessCommand(
+  pid: number,
+  readProcCmdline: (pid: number) => string | null = readProcCmdlineFile,
+): string | null {
   try {
     const r = spawnSync("ps", ["-o", "command=", "-p", String(pid)], {
       encoding: "utf-8",
       timeout: 2_000,
     });
-    if (r.error || r.status !== 0) return null;
-    const out = String(r.stdout).trim();
-    return out === "" ? null : out;
+    if (!r.error && r.status === 0) {
+      const out = String(r.stdout).trim();
+      if (out !== "") return out;
+    }
+  } catch {
+    // fall through to /proc
+  }
+  return readProcCmdline(pid);
+}
+
+/** `/proc/<pid>/cmdline` -> a command line: arguments are NUL-separated. */
+export function parseProcCmdline(raw: string): string | null {
+  const out = raw.replaceAll("\0", " ").trim();
+  return out === "" ? null : out;
+}
+
+function readProcCmdlineFile(pid: number): string | null {
+  try {
+    return parseProcCmdline(readFileSync(`/proc/${pid}/cmdline`, "utf-8"));
   } catch {
     return null;
   }
 }
 
 /**
- * What the daemon's command line looks like. The daemon is the `start` subcommand of
- * the entry script `src/index.ts` (`bun run /opt/claudeclaw/src/index.ts start --web`,
- * `bun --watch src/index.ts start ...`, docs/deploy-systemd-hardening.md) or of the
- * `claudeclaw` shim (`claudeclaw start`). A bare `bun` is NOT enough: any unrelated Bun
- * app that inherits a stale PID would otherwise be signalled. `src` must be a whole path
- * component (so `fake-src/index.ts` does not match) and `start` must directly follow the
- * entry (`src/index.ts serve`, `src/index.tsx start` do not match).
+ * What the daemon's command line looks like. `src/index.ts` runs the daemon for `start`
+ * AND for any argument that is not one of the other subcommands it dispatches on (its
+ * final `else` is `start()`), so the real launches carry no `start` token:
+ * `bun run src/index.ts --web` (commands/start.md, docs/deploy-systemd-hardening.md),
+ * `bun run src/index.ts` (package.json `start`), `bun --watch src/index.ts start ...`.
+ * The `claudeclaw` shim follows the same rule (`claudeclaw start`, bare `claudeclaw`),
+ * possibly behind an interpreter (`bun /usr/local/bin/claudeclaw start`,
+ * `/usr/bin/env bun .../claudeclaw start`).
+ *
+ * So the entry (or shim) must be followed by the end of the line or by a first argument
+ * that is NOT a non-daemon subcommand (`NON_DAEMON_SUBCOMMANDS`, mirroring src/index.ts).
+ * A bare `bun` is NOT enough: any unrelated Bun app that inherits a stale PID would
+ * otherwise be signalled. `src` must be a whole path component (so `fake-src/index.ts`
+ * does not match) and the entry must be exactly `index.ts` (`src/index.tsx start` does
+ * not match). `(?=\S)` makes `\s+` take the whole gap, so extra spaces cannot be
+ * backtracked into to hide a subcommand.
  */
-const DAEMON_ENTRY = /(?:^|[\s/])src\/index\.ts\s+start(?:\s|$)/;
-const DAEMON_SHIM = /^(?:\S*\/)?claudeclaw\s+start(?:\s|$)/;
+const NON_DAEMON_SUBCOMMANDS =
+  "(?:--help|-h|help|--stop-all|--stop|--clear|status|telegram|discord|slack|send|fire)(?:\\s|$)";
+const DAEMON_ARGS = `(?:\\s*$|\\s+(?=\\S)(?!${NON_DAEMON_SUBCOMMANDS}))`;
+const INTERPRETER = "(?:\\S*\\/)?(?:env|bun|node)(?:\\s+(?:-\\S+|run))*\\s+";
+const DAEMON_ENTRY = new RegExp(`(?:^|[\\s/])src\\/index\\.ts${DAEMON_ARGS}`);
+const DAEMON_SHIM = new RegExp(`^(?:${INTERPRETER})*(?:\\S*\\/)?claudeclaw${DAEMON_ARGS}`);
 
 /** The working directory of `pid` (Linux `/proc`, else `lsof`), or null if unreadable. */
 export function readProcessCwd(pid: number): string | null {

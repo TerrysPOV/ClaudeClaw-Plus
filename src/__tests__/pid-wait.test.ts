@@ -13,6 +13,7 @@ import {
   isPidAlive,
   readConfiguredDrainMs,
   stopGraceMs,
+  SHUTDOWN_MEMORY_SAVE_MS,
   waitForPidExit,
 } from "../pid";
 
@@ -42,7 +43,7 @@ describe("waitForPidExit (#315)", () => {
       const f = join(dir, ".claude", "claudeclaw", "settings.json");
       writeFileSync(f, JSON.stringify({ shutdown: { drainTurnsMs: 60_000 } }));
       expect(await readConfiguredDrainMs(dir)).toBe(60_000);
-      expect(stopGraceMs(await readConfiguredDrainMs(dir))).toBe(65_000);
+      expect(stopGraceMs(await readConfiguredDrainMs(dir))).toBe(95_000);
       writeFileSync(f, JSON.stringify({ shutdown: { drainTurnsMs: 0 } }));
       expect(await readConfiguredDrainMs(dir)).toBe(0);
       writeFileSync(f, JSON.stringify({ shutdown: { drainTurnsMs: -5 } }));
@@ -86,9 +87,10 @@ describe("waitForPidExit (#315)", () => {
     }
   });
 
-  it("stopGraceMs = drain window + teardown margin, default 35s", () => {
-    expect(stopGraceMs()).toBe(35_000);
-    expect(stopGraceMs(0)).toBe(5_000);
-    expect(stopGraceMs(10_000)).toBe(15_000);
+  it("stopGraceMs = drain window + the memory save's own slot + teardown margin, default 65s", () => {
+    expect(stopGraceMs()).toBe(65_000);
+    expect(stopGraceMs(0)).toBe(SHUTDOWN_MEMORY_SAVE_MS + 5_000);
+    expect(stopGraceMs(0)).toBe(35_000);
+    expect(stopGraceMs(10_000)).toBe(45_000);
   });
 });

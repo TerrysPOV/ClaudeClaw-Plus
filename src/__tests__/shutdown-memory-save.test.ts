@@ -3,6 +3,9 @@
  * memory, in the daemon, inside what is left of `shutdown.drainTurnsMs`.
  */
 import { describe, expect, it } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { SHUTDOWN_MEMORY_SAVE_MS } from "../pid";
 import type { LiveSendResult } from "../runner/pty-supervisor";
 import {
   type MemorySaveDeps,
@@ -59,7 +62,7 @@ describe("saveMemoryAtShutdown", () => {
     expect(out.skipped.map((s) => s.key).sort()).toEqual(["fallback:global", "thread:42"]);
   });
 
-  it("issues nothing when no time is left (drain used the whole budget, or drainTurnsMs is 0)", async () => {
+  it("issues nothing when the budget it is handed is 0", async () => {
     let called = 0;
     const out = await saveMemoryAtShutdown(
       0,
@@ -75,7 +78,7 @@ describe("saveMemoryAtShutdown", () => {
     expect(called).toBe(0);
     expect(out.saved).toEqual([]);
     expect(out.skipped).toEqual([
-      { key: "global", reason: "no time left in shutdown.drainTurnsMs" },
+      { key: "global", reason: "no time left in the memory-save budget" },
     ]);
   });
 
@@ -166,6 +169,36 @@ describe("saveMemoryAtShutdown", () => {
 
     await saveMemoryAtShutdown(10_000, deps({ keys: ["global"], fallbackSave }));
     expect(fallbackCalls).toBe(1); // live global: the fallback would be a second writer
+  });
+});
+
+describe("the save has its own slot, independent of the drain (#549 review)", () => {
+  it("is handed the whole slot to send in, so a drain that ate its window costs it nothing", async () => {
+    const timeouts: number[] = [];
+    const out = await saveMemoryAtShutdown(
+      SHUTDOWN_MEMORY_SAVE_MS,
+      deps({
+        keys: ["global"],
+        send: async (_k, _t, o) => {
+          timeouts.push(o.timeoutMs);
+          return sent();
+        },
+      }),
+    );
+
+    expect(out.saved).toEqual(["global"]);
+    expect(timeouts.length).toBe(1);
+    expect(timeouts[0]).toBeGreaterThan(SHUTDOWN_MEMORY_SAVE_MS - 1000);
+    expect(timeouts[0]).toBeLessThanOrEqual(SHUTDOWN_MEMORY_SAVE_MS);
+  });
+
+  it("the daemon hands it SHUTDOWN_MEMORY_SAVE_MS, not what is left of shutdown.drainTurnsMs", () => {
+    // start.ts is a monolith with no seam for the shutdown steps, so pin the wiring.
+    // A save budgeted from the drain is skipped when a turn eats the drain (the #315
+    // restart case) and always when `drainTurnsMs` is 0.
+    const src = readFileSync(join(import.meta.dir, "../commands/start.ts"), "utf-8");
+    expect(src).toContain("saveMemoryAtShutdown(SHUTDOWN_MEMORY_SAVE_MS,");
+    expect(src).not.toMatch(/drainMs\s*-\s*\(?performance\.now/);
   });
 });
 

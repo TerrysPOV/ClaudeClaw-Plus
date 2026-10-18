@@ -1525,6 +1525,8 @@ export async function runCompact(opts: {
   model: string;
   timeoutMs: number;
   cwd?: string;
+  /** The session is wedged (its last turn timed out): retire it, then resume one-shot. */
+  skipLive?: boolean;
 }): Promise<boolean> {
   console.log(
     `[${new Date().toLocaleTimeString()}] Running /compact on session ${opts.sessionId.slice(0, 8)}...`,
@@ -1535,6 +1537,7 @@ export async function runCompact(opts: {
     sessionKey: opts.sessionKey,
     sessionId: opts.sessionId,
     timeoutMs: opts.timeoutMs,
+    skipLive: opts.skipLive,
     model: opts.model,
     cwd: opts.cwd,
     // /compact needs no tools. An empty grant (not an absent one) keeps the one-shot
@@ -2479,7 +2482,9 @@ async function execClaude(
     // --- Auto-compact on timeout (exit 124) ---
     if (COMPACT_TIMEOUT_ENABLED && exitCode === 124 && !isNew && existing && !recoveredFromStale) {
       // Save memory before compact wipes context. The turn timed out, so the
-      // session is wedged: skip the live path and resume it one-shot (#549).
+      // session is wedged: skip the live path and resume it one-shot (#549). The
+      // compact below skips it too, whether or not the save got as far as retiring it
+      // (a memory path `memoryFileGrant` cannot scope returns before it does).
       try {
         const memPath = getMemoryPath(agentName);
         console.log(
@@ -2508,6 +2513,7 @@ async function execClaude(
       const compactOk = await runCompact({
         sessionId: existing.sessionId,
         sessionKey: ptySessionKey,
+        skipLive: true,
         model: primaryConfig.model,
         timeoutMs,
         cwd: spawnCwd,
