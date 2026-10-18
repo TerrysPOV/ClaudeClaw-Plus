@@ -72,6 +72,29 @@ This task resolved all ten accuracy issues in `README.md` documented in issue #5
 
 ---
 
+## Round 4: the restart and hot-reload contract, completed (branch `review/558`, from head 0f35d801)
+
+Codex's fourth pass found two holes in the lists (README ~194 and ~199). Both were real, so instead of adding two entries this pass enumerated every setting and classified it as read once (startup, mount, first use) or read on use. Per-setting rows with evidence: the second table in [`AUDIT.md`](AUDIT.md) (45 rows, 39 settings new to the README's lists).
+
+| Codex round 4 finding | Verdict | What changed |
+|---|---|---|
+| ~194: add `slack.appToken` and `slack.signingSecret` to the bus restart list | `signingSecret` valid; `appToken` valid only as "applied at mount" | `mountSlack()` passes both once (`adapter-wiring.ts:287-308`). `signingSecret` is stored at `adapters/slack/index.ts:207` and used for HMAC verification (`signature.ts:44`). `appToken` is **not read by anything in the bus Slack adapter**: Socket Mode is a deferred follow-up there (`types.ts:108-126`, `index.ts:209` takes only an injected `socket`), so Codex's "Socket Mode connection keeps the old credential" cannot happen on the bus today. Both are listed as restart-bound; `appToken` carries that qualification. The legacy runtime uses it and reloads it live. |
+| ~199: add `mcp.perPtyOnly` | Valid | `config.ts:1747-1757` removes a name that is in both lists from `shared`, so `perPtyOnly` changes the effective shared set the multiplexer and the bus session manager fixed at startup (`start.ts:1053-1095`). The legacy PTY supervisor re-reads `mcp.shared` on each spawn (`pty-supervisor.ts:1276`), so a live edit would also split the two. |
+
+**Restart-required settings added** (read once): `slack.appToken`, `slack.signingSecret` (+ `slack.busRouting.signingSecret`), `telegram.receiveEnabled` (bus), `mcp.perPtyOnly`, `mcp.healthProbeIntervalMs`, `mcp.sessionPersistenceEnabled`, `mcp.sessionMaxAgeSeconds`, `mcp.sessionPersistencePath`, `mcp.rateLimit`, `mcp.metricsEnabled`, `mcp.cache`, `web.bus.token` (+ `CCAW_WEBUI_TOKEN`), `web.bus.allowedAgentIds`, `web.bus.allowedOrigins`, `agentJobs.*`, `stallWatchdog.*`, `kanban.enabled`, `plugins`, `governance.watchdog.*`, `governance.evalFramework.*`, `agentic.modes`, `agentic.defaultMode`, `pty.idleReapMinutes`, `pty.namedAgentsAlwaysAlive`.
+
+**Hot-reload settings added** (read on use): `model`, `api`, `fallback`, `agentic.enabled`, `watchdog`, `timeouts`, `session.*`, `sessionTimeoutMs`, `jobsDir`, `quietHours`, `llmRouter.*`, `pty.maxRetries`/`respawnRetries`/`backoffMs`/`maxConcurrent` (per call), `pty.cols`/`rows`/`turnIdleTimeoutMs`/`quietWindowMs`/`sentinelMaxWaitMs` (per new PTY), the legacy-only adapter options (`telegram.listenChats`/`dmIsolation`/`whisperModel`, `discord.listenChannels`/`listenGuilds`/`channelNames`/`imageOutputRoots`/`streaming`, `slack.listenChannels`/`allowBots`/`allowBotIds`), `stt.*`, `apiToken`, `shutdown.drainTurnsMs`, `memorySearch.reindexEveryNTurns`, `attachments.*` (Discord adapter only), and `slack.appToken` / `telegram.receiveEnabled` under the legacy runtime.
+
+How it was done: all 33 keys of the `Settings` interface (`config.ts:779-838`); every settings read in `start.ts` (126 sites) extracted and grouped; then each other consumer read for "once or on use". The reload loop re-applies only MCP bridge/audit policy, jobs, heartbeat, the legacy adapter tokens, and the bus scheduler; `security` is only logged there because the runner reads it live.
+
+Checks: `bun run lint` (whole repo) exit 0; the README link, anchor and citation check passes (41 links, 120 citations in range). A new key-coverage script confirms all 33 top-level keys are named in the two lists, and fails when one is removed (shown by deleting `kanban`). It found a real gap in my own first draft (`heartbeat` and `timezone` were not named with the key spelling), fixed.
+
+Judgement calls: `memorySearch` is listed as hot, because only a one-off index at boot uses the boot value. `attachments.*` is claimed only for the Discord adapter, the one consumer I traced. `governance.evalFramework` is described as read when that server process starts, since it calls `loadSettings()` itself. `mcp-proxy.json` is a separate file, not part of `settings.json`, and is not listed. No version bump (the branch carries 2.2.337).
+
+Not done: no runtime test of the reload behaviour, only code reading. A live check would be to change each restart-bound value, wait 30 s, and confirm the process behaves as before.
+
+---
+
 ## Round 3: Codex findings and full code audit (branch `review/558`, from head 7bcb673c)
 
 Round 3 had three open Codex findings. Because every round had found new claims the code contradicts, this pass also re-audited the whole README diff against the code: **80 claims, 38 fixed, 1 added, 41 confirmed**. Row by row, with `file:line` evidence: [`AUDIT.md`](AUDIT.md). That table supersedes the "Verified Evidence Table" below, whose citations were not all right (see the list of wrong cites in AUDIT.md).

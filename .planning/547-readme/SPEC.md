@@ -89,6 +89,13 @@ Update `README.md` to:
 - **`locked`** is described by its tool list, not as read-only, even though the wizard text says "Read-only".
 - **`marketplace.json`:** both version fields are set by hand to match; fixing `scripts/bump-marketplace-version.ts` is out of scope here.
 
+### Added in round 4
+
+- **The reload contract is complete by construction, not by patching.** Every key of the `Settings` interface is classified as read-once (restart) or read-on-use (hot), with a per-setting row in AUDIT.md. A script checks that all top-level keys are named in the two README lists.
+- **`slack.appToken` is listed as restart-bound with a qualification**, because applying it requires a restart but the bus Slack adapter does not use it yet. Codex's stale-connection scenario does not occur on the bus.
+- **"Read once" includes first use** (`agentic.*` router, the PTY reaper), not only startup.
+- **Options a runtime does not take are called out as such**, not listed as restart-bound: the bus adapters ignore the legacy-only Telegram/Discord/Slack options.
+
 ## Key Files
 
 - `README.md`
