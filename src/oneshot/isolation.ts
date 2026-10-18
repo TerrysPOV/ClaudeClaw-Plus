@@ -34,3 +34,37 @@ export function validateIsolation(req: import("./engine.js").OneShotRequest): vo
   if (!Number.isFinite(req.timeoutMs) || req.timeoutMs <= 0)
     throw new Error("oneShot timeoutMs must be positive");
 }
+
+/** `Edit(//p)` -> `Edit`: the unique bare tool names of a list of permission rules. */
+function bareToolNames(rules: string[]): string[] {
+  const names = rules.map((r) => r.replace(/\(.*$/s, "").trim()).filter((n) => n !== "");
+  return [...new Set(names)];
+}
+
+/**
+ * The `--tools` / `--allowedTools` flags for a trusted-session request, shared by every
+ * engine that starts a claude CLI so they cannot drift apart. `--tools` takes BARE tool
+ * names (`req.tools`, else the names of the `allowedTools` rules); permission rules,
+ * path-scoped or not, go in `--allowedTools`. `allowedTools: []` is "no tools":
+ * `--tools ""` and no `--allowedTools`. `undefined` when the caller gave no grant at all,
+ * which means "use the default permission profile".
+ *
+ * A grant also sets `--permission-mode dontAsk`: a tool outside the list is denied, where
+ * the default mode would leave the TUI waiting at a permission prompt nobody answers.
+ */
+export function trustedToolFlags(req: {
+  allowedTools?: string[];
+  tools?: string[];
+}): string[] | undefined {
+  if (req.allowedTools === undefined && req.tools === undefined) return undefined;
+  const flags = [
+    "--permission-mode",
+    "dontAsk",
+    "--tools",
+    (req.tools ?? bareToolNames(req.allowedTools ?? [])).join(","),
+  ];
+  if (req.allowedTools && req.allowedTools.length > 0) {
+    flags.push("--allowedTools", req.allowedTools.join(","));
+  }
+  return flags;
+}

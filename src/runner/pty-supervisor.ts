@@ -58,7 +58,7 @@ import type { PtyProcess, PtyProcessOptions, PtyTurnResult, SpawnPty } from "./p
 import { PtyClosedError, PtyTurnTimeoutError } from "./pty-process.js";
 import { ensureTrustAccepted } from "./pty-trust-prompt.js";
 import type { OneShotRequest, OneShotResult } from "../oneshot/engine.js";
-import { validateIsolation } from "../oneshot/isolation.js";
+import { trustedToolFlags, validateIsolation } from "../oneshot/isolation.js";
 import { validateRouteEngine } from "../oneshot/config.js";
 import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -1666,18 +1666,9 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
         ...(untrusted
           ? { mcpConfig: { path: undefined } }
           : {
-              securityArgs: req.allowedTools
-                ? [
-                    // dontAsk denies a tool outside the list; the default mode
-                    // would leave the TUI waiting at a permission prompt.
-                    "--permission-mode",
-                    "dontAsk",
-                    "--tools",
-                    req.allowedTools.join(","),
-                    "--allowedTools",
-                    req.allowedTools.join(","),
-                  ]
-                : helpers.buildSecurityArgs(settings.security),
+              // Same flags as the `print` engine (`trustedToolFlags`); the default
+              // permission profile only when the caller gave no grant at all.
+              securityArgs: trustedToolFlags(req) ?? helpers.buildSecurityArgs(settings.security),
               appendSystemPrompt: [req.system, PTY_OUTPUT_FORMAT_CONSTRAINT]
                 .filter(Boolean)
                 .join("\n\n"),

@@ -155,7 +155,11 @@ read-only "is this key live and idle" accessor. PTY session keys are `thread:<id
     `--tools` cannot be derived from `allowedTools` here. `print` now emits
     `--tools <tools ?? unique bare names of allowedTools>` and `--allowedTools <rules as given>`;
     `allowedTools: []` is `--tools ""` with no `--allowedTools`; `tools` alone does not fall back
-    to the default permission profile; `untrusted` rejects `tools` like `allowedTools`. Agreed
+    to the default permission profile; `untrusted` rejects `tools` like `allowedTools`. The flag
+    construction lives in ONE function, `trustedToolFlags` (`isolation.ts`), used by both the `print`
+    and the `pty` engine (`runOnceOnPty`), so they cannot drift (the automated security review caught
+    the `pty` engine still joining `allowedTools` into `--tools`; `docs/oneshot-engines.md` maps
+    `memory.save.stop` to `pty`). Agreed
     with the coordinator (ask: "you do it in 549"); the stacked PR shows these #548 files.
 18. **Rotation summary gets no tools (review fix, MEDIUM; deliberate deviation from the issue
     text, which says `["Write"]`).** The summary returns on stdout and the daemon writes the

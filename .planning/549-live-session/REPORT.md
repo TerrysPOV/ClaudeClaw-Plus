@@ -5,8 +5,12 @@ Branch `feat/549-live-session-compact`, stacked on `povai/feat/548-oneshot-modul
 
 ## Review-fix pass (Codex deep review + security review; no CRITICAL)
 
-Same branch, new commits only (`db4528e5`, `719c799b`, then this report). Rebased onto the **final** #548
-(`povai/feat/548-oneshot-module` @ 7898a063, PR #560), which already had stdin-only untrusted prompts and capability gating.
+Rebased onto the **final** #548 (`povai/feat/548-oneshot-module` @ 7898a063, PR #560), which already had stdin-only untrusted prompts and
+capability gating, then new commits on top.
+
+**History note.** That rebase rewrote the first-pass commits. The remote tip before this pass was **8975876c**; the coordinator approved
+`git push --force-with-lease=feat/549-live-session-compact:8975876c povai HEAD:feat/549-live-session-compact` (no PR existed for the branch).
+The old tip stays recoverable from this machine's reflog. `git log povai/feat/548-oneshot-module..HEAD` shows only #549 commits.
 
 | # | Severity | Finding | Fix | Test |
 |---|---|---|---|---|
@@ -16,6 +20,7 @@ Same branch, new commits only (`db4528e5`, `719c799b`, then this report). Rebase
 | 4 | MEDIUM | The live path keeps the live session's full permissions | Not changed, as instructed. Documented at `actOnSession` and in SPEC decision 20: `allowedTools`/`tools` restrict the one-shot fallback only | comment only |
 | 5 | LOW | `stop` could signal pid 0 / -1 / a recycled PID | `parseDaemonPid` (digits only, 1..2^22), `isPidAlive` false for `<= 0`/non-integers, `decideStopTarget` checks `ps -o command= -p` for `claudeclaw`/`bun`/`index.ts`; a non-daemon is treated as "no daemon" and never signalled; unreadable command line -> old behaviour. `stopAll` likewise | `stop-pid-validation.test.ts` (21) |
 | 6 | LOW | Compact fallback could run with the bypass flag | `allowedTools: []` | `session-actions-argv.test.ts` |
+| sec | MEDIUM | Automated security review of the pushed commit: #548's `pty` engine (`runOnceOnPty`) still joined `allowedTools` into `--tools` and treated `[]` as a grant of one empty entry, so scoped rules would break (or fail open) when a route is mapped to `pty`; `docs/oneshot-engines.md` maps `memory.save.stop` to `pty` | One shared `trustedToolFlags` in `isolation.ts`, used by `print` **and** `pty`; `[]` there now also means no tools and no default profile | `oneshot-pty-tools.test.ts` (5), incl. "matches the print engine flag for flag" |
 
 **Things to know**
 
@@ -38,12 +43,12 @@ Same branch, new commits only (`db4528e5`, `719c799b`, then this report). Rebase
 **Tests (this pass)**
 
 ```
-env -u ANTHROPIC_BASE_URL bun test <19 original files + session-actions-argv, memory-save-grant, oneshot-print-tools, stop-pid-validation>
- 369 pass, 0 fail  (23 files)
-other tests that import the oneshot module (tuner skills-fitness/memory-quality-judge, oneshot e2e, agents, discord-classifier-isolation)
- 153 pass, 1 skip (opt-in e2e), 0 fail  (5 files)
+env -u ANTHROPIC_BASE_URL bun test <the 19 original files + session-actions-argv, memory-save-grant, oneshot-print-tools,
+  oneshot-pty-tools, stop-pid-validation + the other oneshot importers: oneshot e2e, agents, discord-classifier-isolation,
+  tuner skills-fitness and memory-quality-judge>
+ 527 pass, 1 skip (the opt-in e2e), 0 fail  (29 files)
 ```
-`bun run lint` (whole repo): exit 0, 1252 warnings (1243 before the rebase onto the final #548; none are on lines I changed). Typecheck ratchet: `149 error(s), baseline 149`, unchanged.
+`bun run lint` (whole repo): exit 0, 1252 warnings (1243 before the rebase onto the final #548; none are on lines I changed). One formatting error in a new test file was caught and fixed before the final run. Typecheck ratchet: `149 error(s), baseline 149`, unchanged.
 Version: this branch is 2.2.338; `povai/main` is 2.2.336 and #548 is 2.2.337, so no re-bump was needed.
 
 **Fault injections, one site at a time** (file restored from a backup and `cmp`-checked after each; first `(fail)` line per run)
@@ -75,6 +80,11 @@ Version: this branch is 2.2.338; `povai/main` is 2.2.336 and #548 is 2.2.337, so
 | engine | P3 ignore explicit `tools` | `(fail) buildPrintArgs tool flags (trusted-session) > explicit tools + scoped rules: --tools is the bare list, --allowedTools the rules as given` (+1) |
 | engine | P4 no de-duplication | `(fail) buildPrintArgs tool flags (trusted-session) > without explicit tools, --tools is the unique bare names of the allowed entries` |
 | engine | P5 untrusted accepts `tools` | `(fail) buildPrintArgs untrusted > rejects tools just like allowedTools: untrusted calls never take a grant` |
+| sec | Q1 `pty` engine builds its own flags again | `(fail) pty engine tool flags > explicit tools + scoped rules: --tools is the bare list, --allowedTools the rules` (+3) |
+| sec | Q2 `pty` engine always uses the default profile | same four tests |
+| sec | Q3 shared helper puts rules in `--tools` | `(fail) buildPrintArgs tool flags (trusted-session) > without explicit tools, --tools is the unique bare names of the allowed entries` and `(fail) pty engine tool flags > a rule list without explicit tools derives unique bare names` |
+| sec | Q4 shared helper emits `--allowedTools` for `[]` | `(fail) buildPrintArgs tool flags (trusted-session) > allowedTools [] means no tools: --tools '' and no --allowedTools at all` and the `pty` twin |
+| sec | Q5 shared helper turns "no grant" into `--tools ""` | `(fail) buildPrintArgs tool flags (trusted-session) > no grant given: neither flag (the caller gets the default permission profile)` and `(fail) pty engine tool flags > no grant at all: the default permission profile applies, as before` |
 | 3, 6 | (RED before the fix) rotation granted `Write`; compact passed no `--tools` | `Expected: ""` / `Received: "Write"` (rotation) and `Expected: ""` / `Received: undefined` (compact), in `session-actions-argv.test.ts` before the change |
 | 5 | N1 drop the `isPidAlive` guard | `(fail) isPidAlive > is false for pids that would address a process group or everyone` |
 | 5 | N2 lenient parse | `(fail) parseDaemonPid > rejects 0, negatives, fractions, exponents, hex, garbage, empty and huge values` |

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { cleanSpawnEnv } from "../runner/spawn-env.js";
 import type { OneShotRequest, OneShotResult } from "./engine.js";
-import { UNTRUSTED_CLAUDE_ARGS, validateIsolation } from "./isolation.js";
+import { UNTRUSTED_CLAUDE_ARGS, trustedToolFlags, validateIsolation } from "./isolation.js";
 import { cliModelFlag } from "./model.js";
 import { stderrExcerpt } from "./redact.js";
 
@@ -26,12 +26,6 @@ export function withPrintRuntime<T>(options: PrintRuntime, call: () => T): T {
   return runtime.run(options, call);
 }
 
-/** `Edit(//p)` -> `Edit`: the unique bare tool names of a list of permission rules. */
-function bareToolNames(rules: string[]): string[] {
-  const names = rules.map((r) => r.replace(/\(.*$/s, "").trim()).filter((n) => n !== "");
-  return [...new Set(names)];
-}
-
 export function buildPrintArgs(req: OneShotRequest, stdinPrompt = false): string[] {
   validateIsolation(req);
   // Untrusted text never goes in argv: a prompt such as `--settings=...` would
@@ -44,13 +38,7 @@ export function buildPrintArgs(req: OneShotRequest, stdinPrompt = false): string
   if (req.isolation === "untrusted") args.push(...UNTRUSTED_CLAUDE_ARGS);
   else {
     if (req.resumeSessionId) args.push("--resume", req.resumeSessionId);
-    if (req.allowedTools !== undefined || req.tools !== undefined) {
-      // `--tools` takes bare tool names only; path rules belong in `--allowedTools`.
-      args.push("--tools", (req.tools ?? bareToolNames(req.allowedTools ?? [])).join(","));
-      // `[]` means no tools: nothing to pre-approve, and an empty flag value adds nothing.
-      if (req.allowedTools && req.allowedTools.length > 0)
-        args.push("--allowedTools", req.allowedTools.join(","));
-    }
+    args.push(...(trustedToolFlags(req) ?? []));
   }
   // Claude CLI has no maxTokens flag. HTTP engines can honour it later.
   return args;
