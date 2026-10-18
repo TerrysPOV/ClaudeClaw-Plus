@@ -265,6 +265,9 @@ const DEFAULT_QUIET_TICK_MS = 50;
 const DEFAULT_COLS = 100;
 const DEFAULT_ROWS = 30;
 const DEFAULT_PERMISSION_MODE_ARGS = ["--dangerously-skip-permissions"];
+/** Bracketed-paste markers (xterm mode 2004, which claude's TUI turns on) (#559). */
+const PASTE_START = "\x1b[200~";
+const PASTE_END = "\x1b[201~";
 
 /** Delay between the project MCP server dialog showing and its Esc (#469). */
 const MCP_DIALOG_ANSWER_DELAY_MS = 500;
@@ -656,9 +659,18 @@ class PtyProcessImpl implements PtyProcess {
 
     // Write prompt + CR (TUI submits on Enter). Sanitize embedded CR/LF so
     // they don't submit mid-prompt.
+    //
+    // Issue #559: the prompt goes in as a bracketed paste. claude's TUI reads
+    // a burst of input as a paste when it is long enough (64+ bytes with CLI
+    // 2.1.296), and a CR inside that paste is kept as text, not Enter: the
+    // prompt sits in the input box and the turn times out. The clock prefix
+    // `runUserMessage` adds pushes nearly every chat prompt past that size.
+    // With explicit paste markers the TUI knows where the text ends, so the
+    // CR after them is a keypress whatever the length. The sanitizer strips
+    // ESC, so the prompt cannot close the paste early.
     try {
       dumpPtyTrace(`>> pid=${this._pid} write prompt`, `${JSON.stringify(prompt).slice(0, 80)}+CR`);
-      this._pty.write(sanitizePtyPromptText(prompt) + "\r");
+      this._pty.write(`${PASTE_START}${sanitizePtyPromptText(prompt)}${PASTE_END}\r`);
     } catch (err) {
       this._turnInProgress = false;
       this._activeSentinelBytes = null;
