@@ -94,6 +94,15 @@ export async function saveMemoryAtShutdown(
     key: string;
     run: (timeoutMs: number, signal: AbortSignal) => Promise<void>;
   }> = [];
+  const fallback = deps.fallbackSave;
+  /** The one-shot save of the global session, recorded under its own label. */
+  const runFallback = async (timeoutMs: number, signal: AbortSignal): Promise<void> => {
+    if (!fallback) return;
+    const r = await fallback({ timeoutMs, signal });
+    if (r === "saved") out.saved.push(FALLBACK_LABEL);
+    else if (r === "skipped") out.skipped.push({ key: FALLBACK_LABEL, reason: "nothing to save" });
+    else out.failed.push({ key: FALLBACK_LABEL, error: "one-shot save failed" });
+  };
   for (const key of keys) {
     const memPath = deps.memoryPathFor(key);
     if (!memPath) {
@@ -105,24 +114,23 @@ export async function saveMemoryAtShutdown(
       run: async (timeoutMs, signal) => {
         const r = await deps.send(key, memorySavePrompt(memPath), { timeoutMs, signal });
         if (r.status === "sent") out.saved.push(key);
-        else if (r.status === "not-live")
-          out.skipped.push({ key, reason: `not-live: ${r.reason}` });
-        else out.failed.push({ key, error: r.error });
+        else if (r.status === "not-live") {
+          // The global process went away between the snapshot and this send (exited,
+          // or finished retiring): `not-live` means NO process holds the session, so
+          // the one-shot cannot race it, and skipping would lose the save. Only the
+          // global session has a one-shot save; `failed` never gets one (the live turn
+          // was attempted and a process may still be writing the transcript).
+          if (key === "global" && fallback) {
+            await runFallback(Math.max(1, timeoutMs), signal);
+          } else {
+            out.skipped.push({ key, reason: `not-live: ${r.reason}` });
+          }
+        } else out.failed.push({ key, error: r.error });
       },
     });
   }
-  const fallback = deps.fallbackSave;
   if (fallback && !keys.includes("global")) {
-    jobs.push({
-      key: FALLBACK_LABEL,
-      run: async (timeoutMs, signal) => {
-        const r = await fallback({ timeoutMs, signal });
-        if (r === "saved") out.saved.push(FALLBACK_LABEL);
-        else if (r === "skipped")
-          out.skipped.push({ key: FALLBACK_LABEL, reason: "nothing to save" });
-        else out.failed.push({ key: FALLBACK_LABEL, error: "one-shot save failed" });
-      },
-    });
+    jobs.push({ key: FALLBACK_LABEL, run: runFallback });
   }
 
   if (jobs.length === 0) {

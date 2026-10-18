@@ -168,3 +168,97 @@ describe("saveMemoryAtShutdown", () => {
     expect(fallbackCalls).toBe(1); // live global: the fallback would be a second writer
   });
 });
+
+describe("the global PTY disappears between the snapshot and the send (Codex P2)", () => {
+  const countingFallback = () => {
+    const calls: Array<{ timeoutMs: number }> = [];
+    const fallbackSave: NonNullable<MemorySaveDeps["fallbackSave"]> = async (o) => {
+      calls.push({ timeoutMs: o.timeoutMs });
+      return "saved";
+    };
+    return { calls, fallbackSave };
+  };
+
+  it("snapshot has global, send says not-live -> the fallback runs exactly once", async () => {
+    const { calls, fallbackSave } = countingFallback();
+    const send: Send = async () => ({ status: "not-live", reason: "no-entry" });
+
+    const out = await saveMemoryAtShutdown(10_000, deps({ keys: ["global"], send, fallbackSave }));
+
+    expect(calls.length).toBe(1);
+    expect(out.saved).toEqual(["global (one-shot)"]);
+    expect(out.skipped).toEqual([]); // not recorded as a lost save
+    expect(out.failed).toEqual([]);
+  });
+
+  it("the fallback gets only the time that is left, never more than the budget", async () => {
+    const { calls, fallbackSave } = countingFallback();
+    const send: Send = async () => ({ status: "not-live", reason: "no-process" });
+
+    await saveMemoryAtShutdown(5_000, deps({ keys: ["global"], send, fallbackSave }));
+
+    expect(calls[0].timeoutMs).toBeGreaterThan(0);
+    expect(calls[0].timeoutMs).toBeLessThanOrEqual(5_000);
+  });
+
+  it("send says failed (the live turn was attempted) -> NO fallback: a process may still hold the session", async () => {
+    const { calls, fallbackSave } = countingFallback();
+    const send: Send = async () => ({
+      status: "failed",
+      error: "waited for the running turn",
+      timedOut: true,
+      aborted: false,
+    });
+
+    const out = await saveMemoryAtShutdown(10_000, deps({ keys: ["global"], send, fallbackSave }));
+
+    expect(calls.length).toBe(0);
+    expect(out.failed.map((f) => f.key)).toEqual(["global"]);
+    expect(out.saved).toEqual([]);
+  });
+
+  it("send says sent -> no fallback", async () => {
+    const { calls, fallbackSave } = countingFallback();
+
+    const out = await saveMemoryAtShutdown(10_000, deps({ keys: ["global"], fallbackSave }));
+
+    expect(calls.length).toBe(0);
+    expect(out.saved).toEqual(["global"]);
+  });
+
+  it("an AGENT session that is not-live never uses the global fallback", async () => {
+    const { calls, fallbackSave } = countingFallback();
+    const send: Send = async (key) =>
+      key === "agent:a" ? { status: "not-live", reason: "no-entry" } : sent();
+
+    const out = await saveMemoryAtShutdown(
+      10_000,
+      deps({ keys: ["agent:a", "global"], send, fallbackSave }),
+    );
+
+    expect(calls.length).toBe(0);
+    expect(out.skipped).toEqual([{ key: "agent:a", reason: "not-live: no-entry" }]);
+  });
+
+  it("not-live with no fallback available (bus runtime): recorded as skipped, as before", async () => {
+    const send: Send = async () => ({ status: "not-live", reason: "no-entry" });
+
+    const out = await saveMemoryAtShutdown(10_000, deps({ keys: ["global"], send }));
+
+    expect(out.skipped).toEqual([{ key: "global", reason: "not-live: no-entry" }]);
+  });
+
+  it("a fallback that fails is a failed save, and is not retried", async () => {
+    let calls = 0;
+    const fallbackSave: NonNullable<MemorySaveDeps["fallbackSave"]> = async () => {
+      calls++;
+      return "failed";
+    };
+    const send: Send = async () => ({ status: "not-live", reason: "no-entry" });
+
+    const out = await saveMemoryAtShutdown(10_000, deps({ keys: ["global"], send, fallbackSave }));
+
+    expect(calls).toBe(1);
+    expect(out.failed.map((f) => f.key)).toEqual(["global (one-shot)"]);
+  });
+});
