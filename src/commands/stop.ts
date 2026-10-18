@@ -9,10 +9,8 @@ import {
   stopGraceMs,
   readConfiguredDrainMs,
 } from "../pid";
-import { getSession } from "../sessions";
-import { loadSettings, type SecurityConfig } from "../config";
-import { getMemoryPath } from "../memory";
 import { removeStatuslineSetting } from "../statusline-settings";
+import { saveGlobalMemoryOneShot } from "../shutdown-memory-save";
 
 const CLAUDE_DIR = join(process.cwd(), ".claude");
 const HEARTBEAT_DIR = join(CLAUDE_DIR, "claudeclaw");
@@ -33,45 +31,35 @@ async function teardownStatusline() {
   }
 }
 
-async function preShutdownMemorySave(): Promise<void> {
-  const session = await getSession();
-  if (!session) return;
+/** The CLI-side save is bounded like the old `claude -p` call was. */
+const CLI_MEMORY_SAVE_TIMEOUT_MS = 30_000;
 
-  const settings = await loadSettings();
-  const memPath = getMemoryPath();
-  console.log(`[shutdown] Saving memory to ${memPath}...`);
-
-  try {
-    // Always include Write tool so memory can be saved regardless of security level
-    const securityArgs = ["--dangerously-skip-permissions"];
-    if (settings.security.level === "locked") {
-      securityArgs.push("--tools", "Read,Grep,Glob,Write");
-    }
-
-    const proc = Bun.spawn(
-      [
-        "claude",
-        "-p",
-        `Session is shutting down. Save your current memory to ${memPath} now. Include: current status, what was accomplished, key context for next session.`,
-        "--output-format",
-        "text",
-        "--resume",
-        session.sessionId,
-        ...securityArgs,
-        "--model",
-        settings.model || "haiku",
-      ],
-      { stdout: "pipe", stderr: "pipe", timeout: 30_000 },
-    );
-    await proc.exited;
-    console.log("[shutdown] Memory saved.");
-  } catch (e) {
-    console.warn("[shutdown] Memory save failed:", e);
-  }
+/** What `stop()` touches outside the daemon, injectable so it can be tested without a real project dir. */
+export interface StopDeps {
+  pidFile: string;
+  /** One-shot memory save, for when NO daemon is running. */
+  saveMemoryOneShot: () => Promise<unknown>;
+  teardownStatusline: () => Promise<void>;
+  removeHeartbeatState: () => Promise<void>;
 }
 
-export async function stop() {
-  const pidFile = getPidPath();
+function defaultStopDeps(): StopDeps {
+  return {
+    pidFile: getPidPath(),
+    saveMemoryOneShot: () => saveGlobalMemoryOneShot({ timeoutMs: CLI_MEMORY_SAVE_TIMEOUT_MS }),
+    teardownStatusline,
+    removeHeartbeatState: async () => {
+      try {
+        await unlink(join(HEARTBEAT_DIR, "state.json"));
+      } catch {
+        // already gone
+      }
+    },
+  };
+}
+
+export async function stop(deps: StopDeps = defaultStopDeps()) {
+  const pidFile = deps.pidFile;
   let pid: string;
   try {
     pid = (await Bun.file(pidFile).text()).trim();
@@ -80,8 +68,13 @@ export async function stop() {
     process.exit(0);
   }
 
-  // Save memory before killing
-  await preShutdownMemorySave();
+  // #549: with a daemon running, the daemon saves memory itself when it gets the
+  // SIGTERM, by asking its live sessions — a `claude -p` resumed here would be a
+  // second process writing the transcript the live PTY owns. Only when no daemon is
+  // running (a stale PID file) is there nobody else to do it.
+  if (!isPidAlive(Number(pid))) {
+    await deps.saveMemoryOneShot();
+  }
 
   try {
     process.kill(Number(pid), "SIGTERM");
@@ -112,7 +105,7 @@ export async function stop() {
         console.log(
           `Daemon (PID ${pid}) did not exit after SIGKILL — leaving ${pidFile} in place; check the process before starting another daemon.`,
         );
-        await teardownStatusline();
+        await deps.teardownStatusline();
         process.exit(1);
       }
     }
@@ -122,7 +115,7 @@ export async function stop() {
       console.log(
         `Daemon (PID ${pid}) belongs to another user — cannot signal it; PID file left in place.`,
       );
-      await teardownStatusline();
+      await deps.teardownStatusline();
       process.exit(1);
     }
     console.log(`Daemon process ${pid} already dead.`);
@@ -131,7 +124,7 @@ export async function stop() {
   // #420: only if the file still names the daemon we stopped — a `start` that
   // raced us may already own it. "absent" is the normal graceful case: the
   // daemon removes its own file when it exits.
-  const cleanup = await cleanupPidFileIf(Number(pid));
+  const cleanup = await cleanupPidFileIf(Number(pid), pidFile);
   if (cleanup === "foreign") {
     console.log(
       `PID file no longer names ${pid} (another daemon started meanwhile) — left in place.`,
@@ -141,13 +134,9 @@ export async function stop() {
     // file naming a dead PID is removed by the next start's own check.
     console.log("PID lock busy or unavailable in this directory — PID file left in place.");
   }
-  await teardownStatusline();
+  await deps.teardownStatusline();
 
-  try {
-    await unlink(join(HEARTBEAT_DIR, "state.json"));
-  } catch {
-    // already gone
-  }
+  await deps.removeHeartbeatState();
 
   process.exit(0);
 }

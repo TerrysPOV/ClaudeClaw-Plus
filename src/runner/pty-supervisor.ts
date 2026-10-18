@@ -54,7 +54,12 @@
 // used bare specifiers. Both work under `moduleResolution: bundler`, but
 // mixing forms makes greps lie and risks breakage if we ever flip to
 // `moduleResolution: nodenext` (which requires the extension).
-import type { PtyProcess, PtyProcessOptions, SpawnPty } from "./pty-process.js";
+import type {
+  PtyProcess,
+  PtyProcessOptions,
+  PtyTurnResult,
+  SpawnPty,
+} from "./pty-process.js";
 import { PtyClosedError, PtyTurnTimeoutError } from "./pty-process.js";
 import { ensureTrustAccepted } from "./pty-trust-prompt.js";
 import type { OneShotRequest, OneShotResult } from "../oneshot/engine.js";

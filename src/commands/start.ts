@@ -56,6 +56,12 @@ import {
   type Settings,
 } from "../config";
 import { DEFAULT_DRAIN_TURNS_MS, drainActiveTurns } from "../bus/shutdown-drain";
+import {
+  memoryPathForSessionKey,
+  saveGlobalMemoryOneShot,
+  saveMemoryAtShutdown,
+} from "../shutdown-memory-save";
+import { createShutdownController, runShutdownSequence } from "./shutdown-sequence";
 import { defaultCredentialsPath, enforceCredentialReadiness } from "../bus/credential-readiness";
 import { getDayAndMinuteAtOffset, buildClockPromptPrefix } from "../timezone";
 import { isHeartbeatExcludedAt, isHeartbeatExcludedNow } from "../heartbeat-windows";
@@ -71,7 +77,11 @@ import { getMcpProxyPlugin } from "../plugins/mcp-proxy/index.js";
 import { getMcpMultiplexerPlugin } from "../plugins/mcp-multiplexer/index.js";
 import { getMcpBridge } from "../plugins/mcp-bridge.js";
 import { getToolCallSink } from "../observability/tool-call-sink.js";
-import { injectMcpIdentityIssuer } from "../runner/pty-supervisor";
+import {
+  injectMcpIdentityIssuer,
+  liveSessionKeys,
+  sendToLiveSession,
+} from "../runner/pty-supervisor";
 import { defaultOutboxPath, getTelegramOutbox, type TelegramOutbox } from "../telegram-outbox";
 import { describeQuietHours, proactiveDeliver, quietHoursFrom } from "../quiet-hours";
 
@@ -716,92 +726,116 @@ export async function start(args: string[] = []) {
 
   let mcpProxyStarted: Promise<void> = Promise.resolve();
 
-  let shuttingDown = false;
-  let abortDrain = false;
+  const shutdownCtl = createShutdownController();
   async function shutdown() {
     // A second SIGTERM/SIGINT does not start a second teardown: it aborts the
-    // drain below so the first one proceeds at once (Ctrl-C twice in a
-    // terminal, or an operator who does not want to wait).
-    if (shuttingDown) {
-      abortDrain = true;
-      return;
+    // drain and the memory save below so the first one proceeds at once (Ctrl-C
+    // twice in a terminal, or an operator who does not want to wait).
+    if (shutdownCtl.request() === "abort") return;
+    const shutdownStartedAt = performance.now();
+    // `getSettings()` follows the hot reload and is safe before
+    // `currentSettings` is initialised (a SIGTERM during boot).
+    let drainMs = DEFAULT_DRAIN_TURNS_MS;
+    try {
+      drainMs = getSettings().shutdown.drainTurnsMs;
+    } catch {
+      /* settings not loaded yet — keep the default */
     }
-    shuttingDown = true;
-    // #315: let the bus finish what it owes the model (bounded) BEFORE any
-    // adapter or the bus goes away — a restart mid-turn used to drop the
-    // reply silently. Nothing here may prevent the teardown that follows.
-    if (busCoreForWebUi) {
-      const bus = busCoreForWebUi;
-      try {
-        // `getSettings()` follows the hot reload and is safe before
-        // `currentSettings` is initialised (a SIGTERM during boot).
-        let drainMs = DEFAULT_DRAIN_TURNS_MS;
+    await runShutdownSequence({
+      // #315: let the bus finish what it owes the model (bounded) BEFORE any
+      // adapter or the bus goes away — a restart mid-turn used to drop the
+      // reply silently. Nothing here may prevent the teardown that follows.
+      drain: async () => {
+        if (!busCoreForWebUi) return;
+        const bus = busCoreForWebUi;
         try {
-          drainMs = getSettings().shutdown.drainTurnsMs;
-        } catch {
-          /* settings not loaded yet — keep the default */
+          await drainActiveTurns(drainMs, {
+            busyAgents: () => (bus.busyAgents ? bus.busyAgents() : bus.activeTurnAgents()),
+            onTurnEnd: (handler) => {
+              const sub = bus.subscribe({ topics: ["response.turn_end"] }, (event) =>
+                handler(event.agent_id),
+              );
+              return () => sub.close();
+            },
+            shouldAbort: () => shutdownCtl.aborted,
+            log: (line) => console.log(`[${ts()}] ${line}`),
+          });
+        } catch (err) {
+          console.error(`[${ts()}] [shutdown] drain failed (continuing with teardown):`, err);
         }
-        await drainActiveTurns(drainMs, {
-          busyAgents: () => (bus.busyAgents ? bus.busyAgents() : bus.activeTurnAgents()),
-          onTurnEnd: (handler) => {
-            const sub = bus.subscribe({ topics: ["response.turn_end"] }, (event) =>
-              handler(event.agent_id),
-            );
-            return () => sub.close();
-          },
-          shouldAbort: () => abortDrain,
+      },
+      // #549: ask each live session to save its memory — here, in the daemon, from
+      // the session it already has. What is left of the drain window bounds it, so
+      // drain plus save stay inside what `claudeclaw stop` waits for.
+      saveMemory: async () => {
+        const leftMs = Math.max(0, drainMs - (performance.now() - shutdownStartedAt));
+        await saveMemoryAtShutdown(leftMs, {
+          liveKeys: liveSessionKeys,
+          send: sendToLiveSession,
+          memoryPathFor: memoryPathForSessionKey,
+          // No live PTY (legacy `-p` runtime): resume the stored session instead, so
+          // that runtime keeps the save `claudeclaw stop` used to do. Not under the
+          // bus runtime, whose agents own their sessions.
+          fallbackSave: busRuntimeHandle ? undefined : saveGlobalMemoryOneShot,
+          signal: shutdownCtl.signal,
           log: (line) => console.log(`[${ts()}] ${line}`),
         });
-      } catch (err) {
-        console.error(`[${ts()}] [shutdown] drain failed (continuing with teardown):`, err);
-      }
-    }
-    await mcpProxyStarted.catch(() => {}); // drain start() before stop() clears server map
-    await getMcpProxyPlugin().stop();
-    await pluginManager.stopServices();
-    setPluginManager(null);
-    if (discordStopGateway) discordStopGateway();
-    if (slackStopFn) slackStopFn();
-    if (web) web.stop();
-    // #294: unsubscribe the kanban tracker before the bus stops.
-    if (kanbanTracker) {
-      try {
-        kanbanTracker.stop();
-      } catch (err) {
-        console.error("[kanban-tracker] shutdown failed", err);
-      }
-      kanbanTracker = null;
-    }
-    // #325: detach the operator-alert buffer before the bus stops.
-    if (operatorAlertBuffer) {
-      try {
-        operatorAlertBuffer.detach();
-      } catch (err) {
-        console.error("[operator-alert-buffer] shutdown failed", err);
-      }
-      operatorAlertBuffer = null;
-    }
-    if (busRuntimeHandle) {
-      try {
-        await busRuntimeHandle.stop();
-      } catch (err) {
-        console.error("[bus-runtime] shutdown failed", err);
-      }
-    }
-    // #436: a web-UI fire's frontmatter restore waits for its turn to end;
-    // the turns are drained by now, and a pending restore dies with us.
-    try {
-      const { restorePendingFrontmatter } = await import("./fire");
-      await restorePendingFrontmatter();
-    } catch (err) {
-      console.error("[fire] pending frontmatter restore failed at shutdown", err);
-    }
-    await teardownStatusline();
-    // #420: only our own file — a replacement that already wrote its PID keeps it.
-    // #435: a short lock wait: under `--replace-existing` the replacement holds
-    // the lock for our whole drain and removes the file itself, and a file left
-    // naming our dead PID is cleaned by the next check anyway.
-    await cleanupPidFileIf(process.pid, undefined, 250);
+      },
+      teardown: async () => {
+        await mcpProxyStarted.catch(() => {}); // drain start() before stop() clears server map
+        await getMcpProxyPlugin().stop();
+        await pluginManager.stopServices();
+        setPluginManager(null);
+        if (discordStopGateway) discordStopGateway();
+        if (slackStopFn) slackStopFn();
+        if (web) web.stop();
+        // #294: unsubscribe the kanban tracker before the bus stops.
+        if (kanbanTracker) {
+          try {
+            kanbanTracker.stop();
+          } catch (err) {
+            console.error("[kanban-tracker] shutdown failed", err);
+          }
+          kanbanTracker = null;
+        }
+        // #325: detach the operator-alert buffer before the bus stops.
+        if (operatorAlertBuffer) {
+          try {
+            operatorAlertBuffer.detach();
+          } catch (err) {
+            console.error("[operator-alert-buffer] shutdown failed", err);
+          }
+          operatorAlertBuffer = null;
+        }
+      },
+      stopBus: async () => {
+        if (busRuntimeHandle) {
+          try {
+            await busRuntimeHandle.stop();
+          } catch (err) {
+            console.error("[bus-runtime] shutdown failed", err);
+          }
+        }
+      },
+      finalize: async () => {
+        // #436: a web-UI fire's frontmatter restore waits for its turn to end;
+        // the turns are drained by now, and a pending restore dies with us.
+        try {
+          const { restorePendingFrontmatter } = await import("./fire");
+          await restorePendingFrontmatter();
+        } catch (err) {
+          console.error("[fire] pending frontmatter restore failed at shutdown", err);
+        }
+        await teardownStatusline();
+        // #420: only our own file — a replacement that already wrote its PID keeps it.
+        // #435: a short lock wait: under `--replace-existing` the replacement holds
+        // the lock for our whole drain and removes the file itself, and a file left
+        // naming our dead PID is cleaned by the next check anyway.
+        await cleanupPidFileIf(process.pid, undefined, 250);
+      },
+      onStepError: (step, err) =>
+        console.error(`[${ts()}] [shutdown] ${step} failed (continuing with teardown):`, err),
+    });
     process.exit(0);
   }
   process.on("SIGTERM", shutdown);

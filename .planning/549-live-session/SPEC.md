@@ -88,9 +88,17 @@ read-only "is this key live and idle" accessor. PTY session keys are `thread:<id
    live summary to be sound: the live session now also holds the summary exchange).
 10. **Prompts are unchanged.** The existing memory-save, compact and summary prompt texts are
     reused verbatim; only the transport changes.
-11. **`runOneShot` is consumed as frozen by #548.** No local copy. If its request lacks a way
-    to pass the agent `cwd` that `--resume` needs for agent sessions, that is raised with the
-    coordinator, not worked around here.
+11. **`runOneShot` is consumed from #548; no local copy.** The interface frozen at `dede882b`
+    has no `cwd`, but `claude --resume` finds a session by its working directory and
+    `runCompact` resumes agent/thread sessions with `cwd = agents/<name>`. Asked the
+    coordinator (answer: add it to #548): `OneShotRequest.cwd?: string`, honoured only for
+    `trusted-session`, rejected by `runOneShot` for `untrusted`. There is no `api`/`baseEnv`
+    field: the `print` engine derives api, env and security args from settings, as
+    `runClaudeOnce` does today. #549 codes against `cwd?: string`.
+12. **Memory saves pass `allowedTools: ["Write"]`.** The old stop-time save forced
+    `--dangerously-skip-permissions` so the write could not be refused. The one-shot
+    engine builds its own permission flags, so the Write the save needs is requested
+    explicitly instead of relying on a bypass.
 
 ## Key files
 
