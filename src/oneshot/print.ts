@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { cleanSpawnEnv } from "../runner/spawn-env.js";
 import type { OneShotRequest, OneShotResult } from "./engine.js";
 import { UNTRUSTED_CLAUDE_ARGS, validateIsolation } from "./isolation.js";
+import { cliModelFlag } from "./model.js";
 import { stderrExcerpt } from "./redact.js";
 
 interface PrintRuntime {
@@ -31,13 +32,8 @@ export function buildPrintArgs(req: OneShotRequest, stdinPrompt = false): string
   // be parsed as a flag. Trusted callers may opt in to stdin delivery.
   const viaStdin = stdinPrompt || req.isolation === "untrusted";
   const args = viaStdin ? ["--print", "--output-format", "text"] : ["-p", req.prompt];
-  const model = req.model?.trim();
-  if (
-    model &&
-    model.toLowerCase() !== "glm" &&
-    (req.isolation === "untrusted" || model.toLowerCase() !== "kimi-k2p6")
-  )
-    args.push("--model", model);
+  const model = cliModelFlag(req.model);
+  if (model) args.push("--model", model);
   if (req.system) args.push("--system-prompt", req.system);
   if (req.isolation === "untrusted") args.push(...UNTRUSTED_CLAUDE_ARGS);
   else {

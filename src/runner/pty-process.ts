@@ -33,6 +33,7 @@
 import { spawn as ptySpawn, type IPty } from "bun-pty";
 import type { SecurityConfig } from "../config";
 import { UNTRUSTED_CLAUDE_ARGS } from "../oneshot/isolation.js";
+import { cliModelFlag } from "../oneshot/model.js";
 import { withCleanProcessEnv } from "../runner";
 import {
   createParser,
@@ -323,8 +324,8 @@ function buildClaudeArgs(opts: PtyProcessOptions): string[] {
   const args: string[] = [];
 
   if (opts.isolation === "untrusted") {
-    const model = opts.modelOverride?.trim();
-    if (model && model.toLowerCase() !== "glm") args.push("--model", model);
+    const model = cliModelFlag(opts.modelOverride);
+    if (model) args.push("--model", model);
     args.push(...UNTRUSTED_CLAUDE_ARGS);
     return args;
   }
@@ -355,10 +356,8 @@ function buildClaudeArgs(opts: PtyProcessOptions): string[] {
     args.push("--session-id", opts.newSessionId);
   }
 
-  const model = (opts.modelOverride ?? "").trim();
-  if (model.length > 0 && model.toLowerCase() !== "glm") {
-    args.push("--model", model);
-  }
+  const model = cliModelFlag(opts.modelOverride);
+  if (model) args.push("--model", model);
 
   if (opts.appendSystemPrompt && opts.appendSystemPrompt.length > 0) {
     args.push("--append-system-prompt", opts.appendSystemPrompt);
