@@ -3,29 +3,14 @@ import { join } from "path";
 import { existsSync } from "fs";
 import { peekSession, backupSession, resetSession } from "./sessions";
 import type { GlobalSession } from "./sessions";
+import { actOnSession } from "./runner/live-session-actions";
+import { retirePtySession } from "./runner/pty-supervisor";
 
 const SUMMARY_TIMEOUT_MS = 60_000;
 import type { SessionConfig } from "./config";
 
 const PROMPTS_DIR = join(import.meta.dir, "..", "prompts");
 const SUMMARY_PROMPT_FILE = join(PROMPTS_DIR, "SUMMARY.md");
-
-// Env vars injected by a parent Claude Code session that break detached child auth.
-// Mirror of the stripping done in runner.ts cleanSpawnEnv().
-const STRIPPED_ENV_KEYS = new Set([
-  "CLAUDECODE",
-  "CLAUDE_CODE_OAUTH_TOKEN",
-  "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
-]);
-
-function cleanEnv(): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (STRIPPED_ENV_KEYS.has(key)) continue;
-    if (typeof value === "string") out[key] = value;
-  }
-  return out;
-}
 
 export function needsRotation(session: GlobalSession, config: SessionConfig): boolean {
   if (!config.autoRotate) return false;
@@ -35,9 +20,34 @@ export function needsRotation(session: GlobalSession, config: SessionConfig): bo
   return false;
 }
 
+/** The steps `rotateSession` takes, injectable so the order can be tested. */
+export interface RotateDeps {
+  peek: () => Promise<GlobalSession | null>;
+  summarize: (
+    sessionId: string,
+    summaryPath: string,
+    opts?: { sessionKey?: string },
+  ) => Promise<string | null>;
+  backup: () => Promise<string | null>;
+  reset: () => Promise<unknown>;
+  /** Retire the live supervisor entry for a key. */
+  retireLive: (sessionKey: string) => Promise<void>;
+}
+
+const defaultRotateDeps: RotateDeps = {
+  peek: peekSession,
+  summarize: (sessionId, summaryPath, opts) => generateSummary(sessionId, summaryPath, opts),
+  backup: backupSession,
+  reset: resetSession,
+  retireLive: retirePtySession,
+};
+
 /** Rotate the global session. Returns the freshly-written summary content, or null if summary generation was skipped, timed out, or failed. */
-export async function rotateSession(config: SessionConfig): Promise<string | null> {
-  const session = await peekSession();
+export async function rotateSession(
+  config: SessionConfig,
+  deps: RotateDeps = defaultRotateDeps,
+): Promise<string | null> {
+  const session = await deps.peek();
   if (!session) return null;
 
   const ageH = Math.round((Date.now() - new Date(session.createdAt).getTime()) / 3_600_000);
@@ -48,18 +58,29 @@ export async function rotateSession(config: SessionConfig): Promise<string | nul
   let freshSummary: string | null = null;
   if (config.summaryPath) {
     try {
-      freshSummary = await generateSummary(session.sessionId, config.summaryPath);
+      // The global session may be live in the PTY supervisor: ask it first (#549).
+      freshSummary = await deps.summarize(session.sessionId, config.summaryPath, {
+        sessionKey: "global",
+      });
     } catch (e) {
       console.error(`[${new Date().toLocaleTimeString()}] Failed to generate session summary:`, e);
     }
   }
 
-  const backupName = await backupSession();
+  const backupName = await deps.backup();
   if (backupName) {
     console.log(`[${new Date().toLocaleTimeString()}] Session backed up as ${backupName}`);
   }
 
-  await resetSession();
+  await deps.reset();
+  // The stored session is gone, but a live PTY would carry on with the old
+  // conversation (and now the summary exchange too): retire it so the next turn
+  // spawns fresh. Without this a rotation does nothing in PTY mode.
+  try {
+    await deps.retireLive("global");
+  } catch (e) {
+    console.warn(`[${new Date().toLocaleTimeString()}] Failed to retire the live session:`, e);
+  }
   console.log(
     `[${new Date().toLocaleTimeString()}] Session rotated — next message will create a new session`,
   );
@@ -78,6 +99,7 @@ export async function rotateSession(config: SessionConfig): Promise<string | nul
 export async function generateSummary(
   sessionId: string,
   summaryPath: string,
+  opts: { sessionKey?: string } = {},
 ): Promise<string | null> {
   await mkdir(summaryPath, { recursive: true });
 
@@ -89,38 +111,22 @@ export async function generateSummary(
       "Generate a brief session summary in markdown. Include: key decisions, unfinished tasks, important context for the next session. Max 500 words.";
   }
 
-  const proc = Bun.spawn(
-    ["claude", "-p", summaryPrompt, "--resume", sessionId, "--output-format", "text"],
-    { stdout: "pipe", stderr: "pipe", env: cleanEnv() },
-  );
+  // Live session first when the caller knows one (`sessionKey`); otherwise a
+  // one-shot resume of `sessionId`, with only the Write tool instead of the full
+  // default set (#549).
+  const result = await actOnSession({
+    route: "rotation.summary",
+    prompt: summaryPrompt,
+    sessionKey: opts.sessionKey,
+    sessionId,
+    timeoutMs: SUMMARY_TIMEOUT_MS,
+    allowedTools: ["Write"],
+  });
+  const stdout = result.text;
 
-  // Kill the subprocess and skip summary if it takes too long.
-  let killed = false;
-  const timer = setTimeout(() => {
-    killed = true;
-    try {
-      proc.kill();
-    } catch {}
-  }, SUMMARY_TIMEOUT_MS);
-
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ]);
-  await proc.exited;
-  clearTimeout(timer);
-
-  if (killed) {
-    console.warn(
-      `[${new Date().toLocaleTimeString()}] Summary generation timed out after ${SUMMARY_TIMEOUT_MS / 1000}s — continuing rotation without summary`,
-    );
-    return null;
-  }
-
-  if (proc.exitCode !== 0 || !stdout.trim()) {
+  if (!result.ok || !stdout.trim()) {
     console.error(
-      `[${new Date().toLocaleTimeString()}] Summary generation failed (exit ${proc.exitCode}):`,
-      stderr,
+      `[${new Date().toLocaleTimeString()}] Summary generation failed (${result.detail ?? result.via}) — continuing rotation without summary`,
     );
     return null;
   }
