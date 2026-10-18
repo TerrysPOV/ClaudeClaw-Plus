@@ -12,11 +12,12 @@
  *     `claude -p` argv, no PTY is spawned.
  *
  * Settings are stubbed through `getSettings`; the session files the paths read
- * and write in `<cwd>/.claude/claudeclaw/` are restored after each test.
+ * and write in `<cwd>/.claude/claudeclaw/` are restored after the suite,
+ * deleted ones included.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import * as configMod from "../config";
 import { getSettings, initConfig, loadSettings } from "../config";
@@ -32,8 +33,19 @@ import {
   resetSleep,
   snapshotSupervisor,
 } from "../runner/pty-supervisor";
-import { PtyClosedError, type PtyProcess, type PtyProcessOptions } from "../runner/pty-process";
-import { createFallbackSession, getFallbackSession, resetFallbackSession } from "../sessions";
+import {
+  PtyClosedError,
+  type PtyProcess,
+  type PtyProcessOptions,
+  spawnPty,
+} from "../runner/pty-process";
+import {
+  createFallbackSession,
+  getFallbackSession,
+  peekSession,
+  resetFallbackSession,
+  resetSession,
+} from "../sessions";
 import { createThreadSession, removeThreadSession } from "../sessionManager";
 
 const STATE_DIR = join(process.cwd(), ".claude", "claudeclaw");
@@ -80,6 +92,14 @@ async function restoreDir(dir: string, snap: Map<string, string>): Promise<void>
     const isDirWithKnownFiles = [...snap.keys()].some((k) => k.startsWith(`${p}/`));
     if (isDirWithKnownFiles) await restoreDir(p, snap);
     else await rm(p, { recursive: true, force: true });
+  }
+}
+/** Put back the snapshotted files a test deleted (e.g. the fallback session file). */
+async function restoreDeleted(snap: Map<string, string>): Promise<void> {
+  for (const [p, before] of snap) {
+    if (await Bun.file(p).exists()) continue;
+    await mkdir(dirname(p), { recursive: true });
+    await writeFile(p, before);
   }
 }
 
@@ -154,7 +174,10 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  if (stateBefore) await restoreDir(STATE_DIR, stateBefore);
+  if (stateBefore) {
+    await restoreDir(STATE_DIR, stateBefore);
+    await restoreDeleted(stateBefore);
+  }
   await rm(AGENT_DIR, { recursive: true, force: true });
 });
 
@@ -526,4 +549,63 @@ describe("#546 rate-limit fallback", () => {
     expect(argv[argv.indexOf("--model") + 1]).toBe("fallback-model");
     expect(argv[argv.indexOf("--resume") + 1]).toBe("fallback-session");
   });
+});
+
+describe("#559 a fresh chat turn with the clock prefix is submitted", () => {
+  // A real PTY running a stand-in for claude's input box (fixtures/paste-burst-tui.ts):
+  // an unmarked burst of 64+ bytes is a paste whose CR stays text, as on CLI 2.1.296.
+  it("runUserMessage('chat') on a new session submits the prefixed prompt", async () => {
+    // A prompt left in the input box ends in the turn timeout: 3 s here, not 5 min.
+    stubSettings(true, { timeouts: { ...getSettings().timeouts, default: 0.05 } });
+    await resetSession();
+    expect(await peekSession()).toBeNull();
+    const tui = join(import.meta.dir, "fixtures", "paste-burst-tui.ts");
+    injectSpawnPty(async (opts) => {
+      ptySpawns.push(opts);
+      return spawnPty({
+        ...opts,
+        _commandOverride: process.execPath,
+        _argsOverride: [tui],
+        quietWindowMs: 300,
+        sentinelMaxWaitMs: 2_000,
+      });
+    });
+    const prompt = "Reply with exactly the word FRESH559 and nothing else.";
+    const r = await runnerMod.runUserMessage("chat", prompt);
+    expect(ptySpawns).toHaveLength(1);
+    expect(ptySpawns[0].sessionId).toBe(""); // fresh: nothing to resume
+    expect(r.exitCode).toBe(0);
+    const submitted = /SUBMITTED<([^>]*)>/.exec(r.stdout)?.[1];
+    expect(submitted).toMatch(/^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC[+-]\d+(?::\d{2})?\] /);
+    expect(submitted?.endsWith(prompt)).toBe(true);
+  }, 20_000);
+
+  it("a prompt carrying a paste end marker cannot close the paste early", async () => {
+    const tui = join(import.meta.dir, "fixtures", "paste-burst-tui.ts");
+    const pty = await spawnPty({
+      sessionId: "",
+      cwd: process.cwd(),
+      security: { level: "unrestricted", allowedTools: [], disallowedTools: [] },
+      env: { ...process.env } as Record<string, string>,
+      agentName: "t559",
+      _commandOverride: process.execPath,
+      _argsOverride: [tui],
+      quietWindowMs: 300,
+      sentinelMaxWaitMs: 2_000,
+    });
+    try {
+      const r = await pty.runTurn(
+        "before \x1b[201~\r after, and enough text after the marker for a burst of 64+ bytes",
+        {
+          timeoutMs: 5_000,
+        },
+      );
+      const submits = r.text.match(/SUBMITTED<[^>]*>/g) ?? [];
+      expect(submits).toEqual([
+        "SUBMITTED<before [201~  after, and enough text after the marker for a burst of 64+ bytes>",
+      ]);
+    } finally {
+      await pty.dispose();
+    }
+  }, 20_000);
 });
