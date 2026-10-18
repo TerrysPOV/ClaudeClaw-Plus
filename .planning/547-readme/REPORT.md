@@ -72,6 +72,33 @@ This task resolved all ten accuracy issues in `README.md` documented in issue #5
 
 ---
 
+## Round 3: Codex findings and full code audit (branch `review/558`, from head 7bcb673c)
+
+Round 3 had three open Codex findings. Because every round had found new claims the code contradicts, this pass also re-audited the whole README diff against the code: **80 claims, 38 fixed, 1 added, 41 confirmed**. Row by row, with `file:line` evidence: [`AUDIT.md`](AUDIT.md). That table supersedes the "Verified Evidence Table" below, whose citations were not all right (see the list of wrong cites in AUDIT.md).
+
+| Codex round 3 finding | Verdict | Fix |
+|---|---|---|
+| README ~194: token hot-reload differs by runtime | Valid | Under the legacy runtime (`runtime: "pty"`, or a failed bus mount) `initTelegram`/`initDiscord`/`initSlack` start, restart and stop adapters on a token change (`start.ts:885-1022, 1759-1767`); under a mounted bus runtime a restart is needed (`:1791-1795`). Both lists say so, and the line-103 intro no longer says tokens always need a restart. |
+| README ~195: `web.enabled` missing from the restart list | Valid | Added with `web.host`/`web.port`: the dashboard is created once from the startup value (`start.ts:535, 1480`). |
+| `marketplace.json` ~11: top-level `version` stale | Valid | The file has a top-level `version` (line 25) and `plugins[].version` (line 11); `scripts/bump-marketplace-version.ts` bumps only the nested one and earlier bumps edited both by hand. Top-level set to 2.2.337. Not a version bump: no new version. |
+
+Errors the audit found that Codex had not (details and evidence in AUDIT.md):
+
+- **Policy engine "legacy runner only" was wrong.** The bus permission gate consults it (`bus/core.ts:3369-3393, 3820-3832`), the gateway and orchestrator do too; `runner.ts`'s own `evaluateToolForExecution` is never called.
+- **DAG orchestrator "(legacy runner)" was wrong.** Nothing in production submits a workflow to it; its one live wiring is the startup resume.
+- **`memory_file` was documented as used by bus agents; it is parsed and copied, never read.**
+- **`security.level: locked` is not read-only** (`Write` stays allowed, `runner.ts:1505`); `disallowedTools` is ignored under it.
+- **The wizard does not pick `bypassPermissions`**; the bus resolver defaults to it.
+- **Execution-modes matrix:** forks are legacy-Telegram only, agent jobs bus only, and `process-stream-json` (a bus supervision mode) was mislabelled onto the runner.
+- Citations that pointed at the wrong lines: reload loop blocks, `agent-resolver.ts:73` (supervision is `:74`), `types.ts:77-85`, `start.ts:1111-1120` and `1432-1438`, `runner.ts:69`, `runner.ts:39-62`.
+- **Added:** channel allow-lists hot-reload (`allowlist.ts:23-27`, `start.ts:1152`).
+
+Checks run: `bun run lint` (whole repo) and a script that resolves every relative link and anchor in the README (41 links) and checks that every `file:line` citation (90) lies inside its file; the script was shown to fail on an injected broken link, anchor, citation range and missing file. It checks that a citation points inside the file, not that it says what the README claims; the second is what the per-row reading in AUDIT.md covers.
+
+Not done: the "Drain" paragraph (`shutdown.drainTurnsMs`) is not part of this PR's diff and was not re-audited. Prior art (ClaudeClaw-Ultra) not consulted for this pass. No version bump (the branch carries 2.2.337).
+
+---
+
 ## Verified Evidence Table
 
 | README Line(s) | Claim / Statement | Evidence File:Line |
@@ -124,7 +151,7 @@ Verification against the codebase confirmed that `job-loop.ts` calls `deps.run()
    - Current: 149 errors (no regression).
 4. **Version Bumps:**
    - `bun run bump:plugin-version` -> `2.2.337`
-   - `bun run bump:marketplace-version` -> `2.2.337`
+   - `bun run bump:marketplace-version` -> `2.2.337` (nested `plugins[].version` only; the top-level `version` was left at 2.2.336 until round 3)
 5. **Prior Art Inspection:**
    - Checked `ultraassist/ClaudeClaw-Ultra` (local clone: `/Users/terrenceyodaiken/claude-workspace/claudeclaw-ultra`).
    - Verified that Ultra also has no one-shot module, no `sendToLiveSession`, and equivalent execution dispatch conventions. No specific phrasing or documentation patterns were borrowed as Plus's architecture has diverged significantly.

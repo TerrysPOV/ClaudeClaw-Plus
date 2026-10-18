@@ -80,6 +80,15 @@ Update `README.md` to:
 2. Engine policy (#553): Explicitly document that PTY is the official engine; `claude -p` remains a supported option. State that currently `pty.enabled` defaults to `false` and issue #550 will flip the default to `true`.
 3. Anthropic billing: Strictly follow public Anthropic documentation; do not assert private pool behavior.
 
+### Added in round 3 (code wins over the issue text)
+
+- **Orchestrator wording:** the README says the DAG engine exists and resumes persisted workflows at startup, and that no job path submits workflows to it. The issue item 10 says "run on the runner.ts path only"; that is not what the code does.
+- **Policy engine wording:** lists the three places that consult it (bus permission gate, gateway, orchestrator) instead of "legacy runner".
+- **Hot reload is described per setting and per runtime**, from what the 30 s loop in `start.ts` actually re-applies; tokens are the case that differs by runtime. Allow-lists are included because they do hot-reload.
+- **Matrix columns** list only the paths that exist under each runtime (agent jobs: bus; dashboard chat and forks: legacy).
+- **`locked`** is described by its tool list, not as read-only, even though the wizard text says "Read-only".
+- **`marketplace.json`:** both version fields are set by hand to match; fixing `scripts/bump-marketplace-version.ts` is out of scope here.
+
 ## Key Files
 
 - `README.md`
