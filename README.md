@@ -68,7 +68,7 @@ As of v2.0 (May 2026), ClaudeClaw+ runs on a new **event-bus architecture** by d
 
 Here's what changes when you pick the bus runtime:
 
-- **One long-lived `claude` process per declared agent** when using interactive supervision, rather than a fresh subprocess per event. (Cron jobs and agent jobs run via `claude -p` subprocesses).
+- **One long-lived `claude` process per declared agent** when using interactive supervision (`pty-stdin`), rather than a fresh subprocess per event. (Cron jobs and agent jobs route through `runner.ts` and follow `pty.enabled`: running via `claude -p` under the current default `pty.enabled: false`, and via the PTY supervisor when `pty.enabled: true`).
 - **Typed event bus (`BusCore`)** sits between adapters (Discord, Telegram, Slack, web UI, cron, REST, CLI) and agents. Inbound events publish to topics; agents subscribe; replies flow back as `response.text`, `channel.permission_request`, or `system.request_human`.
 - **Origin-aware routing** — a Discord reply goes back to the Discord channel that triggered it, not fanned out across every channel the agent is wired to.
 - **Per-agent process isolation** — agents have separate working directories, permission modes, system prompts, and memory files.
@@ -167,7 +167,7 @@ Telegram already routes one chat per agent, so this setting is Discord/Slack onl
 ### 6. Heartbeat, cron, security
 
 - **`heartbeat.enabled`** + `interval` (minutes) + `excludeWindows` for quiet hours. Off by default.
-- **Cron jobs** — see `commands/` and the wizard's cron setup step. Note that cron jobs run as `claude -p` subprocesses under both runtimes (`src/job-loop.ts:4-8`).
+- **Cron jobs** — see `commands/` and the wizard's cron setup step. Note that cron jobs execute via `runner.ts` under both runtimes and follow `pty.enabled` (`claude -p` subprocesses under the current default `pty.enabled: false`, or the PTY supervisor when `pty.enabled: true`; `src/runner.ts:2015, 2690`).
 - **`security.level`** — `locked` (read-only searching/reading), `strict`, `moderate`, `unrestricted` (default `moderate`). Applies to the legacy `runner.ts` execution engine and prompt construction (`src/runner.ts:1501, 1512, 1999`); bus agents are governed by `permission_mode` per agent. Per-tool overrides via `allowedTools` / `disallowedTools`.
 
 ---
@@ -233,17 +233,19 @@ ClaudeClaw+ supports two distinct runtimes (`runtime: "bus"` and `runtime: "pty"
 **Engine Policy ([#553](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues/553)):**
 - **Interactive PTY** is the official execution engine of ClaudeClaw+.
 - **`claude -p`** remains a permanently supported option for programmatic execution, scriptable environments, or headless subprocess tasks (`pty.enabled: false`, `supervision: "process-stream-json"`).
-- **Current Defaults:** In the current release, `pty.enabled` defaults to `false` (meaning runtimes fall back to `claude -p`). A future release ([#550](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues/550)) will flip the default to `pty.enabled: true`.
+- **Bus Supervision vs. `pty.enabled`:** Bus agent turns do not consult `pty.enabled`. Under `runtime: "bus"`, declared agents receive `entry.supervision ?? "pty-stdin"` (`src/bus/agent-resolver.ts:73`). Undeclared spawns fall back to `defaultSupervisionFor(origin)` (`pty-stdin` for channel-driven origins, `process-stream-json` for others; `src/bus/types.ts:54-56, 77-85`). The valid `SupervisionMode` values are `pty-stdin`, `process-stream-json`, `tmux`, and `process` (`src/bus/types.ts:48-52`).
+- **Scope of `pty.enabled`:** `pty.enabled` governs `runner.ts` paths only (`src/runner.ts:732-742, 2015, 2070`): agent turns under `runtime: "pty"`, plus cron jobs (`job-loop.ts`), agent jobs, rate-limit fallback, dashboard chat, and forks under either runtime.
+- **Current Defaults:** In the current release, `pty.enabled` defaults to `false` (meaning `runner.ts` paths fall back to `claude -p`). A future release ([#550](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues/550)) will flip the default to `pty.enabled: true`.
 - **Runtime Isolation:** Switching between `runtime: "bus"` and `runtime: "pty"` requires a full daemon restart (`src/commands/start.ts:606-607`). The two runtimes share neither IPC nor runtime state.
 
 #### Execution Modes Matrix
 
-| Runtime | `pty.enabled` | Agent Turns & Routing | Cron & Scheduled Jobs | Behavior & Supervision |
+| Runtime | `pty.enabled` | Bus Agent Turns (Supervision) | `runner.ts` Paths (Cron, Agent Jobs, Fallback, Dashboard Chat, Forks) | Details & Architecture |
 |---|---|---|---|---|
-| `runtime: "bus"` (default) | `false` (current default) | `claude -p` | `claude -p` (`job-loop.ts:4-8`) | Agents default to `supervision: "interactive-pty"`, but fall back to `process-stream-json` (`claude -p`) when PTY is disabled. Turns, rate-limit fallback, dashboard chat, forks, and bus agent jobs route via `resolveAgentTurnRoute()`. |
-| `runtime: "bus"` | `true` (upcoming default) | Interactive PTY | `claude -p` (`job-loop.ts:4-8`) | Agents run interactive PTY supervision (`interactive-pty`). Rate-limit fallback, dashboard chat, forks, and bus agent jobs follow PTY sessions. |
-| `runtime: "pty"` | `false` (current default) | `claude -p` | `claude -p` (`job-loop.ts:4-8`) | Legacy runner spawns a fresh `claude -p` subprocess per inbound event (`runner.ts:740-743, 2015-2018`). |
-| `runtime: "pty"` | `true` (upcoming default) | Interactive PTY | `claude -p` (`job-loop.ts:4-8`) | Legacy runner uses the interactive PTY supervisor path (`runner.ts:740-743`). |
+| `runtime: "bus"` (default) | `false` (current default) | `pty-stdin` (or declared `supervision`) | `claude -p` (`process-stream-json`) | Bus agents run with `pty-stdin` (or per-agent `supervision`); undeclared spawns follow `defaultSupervisionFor(origin)`. `pty.enabled` does not change bus agent supervision. Cron jobs (`job-loop.ts:21-30`), agent jobs, fallback, and chat route through `runner.ts` and run as `claude -p` (`src/runner.ts:732-742, 2015, 2070, 2690`). |
+| `runtime: "bus"` | `true` (upcoming default) | `pty-stdin` (or declared `supervision`) | Interactive PTY supervisor | Bus agents run with `pty-stdin` (or per-agent `supervision`). Cron jobs, agent jobs, fallback, and dashboard chat route through `runner.ts` and run on the PTY supervisor (`src/runner.ts:732-742, 2015, 2070, 2690`). |
+| `runtime: "pty"` | `false` (current default) | N/A (bus runtime not mounted) | `claude -p` (`process-stream-json`) | Legacy runner spawns a fresh `claude -p` subprocess per inbound event, cron job, agent job, or chat (`src/runner.ts:732-742, 2015, 2070`). |
+| `runtime: "pty"` | `true` (upcoming default) | N/A (bus runtime not mounted) | Interactive PTY supervisor | Legacy runner routes agent turns, cron jobs, agent jobs, fallback, and chat to the interactive PTY supervisor (`src/runner.ts:732-742, 2015, 2070`). |
 
 #### When to pick `claude -p` vs. PTY / Bus
 

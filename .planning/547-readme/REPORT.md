@@ -13,7 +13,7 @@ This task resolved all ten accuracy issues in `README.md` documented in issue #5
 2. **What's New in v2.0 (L65-80):**
    - Articulated the engine policy (#553): PTY is the official engine, `claude -p` remains a permanent option.
    - Removed unbacked claims about Anthropic credit pools ("Subscription billing covers daemon work; the Agent SDK credit pool stays untouched").
-   - Clarified that cron and agent jobs execute via `claude -p` subprocesses.
+   - Clarified that cron and agent jobs follow `pty.enabled` via `runner.ts` (executing via `claude -p` under the current default `pty.enabled: false`, and via the PTY supervisor when `pty.enabled: true`).
    - Clarified that the Human-in-the-loop permission gate under the bus runtime is configured per-agent via `permission_mode` (default `bypassPermissions`).
 3. **Getting Started Command (L94):**
    - Corrected `/claudeclaw:start` to `/claudeclaw-plus:start` per plugin manifest (`.claude-plugin/plugin.json`).
@@ -32,7 +32,8 @@ This task resolved all ten accuracy issues in `README.md` documented in issue #5
    - Documented dashboard URL and auth token path `<project>/.claude/claudeclaw/web.token`.
    - Corrected adapter summary: removed references to non-existent `web.bind`.
 6. **Execution Modes and Engine Policy (L223-280):**
-   - Replaced `claude -p runtime` section with comprehensive Execution Modes matrix covering `runtime: "bus"` and `runtime: "pty"` across `pty.enabled: false` and `true`.
+   - Replaced `claude -p runtime` section with comprehensive Execution Modes matrix separating Bus Agent Turns from `runner.ts` paths (cron, agent jobs, rate-limit fallback, dashboard chat, forks).
+   - Documented that bus agents do not consult `pty.enabled` (declared agents use `entry.supervision ?? "pty-stdin"`, undeclared spawns use `defaultSupervisionFor(origin)`), and real `SupervisionMode` values are `pty-stdin`, `process-stream-json`, `tmux`, and `process`.
    - Stated engine policy (#553) and transition roadmap (#550).
    - Removed dead planning links `.planning/pty-migration/SPEC.md` and `.planning/pty-migration/`.
 7. **MCP Multiplexer (L283-340):**
@@ -53,7 +54,7 @@ This task resolved all ten accuracy issues in `README.md` documented in issue #5
 | L56 | Workflows use DAGs; mid-execution restart survival removed | `src/orchestrator/index.ts:1-25`, `src/orchestrator/task-graph.ts:1-40` |
 | L60-61 | `MEMORY.md` dual-layer write guarantee & DAG orchestrator run on legacy runner | `src/runner.ts:69`, `src/runner.ts:39-62` |
 | L67, L230-236 | Engine policy (#553): PTY official engine, `claude -p` supported; current default `pty.enabled: false` | `src/runner.ts:740-743`, `src/config.ts:140-148` |
-| L71, L170 | Cron & agent jobs execute as `claude -p` subprocesses | `src/job-loop.ts:4-8`, `src/runner.ts:842, 865` |
+| L71, L170 | Cron & agent jobs route through `runner.ts` and follow `pty.enabled` (`claude -p` when false, PTY supervisor when true) | `src/runner.ts:732-742, 2015, 2690` |
 | L75, L129, L136 | Bus agents default to `bypassPermissions`; `security.level` does not restrict bus agents | `src/bus/agent-resolver.ts:73`, `src/bus/session-manager.ts:686-697`, `src/runner.ts:1501, 1512, 1999` |
 | L94 | Slash command is `/claudeclaw-plus:start` | `.claude-plugin/plugin.json:2` |
 | L103, L183-195 | Hot-reload polls every 30s for heartbeat, legacy security, MCP bridge, and jobs; restarts required for adapters, agents, runtime, tokens, binds | `src/commands/start.ts:1693-1789`, `src/config.ts:734-735` |
@@ -64,7 +65,7 @@ This task resolved all ten accuracy issues in `README.md` documented in issue #5
 | L181 | Settings path is `<project>/.claude/claudeclaw/settings.json` | `src/config.ts:23-24` |
 | L201-202 | `/mode` only on legacy Telegram; bus adapters handle no slash commands | `src/commands/telegram.ts:1470-1513`, `src/bus/core.ts:2470-2475`, `src/adapters/discord/index.ts:646-647` |
 | L206 | Dashboard auth token stored at `<project>/.claude/claudeclaw/web.token` | `src/ui/auth.ts:11`, `src/commands/start.ts:1481-1501` |
-| L239-246 | Execution matrix: bus and pty runtimes across pty.enabled; route resolution follows pty.enabled | `src/runner.ts:740-743, 842, 2174-2183, 2738-2760, 2975`, `src/bus/types.ts:48-56` |
+| L233-246 | Bus agent supervision uses `entry.supervision ?? "pty-stdin"`; undeclared spawns use `defaultSupervisionFor(origin)`; `pty.enabled` governs `runner.ts` paths only | `src/bus/agent-resolver.ts:73`, `src/bus/types.ts:48-56, 77-85`, `src/runner.ts:732-742, 2015, 2070` |
 | L236, L271 | Switching `runtime` requires daemon restart; runtimes share neither IPC nor state | `src/commands/start.ts:606-607`, `src/config.ts:734-735` |
 | L289 | MCP multiplexer requires `web.enabled: true` | `src/commands/start.ts:1053, 1111-1120` |
 | L347 | Policy Engine runs on legacy runner | `src/runner.ts:39-62` |
@@ -72,6 +73,15 @@ This task resolved all ten accuracy issues in `README.md` documented in issue #5
 | L371 | Gateway and escalation framework run on legacy adapter pipeline | `src/commands/telegram.ts:31, 1742`, `src/commands/discord.ts:1333` |
 | L383 | DAG Orchestrator runs on legacy runner; does not persist across restarts | `src/runner.ts:39-62`, `src/orchestrator/index.ts:1-35` |
 | L405 | Memory dual-layer write guarantee runs on legacy runner | `src/runner.ts:69` |
+
+---
+
+## Audit Finding: Stale Comment in `src/job-loop.ts:1-8`
+
+During the audit, a stale comment was identified at `src/job-loop.ts:1-8` stating:
+> *Each due job runs as a one-shot `claude -p` through `run()`...*
+
+Verification against the codebase confirmed that `job-loop.ts` calls `deps.run()` (`src/runner.ts:2690`) -> `execClaude` (`src/runner.ts:1807`) -> `resolveAgentTurnRoute` (`src/runner.ts:2070`), which branches on `settings.pty.enabled` at `src/runner.ts:732-742, 2015`. When `pty.enabled: true`, cron jobs run on the PTY supervisor rather than `claude -p`. Per instructions, source code was left untouched, but documentation in `README.md` and this report accurately reflects the code execution path rather than the stale comment.
 
 ---
 

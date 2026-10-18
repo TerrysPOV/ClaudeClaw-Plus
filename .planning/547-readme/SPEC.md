@@ -17,9 +17,10 @@ The README describes the legacy `runtime: "pty"` path in several places as if it
 ## Current Behaviour (file:line)
 
 - Execution modes & pty.enabled:
-  - `src/runner.ts:740-743`: `resolveAgentTurnRoute` resolves engine based on `pty.enabled`.
-  - `src/bus/types.ts:48-56`: Bus supervision modes (`pty-stdin`, `process-stream-json`, `tmux`, `process`). Default for non-channel is `process-stream-json`.
-  - `src/job-loop.ts:4-8`: Cron jobs run through `run()` under every runtime.
+  - `src/runner.ts:732-742, 2015, 2070`: `resolveAgentTurnRoute` resolves engine based on `pty.enabled` for runner.ts paths (agent turns under legacy pty runtime, cron jobs, agent jobs, rate-limit fallback, dashboard chat, forks).
+  - `src/bus/agent-resolver.ts:73`: Declared bus agents get `entry.supervision ?? "pty-stdin"`.
+  - `src/bus/types.ts:48-56, 77-85`: Real `SupervisionMode` values are `pty-stdin`, `process-stream-json`, `tmux`, and `process`. Undeclared spawns fall back to `defaultSupervisionFor(origin)` (`pty-stdin` for channels, `process-stream-json` for others). Bus supervision does not consult `pty.enabled`.
+  - `src/runner.ts:2690`, `src/job-loop.ts:21-30`: Cron jobs run through `runner.run()`, which routes through `execClaude` and follows `pty.enabled`. Note stale comment in `src/job-loop.ts:1-8`.
   - `src/config.ts:734-735`, `src/commands/start.ts:606`: Runtime switch happens at daemon startup.
 - Billing:
   - `src/job-loop.ts:4-8`, `src/runner.ts:865`: Jobs invoke `claude -p` via `run()` or one-shot PTY.
@@ -57,7 +58,7 @@ Update `README.md` to:
 1. Replace lines 223-262 with an "Execution modes" table (`runtime` × `pty.enabled` × `supervision` × cron/agent jobs, with what actually runs and whether restart is needed).
 2. State the engine policy of the PTY migration (#553): PTY is the official engine; `claude -p` stays a supported option (`pty.enabled: false`, `supervision: "process-stream-json"`). Keep enterprise/API-billing rationale for `-p`, reworded as an option rather than default. Describe current default (`pty.enabled: false`) and state that a future release (#550) flips defaults.
 3. Fix items 2-10 in place:
-   - Billing: Remove unsubstantiated credit pool claims. Note that cron and agent jobs run as `claude -p` under both runtimes today.
+   - Billing: Remove unsubstantiated credit pool claims. Note that cron and agent jobs route through runner.ts and follow pty.enabled (claude -p under current default pty.enabled: false, PTY supervisor when pty.enabled: true).
    - Security under bus: Accurately state that bus agents run with `bypassPermissions` by default and `security.level` does not restrict bus agents. Fix security level names (`locked` instead of `read-only`).
    - Hot reload: Accurately list restart-required changes vs hot-reloadable changes.
    - Settings path: Correct to `<project>/.claude/claudeclaw/settings.json`.
