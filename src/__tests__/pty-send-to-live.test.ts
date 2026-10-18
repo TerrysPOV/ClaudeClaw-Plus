@@ -7,6 +7,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { initConfig, loadSettings, reloadSettings } from "../config";
+import { type MemorySaveDeps, saveMemoryAtShutdown } from "../shutdown-memory-save";
 import {
   __resetSupervisorForTests,
   injectIsSessionResumable,
@@ -526,5 +527,148 @@ describe("liveSessionKeys", () => {
     await spawned[0].dispose();
 
     expect(liveSessionKeys()).toEqual([]);
+  });
+
+  // #561 Codex P1: an entry with no live process YET, or one that STILL has one, is not
+  // "gone". Leaving it out sent a shutdown to the one-shot fallback, a second writer on
+  // the transcript.
+  it("lists an entry whose spawn is still in flight (no process yet)", async () => {
+    const spawnGate = deferred<void>();
+    injectSpawnPty(async (o) => {
+      await spawnGate.promise;
+      const f = nextFake();
+      spawned.push(f);
+      spawnOpts.push(o);
+      return f;
+    });
+    const first = runOnPty("global", "first", { timeoutMs: 5000, ...scope() });
+    await Bun.sleep(10);
+
+    expect(spawned.length).toBe(0);
+    expect(liveSessionKeys()).toEqual(["global"]);
+
+    spawnGate.resolve();
+    await first;
+  });
+
+  it("lists an entry that is being retired (its process may still be there)", async () => {
+    await seed("global");
+    const disposeGate = deferred<void>();
+    spawned[0].dispose = async () => {
+      await disposeGate.promise;
+    };
+    const retiring = retirePtySession("global");
+    await Bun.sleep(5);
+
+    expect(liveSessionKeys()).toEqual(["global"]);
+
+    disposeGate.resolve();
+    await retiring;
+    // retirement done: the entry is gone and so is the key
+    expect(liveSessionKeys()).toEqual([]);
+  });
+
+  it("still omits an ephemeral entry, spawning or live", async () => {
+    const spawnGate = deferred<void>();
+    injectSpawnPty(async (o) => {
+      await spawnGate.promise;
+      const f = nextFake();
+      spawned.push(f);
+      spawnOpts.push(o);
+      return f;
+    });
+    const gate = deferred<PtyTurnResult>();
+    nextFake = () => makeFake({ onPrompt: () => gate.promise });
+    const oneShot = runOnPty("fallback:global", "x", {
+      timeoutMs: 5000,
+      ...scope(),
+      ephemeral: true,
+    });
+    await Bun.sleep(10);
+    expect(spawned.length).toBe(0); // still spawning
+    expect(liveSessionKeys()).toEqual([]);
+
+    spawnGate.resolve();
+    await Bun.sleep(10);
+    expect(spawned.length).toBe(1); // live and mid-turn
+    expect(liveSessionKeys()).toEqual([]);
+
+    gate.resolve({ text: "x", bytesCaptured: 1, cleanBoundary: true, sessionId: "s" });
+    await oneShot;
+  });
+});
+
+/**
+ * The real supervisor wired into `saveMemoryAtShutdown` the way `start.ts` wires it:
+ * a global entry that is mid-transition when the shutdown starts must never reach the
+ * one-shot fallback while its process is, or may yet be, writing the transcript (#561).
+ */
+describe("shutdown memory save over a transitional global entry", () => {
+  function wiredDeps(fallbackCalls: Array<{ processGone: boolean }>): MemorySaveDeps {
+    return {
+      liveKeys: liveSessionKeys,
+      send: sendToLiveSession,
+      memoryPathFor: (k) => (k === "global" ? "/mem/global.md" : null),
+      fallbackSave: async () => {
+        // every process the supervisor spawned is disposed (none spawned counts as gone)
+        fallbackCalls.push({ processGone: spawned.every((p) => p.disposed) });
+        return "saved";
+      },
+      log: () => {},
+    };
+  }
+
+  it("global spawning: no one-shot while the spawn is in flight; once it lands the save goes live", async () => {
+    const spawnGate = deferred<void>();
+    injectSpawnPty(async (o) => {
+      await spawnGate.promise;
+      const f = nextFake();
+      spawned.push(f);
+      spawnOpts.push(o);
+      return f;
+    });
+    const first = runOnPty("global", "first", { timeoutMs: 5000, ...scope() });
+    await Bun.sleep(10);
+
+    const fallbackCalls: Array<{ processGone: boolean }> = [];
+    const saving = saveMemoryAtShutdown(5000, wiredDeps(fallbackCalls));
+    await Bun.sleep(30);
+    expect(fallbackCalls).toEqual([]);
+    expect(spawned.length).toBe(0);
+
+    spawnGate.resolve();
+    const out = await saving;
+    await first;
+
+    expect(fallbackCalls).toEqual([]);
+    expect(out.saved).toEqual(["global"]);
+    expect(spawned[0].prompts.length).toBe(2);
+    expect(spawned[0].prompts[0]).toBe("first");
+    expect(spawned[0].prompts[1]).toContain("/mem/global.md");
+  });
+
+  it("global retiring: the save waits for the process to go, then runs the one-shot exactly once", async () => {
+    await seed("global");
+    const disposeGate = deferred<void>();
+    const realDispose = spawned[0].dispose.bind(spawned[0]);
+    spawned[0].dispose = async () => {
+      await disposeGate.promise;
+      await realDispose();
+    };
+    const retiring = retirePtySession("global");
+    await Bun.sleep(5);
+
+    const fallbackCalls: Array<{ processGone: boolean }> = [];
+    const saving = saveMemoryAtShutdown(5000, wiredDeps(fallbackCalls));
+    await Bun.sleep(30);
+    expect(fallbackCalls).toEqual([]); // the old process may still be writing
+
+    disposeGate.resolve();
+    await retiring;
+    const out = await saving;
+
+    expect(fallbackCalls).toEqual([{ processGone: true }]);
+    expect(out.saved).toEqual(["global (one-shot)"]);
+    expect(spawned[0].prompts).toEqual(["seed"]); // nothing written into the retiring PTY
   });
 });

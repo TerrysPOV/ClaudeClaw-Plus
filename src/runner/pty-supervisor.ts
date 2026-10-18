@@ -1136,13 +1136,20 @@ export async function sendToLiveSession(
 }
 
 /**
- * Keys of the live, non-ephemeral entries (sorted): the sessions a shutdown
- * should ask to save their memory (#549).
+ * Keys of the non-ephemeral entries that have a process or may yet get one (sorted):
+ * the sessions a shutdown should ask to save their memory (#549).
+ *
+ * That includes an entry whose spawn or respawn is in flight and one that is retiring.
+ * Leaving them out would let the caller treat the key as having no process and resume
+ * the transcript in a one-shot while the PTY lands or is still being disposed (#561).
+ * `sendToLiveSession` waits those states out and answers `not-live` only once the
+ * process is gone, so the caller goes through it either way.
  */
 export function liveSessionKeys(): string[] {
   const keys: string[] = [];
   for (const entry of state.ptys.values()) {
-    if (entry.scope.ephemeral || entry.retiring || !entry.pty?.isAlive()) continue;
+    if (entry.scope.ephemeral) continue;
+    if (!entry.retiring && !entry.spawnInFlight && !entry.pty?.isAlive()) continue;
     keys.push(entry.sessionKey);
   }
   return keys.sort();

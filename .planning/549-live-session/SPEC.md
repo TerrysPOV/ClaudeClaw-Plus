@@ -262,3 +262,39 @@ Callers are unchanged: `src/shutdown-memory-save.ts:228`, `src/runner/live-sessi
 
 - A backslash in a POSIX filename is a gitignore escape in a rule. It is not newly introduced, was not part of the finding, and is left alone (noted in REPORT.md).
 - Whether claude on Windows honours the converted rule: not verifiable here (no Windows host).
+
+## Addendum: transitional global entry at shutdown (Codex P1 on PR #561, head a8ca32bf)
+
+### Problem
+
+`liveSessionKeys()` (`src/runner/pty-supervisor.ts`) skipped an entry that was retiring or had no live
+process. A shutdown that began while the global entry was spawning, respawning or retiring therefore saw no
+`global` key, and `saveMemoryAtShutdown` ran the one-shot fallback (`memory.save.stop`, which resumes the
+transcript) while the transitional PTY landed or was still being disposed: the two-writers bug again.
+
+### Target behaviour
+
+`liveSessionKeys()` lists every non-ephemeral entry that has a process or may yet get one:
+retiring, `spawnInFlight` (a respawn sets the same field), or a live `pty`. It omits an ephemeral entry and a
+non-ephemeral entry that is idle with a dead or missing process. The save then goes through
+`sendToLiveSession`, which already waits out a spawn or retirement and answers `not-live` only once the
+process is gone; the existing `not-live` branch of `saveMemoryAtShutdown` runs the fallback for `global` then.
+
+### Frozen decisions
+
+- The fix is in the filter only. `sendToLiveSession` and `saveMemoryAtShutdown` are unchanged: they already
+  do the right thing for a listed transitional key (spawn: sends once it lands; retiring: waits, then
+  `not-live`/`no-entry`, then the fallback exactly once).
+- A dead idle entry stays out of the list. It has no process and will not get one without a new
+  `runOnPty`, so listing it would only turn `global`'s verdict into a `not-live` detour for the same fallback.
+- Only `liveKeys` in `src/commands/start.ts` consumes the list (`MemorySaveDeps.liveKeys`); no other caller exists.
+- A send that outlives its budget on a transitional entry returns `failed` and no fallback runs. That is
+  intended: a process may still be writing.
+
+### Key files
+
+`src/runner/pty-supervisor.ts` (`liveSessionKeys`), `src/__tests__/pty-send-to-live.test.ts`.
+
+### Out of scope
+
+The `-p` runtime (no PTY entries at all) keeps its fallback path, unchanged.

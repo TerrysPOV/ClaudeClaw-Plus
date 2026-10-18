@@ -3,6 +3,50 @@
 Branch `feat/549-live-session-compact`, stacked on `povai/feat/548-oneshot-module` @ 0d636b6a
 (which is on `povai/main` d81bd579). Spec: `.planning/549-live-session/SPEC.md`.
 
+## Transitional global entry at shutdown (Codex P1 on PR #561, head a8ca32bf)
+
+**Fix.** `liveSessionKeys()` (`src/runner/pty-supervisor.ts`) now lists every non-ephemeral entry that is retiring, has a spawn or
+respawn in flight, or has a live PTY. It still omits ephemeral entries and idle entries with a dead process. A shutdown that starts mid-spawn
+or mid-retirement now sees `global` and goes through `sendToLiveSession`, which waits the transition out. No one-shot runs while a process
+is, or may become, live. `sendToLiveSession` and `saveMemoryAtShutdown` are unchanged.
+
+**Other callers.** `liveSessionKeys` has one consumer outside tests: `liveKeys` in `src/commands/start.ts:773`, which feeds
+`saveMemoryAtShutdown`. Its per-key `not-live` and `failed` handling already covers the keys that are newly listed (a thread key is skipped
+as "no memory file", an agent key gets a `not-live` skip, `global` gets the fallback). Nothing else breaks.
+
+**Tests** (`src/__tests__/pty-send-to-live.test.ts`, 5 new; the supervisor is real, PTYs are fakes):
+- `liveSessionKeys` lists an entry whose spawn is in flight; lists an entry being retired (and drops it once retirement ends); still omits an
+  ephemeral entry both while spawning and while live.
+- Shutdown while global is spawning: no fallback while the spawn is in flight and no PTY exists; once the spawn lands the save goes live
+  (`saved: ["global"]`, the save prompt written into the new PTY, fallback never called).
+- Shutdown while global is retiring: nothing runs while the dispose is held; after it, the fallback runs exactly once and its probe sees every
+  spawned process disposed (`[{ processGone: true }]`); nothing was written into the retiring PTY.
+
+Written first: 4 of the 5 failed against the old filter (the ephemeral test passes before and after by design, and is the guard for fault C).
+
+**Runs.**
+- `bun test pty-send-to-live shutdown-memory-save shutdown-sequence live-session-actions stop-no-spawn src/oneshot/`: 128 pass, 0 fail
+  (129 tests across 8 files, the one skip is `src/oneshot/e2e.test.ts`, opt-in via `ONESHOT_E2E=1`).
+- `bun run lint` (whole repo): exit 0, no errors (1261 warnings and 324 infos are pre-existing).
+- `bun run typecheck` (ratchet): 149 errors, baseline 149.
+- No version bump (per the dispatch).
+
+**Fault injection** (one site each, run against `pty-send-to-live.test.ts`, reverted from a backup after each; predictions made before running):
+
+| Fault | Predicted red | RED lines (verbatim) |
+|---|---|---|
+| Old filter back (`ephemeral \|\| retiring \|\| !alive`) | all four new transitional tests | `(fail) liveSessionKeys > lists an entry whose spawn is still in flight (no process yet)`, `(fail) liveSessionKeys > lists an entry that is being retired (its process may still be there)`, `(fail) shutdown memory save over a transitional global entry > global spawning: no one-shot while the spawn is in flight; once it lands the save goes live`, `(fail) shutdown memory save over a transitional global entry > global retiring: the save waits for the process to go, then runs the one-shot exactly once` (4 fail) |
+| A: `retiring` excluded again | the two retiring tests only | `(fail) liveSessionKeys > lists an entry that is being retired (its process may still be there)` and `(fail) shutdown memory save over a transitional global entry > global retiring: the save waits for the process to go, then runs the one-shot exactly once` (2 fail) |
+| B: `spawnInFlight` clause dropped (alive required) | the two spawning tests only | `(fail) liveSessionKeys > lists an entry whose spawn is still in flight (no process yet)` and `(fail) shutdown memory save over a transitional global entry > global spawning: no one-shot while the spawn is in flight; once it lands the save goes live` (2 fail) |
+| C: ephemeral check dropped | ephemeral tests | `(fail) sendToLiveSession > does not treat an in-flight ephemeral one-shot as a live session` and `(fail) liveSessionKeys > still omits an ephemeral entry, spawning or live` (2 fail) |
+| D: aliveness check dropped (dead idle listed) | the existing dead-process test | `(fail) liveSessionKeys > omits an entry whose process has died` (1 fail) |
+
+All five went red as predicted, each only at its own site; the tree was restored from the backup and `git diff --stat` shows only the intended change.
+The retiring tests take about 5 s when red because the held dispose is only released after the failed assertion, so `afterEach`'s shutdown waits on it.
+
+**Left undone.** No `ps` check on a real daemon (needs a real claude and a shutdown timed mid-spawn). Prior art: ClaudeClaw-Ultra has no
+`sendToLiveSession` or `liveSessionKeys`, so nothing was reused.
+
 ## Windows memory path in the scoped grant (Codex P2 on 2d389fcf)
 
 **Fix.** `memoryFileGrant(memPath, flavour?)` in `src/memory.ts` now resolves with `node:path` `posix`/`win32` and converts a
