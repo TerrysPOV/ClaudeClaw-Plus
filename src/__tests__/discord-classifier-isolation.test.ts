@@ -74,7 +74,11 @@ describe("classifyThreadIntent isolation", () => {
 describe("classifyThreadIntent itself (not a hand-built request)", () => {
   it("runs the real classifier untrusted: stdin delivery, no tools, allowlisted env, empty cwd", async () => {
     const seen = { args: [] as string[], input: "", env: {} as Record<string, string>, cwd: "" };
-    const spawnFn = ((_cmd: string, args: string[], opts: { env: Record<string, string>; cwd: string }) => {
+    const spawnFn = ((
+      _cmd: string,
+      args: string[],
+      opts: { env: Record<string, string>; cwd: string },
+    ) => {
       seen.args = args;
       seen.env = opts.env;
       seen.cwd = opts.cwd;

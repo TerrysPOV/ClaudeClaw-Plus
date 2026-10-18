@@ -226,6 +226,8 @@ Branch `feat/548-oneshot-module`, review worktree branch `review/548-fixes`. Wor
 | `bun run typecheck` | exit 0; 149 against baseline 149 |
 | `bunx tsc --noEmit` | 154 diagnostics, same as before this pass |
 
+Flake note: `pty-process.test.ts` "a dialog that paints late gets a fresh hard-timeout window" (a real-timer test, unrelated to argv) failed in 2 of 3 runs immediately after heavy runs (typecheck, a 12-file combined run, which also tripped `pty-supervisor.test.ts` invariant 2 from cross-test pollution), then passed 4 of 4 runs alternating with a detached worktree at 7898a063, which itself passed 4 of 4. Treat it as load-sensitive timing; the combined single-process run is the known-polluted default and is not used as evidence.
+
 The one `pty-supervisor.test.ts` failure ("non-glm model with no api leaves ANTHROPIC_AUTH_TOKEN unset") reads `ANTHROPIC_BASE_URL` from the ambient shell, which this Orca session sets (`http://127.0.0.1:8787`). It passes with `env -u ANTHROPIC_BASE_URL`. Not caused by this pass; the test does not scrub its environment.
 
 Full suite not run (known cross-test pollution). First lint run found 5 errors in my own files (4 unformatted, one `noAssignInExpressions`); fixed and re-run clean.
@@ -349,3 +351,84 @@ Note on 3b: with the gate keyed on `id === "pty"` again, the temp-dir tests also
 - The interactive PTY isolation spike.
 - Prior art: ultraassist/ClaudeClaw-Ultra was not re-checked; nothing reused.
 - No PR, merge or GitHub comment.
+
+
+---
+
+# Second follow-up: trusted-route PTY engine (production grade)
+
+Branch `review/548-fixes` on `povai/feat/548-oneshot-module` (7898a063). Spec: `SPEC.md` § "Second follow-up". `OneShotRequest` is unchanged (stacked #549); no default engine is changed (#550).
+
+## What changed
+
+| # | Finding | Change |
+|---|---|---|
+| 5 | kimi-k2p6 alias (Codex P2 on #560, fixed first, commit 3e4674bd) | `src/oneshot/model.ts` `cliModelFlag()` is the one rule (`glm`, `kimi-k2p6`, any case, never forwarded). `print.ts` and both `pty-process.ts` argv branches use it. `print` used to forward kimi for untrusted calls only. |
+| 1 | hand-built `PtyProcessOptions` | `runOnceOnPty` now calls `runOnPty` with the #546 ephemeral scope, so options come from `buildSpawnOptions`: `settings.pty` cols/rows/turnIdleTimeoutMs/quietWindowMs/sentinelMaxWaitMs and the synthesized multiplexer `mcpConfigPath` (released on retire). Untrusted calls keep `mcpConfig: { path: undefined }`. |
+| 2 | child spawned outside `state.ptys` | Entry `oneshot:<route>:<uuid>` lives in `state.ptys` while it runs: `shutdownSupervisor` and `killAllPtys` dispose it, admission refuses it during shutdown. Still `scope.ephemeral`: never reused, outside the LRU and the `maxConcurrent` cap, `retireEntry` on return. |
+| 3 | no output-format constraint | `PTY_OUTPUT_FORMAT_CONSTRAINT` moved to the leaf module `src/runner/pty-output-format.ts` (no circular import; `runner.ts` imports it) and is appended to the trusted system prompt. |
+| 4 | exit contract | Timeout and abort resolve `exitCode: 124`; a failed spawn or turn resolves non-zero (logged). Already-aborted requests still throw `AbortError` from the engine pre-check. The registry-wide contract test runs the same two scenarios on every engine. |
+| 6 | trust self-heal | Falls out of delegation: `spawnEntry`'s try/catch + `heal.ok === false` warning. `injectOneShotTrustForTests` now seams `spawnEntry`. Untrusted skips healing (throwaway cwd), as before. |
+| 7 | allowedTools on PTY | `--permission-mode dontAsk --tools X --allowedTools X` (`claude --help`: `dontAsk` is a valid mode; it denies instead of prompting). No `--dangerously-skip-permissions`. |
+| 8 | unknown route names | `KNOWN_ROUTES` in `config.ts`; `parseOneShotSettings` rejects any `oneShot.routes` key that is not a known route or a `<family>.*` wildcard that `resolveOneShotEngine` can reach. |
+| 9 | drift | llm.ts maxTokens comment; `classifyThreadIntent` JSDoc moved off `CLASSIFIER_ENV_KEYS`; OR-6 comment now covers the untrusted branch; REPORT.md lines 13-14 no longer claim unchanged tests. |
+| 10 | classifier test | `classifyThreadIntent(text, { spawn })` is exported with a spawn seam; the new test drives it and asserts untrusted argv, stdin delivery, the `classifierSpawnEnv` allowlist (a `DISCORD_TOKEN` in `process.env` is absent in the child) and a throwaway cwd. |
+
+Supporting supervisor changes: `PtyRunScope` gained `resumeSessionId` (ephemeral resume, used as given, no resumability probe) and `isolation`; the #546 wrapper `runOneShotOnPty` moved from `runner.ts` to `runEphemeralWithDeadline` in the supervisor and is shared.
+
+## Tests run
+
+| Command | Result |
+|---|---|
+| `bun test src/oneshot src/__tests__/discord-classifier-isolation.test.ts src/skills-tuner/core/__tests__` | 134 pass, 1 opt-in skip, 0 fail |
+| `bun test src/__tests__/pty-process.test.ts` | 55 pass |
+| `bun test src/__tests__/pty-supervisor.test.ts` | 76 pass with `env -u ANTHROPIC_BASE_URL`; 75 pass + 1 fail without (see below) |
+| `bun test src/__tests__/pty-supervisor-mcp.test.ts src/__tests__/pty-mcp-config-writer.test.ts` | 25 pass |
+| `bun test src/__tests__/pty-config.test.ts src/__tests__/runtime-config.test.ts src/__tests__/skills-tuner-config.test.ts` | 112 pass |
+| `bun test src/__tests__/runner.test.ts src/__tests__/pty-enabled-routing.test.ts` (#546 fork/job callers of the moved wrapper) | 50 pass |
+| `bun run lint` (whole repo) | exit 0; 0 errors (biome format applied to three touched files); existing advisory warnings remain |
+| `bun run typecheck` | 149 errors, baseline 149 (unchanged) |
+
+The one `pty-supervisor.test.ts` failure ("non-glm model with no api leaves ANTHROPIC_AUTH_TOKEN unset") is environmental: this shell exports `ANTHROPIC_BASE_URL`, which the test does not clear. It passes with the variable unset, and the test is not touched by this change.
+
+## Fault injection (one site at a time, each reverted with `git checkout`)
+
+Each fault was applied alone to the committed tree (43fed058) and the owning test file run. RED lines are verbatim from the run.
+
+| Fault | Result | RED line |
+|---|---|---|
+| 1a spawn options drop settings.pty.cols | 18 pass, 1 fail | `(fail) trusted-route PTY engine > builds spawn options like keyed sessions: settings.pty values and the multiplexer config [29.90ms]` |
+| 1b no multiplexer config | 18 pass, 1 fail | `(fail) trusted-route PTY engine > builds spawn options like keyed sessions: settings.pty values and the multiplexer config [6.63ms]` |
+| 2a one-shot entry not registered in state.ptys | 11 pass, 8 fail | `(fail) trusted-route PTY engine > builds spawn options like keyed sessions: settings.pty values and the multiplexer config [4.38ms]` |
+| 2b one-shot admitted through the LRU cap | 18 pass, 1 fail | `(fail) trusted-route PTY engine > is never reused and never evicts a keyed session, even at the concurrency cap [4.98ms]` |
+| 2c resumeSessionId ignored | 42 pass, 1 fail | `(fail) one-shot isolation contract > PTY uses a fresh process, registered while it runs and gone after, outside the LRU [2.51ms]` |
+| 3 output constraint dropped | 18 pass, 1 fail | `(fail) trusted-route PTY engine > appends the plain-prose output constraint to the system prompt [6.93ms]` |
+| 4a timeout returns 1 not 124 | 18 pass, 1 fail | `(fail) exit contract is the same for every engine > pty: a timeout resolves with exitCode 124 [58.66ms]` |
+| 4b failed turn reported as success | 16 pass, 3 fail | `(fail) trusted-route PTY engine > registers the child in the supervisor: shutdown during an in-flight one-shot disposes it [3.54ms]` |
+| 6a trust self-heal unwrapped (no try/catch) | 18 pass, 1 fail | `(fail) trusted-route PTY engine > survives a throwing or failing trust self-heal, and says so [1.49ms]` |
+| 6b trust failure not logged | 18 pass, 1 fail | `(fail) trusted-route PTY engine > survives a throwing or failing trust self-heal, and says so [2.77ms]` |
+| 7 allowedTools without dontAsk | 18 pass, 1 fail | `(fail) trusted-route PTY engine > denies tools outside allowedTools instead of waiting at a permission prompt [3.69ms]` |
+| 8 unknown route not rejected | 42 pass, 1 fail | `(fail) one-shot configuration > rejects unknown route names at load instead of dropping them [1.18ms]` |
+| 10 classifier env allowlist dropped | 4 pass, 1 fail | `(fail) classifyThreadIntent itself (not a hand-built request) > runs the real classifier untrusted: stdin delivery, no tools, allowlisted env, empty cwd [2.72ms]` |
+
+Fault 4b also reddens the registry-wide "failed turn" case; fault 2a reddens eight tests (the registration contract underpins most of the file). The earlier kimi injection (alias dropped from the set): `Expected not contain: "--model"` / `Received: [ "-p", "p", "--model", "kimi-k2p6" ]`.
+
+## Decisions and deviations to review
+
+- **`maxConcurrent` does not count one-shots.** The brief says registered entries should be counted by "admission/maxConcurrent" and also to follow #546. They conflict: #546 ephemeral entries are deliberately outside the cap (`admitEntry`, `enforceMaxConcurrent`). I followed #546 and recorded it in SPEC.md. Counting them would let a compaction burst evict keyed sessions; the test "never evicts a keyed session, even at the concurrency cap" pins it. Admission serialisation and the shutdown refusal do apply.
+- **Default model.** With no `req.model` the PTY engine uses `settings.model` (as keyed sessions do); `print` leaves the CLI default. They differ for a real model name set in settings. Not changed here.
+- **Legacy `-p` paths.** `runner.ts` `runClaudeOnce` skips kimi, but the two other `-p` argv builders skip only `glm`. Untouched (out of scope); `pty-process.ts` now also omits kimi for keyed PTY sessions, since it shares `buildClaudeArgs`.
+- **`dispose()` must settle a pending turn** (the real `PtyProcessImpl.dispose` does). A PTY double that ignores that would hang the call, so the old engine tests were rewritten around a double that honours it (`ptyDouble`).
+- **Not hardened:** a turn that ends with `cleanBoundary: false` is still reported as exit 0, as `runOnPty` does for keyed sessions.
+
+## Existing tests changed
+
+`engine.test.ts`: the PTY deadline/late-spawn/untrusted-cwd cases now assert `exitCode: 124` instead of a thrown "timed out"; the fresh-process case expects the child registered during the turn (`before + 1`) and gone after; PTY doubles go through `ptyDouble`. `discord-classifier-isolation.test.ts` gained the `classifyThreadIntent` test.
+
+## Not done / not performed
+
+- No live `claude` PTY run (no real TUI turn, no real permission prompt under `dontAsk`): argv is asserted, behaviour of the flag is from `claude --help`. The issue's manual check for live-TUI behaviour remains open.
+- Untrusted PTY stays disabled (`caps.isolation: false`); no spike run.
+- ClaudeClaw-Ultra clone: nothing concrete found to reuse, nothing taken.
+- Version bumped to 2.2.338 (plugin and marketplace).
+

@@ -658,13 +658,13 @@ Rules:
     const call = await withPrintRuntime(
       { env: classifierSpawnEnv(), stdinPrompt: true, spawn: deps.spawn },
       () =>
-      runOneShot({
-        route: "discord.classifier",
-        prompt: input,
-        model: "claude-sonnet-4-20250514",
-        isolation: "untrusted",
-        timeoutMs: 15000,
-      }),
+        runOneShot({
+          route: "discord.classifier",
+          prompt: input,
+          model: "claude-sonnet-4-20250514",
+          isolation: "untrusted",
+          timeoutMs: 15000,
+        }),
     );
     if (call.exitCode !== 0) throw new Error(`classifier exited ${call.exitCode}`);
     const result = call.text.trim();

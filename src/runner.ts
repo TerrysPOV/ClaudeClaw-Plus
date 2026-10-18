@@ -78,7 +78,6 @@ import {
   supervisorEntryCount,
   retirePtySession,
   type PtySessionStore,
-  type RunOnPtyResult,
   runEphemeralWithDeadline,
 } from "./runner/pty-supervisor";
 import { encodeCwdForProjectsDir } from "./bus/jsonl-line-types";

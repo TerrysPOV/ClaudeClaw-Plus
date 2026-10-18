@@ -1189,11 +1189,7 @@ async function buildSpawnOptions(
   // least one turn). Fail-closed: if we can't confirm, treat as phantom
   // and allocate a fresh session. Worst case we lose continuity for one
   // bad record; far better than user-visible "max retries exhausted".
-  if (
-    sessionId &&
-    !entry.scope.resumeSessionId &&
-    !(await _isSessionResumable(cwd, sessionId))
-  ) {
+  if (sessionId && !entry.scope.resumeSessionId && !(await _isSessionResumable(cwd, sessionId))) {
     sessionId = "";
   }
 
@@ -1396,7 +1392,6 @@ function cloneSecurity(security: SecurityConfig): SecurityConfig {
 // `ANTHROPIC_API_KEY`), which silently re-introduced API-credit billing on
 // every PTY spawn. Don't add a local copy — always go through
 // `getCleanSpawnEnv()`.
-
 
 /**
  * A utility turn on its own PTY, through the same spawn path as keyed sessions
