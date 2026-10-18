@@ -178,4 +178,3 @@ Applied the security-review skill to the changed boundaries. No critical or high
 The live adversarial test is implemented behind ONESHOT_E2E=1 and was not run as an opt-in live model check. It inspects actual stream-json tool_use events and canary files. The interactive PTY trust/isolation spike is also not run; the hard gate remains false. No live daemon or production process inspection was required or performed for this module; #549 owns its manual single-transcript-writer check.
 
 No prior-art code was reused: the previously reviewed read-only Ultra clone has no one-shot module or equivalent helper. No PR, merge or GitHub comment was created. Initial local memory/Serena scaffolding remains outside the task commits.
-
