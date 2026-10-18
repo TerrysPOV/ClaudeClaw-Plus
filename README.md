@@ -53,26 +53,26 @@ There is no guaranteed turnaround on upstream changes landing here. If you need 
 | API Overhead | Directly uses your Claude Code subscription | Same | Nightmare |
 | Setup & Installation | ~5 minutes | ~5 minutes | Nightmare |
 | Isolation | Folder-based and isolated as needed | Folder-based + per-agent scope | Nightmare |
-| Reliability | Simple reliable system | Simple + durable workflows that survive restarts | Nightmare |
+| Reliability | Simple reliable system | Simple + multi-step workflows with topological DAGs | Nightmare |
 | Feature Scope | Lightweight features you actually use | Everything in ClaudeClaw, plus governance and orchestration | 600k+ LOC nightmare |
 | Security | Average Claude Code usage | Policy engine, audit log, CSRF protection | Nightmare |
 | Cost Control | Manual | Automatic token budgets + model routing per task type | Nightmare |
-| Memory | Claude internal memory + `CLAUDE.md` | Persistent cross-session `MEMORY.md` with dual-layer write guarantee | Nightmare |
-| Multi-step Jobs | Cron + heartbeat | DAG orchestrator with dependency resolution and resumable state | Nightmare |
+| Memory | Claude internal memory + `CLAUDE.md` | Persistent cross-session `MEMORY.md` with dual-layer write guarantee (legacy runner) | Nightmare |
+| Multi-step Jobs | Cron + heartbeat | DAG orchestrator with dependency resolution (legacy runner) | Nightmare |
 
 ---
 
 ## What's new in v2.0 — Bus runtime is the default
 
-As of v2.0 (May 2026), ClaudeClaw+ runs on a new **event-bus architecture** by default. The `claude -p` subprocess path (`runtime: "pty"`) remains a **permanent first-class option** — especially for enterprise deployments where API billing is the safer or only viable route (audit trails, cost ceilings, regulatory constraints). Operators pick per deployment: bus for subscription-billed interactive work, `claude -p` for API-billed programmatic work. Both are fully supported, side by side.
+As of v2.0 (May 2026), ClaudeClaw+ runs on a new **event-bus architecture** by default. PTY is the official execution engine ([#553](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues/553)), while the `claude -p` subprocess path remains a **permanent first-class option** — especially for enterprise deployments with audit trails, cost ceilings, or scripting constraints. Operators pick per deployment: interactive event-bus or PTY supervision for continuous agent workflows, or `claude -p` for isolated subprocess work. Both are fully supported, side by side.
 
 Here's what changes when you pick the bus runtime:
 
-- **One long-lived `claude` process per declared agent**, not a fresh subprocess per event. Subscription billing covers daemon work; the Agent SDK credit pool stays untouched.
+- **One long-lived `claude` process per declared agent** when using interactive supervision, rather than a fresh subprocess per event. (Cron jobs and agent jobs run via `claude -p` subprocesses).
 - **Typed event bus (`BusCore`)** sits between adapters (Discord, Telegram, Slack, web UI, cron, REST, CLI) and agents. Inbound events publish to topics; agents subscribe; replies flow back as `response.text`, `channel.permission_request`, or `system.request_human`.
 - **Origin-aware routing** — a Discord reply goes back to the Discord channel that triggered it, not fanned out across every channel the agent is wired to.
 - **Per-agent process isolation** — agents have separate working directories, permission modes, system prompts, and memory files.
-- **Human-in-the-loop permission gate** — privileged tool calls (Bash, Edit, etc.) prompt the operator inline. Approve or deny from any connected channel.
+- **Human-in-the-loop permission gate** — privileged tool calls (Bash, Edit, etc.) prompt the operator inline when configured via per-agent `permission_mode` (default is `bypassPermissions`). Approve or deny from any connected channel.
 - **MCP multiplexer** fronts shared MCP servers behind a single HTTP endpoint with per-agent identity tokens — no per-PTY process explosion.
 
 Architecture spec: [`docs/ClaudeClaw_Plus_Bus_Architecture_Spec.md`](docs/ClaudeClaw_Plus_Bus_Architecture_Spec.md).
@@ -91,7 +91,7 @@ claude plugin install claudeclaw-plus
 Then open a Claude Code session and run:
 
 ```
-/claudeclaw:start
+/claudeclaw-plus:start
 ```
 
 The setup wizard covers the choices listed below. Your daemon is live in under five minutes.
@@ -100,7 +100,7 @@ The setup wizard covers the choices listed below. Your daemon is live in under f
 
 ## Setup choices at first run
 
-The wizard (and `settings.json`) asks you to decide six things. None of them are permanent — every one is editable in `settings.json` and picked up on hot-reload (within ~30s, no restart).
+The wizard (and `settings.json`) asks you to decide six things. None of them are permanent — every one is editable in `settings.json`. Certain operational parameters (heartbeat, legacy security level, MCP bridge policy, jobs) reload automatically within ~30s; structural changes (adapters, agents, runtime, tokens, bind addresses) require a daemon restart (see [Changing decisions later](#changing-decisions-later)).
 
 ### 1. Which adapters to enable
 
@@ -108,27 +108,32 @@ Pick the surfaces you want the daemon to listen on. Multiple adapters can run at
 
 | Adapter | Status | Where to enable |
 |---|---|---|
-| **Discord** | Production-tested | `discord.token`, `discord.busRouting.channels` |
+| **Discord** | Production-tested | `discord.token`, `discord.busRouting.channels` (required under bus; non-empty `discord.allowedUserIds` required) |
 | **Telegram** | Production-tested | `telegram.token`, `telegram.busRouting.chats` |
 | **Slack** | ⚠️ Less tested than Discord/Telegram — see [Adapters](#adapters) | `slack.botToken`, `slack.busRouting.channels` |
-| **Web UI** | Production-tested | `web.enabled: true`, `web.bus.bind` |
+| **Web UI (Dashboard)** | Production-tested | `web.enabled: true`, `web.host:web.port` (default `127.0.0.1:4632`) |
+| **Web UI (Bus Adapter)** | Production-tested | `web.bus.bind` (default `127.0.0.1:7878`) |
+
+> ⚠ **Discord Note:** Under the event-bus runtime, `discord.busRouting` (`channels` or `guilds`) must be configured (`src/adapters/discord/index.ts:266-270`). In addition, `discord.allowedUserIds` must not be empty; an empty allowlist refuses all incoming messages (`src/adapters/discord/index.ts:247`, `src/allowlist.ts`).
 
 ### 2. Primary model + fallback
 
-`model` is the headline choice (default `"sonnet"`). `fallback.model` is the rescue (default `"kimi-k2p6"` via OpenRouter). Routing kicks in automatically when the primary 401s or rate-limits.
+In `settings.json`, `model` and `fallback.model` default to empty strings `""` (`src/config.ts:86-90`), inheriting Claude Code's active model. The setup wizard offers `opus` (default), `sonnet`, `haiku`, and `glm`.
+
+When configured, `fallback.model` triggers on rate-limit HTTP 429 errors only, executing via `runner.ts` (`src/runner.ts:2125-2135`) for legacy tasks (fallback routing does not apply to bus agents). `kimi-k2p6` routes directly to Kimi's Coding API at `https://api.kimi.com/coding/` (`src/runner.ts:643-644`), not OpenRouter.
 
 ### 3. Permission mode per agent
 
 The most consequential setup choice. Each agent declares one:
 
-- **`bypassPermissions`** — runs without prompting (the recommended default for headless deployments where you trust the agent's scope)
+- **`bypassPermissions`** — runs without prompting (the default for bus agents; recommended for headless deployments where you trust the agent's scope)
 - **`plan`** — drafts a plan first, you approve before execution
 - **`acceptEdits`** — auto-allows file edits, prompts for shell/network
 - **`default`** — Claude Code's interactive default (prompts inline on every tool call)
 - **`dontAsk`** — never prompts, denies anything that needs approval
 - **`auto`** — Claude decides per-tool
 
-Set per-agent in `settings.agents[].permission_mode`. The wizard picks `bypassPermissions` if you don't choose explicitly.
+Set per-agent in `settings.agents[].permission_mode`. The wizard picks `bypassPermissions` if you don't choose explicitly (`src/bus/agent-resolver.ts:73`). Note that `security.level` applies to the legacy `runner.ts` path and does not restrict bus agents.
 
 ### 4. Agents
 
@@ -162,8 +167,8 @@ Telegram already routes one chat per agent, so this setting is Discord/Slack onl
 ### 6. Heartbeat, cron, security
 
 - **`heartbeat.enabled`** + `interval` (minutes) + `excludeWindows` for quiet hours. Off by default.
-- **Cron jobs** — see `commands/` and the wizard's cron setup step.
-- **`security.level`** — `unrestricted` / `moderate` / `strict` / `read-only`. Default `moderate`. Per-tool overrides via `allowedTools` / `disallowedTools`.
+- **Cron jobs** — see `commands/` and the wizard's cron setup step. Note that cron jobs run as `claude -p` subprocesses under both runtimes (`src/job-loop.ts:4-8`).
+- **`security.level`** — `locked` (read-only searching/reading), `strict`, `moderate`, `unrestricted` (default `moderate`). Applies to the legacy `runner.ts` execution engine and prompt construction (`src/runner.ts:1501, 1512, 1999`); bus agents are governed by `permission_mode` per agent. Per-tool overrides via `allowedTools` / `disallowedTools`.
 
 ---
 
@@ -173,35 +178,34 @@ Every setup choice is editable. There are three update paths:
 
 ### A. Edit `settings.json` directly
 
-Located at `~/.claude/claudeclaw/settings.json` (per-user). The daemon watches this file and reloads within ~30 seconds — no restart needed for most fields.
+Located at `<project>/.claude/claudeclaw/settings.json` (per-project configuration). The daemon polls this file every 30 seconds (`src/commands/start.ts:1693-1789`).
 
-Hot-reload-safe changes:
+**Hot-reload-safe changes (applied within ~30s without restart):**
+- Heartbeat interval and exclude windows (`src/commands/start.ts:1700-1707`)
+- Security level for legacy runner (`src/commands/start.ts:1709-1715`)
+- MCP bridge tool policy (`src/commands/start.ts:1717-1723`)
+- Scheduled job list (`src/commands/start.ts:1725-1748`)
+
+**Restart-required changes (require restarting the daemon):**
 - Adapter routing (`discord.busRouting`, `telegram.busRouting`, `slack.busRouting`, `web.bus`)
-- Agent declarations (`agents[]`)
-- Primary channel per agent
-- Heartbeat interval and exclude windows
-- Security level
-- MCP shared/perPtyOnly/stateless lists
-- Permission mode
-
-Restart-required changes (rare):
-- Telegram/Discord token rotation
-- Web UI bind address change
+- Agent declarations (`agents[]`) and agent `permission_mode`
+- Runtime mode (`runtime`, `pty.enabled`)
+- Authentication tokens (`discord.token`, `telegram.token`, `slack.botToken`)
+- Web UI bind addresses (`web.host`, `web.port`, `web.bus.bind`)
+- MCP shared and stateless server processes
 
 Restarting while an agent is mid-turn: `GET /api/health` reports `busy: true` while any turn is active, so a deploy script can wait for it to clear. If you restart anyway, the daemon drains on `SIGTERM`/`SIGINT` — it waits up to `shutdown.drainTurnsMs` (default `30000`, `0` to stop at once) until the bus owes the model nothing (no turn in flight, no prompt still queued, held through a compaction or being verified), gives the last reply a second to leave the adapter (an idle daemon therefore takes about a second to exit, so a prompt accepted right after the signal is still seen), and logs which turns finished, which agents lost their connection before `turn_end`, and what was still busy when it gave up. A second signal stops the wait. Two conditions for the drain to protect anything: keep the value under your service manager's stop timeout (systemd `TimeoutStopSec` defaults to 90 s), and make sure the signal reaches only the daemon — with systemd's default `KillMode=control-group` the `claude` children die at the same instant and there is nothing left to drain; use `KillMode=mixed` (see `docs/deploy-systemd-hardening.md`). New prompts are still accepted during the drain, so under steady traffic it runs to the window.
 
-### B. Slash commands in any connected channel
+### B. Slash commands
 
-- **`/mode <mode>`** — flip the daemon's per-agent permission mode without editing settings
-- **`/heartbeat on|off`** — toggle the heartbeat
-- **`/agents`** — list active agents
-- **`/help`** — full command list
-
-Slash commands work from Discord, Telegram, Slack, and the web UI.
+- **`/mode <mode>`** — toggles permission mode on the **legacy Telegram adapter only** (`src/commands/telegram.ts:1470-1513`).
+- **Commands under bus runtime**: Under the default event-bus runtime, adapters forward messages directly to `BusCore` as inbound events; slash commands (`/mode`, `/heartbeat`, `/agents`, `/help`) are **not** intercepted or handled by bus adapters (`src/bus/core.ts:2470-2475`, `src/adapters/discord/index.ts:646-647`).
 
 ### C. Web UI
 
-Browse to `http://<bind>:4632` (default). Manage jobs, monitor runs, inspect logs, toggle the heartbeat from the dashboard.
+Browse to `http://<web.host>:<web.port>` (default `http://127.0.0.1:4632`). Enabled with the `--web` CLI flag or `web.enabled: true` in `settings.json`. Authentication requires the token stored in `<project>/.claude/claudeclaw/web.token`. Manage jobs, monitor runs, inspect logs, and toggle the heartbeat from the dashboard.
+
+For headless programmatic access to the event bus, the bus web adapter binds separately to `web.bus.bind` (default `127.0.0.1:7878`), exposing `GET /health`, `POST /prompt`, and `GET /ws`.
 
 ---
 
@@ -212,7 +216,7 @@ Adapter coverage as of v2.0:
 - **Discord** — full production support. Multi-channel routing, threads, DMs, permission flow, inline progress UX, primary-channel-per-agent for cron/heartbeat. Tested daily on a live Hetzner deployment.
 - **Telegram** — full production support. Per-chat routing, bracketed-paste prompt delivery, bounded spinner edits with per-chat 429 cooldown, voice/image input via Whisper.
 - **Slack** — ⚠️ **less tested than Discord and Telegram.** The code paths are implemented (channels, threads, signing-secret verification, permission flow, primary-channel-per-agent), but the v2.0 soak ran without a daily Slack deployment. **Please file [issues](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues) or PRs as you encounter them — we'll review and ship fixes promptly.**
-- **Web UI** — production-tested. CSRF-protected, mobile-responsive, runs at the configured `web.bind`.
+- **Web UI** — production-tested. The web dashboard provides CSRF protection and mobile responsiveness at `http://<web.host>:<web.port>` (default `127.0.0.1:4632`), while the bus web adapter serves HTTP and WebSocket endpoints at `web.bus.bind` (default `127.0.0.1:7878`). Note that `web.bind` is not a valid setting (`src/config.ts:203, 911-915`).
 
 ---
 
@@ -220,31 +224,39 @@ Adapter coverage as of v2.0:
 
 These features originated as PRs to `moazbuilds/claudeclaw` and have been closed upstream — they're out of scope for the lightweight core and live here permanently. Links below point to the originating PRs so you can read the full rationale.
 
-### `claude -p` runtime — permanent first-class option for API-billed deployments
+### Execution Modes and Engine Policy
 
-**Tracking issue: [#61](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues/61) · Merged PR: [#62](https://github.com/TerrysPOV/ClaudeClaw-Plus/pull/62)**
+**Tracking issues: [#61](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues/61), [#546](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues/546), [#550](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues/550), [#553](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues/553)**
 
-`runtime: "pty"` selects the `claude -p` subprocess path — one `claude -p` invocation per event. From 2026-06-15 onwards this routes through Anthropic's Agent SDK credit pool (API billing), separate from the Pro/Max subscription pool used by interactive sessions.
+ClaudeClaw+ supports two distinct runtimes (`runtime: "bus"` and `runtime: "pty"`) and two execution engines: interactive PTY supervision and non-interactive `claude -p` subprocess execution.
 
-This path is **not** going away. For many production deployments — particularly enterprise installs with audit, cost-ceiling, or regulatory constraints — API billing is the safer or only viable route. We keep `claude -p` as a permanent, fully supported first-class option:
+**Engine Policy ([#553](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues/553)):**
+- **Interactive PTY** is the official execution engine of ClaudeClaw+.
+- **`claude -p`** remains a permanently supported option for programmatic execution, scriptable environments, or headless subprocess tasks (`pty.enabled: false`, `supervision: "process-stream-json"`).
+- **Current Defaults:** In the current release, `pty.enabled` defaults to `false` (meaning runtimes fall back to `claude -p`). A future release ([#550](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues/550)) will flip the default to `pty.enabled: true`.
+- **Runtime Isolation:** Switching between `runtime: "bus"` and `runtime: "pty"` requires a full daemon restart (`src/commands/start.ts:606-607`). The two runtimes share neither IPC nor runtime state.
 
-```json
-"runtime": "pty"
-```
+#### Execution Modes Matrix
 
-**When to pick `claude -p` over bus:**
+| Runtime | `pty.enabled` | Agent Turns & Routing | Cron & Scheduled Jobs | Behavior & Supervision |
+|---|---|---|---|---|
+| `runtime: "bus"` (default) | `false` (current default) | `claude -p` | `claude -p` (`job-loop.ts:4-8`) | Agents default to `supervision: "interactive-pty"`, but fall back to `process-stream-json` (`claude -p`) when PTY is disabled. Turns, rate-limit fallback, dashboard chat, forks, and bus agent jobs route via `resolveAgentTurnRoute()`. |
+| `runtime: "bus"` | `true` (upcoming default) | Interactive PTY | `claude -p` (`job-loop.ts:4-8`) | Agents run interactive PTY supervision (`interactive-pty`). Rate-limit fallback, dashboard chat, forks, and bus agent jobs follow PTY sessions. |
+| `runtime: "pty"` | `false` (current default) | `claude -p` | `claude -p` (`job-loop.ts:4-8`) | Legacy runner spawns a fresh `claude -p` subprocess per inbound event (`runner.ts:740-743, 2015-2018`). |
+| `runtime: "pty"` | `true` (upcoming default) | Interactive PTY | `claude -p` (`job-loop.ts:4-8`) | Legacy runner uses the interactive PTY supervisor path (`runner.ts:740-743`). |
 
-- **Audit / compliance**: every invocation is its own subprocess with a clean stdin/stdout boundary — easier to log, intercept, and reason about than a long-lived interactive session.
-- **Predictable cost ceilings**: API billing is metered per-token; subscription billing is harder to attribute per-request.
-- **Regulatory / data-residency**: some setups require the API path specifically because of vendor contract scope.
-- **No long-lived processes**: each event is a clean subprocess; no per-agent state to manage, no PTY supervision, no MCP multiplexer.
+#### When to pick `claude -p` vs. PTY / Bus
 
-**When to pick bus over `claude -p`:**
+**When to pick `claude -p` execution:**
+- **Audit / compliance**: Every invocation is its own subprocess with a clean stdin/stdout boundary — easier to log, intercept, and reason about than a long-lived interactive session.
+- **Predictable cost ceilings**: Clean subprocess boundaries allow precise metering per command.
+- **Stateless environments**: No long-lived process management or terminal state to maintain.
 
-- **Subscription billing**: daemon work bills against your existing Pro/Max subscription, not the Agent SDK pool.
-- **Lower latency**: long-lived `claude` sessions skip the per-event cold start.
-- **Multi-channel routing**: same agent reachable from Discord/Telegram/Slack/web UI with origin-aware replies.
-- **Permission gate inline**: tool calls prompt for approval in whichever channel you're on.
+**When to pick interactive PTY / Bus:**
+- **Full tool interactivity**: Long-lived interactive sessions with real-time streaming, interactive approvals, and persistent state.
+- **Lower latency**: Avoids per-turn subprocess cold start.
+- **Multi-channel routing**: The event bus routes between Discord, Telegram, Slack, and the Web UI with origin-aware replies.
+- **Per-agent supervision**: Distinct working directories, system prompts, and memory files per declared agent.
 
 #### Settings block (defaults shown)
 
@@ -259,13 +271,12 @@ This path is **not** going away. For many production deployments — particularl
 }
 ```
 
-Hot-reload picks up `settings.json` changes within 30 seconds — no daemon restart needed to flip between runtimes.
+> **Note on hot-reload:** Flipping `runtime` or `pty.enabled` requires restarting the daemon; hot-reload does not re-bootstrap the runtime execution engine (`src/config.ts:734-735`).
 
 #### References
 
-- Architecture: [`.planning/pty-migration/SPEC.md`](.planning/pty-migration/SPEC.md)
-- Phase D audit reports: [`.planning/pty-migration/`](.planning/pty-migration/)
-- Bus runtime spec (the recommended path): [`docs/ClaudeClaw_Plus_Bus_Architecture_Spec.md`](docs/ClaudeClaw_Plus_Bus_Architecture_Spec.md)
+- Bus architecture spec: [`docs/ClaudeClaw_Plus_Bus_Architecture_Spec.md`](docs/ClaudeClaw_Plus_Bus_Architecture_Spec.md)
+- Tracking issues: [#61](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues/61), [#546](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues/546), [#550](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues/550), [#553](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues/553)
 
 ---
 
@@ -274,6 +285,8 @@ Hot-reload picks up `settings.json` changes within 30 seconds — no daemon rest
 **Tracking issue: [#72](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues/72) · Lands across [#71](https://github.com/TerrysPOV/ClaudeClaw-Plus/pull/71), [#78](https://github.com/TerrysPOV/ClaudeClaw-Plus/pull/78), and a series of v1.1 hardening PRs (#91–#97)**
 
 The multiplexer hosts each shared MCP server child **once** and demultiplexes per-PTY traffic over a loopback HTTP route (`/mcp/<server>`). Each PTY claude gets a synthesized `--mcp-config` JSON pointing at that route with a per-PTY bearer + identity headers. Without this, every PTY would spawn its own copy of every MCP server — N × M subprocesses for N PTYs × M servers — which OOMs even a modest Hetzner box at moderate concurrency.
+
+> **Requirement:** The MCP multiplexer requires the web dashboard to be enabled (`web.enabled: true` or `--web`), as its proxy endpoints (`/mcp/<server>`) are registered on the dashboard HTTP server (`src/commands/start.ts:1053, 1111-1120`).
 
 #### Operator footgun: `mcp-proxy.json` ↔ `~/.claude/mcp.json` collisions
 
@@ -323,7 +336,6 @@ The multiplexer currently proxies **`ListTools` + `CallTool` only**. MCP servers
 
 #### References
 
-- Architecture: [`.planning/mcp-multiplexer/SPEC.md`](.planning/mcp-multiplexer/SPEC.md)
 - v1.1 follow-ups: [#72](https://github.com/TerrysPOV/ClaudeClaw-Plus/issues/72)
 
 ---
@@ -332,15 +344,19 @@ The multiplexer currently proxies **`ListTools` + `CallTool` only**. MCP servers
 
 **[PR #71 — closed upstream — lives here](https://github.com/moazbuilds/claudeclaw/pull/71)**
 
+> **Note:** The Policy Engine operates on the legacy `runner.ts` execution pipeline (`src/runner.ts:39-62`). Under the default event-bus runtime, agent permissions are governed per-agent via `settings.agents[].permission_mode`.
+
 Every tool call (Bash, Read, Edit, etc.) is evaluated against deterministic rules before execution. Rules can allow, deny, or gate behind operator approval — scoped by channel, user, skill, and source. Includes an audit log and a bounded LRU approval cache.
 
-**Why:** Replaces blanket `--dangerously-skip-permissions` with actual governance. Operators can deny destructive tools in public channels, require approval for high-risk operations, and keep a tamper-evident audit trail for compliance.
+**Why:** Replaces blanket `--dangerously-skip-permissions` with actual governance for legacy runner invocations. Operators can deny destructive tools in public channels, require approval for high-risk operations, and keep a tamper-evident audit trail for compliance.
 
 ---
 
 ### Governance Layer — model routing, budgets, watchdog
 
 **[PR #72 — closed upstream — lives here](https://github.com/moazbuilds/claudeclaw/pull/72)**
+
+> **Note:** The Governance Layer operates on the legacy `runner.ts` execution pipeline (`src/runner.ts:39-62`) and does not govern bus agents.
 
 Sits between the daemon and Claude CLI. Automatically routes planning tasks to Opus and implementation tasks to Sonnet. Tracks token and cost spend per session and globally, with configurable warn/throttle/block states. Watchdog kills runaway sessions before they drain your credits.
 
@@ -352,6 +368,8 @@ Sits between the daemon and Claude CLI. Automatically routes planning tasks to O
 
 **[PR #73 — closed upstream — lives here](https://github.com/moazbuilds/claudeclaw/pull/73)**
 
+> **Note:** The Gateway and escalation framework operate on the legacy adapter pipeline (`src/commands/telegram.ts:31, 1742`, `src/commands/discord.ts:1333`); the event-bus runtime uses `BusCore` topics and subscriptions instead.
+
 Unified message ingestion pipeline normalises Discord/Telegram messages to a common format. Crash-safe append-only event log, retry queue with exponential backoff, dead-letter queue, full event replay, and an escalation framework (pause session, hand off to a human, notify across channels).
 
 **Why:** Eliminates duplicated per-adapter logic and gives you an audit trail you can replay. When something goes wrong at 3am, you can see exactly what happened and re-run it.
@@ -362,9 +380,11 @@ Unified message ingestion pipeline normalises Discord/Telegram messages to a com
 
 **[PR #74 — closed upstream — lives here](https://github.com/moazbuilds/claudeclaw/pull/74)**
 
-Multi-step task execution via dependency graph with topological sort. Durable workflow state with atomic writes. Jobs survive daemon restarts mid-execution. Governance-integrated executor with configurable parallelism.
+> **Note:** The DAG Orchestrator operates on the legacy `runner.ts` execution pipeline and does not govern bus agent turns. Workflows do not persist across daemon restarts mid-execution.
 
-**Why:** Complex requests decompose into dependent subtasks that run in parallel where possible and resume exactly where they left off after a crash. No more lost work.
+Multi-step task execution via dependency graph with topological sort. Durable workflow state with atomic writes during active execution. Governance-integrated executor with configurable parallelism.
+
+**Why:** Complex requests decompose into dependent subtasks that run in parallel where possible.
 
 ---
 
@@ -381,6 +401,8 @@ Cryptographically random single-use UUID tokens per session, timing-safe compari
 ### Persistent Memory — cross-session `MEMORY.md`
 
 **[PR #77 — closed upstream — lives here](https://github.com/moazbuilds/claudeclaw/pull/77)**
+
+> **Note:** The dual-layer memory write guarantee operates on the legacy `runner.ts` invocation pipeline (`src/runner.ts:69`). Bus agents use per-agent memory files configured in `settings.agents[].memory_file`.
 
 `MEMORY.md` loaded into `--append-system-prompt` on every invocation. Dual-layer write guarantee: Claude is instructed to write after each task, and a daemon-side fallback appends a log entry if `MEMORY.md` is unchanged after a run. Pre-compact and pre-shutdown saves, 200-line cap with auto-trim, per-agent memory paths.
 
@@ -416,7 +438,7 @@ Everything ClaudeClaw ships, Plus ships too:
 - **Discord** — DMs, server mentions/replies, slash commands, voice, images
 - **GLM Fallback** — continue with GLM models when your primary limit is hit
 - **Web Dashboard** — manage jobs, monitor runs, inspect logs in real time
-- **Security Levels** — four access levels from read-only to full system access
+- **Security Levels** — four access levels (`locked`, `strict`, `moderate`, `unrestricted`) for the legacy runner
 - **Skills & Plugins** — folder-based, isolated as needed
 
 ---
