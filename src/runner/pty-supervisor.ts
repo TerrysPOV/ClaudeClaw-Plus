@@ -57,6 +57,13 @@
 import type { PtyProcess, PtyProcessOptions, SpawnPty } from "./pty-process.js";
 import { PtyClosedError, PtyTurnTimeoutError } from "./pty-process.js";
 import { ensureTrustAccepted } from "./pty-trust-prompt.js";
+import type { OneShotRequest, OneShotResult } from "../oneshot/engine.js";
+import { validateIsolation } from "../oneshot/isolation.js";
+import { validateRouteEngine } from "../oneshot/config.js";
+import { randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { getSettings, type SecurityConfig } from "../config.js";
 import { getSession, createSession } from "../sessions.js";
 import { getThreadSession, createThreadSession } from "../sessionManager.js";
@@ -1369,6 +1376,102 @@ function cloneSecurity(security: SecurityConfig): SecurityConfig {
 // `ANTHROPIC_API_KEY`), which silently re-introduced API-credit billing on
 // every PTY spawn. Don't add a local copy — always go through
 // `getCleanSpawnEnv()`.
+
+let ensureOneShotTrust: (cwd: string) => Promise<unknown> = ensureTrustAccepted;
+/** Keep unit tests from changing the operator's Claude trust configuration. */
+export function injectOneShotTrustForTests(fn: ((cwd: string) => Promise<unknown>) | null): void {
+  ensureOneShotTrust = fn ?? ensureTrustAccepted;
+}
+
+/** A utility turn owns its process directly, never the keyed-session LRU. */
+export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> {
+  validateIsolation(req);
+  validateRouteEngine(
+    "pty",
+    req.route,
+    req.isolation === "untrusted",
+    req.resumeSessionId !== undefined,
+  );
+  req.signal?.throwIfAborted();
+  const settings = getSettings();
+  const helpers = await getRunnerHelpers();
+  const spawn = await ensureSpawnPty();
+  const untrusted = req.isolation === "untrusted";
+  const cwd = untrusted
+    ? mkdtempSync(join(tmpdir(), "claudeclaw-oneshot-pty-"))
+    : (req.cwd ?? process.cwd());
+  const options: PtyProcessOptions = {
+    sessionId: req.resumeSessionId ?? "",
+    newSessionId: req.resumeSessionId ? undefined : randomUUID(),
+    isolation: req.isolation,
+    cwd,
+    modelOverride: req.model,
+    security: settings.security,
+    securityArgs: untrusted
+      ? undefined
+      : req.allowedTools
+        ? ["--tools", req.allowedTools.join(","), "--allowedTools", req.allowedTools.join(",")]
+        : helpers.buildSecurityArgs(settings.security),
+    appendSystemPrompt: untrusted ? undefined : req.system,
+    env: helpers.buildChildEnv(helpers.cleanSpawnEnv(), req.model ?? settings.model, settings.api),
+  };
+  let pty: PtyProcess | undefined;
+  let disposal: Promise<void> | undefined;
+  const disposeOnce = (): Promise<void> | undefined => {
+    if (pty) disposal ??= pty.dispose();
+    return disposal;
+  };
+  let cancelled = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let abort: () => void = () => {};
+  const cancelledPromise = new Promise<never>((_, reject) => {
+    abort = () => {
+      cancelled = true;
+      void disposeOnce()?.catch(() => {});
+      reject(new Error("oneShot PTY aborted or timed out"));
+    };
+    timer = setTimeout(abort, req.timeoutMs);
+    req.signal?.addEventListener("abort", abort, { once: true });
+    if (req.signal?.aborted) abort();
+  });
+  const work = (async () => {
+    // Trust handling remains the supervisor's existing path for trusted cwd.
+    if (!untrusted) await ensureOneShotTrust(options.cwd);
+    if (cancelled) throw new Error("oneShot PTY aborted");
+    pty = await spawn(options);
+    if (cancelled) {
+      await disposeOnce();
+      throw new Error("oneShot PTY aborted");
+    }
+    return pty.runTurn(req.prompt, { timeoutMs: req.timeoutMs });
+  })();
+  try {
+    const result = await Promise.race([work, cancelledPromise]);
+    return {
+      text: result.text,
+      engine: "pty",
+      model: req.model ?? settings.model,
+      exitCode: 0,
+      sessionId: result.sessionId,
+    };
+  } finally {
+    if (timer) clearTimeout(timer);
+    req.signal?.removeEventListener("abort", abort);
+    await disposeOnce();
+    // Work owns cleanup if spawn lands after cancellation.
+    void work
+      .finally(() => {
+        if (untrusted) {
+          try {
+            rmSync(cwd, { recursive: true, force: true });
+          } catch {
+            /* best effort */
+          }
+        }
+      })
+      .catch(() => {});
+  }
+}
 
 async function ensureSpawnPty(): Promise<SpawnPty> {
   if (_spawnPty) return _spawnPty;

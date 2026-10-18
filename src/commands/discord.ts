@@ -13,8 +13,11 @@ import { describeAllowlist, isUserAllowed } from "../allowlist";
 import { resetSession, resetFallbackSession, peekSession } from "../sessions";
 import { listThreadSessions, removeThreadSession, peekThreadSession } from "../sessionManager";
 import { readFile } from "node:fs/promises";
-import { existsSync, mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { UNTRUSTED_CLAUDE_ARGS } from "../oneshot/isolation.js";
+import { runOneShot } from "../oneshot/engine.js";
+import { withPrintRuntime } from "../oneshot/print.js";
 import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt } from "../skills";
 import { cacheSkillOverlayFromContent } from "../policy/skill-overlays";
@@ -592,13 +595,7 @@ export const CLASSIFIER_ARGS = [
   "--print",
   "--output-format",
   "text",
-  "--tools",
-  "",
-  "--strict-mcp-config",
-  "--no-session-persistence",
-  "--setting-sources",
-  "",
-  "--disable-slash-commands",
+  ...UNTRUSTED_CLAUDE_ARGS,
 ];
 
 /** Exact keys the classifier's `claude` keeps from the daemon env. */
@@ -661,22 +658,18 @@ Rules:
 - Return ONLY valid JSON or the word null. No explanation.`;
 
   try {
-    const { execFileSync } = await import("node:child_process");
     const input = `${systemPrompt}\n\n---\nUser message: ${text}`;
-    // Empty cwd: no project CLAUDE.md for the classifier to read back.
-    const cwd = mkdtempSync(join(tmpdir(), "claudeclaw-classify-"));
-    let result: string;
-    try {
-      result = execFileSync("claude", CLASSIFIER_ARGS, {
-        input,
-        encoding: "utf-8",
-        timeout: 15000,
-        env: classifierSpawnEnv(),
-        cwd,
-      }).trim();
-    } finally {
-      rmSync(cwd, { recursive: true, force: true });
-    }
+    const call = await withPrintRuntime({ env: classifierSpawnEnv(), stdinPrompt: true }, () =>
+      runOneShot({
+        route: "discord.classifier",
+        prompt: input,
+        model: "claude-sonnet-4-20250514",
+        isolation: "untrusted",
+        timeoutMs: 15000,
+      }),
+    );
+    if (call.exitCode !== 0) throw new Error(`classifier exited ${call.exitCode}`);
+    const result = call.text.trim();
 
     if (!result || result === "null") return null;
     // Extract JSON from response (in case there's extra text)

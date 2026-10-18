@@ -1,8 +1,6 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { cleanSpawnEnv } from "../../runner/spawn-env.js";
+import { runOneShot } from "../../oneshot/engine.js";
+import { buildPrintArgs, withPrintRuntime } from "../../oneshot/print.js";
 import type { TunerConfig } from "./config.js";
 
 export type Role = "intent_classifier" | "detector" | "proposer" | "proposer_high_stakes" | "judge";
@@ -35,19 +33,13 @@ function buildPrompt(system: string, messages: Message[]): string {
  * (same rule as the runner's spawn sites).
  */
 export function cliArgs(prompt: string, model: string | undefined): string[] {
-  const args = ["-p", prompt];
-  const m = model?.trim();
-  if (m && m.toLowerCase() !== "glm") args.push("--model", m);
-  args.push(
-    "--tools",
-    "",
-    "--strict-mcp-config",
-    "--setting-sources",
-    "",
-    "--no-session-persistence",
-    "--disable-slash-commands",
-  );
-  return args;
+  return buildPrintArgs({
+    route: "tuner.propose",
+    prompt,
+    model,
+    isolation: "untrusted",
+    timeoutMs: 60000,
+  });
 }
 
 export class ClaudeCliBackend implements LLMClient {
@@ -75,44 +67,33 @@ export class ClaudeCliBackend implements LLMClient {
 
   // The claude CLI has no output-length flag, so maxTokens is accepted for
   // interface compatibility but not forwarded.
-  async call(
-    role: Role,
-    system: string,
-    messages: Message[],
-    _maxTokens?: number,
-  ): Promise<string> {
+  async call(role: Role, system: string, messages: Message[], maxTokens?: number): Promise<string> {
     const prompt = buildPrompt(system, messages);
-    // Empty cwd, so no project dir is ever in reach of the call. Removed once
-    // the child is done, whatever the outcome; a failed removal (Windows file
-    // lock) must not replace the result.
-    const cwd = mkdtempSync(join(tmpdir(), "claudeclaw-tuner-"));
-    const cleanup = () => {
-      try {
-        rmSync(cwd, { recursive: true, force: true });
-      } catch {
-        // best effort
-      }
-    };
-    return new Promise<string>((resolve, reject) => {
-      const child = this.spawnFn("claude", cliArgs(prompt, this.modelFor(role)), {
-        stdio: ["ignore", "pipe", "pipe"],
-        env: cleanSpawnEnv(),
-        cwd,
-      });
-      let out = "";
-      let err = "";
-      child.stdout.on("data", (d: Buffer) => {
-        out += d.toString();
-      });
-      child.stderr.on("data", (d: Buffer) => {
-        err += d.toString();
-      });
-      child.on("close", (code) => {
-        if (code !== 0) reject(new Error("claude CLI exited " + code + ": " + err.slice(0, 200)));
-        else resolve(out.trim());
-      });
-      child.on("error", reject);
-    }).finally(cleanup);
+    const result = await withPrintRuntime(
+      { spawn: this.spawnFn, forcePrint: this.forcePrint },
+      () =>
+        runOneShot({
+          route: role === "judge" ? "tuner.judge" : "tuner.propose",
+          prompt,
+          model: this.modelFor(role),
+          isolation: "untrusted",
+          timeoutMs: 60000,
+          maxTokens,
+        }),
+    );
+    if (result.exitCode !== 0) throw new Error(`claude CLI exited ${result.exitCode}`);
+    return result.text.trim();
+  }
+
+  protected get forcePrint(): boolean {
+    return true;
+  }
+}
+
+/** Uses the configured oneShot route; claude_cli remains a print alias. */
+export class OneShotBackend extends ClaudeCliBackend {
+  protected override get forcePrint(): boolean {
+    return false;
   }
 }
 
@@ -165,5 +146,6 @@ export class AnthropicApiBackend implements LLMClient {
 
 export function makeLLMClient(config: TunerConfig): LLMClient {
   if (config.llm.backend === "anthropic_api") return new AnthropicApiBackend(config);
+  if (config.llm.backend === "oneshot") return new OneShotBackend(config);
   return new ClaudeCliBackend(config);
 }

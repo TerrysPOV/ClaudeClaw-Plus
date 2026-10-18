@@ -15,6 +15,7 @@ import {
 } from "./bus/agent-jobs";
 import { parsePlugins, type PluginEntry } from "./plugins";
 import { parseMemorySearchSettings, type MemorySearchSettings } from "./memory";
+import { parseOneShotSettings, type OneShotSettings } from "./oneshot/config.js";
 import type { AuditPolicy } from "./observability/tool-call";
 
 /** Re-exported under the name used in the Settings interface. */
@@ -83,6 +84,7 @@ export function getAgentsDir(): string {
 }
 
 const DEFAULT_SETTINGS: Settings = {
+  oneShot: parseOneShotSettings(undefined),
   model: "",
   api: "",
   fallback: {
@@ -776,6 +778,7 @@ export interface BusAgentSettings {
 }
 
 export interface Settings {
+  oneShot: OneShotSettings;
   model: string;
   api: string;
   fallback: ModelConfig;
@@ -1054,6 +1057,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
 
   return {
     model: typeof raw.model === "string" ? raw.model.trim() : "",
+    oneShot: parseOneShotSettings(raw.oneShot),
     api: typeof raw.api === "string" ? raw.api.trim() : "",
     fallback: {
       model: typeof raw.fallback?.model === "string" ? raw.fallback.model.trim() : "",

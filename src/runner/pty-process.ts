@@ -32,6 +32,7 @@
  */
 import { spawn as ptySpawn, type IPty } from "bun-pty";
 import type { SecurityConfig } from "../config";
+import { UNTRUSTED_CLAUDE_ARGS } from "../oneshot/isolation.js";
 import { withCleanProcessEnv } from "../runner";
 import {
   createParser,
@@ -75,6 +76,8 @@ export { sanitizePtyPromptText };
 // ─── Public types (FROZEN per SPEC §3.1) ────────────────────────────────────
 
 export interface PtyProcessOptions {
+  /** One-shot isolation overrides every persona, resume and permission flag. */
+  isolation?: "untrusted" | "trusted-session";
   /** Existing Claude Code session ID to resume via `claude --resume <id>`.
    *  Empty string means "no resume". */
   sessionId: string;
@@ -318,6 +321,13 @@ function buildClaudeArgs(opts: PtyProcessOptions): string[] {
   if (opts._skipClaudeArgs) return [];
 
   const args: string[] = [];
+
+  if (opts.isolation === "untrusted") {
+    const model = opts.modelOverride?.trim();
+    if (model && model.toLowerCase() !== "glm") args.push("--model", model);
+    args.push(...UNTRUSTED_CLAUDE_ARGS);
+    return args;
+  }
 
   if (opts.securityArgs && opts.securityArgs.length > 0) {
     args.push(...opts.securityArgs);

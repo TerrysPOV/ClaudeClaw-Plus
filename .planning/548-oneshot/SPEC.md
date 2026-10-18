@@ -16,6 +16,7 @@ Expose the frozen OneShotRequest, OneShotResult, OneShotEngine and runOneShot AP
 # Frozen decisions
 
 - Isolation is required. Untrusted rejects resume and allowedTools.
+- Coordinator ruling `msg_59da082b6bfa` (2026-10-18): add optional `cwd?: string`, honoured only for trusted-session calls by both engines. Untrusted cwd is rejected. This approved addition supports #549 named-agent session lookup. No api or baseEnv fields are added.
 - All routes default to print. Untrusted PTY stays disabled until an independently green isolation spike; no spike success is claimed here.
 - Engine IDs are print and pty; capabilities resume/tools/isolation are booleans.
 - Request strings: route, prompt, optional system/model/resumeSessionId. allowedTools is string[], maxTokens/timeoutMs are numbers, signal is AbortSignal. Result text/engine/model are strings, exitCode is number; optional sessionId and numeric usage counts.
