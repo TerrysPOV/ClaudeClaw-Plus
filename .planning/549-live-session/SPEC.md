@@ -98,7 +98,26 @@ read-only "is this key live and idle" accessor. PTY session keys are `thread:<id
 12. **Memory saves pass `allowedTools: ["Write"]`.** The old stop-time save forced
     `--dangerously-skip-permissions` so the write could not be refused. The one-shot
     engine builds its own permission flags, so the Write the save needs is requested
-    explicitly instead of relying on a bypass.
+    explicitly instead of relying on a bypass. In the `print` engine that becomes
+    `--tools Write --allowedTools Write` (and skips the default permission profile), so
+    the call is restricted to Write and pre-approved for it. Scoping Write to the memory
+    path is not expressible in `OneShotRequest.allowedTools`; the issue's acceptance test
+    asserts exactly `["Write"]`.
+13. **`runCompact` takes an options object** (`sessionId`, `sessionKey?`, `model`,
+    `timeoutMs`, `cwd?`). Its old `api`, `baseEnv`, `securityArgs` parameters are gone: the
+    `print` engine derives them from settings. Known narrowing: the auto-compact path used to
+    pass the routed `primaryConfig.api`; the one-shot fallback now uses `settings.api`.
+14. **A live slash command that prints `Error: …` is a failed command.** `claude -p` exits
+    non-zero for e.g. "Not enough messages to compact"; a live turn ends cleanly either way
+    (docs/spikes/0.4-slash-stdin.md shows the TUI's own error line). `looksLikeCommandError`
+    is applied only to prompts that start with `/`, never to free-form model output.
+    Unverified against a real claude here; part of the manual check.
+15. **`stop()` takes injectable dependencies** (`StopDeps`: pid file, one-shot saver,
+    statusline and heartbeat teardown), defaulting to the real ones, so the "no claude when a
+    daemon runs" test runs the real SIGTERM/wait/cleanup path without touching the project dir.
+16. **Shutdown order lives in `runShutdownSequence`**, with the first-vs-second-signal logic in
+    `createShutdownController`; `start.ts` supplies the steps. This is what makes "save after
+    drain, before the bus stops" and "a second SIGTERM aborts the save" testable.
 
 ## Key files
 
