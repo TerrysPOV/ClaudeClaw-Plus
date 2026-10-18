@@ -53,6 +53,57 @@ describe("memoryFileGrant", () => {
   });
 });
 
+/**
+ * Windows (Codex P2 on PR #561, 2d389fcf). code.claude.com/docs/en/permissions: "On Windows,
+ * paths are normalized to POSIX form before matching. `C:\Users\alice` becomes
+ * `/c/Users/alice`", so the filesystem-root rule for it is `//c/Users/alice`. The flavour
+ * argument runs the win32 branch on any host.
+ */
+describe("memoryFileGrant path flavours", () => {
+  it("posix: a POSIX path is unchanged", () => {
+    const g = memoryFileGrant("/work/proj/MEMORY.md", "posix");
+
+    expect(g.allowedTools).toEqual(["Edit(//work/proj/MEMORY.md)", "Read(//work/proj/MEMORY.md)"]);
+    expect(g.tools).toEqual(["Read", "Write"]);
+  });
+
+  it("win32: a drive path becomes //<lowercase drive>/<forward-slash path>", () => {
+    const g = memoryFileGrant("C:\\project\\MEMORY.md", "win32");
+
+    expect(g.allowedTools).toEqual(["Edit(//c/project/MEMORY.md)", "Read(//c/project/MEMORY.md)"]);
+    expect(g.tools).toEqual(["Read", "Write"]);
+  });
+
+  it("win32: forward-slash input and nested agent paths convert the same way", () => {
+    expect(memoryFileGrant("D:/Work/Proj/agents/suzy/MEMORY.md", "win32").allowedTools[0]).toBe(
+      "Edit(//d/Work/Proj/agents/suzy/MEMORY.md)",
+    );
+  });
+
+  it("win32: refuses a relative path, a drive-less rooted path, UNC and device paths", () => {
+    // On a non-Windows host the cwd has no drive, so a relative path cannot be made drive-absolute.
+    for (const bad of [
+      "MEMORY.md",
+      "\\project\\MEMORY.md",
+      "\\\\server\\share\\MEMORY.md",
+      "\\\\?\\C:\\p\\MEMORY.md",
+    ]) {
+      expect(() => memoryFileGrant(bad, "win32")).toThrow(/cannot be scoped/);
+    }
+  });
+
+  it("win32: still refuses a glob, parenthesis, comma or newline in the path", () => {
+    for (const bad of [
+      "C:\\p\\a*b\\MEMORY.md",
+      "C:\\p\\a(b)\\MEMORY.md",
+      "C:\\p\\a,b\\MEMORY.md",
+      "C:\\p\\a\nb\\MEMORY.md",
+    ]) {
+      expect(() => memoryFileGrant(bad, "win32")).toThrow(/cannot be scoped/);
+    }
+  });
+});
+
 describe("memory save one-shot request -> argv", () => {
   it("resumes the session with Read,Write available and only the memory file pre-approved", () => {
     const req = memorySaveRequest({

@@ -5,7 +5,7 @@
  * Memory is injected into --append-system-prompt on every invocation.
  */
 
-import { isAbsolute, join, resolve } from "path";
+import { join, posix, win32 } from "path";
 import { existsSync } from "fs";
 import { spawnSync, spawn } from "child_process";
 import { readFile, writeFile, mkdir } from "fs/promises";
@@ -56,17 +56,34 @@ export function getMemoryPath(agentName?: string): string {
  * consulted. `Read` is granted too because the Write tool refuses to overwrite an
  * existing file the session has not read.
  *
- * Throws when the path holds characters the rule syntax would read as a glob or
- * separator: the rule could then match more than the one file, so no grant is better
- * than a wider one.
+ * On Windows, "paths are normalized to POSIX form before matching. `C:\Users\alice`
+ * becomes `/c/Users/alice`", so the rule for it is `//c/Users/alice`: lowercase drive
+ * letter, forward slashes. UNC (`\\server\share`) and device (`\\?\C:`) paths have no
+ * documented form and are refused.
+ *
+ * Throws when the path cannot be made absolute, or holds characters the rule syntax would
+ * read as a glob or separator: the rule could then match more than the one file, so no
+ * grant is better than a wider one.
  */
-export function memoryFileGrant(memPath: string): { tools: string[]; allowedTools: string[] } {
-  const abs = resolve(memPath);
-  if (!isAbsolute(abs) || !abs.startsWith("/") || /[()*?[\]{},\r\n]/.test(abs)) {
+export function memoryFileGrant(
+  memPath: string,
+  flavour: PathFlavour = process.platform === "win32" ? "win32" : "posix",
+): { tools: string[]; allowedTools: string[] } {
+  const abs = (flavour === "win32" ? win32 : posix).resolve(memPath);
+  const posixAbs = flavour === "win32" ? winDriveToPosix(abs) : abs.startsWith("/") ? abs : null;
+  if (posixAbs === null || /[()*?[\]{},\r\n]/.test(posixAbs)) {
     throw new Error(`memory path ${JSON.stringify(abs)} cannot be scoped in a permission rule`);
   }
-  const rulePath = `/${abs}`; // "/" + "/abs/path" = "//abs/path"
+  const rulePath = `/${posixAbs}`; // "/" + "/abs/path" = "//abs/path"
   return { tools: ["Read", "Write"], allowedTools: [`Edit(${rulePath})`, `Read(${rulePath})`] };
+}
+
+export type PathFlavour = "posix" | "win32";
+
+/** `C:\a\b` -> `/c/a/b`; null for anything that is not a drive-letter absolute path. */
+function winDriveToPosix(abs: string): string | null {
+  const m = /^([A-Za-z]):\\(.*)$/.exec(abs);
+  return m ? `/${m[1].toLowerCase()}/${m[2].replace(/\\/g, "/")}` : null;
 }
 
 export async function ensureMemoryFile(agentName?: string): Promise<void> {

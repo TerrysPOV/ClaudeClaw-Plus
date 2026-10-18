@@ -218,3 +218,47 @@ read-only "is this key live and idle" accessor. PTY session keys are `thread:<id
 - Bus restart-based rotation (`runtime-mount.ts:502`): it summarises the old, no-longer-live
   session and so stays on the one-shot path, now with no tools (`allowedTools: []`, decision 18).
 - The manual `ps` check: needs a real claude on a real daemon; documented in REPORT.md for the operator.
+
+## Addendum: Windows memory path in the scoped grant (Codex P2 on PR #561, head 2d389fcf)
+
+### Problem
+
+`memoryFileGrant` (`src/memory.ts:63`) required `resolve(memPath)` to start with `/`. On Windows
+`resolve` yields `C:\project\MEMORY.md`, so every memory path was refused, and the pre-compact save and
+the no-daemon shutdown fallback failed before claude ran.
+
+### Rule (code.claude.com/docs/en/permissions, "Read and Edit" path patterns)
+
+- "`//path`: absolute path from filesystem root", for example `Edit(//tmp/scratch.txt)` for `/tmp/scratch.txt`.
+- "On Windows, paths are normalized to POSIX form before matching. `C:\Users\alice` becomes
+  `/c/Users/alice`, so use `//c/**/.env` to match `.env` files anywhere on that drive."
+
+So a Windows drive path is written `//<lowercase drive letter>/<forward-slash path>`:
+`C:\project\MEMORY.md` -> `Edit(//c/project/MEMORY.md)` and `Read(//c/project/MEMORY.md)`.
+Fetched 2026-10-18.
+
+### Target behaviour
+
+`memoryFileGrant(memPath, flavour?)` resolves with `node:path` `posix` or `win32` (default from
+`process.platform`), converts the absolute result to POSIX form, then prefixes `/`. The flavour argument
+lets the win32 branch be tested on macOS.
+
+### Frozen decisions
+
+- POSIX output is unchanged (`//abs/path`).
+- Only `X:\...` drive-absolute paths convert. UNC (`\\server\share`), device (`\\?\C:`) and drive-less rooted
+  (`\path`) paths are refused: the docs give no form for them, and no grant is better than a guessed one.
+- A relative path is still resolved against the cwd first (existing behaviour and test). It is refused only
+  when that does not give an absolute path of the flavour, which is the case for `win32` on a host whose cwd has no drive.
+- The glob/separator character check runs on the converted POSIX form, so `*`, `?`, `[`, `(`, `{`, `,` and
+  newlines stay refused on both flavours.
+
+### Key files
+
+`src/memory.ts` (`memoryFileGrant`, `winDriveToPosix`), `src/__tests__/memory-save-grant.test.ts`.
+Callers are unchanged: `src/shutdown-memory-save.ts:228`, `src/runner/live-session-actions.ts:155`.
+
+### Out of scope
+
+- A backslash in a POSIX filename is a gitignore escape in a rule. It is not newly introduced, was not part of the finding, and is left alone (noted in REPORT.md).
+- Whether claude on Windows honours the converted rule: not verifiable here (no Windows host).

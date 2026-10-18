@@ -3,6 +3,37 @@
 Branch `feat/549-live-session-compact`, stacked on `povai/feat/548-oneshot-module` @ 0d636b6a
 (which is on `povai/main` d81bd579). Spec: `.planning/549-live-session/SPEC.md`.
 
+## Windows memory path in the scoped grant (Codex P2 on 2d389fcf)
+
+**Fix.** `memoryFileGrant(memPath, flavour?)` in `src/memory.ts` now resolves with `node:path` `posix`/`win32` and converts a
+drive path to the documented POSIX form: `C:\project\MEMORY.md` -> `Edit(//c/project/MEMORY.md)` + `Read(//c/project/MEMORY.md)`
+(docs: "On Windows, paths are normalized to POSIX form before matching. `C:\Users\alice` becomes `/c/Users/alice`"; cited in SPEC.md addendum).
+POSIX output is unchanged. UNC, `\\?\` device and drive-less rooted paths are refused. The glob check runs on the converted path.
+
+**Tests** (`src/__tests__/memory-save-grant.test.ts`, 5 new): posix unchanged; win32 drive path; win32 forward-slash/nested path;
+win32 relative/rooted/UNC/device refused; win32 glob/paren/comma/newline refused. Written first: 3 failed before the change.
+
+**Runs.**
+- `bun test memory-save-grant shutdown-memory-save live-session-actions oneshot-print-tools oneshot-pty-tools`: 54 pass, 0 fail.
+- `bun run lint` (whole repo): exit 0, 0 errors (1261 warnings and 324 infos are pre-existing, none in the touched files). The first run had 1 error, a formatting error in my new test, fixed with `biome format`.
+- `bun run typecheck` (ratchet): 149 errors, baseline 149.
+
+**Fault injection** (one site each, reverted from a backup; prediction made before running):
+
+| Fault | Predicted red | RED line (verbatim) |
+|---|---|---|
+| F1 drop `.toLowerCase()` on the drive | both win32 conversion tests | `Expected: "Edit(//d/Work/Proj/agents/suzy/MEMORY.md)"` / `Received: "Edit(//D/Work/Proj/agents/suzy/MEMORY.md)"` |
+| F2 drop the `\` -> `/` replace | both win32 conversion tests | `Expected: "Edit(//d/Work/Proj/agents/suzy/MEMORY.md)"` / `Received: "Edit(//d/Work\Proj\agents\suzy\MEMORY.md)"` |
+| F3 non-drive win32 path converted instead of refused | refusal test | `(fail) memoryFileGrant path flavours > win32: refuses a relative path, a drive-less rooted path, UNC and device paths` |
+| F4 drop the glob/separator check | posix + win32 glob tests | `(fail) memoryFileGrant > refuses a path the rule syntax cannot pin to one file (glob, parenthesis, comma, newline)` and `(fail) memoryFileGrant path flavours > win32: still refuses a glob, parenthesis, comma or newline in the path` |
+| F5 posix branch `abs.slice(1)` | every posix assertion | `Expected: "Edit(//work/proj/MEMORY.md),Read(//work/proj/MEMORY.md)"` / `Received: "Edit(/work/proj/MEMORY.md),Read(/work/proj/MEMORY.md)"` (5 fail) |
+
+All five went red as predicted. The win32 glob test passed *before* the change (the old code refused every win32 path), so only F4 proves it can fail.
+
+**Left undone.** Not run on a real Windows host, so whether claude honours `//c/...` there rests on the docs. A backslash in a POSIX filename
+is a gitignore escape and is not refused (pre-existing, out of scope). "Relative path rejected" holds for the win32 flavour; a relative path under posix is still resolved against the cwd, as the existing test requires.
+Prior art: ClaudeClaw-Ultra not consulted for this fix; nothing reused.
+
 ## Rebase onto #548 e8d09870 (third pass)
 
 #561 (was `acf95f13`) rebased onto the new head of `feat/548-oneshot-module` (`e8d09870`). Twelve commits replayed; two
