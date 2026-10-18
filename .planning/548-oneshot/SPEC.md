@@ -56,3 +56,40 @@ Issue #549 live session consumers (compact, saves, rotation, stop), HTTP engines
 
 ### Out of scope (noted, no code)
 L1 untrusted PTY path gaps (trust dialog in the mkdtemp cwd, `--session-id` not added, bun-pty env merge) belong to the spike. L4 unknown `oneShot` keys are dropped. L5 a bad `oneShot` block now fails `parseSettings`, which also affects `llm-router` `reloadSettings` (`src/plugins/llm-router/server.ts:225`).
+
+
+## Second follow-up: trusted-route PTY engine (production grade)
+
+### Problem
+The `pty` engine becomes the default for trusted routes (compact, memory.save.*, rotation.summary) in #550, so findings that were latent on `runOnceOnPty` go live.
+
+### Current behaviour (as reviewed, 7898a063)
+- `src/runner/pty-supervisor.ts:1417` builds `PtyProcessOptions` by hand: no `settings.pty` cols/rows/timeouts, no synthesized multiplexer `mcpConfigPath`.
+- The PTY is spawned outside `state.ptys` (`:1450`), so `shutdownSupervisor` / `killAllPtys` cannot reach it.
+- No `PTY_OUTPUT_FORMAT_CONSTRAINT` in the system prompt (`runner.ts:1372`, used by #546 forks).
+- Timeout and TUI failure throw (`:1440`); `print` returns exitCode 124 / non-zero.
+- `--model kimi-k2p6` forwarded (`pty-process.ts:327,359`; Codex P2 on #560); `print.ts` forwarded it for untrusted calls only.
+- `ensureOneShotTrust` is called unwrapped (`:1448`), unlike `spawnEntry` (`:1616`).
+- `allowedTools` on PTY waits at a permission prompt for a tool outside the list.
+- `oneShot.routes` keys that are not routes are accepted (`config.ts` parse loop).
+
+### Target behaviour
+- `runOnceOnPty` delegates to `runOnPty` with the #546 ephemeral scope, so spawn options come from `buildSpawnOptions`, trust healing from `spawnEntry`, and the entry lives in `state.ptys` until it returns.
+- exit contract: timeout and abort mid-flight return `exitCode: 124`; a failed turn / spawn returns a non-zero code. Already-aborted requests still throw `AbortError` (engine pre-check).
+- trusted + `allowedTools`: `--permission-mode dontAsk --tools X --allowedTools X` (deny, never prompt).
+- one model-alias rule (`src/oneshot/model.ts`) for print and PTY argv.
+- unknown route names in `oneShot.routes` fail at load (`KNOWN_ROUTES` in `config.ts`).
+
+### Frozen decisions
+- `OneShotRequest` / `OneShotResult` / `OneShotEngine` unchanged (stacked #549).
+- Two optional `PtyRunScope` fields: `resumeSessionId` (ephemeral only; used verbatim, no resumability probe, so a missing conversation fails instead of silently starting a different one) and `isolation` (forwarded to `PtyProcessOptions`; `untrusted` skips trust healing for the throwaway cwd, as before).
+- One-shot entries are registered in `state.ptys` under `oneshot:<route>:<uuid>` and follow #546: `scope.ephemeral`, outside the `maxConcurrent` cap / LRU / reaper, `retireEntry` on return. They are NOT `survivesKill`: `/kill` and shutdown dispose them. Admission (serialised, refused during shutdown) applies; the cap does not count them, matching the #546 forks and jobs. Counting them would make a compaction burst evict keyed sessions.
+- Default model for a one-shot with no `req.model` is `settings.model` (as keyed sessions); `print` leaves the CLI default. Known divergence, kept out of this PR.
+- `PTY_OUTPUT_FORMAT_CONSTRAINT` moves to `src/runner/pty-output-format.ts` (leaf module, no circular import); `runner.ts` imports it.
+- Default engines are NOT changed here (#550).
+
+### Key files
+`src/runner/pty-supervisor.ts`, `src/runner/pty-process.ts`, `src/runner/pty-output-format.ts`, `src/runner.ts`, `src/oneshot/{model,config,engine.test,pty-trusted.test}.ts`, `src/commands/discord.ts`, `src/skills-tuner/core/llm.ts`.
+
+### Out of scope
+Untrusted PTY (spike), engine default flip (#550), keyed-session `--model` for legacy `-p` paths in `runner.ts`, HTTP engines.

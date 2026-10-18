@@ -28,7 +28,9 @@
  *   Pre-allocate via `--session-id <uuid>` for fresh spawns when
  *   `opts.newSessionId` is provided. The TUI does NOT print a session UUID at
  *   startup. When neither `sessionId` nor `newSessionId` is provided, we spawn
- *   without any session flag and Claude allocates internally.
+ *   without any session flag and Claude allocates internally. An untrusted
+ *   one-shot (`isolation: "untrusted"`) takes neither flag even when an id is
+ *   set: `buildClaudeArgs` returns early with `--no-session-persistence`.
  */
 import { spawn as ptySpawn, type IPty } from "bun-pty";
 import type { SecurityConfig } from "../config";

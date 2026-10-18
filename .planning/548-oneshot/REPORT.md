@@ -10,8 +10,8 @@ Implemented on `feat/548-oneshot-module`, based on `povai/main`. Frozen interfac
 - PTY utility calls own a fresh process/session or explicitly resume, run a turn using existing detection, dispose once and never enter the supervisor's keyed session map/LRU. Late spawns after deadlines are retired.
 - oneShot.default / engines / routes settings are parsed at load. Built-ins need no declaration. Exact route, namespace wildcard and default resolution are supported. Unknown engines, incompatible resume routes, malformed declarations and untrusted PTY mappings are rejected.
 - Untrusted PTY remains blocked in configuration and execution. PTY argv is prepared to strip MCP, resume, persona and permission flags and use the canonical sequence, but no successful interactive isolation spike is claimed.
-- Discord classifier now calls runOneShot with the existing model, 15-second timeout, env allowlist, stdin prompt delivery and JSON parsing. Its original tests are unchanged.
-- Tuner now calls runOneShot using tuner.propose/tuner.judge; claude_cli always selects print. New oneshot backend follows route settings. Existing tests, model mapping, trimmed text and cleanSpawnEnv behavior remain unchanged. The CLI cannot enforce maxTokens; this is documented.
+- Discord classifier now calls runOneShot with the existing model, 15-second timeout, env allowlist, stdin prompt delivery and JSON parsing. Its tests were changed in the review passes (see "Existing tests changed" below): `discord-classifier-isolation.test.ts` now reads `buildPrintArgs` output, and a later pass drives `classifyThreadIntent` itself.
+- Tuner now calls runOneShot using tuner.propose/tuner.judge; claude_cli always selects print. New oneshot backend follows route settings. Model mapping, trimmed text and cleanSpawnEnv behavior are preserved; the existing tuner tests were adjusted (see "Existing tests changed" below). The CLI cannot enforce maxTokens; this is documented.
 - No #549 consumer call sites were modified. Documentation explains configuration and opt-in e2e usage.
 - Both plugin manifests bumped to 2.2.337 with the required scripts.
 

@@ -15,6 +15,7 @@ import { listThreadSessions, removeThreadSession, peekThreadSession } from "../s
 import { readFile } from "node:fs/promises";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
+import type { spawn } from "node:child_process";
 import { runOneShot } from "../oneshot/engine.js";
 import { withPrintRuntime } from "../oneshot/print.js";
 import { transcribeAudioToText } from "../whisper";
@@ -579,17 +580,6 @@ interface ThreadIntent {
   names: string[];
 }
 
-/**
- * The classifier reads a message from any allowed guild member. It only has
- * to answer with JSON, so `runOneShot` runs it as an untrusted call: no tools at
- * all (`--tools ""`), no MCP server (`--strict-mcp-config` with no `--mcp-config`)
- * and no saved session, with the prompt on stdin (the argv comes from
- * `buildPrintArgs`, the single source of the isolation flags):
- * an instruction hidden in the message has nothing to act with. It also loads
- * no settings file (`--setting-sources ""`: no hooks, no user plugins) and no
- * skills, and runs from an empty temp dir so no CLAUDE.md is in its context —
- * otherwise a message can ask for that context back as "thread names".
- */
 /** Exact keys the classifier's `claude` keeps from the daemon env. */
 const CLASSIFIER_ENV_KEYS = new Set([
   "PATH",
@@ -633,7 +623,21 @@ export function classifierSpawnEnv(
   return out;
 }
 
-async function classifyThreadIntent(text: string): Promise<ThreadIntent | null> {
+/**
+ * The classifier reads a message from any allowed guild member. It only has
+ * to answer with JSON, so `runOneShot` runs it as an untrusted call: no tools at
+ * all (`--tools ""`), no MCP server (`--strict-mcp-config` with no `--mcp-config`)
+ * and no saved session, with the prompt on stdin (the argv comes from
+ * `buildPrintArgs`, the single source of the isolation flags):
+ * an instruction hidden in the message has nothing to act with. It also loads
+ * no settings file (`--setting-sources ""`: no hooks, no user plugins) and no
+ * skills, and runs from an empty temp dir so no CLAUDE.md is in its context —
+ * otherwise a message can ask for that context back as "thread names".
+ */
+export async function classifyThreadIntent(
+  text: string,
+  deps: { spawn?: typeof spawn } = {},
+): Promise<ThreadIntent | null> {
   const systemPrompt = `You classify user messages into thread management intents.
 
 If the user wants to CREATE/SPAWN/DEPLOY threads (e.g. "hire X", "派出 X", "叫 X 出來", "派 X 去打", "開 X", "建立 X"):
@@ -651,7 +655,9 @@ Rules:
 
   try {
     const input = `${systemPrompt}\n\n---\nUser message: ${text}`;
-    const call = await withPrintRuntime({ env: classifierSpawnEnv(), stdinPrompt: true }, () =>
+    const call = await withPrintRuntime(
+      { env: classifierSpawnEnv(), stdinPrompt: true, spawn: deps.spawn },
+      () =>
       runOneShot({
         route: "discord.classifier",
         prompt: input,

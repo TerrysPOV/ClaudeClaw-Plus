@@ -19,6 +19,16 @@ export const UNTRUSTED_ROUTES = [
   "memory.recall",
 ];
 
+/** Every route a caller passes to `runOneShot`; the only keys `oneShot.routes` accepts. */
+export const KNOWN_ROUTES: readonly string[] = [...RESUME_ROUTES, ...UNTRUSTED_ROUTES];
+/** `resolveOneShotEngine` falls back on `<first segment>.*`, so only those wildcards bind. */
+const ROUTE_FAMILIES = new Set(KNOWN_ROUTES.map((route) => route.split(".")[0]));
+
+function isKnownRouteKey(key: string): boolean {
+  if (KNOWN_ROUTES.includes(key)) return true;
+  return key.endsWith(".*") && ROUTE_FAMILIES.has(key.slice(0, -2));
+}
+
 /** Routes whose prompt carries text from outside the operator's trust boundary. */
 export function isUntrustedRoute(route: string): boolean {
   return route.startsWith("tuner.") || UNTRUSTED_ROUTES.includes(route);
@@ -63,6 +73,10 @@ export function parseOneShotSettings(raw: unknown): OneShotSettings {
     object(config, `engines.${id}`);
   }
   for (const [route, id] of Object.entries(routes)) {
+    if (!isKnownRouteKey(route))
+      throw new Error(
+        `oneShot.routes.${route} is not a known route (known: ${KNOWN_ROUTES.join(", ")}, or <family>.*)`,
+      );
     if (typeof id !== "string") throw new Error(`oneShot.routes.${route} must be an engine id`);
     validateRouteEngine(id, route, isUntrustedRoute(route), RESUME_ROUTES.includes(route));
   }

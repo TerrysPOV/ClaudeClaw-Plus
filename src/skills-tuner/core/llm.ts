@@ -59,7 +59,7 @@ export class ClaudeCliBackend implements LLMClient {
   }
 
   // The claude CLI has no output-length flag, so maxTokens is accepted for
-  // interface compatibility but not forwarded.
+  // interface compatibility but not forwarded to the CLI.
   async call(role: Role, system: string, messages: Message[], maxTokens?: number): Promise<string> {
     const prompt = buildPrompt(system, messages);
     let stderr = "";

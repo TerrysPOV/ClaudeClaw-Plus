@@ -7,10 +7,10 @@ import { join } from "node:path";
 import { _setSettingsFileForTests, loadSettings, reloadSettings } from "../config.js";
 import { runOneShot, type OneShotRequest } from "./engine.js";
 import { engines } from "./registry.js";
-import { UNTRUSTED_ROUTES, parseOneShotSettings } from "./config.js";
+import { KNOWN_ROUTES, UNTRUSTED_ROUTES, parseOneShotSettings } from "./config.js";
 import { UNTRUSTED_CLAUDE_ARGS } from "./isolation.js";
 import { buildPrintArgs, withPrintRuntime } from "./print.js";
-import { __buildClaudeArgsForTests } from "../runner/pty-process.js";
+import { PtyClosedError, __buildClaudeArgsForTests } from "../runner/pty-process.js";
 import {
   injectSpawnPty,
   snapshotSupervisor,
@@ -64,6 +64,32 @@ async function withPtyIsolation<T>(call: () => T | Promise<T>): Promise<T> {
   } finally {
     caps.isolation = previous;
   }
+}
+/** A PTY double: `runTurn` is the given one, and `dispose` fails a pending turn like the real one. */
+function ptyDouble(
+  runTurn: (prompt: string) => Promise<unknown>,
+  onDispose: () => void = () => {},
+): never {
+  let failTurn: (error: Error) => void = () => {};
+  return {
+    label: "double",
+    pid: 1,
+    sessionId: "s",
+    cwd: "/",
+    isAlive: () => true,
+    lastTurnEndedAt: () => 0,
+    runTurn: (prompt: string) =>
+      Promise.race([
+        runTurn(prompt),
+        new Promise((_, reject) => {
+          failTurn = reject;
+        }),
+      ]),
+    dispose: async () => {
+      onDispose();
+      failTurn(new PtyClosedError("double", null, "SIGTERM"));
+    },
+  } as never;
 }
 const security = { level: "moderate" as const, allowedTools: [], disallowedTools: [] };
 let configDir: string;
@@ -308,22 +334,22 @@ describe("one-shot isolation contract", () => {
       }
     });
   }
-  it("PTY uses a fresh process and disposes it without LRU admission", async () => {
+  it("PTY uses a fresh process, registered while it runs and gone after, outside the LRU", async () => {
     let disposed = 0;
     const before = snapshotSupervisor().ptys.length;
     injectSpawnPty(async (opts) => {
       expect(opts.sessionId).toBe("resume-me");
-      return {
-        sessionId: "resume-me",
-        runTurn: async (prompt: string) => {
+      return ptyDouble(
+        async (prompt) => {
           expect(prompt).toBe("hello");
-          expect(snapshotSupervisor().ptys.length).toBe(before);
+          // Tracked by the supervisor for the duration of the turn.
+          expect(snapshotSupervisor().ptys.length).toBe(before + 1);
           return { text: "done", sessionId: "resume-me", bytesCaptured: 4, cleanBoundary: true };
         },
-        dispose: async () => {
+        () => {
           disposed++;
         },
-      } as never;
+      );
     });
     const result = await engines
       .get("pty")!
@@ -332,24 +358,22 @@ describe("one-shot isolation contract", () => {
     expect(disposed).toBe(1);
     expect(snapshotSupervisor().ptys.length).toBe(before);
   });
-  it("PTY deadline disposes the process exactly once", async () => {
+  it("PTY deadline disposes the process exactly once and resolves with exit code 124", async () => {
     let disposed = 0;
     let started = false;
-    injectSpawnPty(
-      async () =>
-        ({
-          runTurn: () => {
-            started = true;
-            return new Promise(() => {});
-          },
-          dispose: async () => {
-            disposed++;
-          },
-        }) as never,
+    injectSpawnPty(async () =>
+      ptyDouble(
+        () => {
+          started = true;
+          return new Promise(() => {});
+        },
+        () => {
+          disposed++;
+        },
+      ),
     );
-    await expect(engines.get("pty")!.run({ ...trustedReq, timeoutMs: 30 })).rejects.toThrow(
-      "timed out",
-    );
+    const result = await engines.get("pty")!.run({ ...trustedReq, timeoutMs: 30 });
+    expect(result).toMatchObject({ engine: "pty", text: "", exitCode: 124 });
     expect(started).toBe(true);
     expect(disposed).toBe(1);
   });
@@ -363,9 +387,8 @@ describe("one-shot isolation contract", () => {
         release = resolve;
       });
     });
-    await expect(engines.get("pty")!.run({ ...trustedReq, timeoutMs: 30 })).rejects.toThrow(
-      "timed out",
-    );
+    const result = await engines.get("pty")!.run({ ...trustedReq, timeoutMs: 30 });
+    expect(result.exitCode).toBe(124);
     expect(spawned).toBe(true);
     release({
       dispose: async () => {
@@ -384,11 +407,12 @@ describe("one-shot isolation contract", () => {
       injectSpawnPty(async (opts) => {
         cwd = opts.cwd;
         expect(existsSync(cwd)).toBe(true);
-        return { runTurn: () => new Promise(() => {}), dispose: async () => {} } as never;
+        return ptyDouble(() => new Promise(() => {}));
       });
-      await withPtyIsolation(() =>
-        expect(engines.get("pty")!.run({ ...req, timeoutMs: 30 })).rejects.toThrow("timed out"),
+      const result = await withPtyIsolation(() =>
+        engines.get("pty")!.run({ ...req, timeoutMs: 30 }),
       );
+      expect(result.exitCode).toBe(124);
       expect(cwd).not.toBe("");
       expect(existsSync(cwd)).toBe(false);
     });
@@ -398,9 +422,10 @@ describe("one-shot isolation contract", () => {
         cwd = opts.cwd;
         return new Promise(() => {});
       });
-      await withPtyIsolation(() =>
-        expect(engines.get("pty")!.run({ ...req, timeoutMs: 30 })).rejects.toThrow("timed out"),
+      const result = await withPtyIsolation(() =>
+        engines.get("pty")!.run({ ...req, timeoutMs: 30 }),
       );
+      expect(result.exitCode).toBe(124);
       expect(cwd).not.toBe("");
       expect(existsSync(cwd)).toBe(false);
     });
@@ -622,6 +647,21 @@ describe("one-shot configuration", () => {
         routes: { "tuner.*": "print", "discord.classifier": "print", "memory.recall": "print" },
       }).default,
     ).toBe("pty");
+  });
+  it("rejects unknown route names at load instead of dropping them", () => {
+    for (const route of ["compat", "tuner.judje", "memory.save.*", "memory.recal", "nope.*"]) {
+      expect(() => parseOneShotSettings({ routes: { [route]: "print" } })).toThrow(
+        "not a known route",
+      );
+    }
+  });
+  it("accepts every known route and each family wildcard", () => {
+    const routes = Object.fromEntries(
+      [...KNOWN_ROUTES, "tuner.*", "memory.*", "discord.*", "rotation.*"].map((r) => [r, "print"]),
+    );
+    expect(Object.keys(parseOneShotSettings({ routes }).routes).length).toBe(
+      KNOWN_ROUTES.length + 4,
+    );
   });
   it("rejects malformed engine and route declarations", () => {
     for (const raw of [

@@ -79,8 +79,10 @@ import {
   retirePtySession,
   type PtySessionStore,
   type RunOnPtyResult,
+  runEphemeralWithDeadline,
 } from "./runner/pty-supervisor";
 import { encodeCwdForProjectsDir } from "./bus/jsonl-line-types";
+import { PTY_OUTPUT_FORMAT_CONSTRAINT } from "./runner/pty-output-format";
 import { SPAWN_ENV_STRIP_KEYS, cleanSpawnEnv, shouldStripSpawnEnvKey } from "./runner/spawn-env";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
@@ -770,46 +772,8 @@ function spawnClaude(
   });
 }
 
-/**
- * A one-shot agent turn on its own PTY (#546): fresh session, nothing
- * persisted, PTY retired when it returns. `timeoutMs` bounds the whole call —
- * admission, spawn and turn — like the wall-clock timer of the `-p` path
- * (the supervisor bounds each stage separately). `signal` aborts it.
- */
-async function runOneShotOnPty(
-  sessionKey: string,
-  prompt: string,
-  opts: Omit<Parameters<typeof runOnPty>[2], "signal" | "ephemeral">,
-  signal?: AbortSignal,
-): Promise<RunOnPtyResult & { timedOut: boolean; aborted: boolean }> {
-  const controller = new AbortController();
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, opts.timeoutMs);
-  const onAbort = (): void => controller.abort();
-  if (signal?.aborted) controller.abort();
-  else signal?.addEventListener("abort", onAbort, { once: true });
-  try {
-    const exec = await runOnPty(sessionKey, prompt, {
-      ...opts,
-      ephemeral: true,
-      signal: controller.signal,
-    });
-    // A turn that produced its result stands, even if the timer or a cancel
-    // fired while the PTY was being torn down afterwards.
-    const failed = exec.exitCode !== 0;
-    return {
-      ...exec,
-      timedOut: failed && timedOut,
-      aborted: failed && !timedOut && controller.signal.aborted,
-    };
-  } finally {
-    clearTimeout(timer);
-    signal?.removeEventListener("abort", onAbort);
-  }
-}
+/** A one-shot agent turn on its own PTY (#546); see `runEphemeralWithDeadline`. */
+const runOneShotOnPty = runEphemeralWithDeadline;
 
 /**
  * The model override as `run()` accepts it: the bare model string production
@@ -1359,26 +1323,6 @@ const DIR_SCOPE_PROMPT = [
   "You MUST NOT read, write, edit, or delete any file outside this directory.",
   "You MUST NOT run bash commands that modify anything outside this directory (no cd /, no /etc, no ~/, no ../.. escapes).",
   "If a request requires accessing files outside the project, refuse and explain why.",
-].join("\n");
-
-/**
- * Band-aid for #105 — see the call site in `run()` for full context.
- *
- * Constrains the model's user-facing reply to plain prose so the PTY
- * sentinel-echo parser can extract textual content rather than TUI box
- * chrome from rendered markdown blocks. Temporary; remove with the PTY
- * runtime when the Bus runtime (epic #107, spec PR #106) becomes default.
- */
-const PTY_OUTPUT_FORMAT_CONSTRAINT = [
-  "OUTPUT FORMAT CONSTRAINT (response surface limitation):",
-  "Your final user-facing reply MUST be plain prose. The reply is captured through a text-only transport that cannot render markdown.",
-  "Do NOT use in your final reply:",
-  "  - Backtick code fences (```...``` or single `...`) — write paths and commands plainly, e.g. /home/x/file.png NOT `/home/x/file.png`",
-  "  - Markdown bullets (`*`, `-`, `+`) at the start of lines",
-  "  - Numbered list items (`1.`, `2.`)",
-  "  - Block quotes (`>` at start of lines)",
-  "  - Horizontal rules (`---`)",
-  "This constraint applies ONLY to your final response text. You may still use markdown freely inside tool inputs and internal reasoning.",
 ].join("\n");
 
 export async function ensureProjectClaudeMd(): Promise<void> {
