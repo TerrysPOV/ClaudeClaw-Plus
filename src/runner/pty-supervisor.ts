@@ -1411,8 +1411,9 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
   // never depends on `work` settling (a hung turn or a spawn that never lands).
   try {
     const cwd = untrusted
-      ? (tempCwd = mkdtempSync(join(tmpdir(), "claudeclaw-oneshot-pty-")))
+      ? mkdtempSync(join(tmpdir(), "claudeclaw-oneshot-pty-"))
       : (req.cwd ?? process.cwd());
+    if (untrusted) tempCwd = cwd;
     const options: PtyProcessOptions = {
       sessionId: req.resumeSessionId ?? "",
       newSessionId: req.resumeSessionId ? undefined : randomUUID(),

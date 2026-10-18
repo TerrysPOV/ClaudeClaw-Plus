@@ -16,6 +16,7 @@ const CREDENTIAL_PATTERNS: Array<[RegExp, string]> = [
 /** Bounded, credential-masked stderr excerpt for error messages. */
 export function stderrExcerpt(raw: string, max = MAX_EXCERPT): string {
   let text = raw;
-  for (const [pattern, replacement] of CREDENTIAL_PATTERNS) text = text.replace(pattern, replacement);
+  for (const [pattern, replacement] of CREDENTIAL_PATTERNS)
+    text = text.replace(pattern, replacement);
   return text.slice(0, max);
 }

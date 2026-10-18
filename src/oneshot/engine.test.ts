@@ -55,7 +55,7 @@ function recordingSpawn(record: { args: string[]; input: string; cwd: string }):
 }
 
 /** The PTY engine cannot take untrusted calls; open it only to exercise cleanup. */
-async function withPtyIsolation<T>(call: () => Promise<T>): Promise<T> {
+async function withPtyIsolation<T>(call: () => T | Promise<T>): Promise<T> {
   const caps = engines.get("pty")!.caps;
   const previous = caps.isolation;
   caps.isolation = true;
@@ -117,9 +117,7 @@ describe("one-shot isolation contract", () => {
         dispose: async () => {},
       } as never;
     });
-    await engines
-      .get("pty")!
-      .run({ ...trustedReq, cwd: configDir } as OneShotRequest);
+    await engines.get("pty")!.run({ ...trustedReq, cwd: configDir } as OneShotRequest);
     expect(actualCwd).toBe(configDir);
     expect(existsSync(configDir)).toBe(true);
   });
@@ -148,7 +146,12 @@ describe("one-shot isolation contract", () => {
       injectSpawnPty(async () => {
         spawned++;
         return {
-          runTurn: async () => ({ text: "ok", sessionId: "s", bytesCaptured: 2, cleanBoundary: true }),
+          runTurn: async () => ({
+            text: "ok",
+            sessionId: "s",
+            bytesCaptured: 2,
+            cleanBoundary: true,
+          }),
           dispose: async () => {},
         } as never;
       });
@@ -344,9 +347,9 @@ describe("one-shot isolation contract", () => {
           },
         }) as never,
     );
-    await expect(
-      engines.get("pty")!.run({ ...trustedReq, timeoutMs: 30 }),
-    ).rejects.toThrow("timed out");
+    await expect(engines.get("pty")!.run({ ...trustedReq, timeoutMs: 30 })).rejects.toThrow(
+      "timed out",
+    );
     expect(started).toBe(true);
     expect(disposed).toBe(1);
   });
@@ -360,9 +363,9 @@ describe("one-shot isolation contract", () => {
         release = resolve;
       });
     });
-    await expect(
-      engines.get("pty")!.run({ ...trustedReq, timeoutMs: 30 }),
-    ).rejects.toThrow("timed out");
+    await expect(engines.get("pty")!.run({ ...trustedReq, timeoutMs: 30 })).rejects.toThrow(
+      "timed out",
+    );
     expect(spawned).toBe(true);
     release({
       dispose: async () => {
@@ -406,7 +409,12 @@ describe("one-shot isolation contract", () => {
       injectSpawnPty(async (opts) => {
         cwd = opts.cwd;
         return {
-          runTurn: async () => ({ text: "ok", sessionId: "s", bytesCaptured: 2, cleanBoundary: true }),
+          runTurn: async () => ({
+            text: "ok",
+            sessionId: "s",
+            bytesCaptured: 2,
+            cleanBoundary: true,
+          }),
           dispose: async () => {},
         } as never;
       });

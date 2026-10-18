@@ -30,12 +30,7 @@ interface Captured {
   stdin: string;
 }
 
-function fakeSpawn(
-  captured: Captured[],
-  stdout = "ok",
-  code = 0,
-  stderr = "",
-): typeof spawn {
+function fakeSpawn(captured: Captured[], stdout = "ok", code = 0, stderr = ""): typeof spawn {
   return ((command: string, args: string[], options: SpawnOptions) => {
     const cwd = typeof options?.cwd === "string" ? options.cwd : "";
     const record: Captured = {
@@ -311,7 +306,9 @@ describe("ClaudeCliBackend — stderr excerpt on non-zero exit", () => {
 
   it("masks credentials before they reach the error", async () => {
     const apiKey = ["sk", "ant", "api03", "A".repeat(30)].join("-");
-    const error = await failing(`auth failed for ${apiKey}; ANTHROPIC_TOKEN=abc123 Bearer tok.en/xyz`)
+    const error = await failing(
+      `auth failed for ${apiKey}; ANTHROPIC_TOKEN=abc123 Bearer tok.en/xyz`,
+    )
       .call("judge", "s", [])
       .catch((e: Error) => e);
     const message = (error as Error).message;

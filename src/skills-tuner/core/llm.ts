@@ -81,8 +81,7 @@ export class ClaudeCliBackend implements LLMClient {
           maxTokens,
         }),
     );
-    if (result.exitCode !== 0)
-      throw new Error(`claude CLI exited ${result.exitCode}: ${stderr}`);
+    if (result.exitCode !== 0) throw new Error(`claude CLI exited ${result.exitCode}: ${stderr}`);
     return result.text.trim();
   }
 
