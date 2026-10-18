@@ -382,7 +382,7 @@ Sits between the daemon and Claude CLI. Automatically routes planning tasks to O
 
 **[PR #73 — closed upstream — lives here](https://github.com/moazbuilds/claudeclaw/pull/73)**
 
-> **Note:** The gateway, event log and escalation framework sit on the legacy adapter pipeline and are opt-in per adapter with `USE_GATEWAY_TELEGRAM=true` / `USE_GATEWAY_DISCORD=true` (`src/commands/telegram.ts:31, 1741-1742`, `src/commands/discord.ts:1333`); nothing under `src/bus` or `src/adapters` imports them — the event-bus runtime uses `BusCore` topics and subscriptions instead.
+> **Note:** The gateway, event log and escalation framework sit on the legacy adapter pipeline and are opt-in per adapter with `USE_GATEWAY_TELEGRAM=true` / `USE_GATEWAY_DISCORD=true` (`src/commands/telegram.ts:31, 1741-1742`, `src/commands/discord.ts:1333`); nothing under `src/bus` or `src/adapters` imports the gateway or the escalation framework — the event-bus runtime uses `BusCore` topics and subscriptions instead, and only borrows the event log's `append` to write its own `bus:*` audit records (`src/bus/core.ts:31`).
 
 Unified message ingestion pipeline normalises Discord/Telegram messages to a common format. Crash-safe append-only event log, retry queue with exponential backoff, dead-letter queue, full event replay, and an escalation framework (pause session, hand off to a human, notify across channels).
 
