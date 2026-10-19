@@ -115,7 +115,7 @@ Start the heartbeat daemon for this project. Follow these steps exactly:
 
    - **Permission mode mapping** — apply the headless answer to settings:
      - "Yes — headless (Recommended)" → DO NOTHING. The bus resolver default (`bypassPermissions`) and the legacy `permission-mode.json` absence both already deliver headless behaviour. No explicit write is needed.
-     - "No — confirm each Bash/Write call" → write `.claude/claudeclaw/permission-mode.json` with `{"mode": "plan"}` (the legacy `claude -p` runner reads this). AND, for each existing entry in `settings.agents` (if any), set the agent's `permission_mode` to `"plan"` so the bus runtime picks it up per-agent. If `settings.agents` is empty, only the legacy file needs writing — bus agents added later will need a manual `permission_mode` field (this is intentional; bus agents are explicit per-agent configs).
+     - "No — confirm each Bash/Write call" → write `.claude/claudeclaw/permission-mode.json` with `{"mode": "plan"}` (the per-turn runner reads this, on both the PTY and `claude -p` engines). AND, for each existing entry in `settings.agents` (if any), set the agent's `permission_mode` to `"plan"` so the bus runtime picks it up per-agent. If `settings.agents` is empty, only the legacy file needs writing — bus agents added later will need a manual `permission_mode` field (this is intentional; bus agents are explicit per-agent configs).
 
    Update `.claude/claudeclaw/settings.json` with their answers.
 
@@ -292,7 +292,7 @@ Defaults: `WEB_HOST=127.0.0.1`, `WEB_PORT=4632` unless changed via settings or `
 - `security.allowedTools` — extra tools to allow on top of the level (e.g. `["Bash(git:*)"]`)
 - `security.disallowedTools` — tools to block on top of the level
 - `agents[N].permission_mode` (bus runtime) — one of: `"default"`, `"plan"`, `"acceptEdits"`, `"bypassPermissions"`, `"dontAsk"`, `"auto"` (full-parity with Claude Code's `--permission-mode` choices). Default is `"bypassPermissions"` (headless — no Allow/Deny prompts per tool call). Per-agent override; falls back to the resolver default if unset.
-- `.claude/claudeclaw/permission-mode.json` (legacy `claude -p` runtime) — `{"mode": "..."}` file. Absent ≡ `"bypassPermissions"` (headless). Written by the wizard only when the user explicitly opts out of headless.
+- `.claude/claudeclaw/permission-mode.json` (per-turn runner, read by both the PTY and `claude -p` engines) — `{"mode": "..."}` file. Absent ≡ `"bypassPermissions"` (headless). Written by the wizard only when the user explicitly opts out of headless.
 
 ### Security Levels
 The security level controls which tools are available; the headless behaviour is controlled separately via `permission_mode`. By default (`permission_mode: "bypassPermissions"`, set by the wizard or assumed when unset) all levels run without permission prompts, with security enforced via tool restrictions and project-directory scoping. Operators can opt into per-call confirmations by setting `permission_mode: "plan"` — useful for review-bot or compliance-bounded setups.

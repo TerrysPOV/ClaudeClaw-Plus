@@ -122,7 +122,7 @@ This validates `pty-stdin` as the correct default for channel-driven agents and 
 | Origin | Runner | Why |
 |---|---|---|
 | `discord`, `telegram`, `slack`, `webui` | `pty-stdin` (bun-pty) | Channel-driven; needs REPL; REPL needs TTY |
-| `cron`, `heartbeat`, `cli`, `rest` | `process-stream-json` | Channel-free; PTY is overhead; same JSONL semantics |
+| `cron`, `heartbeat`, `cli`, `rest` | `pty-stdin` (#550); `process-stream-json` on win32 only | Channel-free. Since #550 the default is PTY on every platform except win32, where `defaultSupervisionFor` falls back to `claude -p`; same JSONL semantics |
 
 Sprint 1 picks this up as a runner-selection branch keyed on `BusEvent.origin`. The two runners share the JSONL Tailer (same read path) and only differ in how the `claude` child is supervised. Operators don't see this distinction unless they look at `ps` output.
 
@@ -302,7 +302,7 @@ type BusEvent = {
 | Mode | Implementation | Platforms | Use case |
 |---|---|---|---|
 | `pty-stdin` (default for channel-driven agents) | Spawn `claude` via `bun-pty` to satisfy the REPL's `isatty(0)` gate. **`stdout: 'ignore'`** — the Bus never reads stdout. Slash commands written to the PTY master. JSONL is the only read source. | macOS, Linux | Default for `discord`/`telegram`/`slack`/`webui` agents — anywhere Channel notifications drive turns |
-| `process-stream-json` (default for non-channel origins) | `Bun.spawn(['claude', '-p', '--input-format=stream-json'])` with JSON turns written to stdin. No PTY needed — `-p` bypasses the isatty gate. JSONL still authoritative for reads. Channel notifications are NOT delivered in this mode (Probe 0.6); slash commands ARE. | macOS, Linux, Windows | Default for `cron`/`heartbeat`/`cli`/`rest` agents — channel-free invocations where PTY emulation is unnecessary overhead |
+| `process-stream-json` (default for non-channel origins on win32 only; elsewhere opt-in via `supervision`) | `Bun.spawn(['claude', '-p', '--input-format=stream-json'])` with JSON turns written to stdin. No PTY needed — `-p` bypasses the isatty gate. JSONL still authoritative for reads. Channel notifications are NOT delivered in this mode (Probe 0.6); slash commands ARE. | macOS, Linux, Windows | Default for `cron`/`heartbeat`/`cli`/`rest` origins in hand-built configs on win32 only (#550); an explicit opt-in elsewhere |
 | `tmux` (opt-in) | Wraps `claude` in a detached tmux session; operator can `tmux attach` to inspect | macOS, Linux | Operators who want to attach into a running session for debugging or to issue commands by hand |
 | `process` (Windows-only, channel-driven fallback) | Direct `Bun.spawn` with `stdin: 'pipe'` and no PTY — slash command relay does NOT work in this mode on `claude` 2.1.x (REPL downshifts to `--print`). Acceptable only on Windows where `bun-pty` is unavailable AND the agent needs channels. | Windows | Windows fallback when `bun-pty` is unavailable and `process-stream-json` is unsuitable (channel-driven origin) |
 

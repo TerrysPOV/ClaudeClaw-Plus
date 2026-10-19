@@ -10,7 +10,8 @@
  * This gives jobs a supported home: `dispatch()` registers a job and returns its id
  * IMMEDIATELY (fire-and-return — the caller never awaits, which is exactly what
  * wedged #295). The job runs headless in its own tracked process (injected
- * `runAgentJob`, wired to `runClaudeOnce` + `loadAgentPrompts`), bounded by a
+ * `runAgentJob`, wired to `runAgentJobHeadless`: PTY by default, `claude -p` with
+ * `pty.enabled: false` or on win32), bounded by a
  * concurrency cap, cancellable, and its result delivered back to the dispatcher
  * AND kept queryable. In-memory only (a restart cancels in-flight jobs — matches
  * the scheduler + restart-rotation model). SPEC: `.planning/agent-job-primitive/SPEC.md`.
@@ -136,7 +137,7 @@ export interface JobRunResult {
 }
 
 export interface AgentJobDeps {
-  /** Run the agent headless (wraps `runClaudeOnce` + `loadAgentPrompts`). MUST honour
+  /** Run the agent headless (wraps `runAgentJobHeadless`; PTY by default). MUST honour
    *  the AbortSignal — kill the process when it aborts (cancel / stop). */
   runAgentJob(input: {
     jobId: string;

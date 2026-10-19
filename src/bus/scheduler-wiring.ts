@@ -22,7 +22,9 @@
  *
  * The daemon passes no jobs (`busSchedulerJobs()` in `job-loop.ts`, #506):
  * the 60 s job loop runs every job under every runtime, as a one-shot
- * `claude -p` with its own model, timeout, retry and notify. Handing the
+ * `run()` turn on the configured engine (PTY by default; `claude -p` only with
+ * `pty.enabled: false` or on win32) with its own model, timeout, retry and
+ * notify. Handing the
  * jobs here as well ran each one twice. The cron path stays for callers
  * that pass jobs explicitly.
  *

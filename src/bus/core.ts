@@ -3985,7 +3985,7 @@ export class BusCoreImpl implements BusCore {
       case "job_request":
         // #296 PR 3: an agent's dispatch_job/job_status/list_jobs/cancel_job
         // tool routes here over IPC. The AgentJobRunner lives in the daemon
-        // (only it spawns/tracks the headless `claude -p` job processes); we
+        // (only it spawns/tracks the headless job processes, PTY by default); we
         // run the op and send back a correlated `job_result`.
         this.handleJobRequest(agentId, msg);
         break;
