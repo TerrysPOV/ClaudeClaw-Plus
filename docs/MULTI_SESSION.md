@@ -28,8 +28,8 @@ Discord Gateway
 2. `discord.ts` detects the thread via `knownThreads` cache (populated from `GUILD_CREATE`, `THREAD_CREATE`, `THREAD_LIST_SYNC` events).
 3. `runUserMessage()` is called with the `threadId`.
 4. `execClaude()` checks `sessionManager.getThreadSession(threadId)` — returns `null` for new threads.
-5. Claude CLI is invoked with `--output-format json` to bootstrap a new session.
-6. The returned `session_id` is saved via `sessionManager.createThreadSession(threadId, sessionId)`.
+5. Claude CLI bootstraps a new session. On the print engine (`pty.enabled: false`, or the default on Windows) this is a `claude -p` call with `--output-format json`; on the PTY engine (the default elsewhere) the PTY supervisor starts the session and supplies its id, and no JSON output is involved.
+6. The resulting `session_id` is saved via `sessionManager.createThreadSession(threadId, sessionId)`.
 
 ### Resume
 1. Subsequent messages in the same thread hit `getThreadSession(threadId)` which returns the existing `sessionId`.

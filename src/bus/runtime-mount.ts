@@ -709,7 +709,7 @@ export async function mountBusRuntime(
         if (stopped) return;
         stopped = true;
         // Agent-job runner: cancel in-flight jobs + clear the queue so no
-        // headless `claude -p` outlives the daemon, and detach the handler so
+        // headless claude (PTY by default) outlives the daemon, and detach the handler so
         // a late `job_request` gets a clean "not enabled" error (#296 PR 3).
         try {
           jobRunner.stop();

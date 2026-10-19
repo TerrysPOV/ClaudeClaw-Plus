@@ -84,7 +84,7 @@ Manually trigger a cron job immediately (useful for testing).
    ```bash
    bun run ${CLAUDE_PLUGIN_ROOT}/src/index.ts run <job-name>
    ```
-   If the `run` sub-command is not implemented in the CLI, execute the prompt directly using `claude -p "<prompt>" --output-format text` instead.
+   If the `run` sub-command is not implemented in the CLI, fire an agent job with `bun run ${CLAUDE_PLUGIN_ROOT}/src/index.ts fire <agent>:<label>` (agent jobs only; it runs the job once through the same `run()` path as the job loop). Otherwise leave the job to the daemon's 60 s job loop; do not shell out to `claude -p` by hand.
 4. Show the output to the user.
 
 ---
