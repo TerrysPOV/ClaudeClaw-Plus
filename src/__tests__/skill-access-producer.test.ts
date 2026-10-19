@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import {
   mkdtempSync,
   mkdirSync,
@@ -21,10 +21,12 @@ import {
 const NOW = "2026-06-30T00:00:00Z";
 const SKILLS = "/home/x/.claude/skills";
 const HOOK = join(import.meta.dir, "..", "..", "hooks", "log-skill-access.mjs");
-// Hook-integration cases spawn node (several times in one case). Cold start on a slow CI
-// runner blew bun's 5 s default (#577), so give them headroom above the poll bound.
-const POLL_STEP_MS = 50;
-const POLL_MAX_MS = 10_000;
+// Hook-integration cases spawn node (up to twice in sequence in one case). On CI two of
+// them overran bun's 5 s per-test default (#577); node startup on a slow runner is the
+// suspected cause (unconfirmed pending CI evidence), so give them headroom. Each child
+// gets a deadline below the test timeout so a hung hook fails with a clear message
+// instead of waiting for bun's timeout, which does not kill the child.
+const HOOK_DEADLINE_MS = 8_000;
 const HOOK_TEST_TIMEOUT_MS = 20_000;
 
 describe("skill_access producer — skillAccessEntry (pure)", () => {
@@ -116,37 +118,48 @@ describe("skill_access producer — hook integration", () => {
     skillsDir = join(dir, "skills");
     mkdirSync(skillsDir, { recursive: true });
   });
-  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  // Live hook children, so a failing or timed-out case never leaks a node process.
+  const children = new Set<ChildProcess>();
+  afterEach(() => {
+    for (const child of children) child.kill("SIGKILL");
+    children.clear();
+    rmSync(dir, { recursive: true, force: true });
+  });
   const run = (payload: unknown) => runRaw(JSON.stringify(payload));
   // Sends the stdin bytes verbatim (no JSON.stringify) so we can feed genuinely
   // malformed JSON, not a valid JSON string. Resolves only once the hook process has
-  // EXITED ("close"), so any "nothing was written" assertion made afterwards is made
-  // against a finished hook, not a fixed sleep. A spawn failure rejects loudly rather
-  // than looking like "the hook chose not to log".
+  // EXITED ("close"), so a "nothing was written" assertion made afterwards is made
+  // against a finished hook, not a fixed sleep. A spawn failure or a hook that outlives
+  // HOOK_DEADLINE_MS rejects loudly (and the child is killed) rather than looking like
+  // "the hook chose not to log".
   const runRaw = (input: string) =>
     new Promise<{ status: number | null; stderr: string }>((resolveRun, reject) => {
       const child = spawn("node", [HOOK], {
         env: { ...process.env, CLAUDECLAW_SKILL_ACCESS_LOG: log, CLAUDECLAW_SKILLS_DIR: skillsDir },
         stdio: ["pipe", "ignore", "pipe"],
       });
+      children.add(child);
+      const deadline = setTimeout(() => {
+        child.kill("SIGKILL");
+        reject(new Error(`hook did not exit within ${HOOK_DEADLINE_MS} ms`));
+      }, HOOK_DEADLINE_MS);
       let stderr = "";
       child.stderr.setEncoding("utf8");
       child.stderr.on("data", (c: string) => {
         stderr += c;
       });
-      child.on("error", reject);
-      child.on("close", (status) => resolveRun({ status, stderr }));
+      child.on("error", (err) => {
+        clearTimeout(deadline);
+        reject(err);
+      });
+      child.on("close", (status) => {
+        clearTimeout(deadline);
+        children.delete(child);
+        resolveRun({ status, stderr });
+      });
       child.stdin.on("error", () => {}); // the hook may exit before reading all of stdin
       child.stdin.end(input);
     });
-  // Poll (bounded) rather than assert once: node cold start on a loaded CI runner is
-  // far slower than the ~0.3 s seen locally (#577).
-  const waitFor = async (pred: () => boolean, maxMs = POLL_MAX_MS) => {
-    for (let waited = 0; !pred() && waited < maxMs; waited += POLL_STEP_MS) {
-      await new Promise((r) => setTimeout(r, POLL_STEP_MS));
-    }
-    return pred();
-  };
 
   it(
     "appends one line for a skill read, nothing for a non-skill read",
@@ -157,7 +170,8 @@ describe("skill_access producer — hook integration", () => {
       const second = await run({ tool_name: "Read", tool_input: { file_path: "/tmp/other.md" } });
       expect(first.status).toBe(0);
       expect(second.status).toBe(0);
-      expect(await waitFor(() => existsSync(log))).toBe(true);
+      // Both children have exited and the hook appends synchronously before exiting.
+      expect(existsSync(log)).toBe(true);
       const lines = readFileSync(log, "utf8").trim().split("\n").filter(Boolean);
       expect(lines).toHaveLength(1);
       const e = JSON.parse(lines[0]!);
