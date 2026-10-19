@@ -54,9 +54,16 @@
 // used bare specifiers. Both work under `moduleResolution: bundler`, but
 // mixing forms makes greps lie and risks breakage if we ever flip to
 // `moduleResolution: nodenext` (which requires the extension).
-import type { PtyProcess, PtyProcessOptions, SpawnPty } from "./pty-process.js";
+import type { PtyProcess, PtyProcessOptions, PtyTurnResult, SpawnPty } from "./pty-process.js";
 import { PtyClosedError, PtyTurnTimeoutError } from "./pty-process.js";
 import { ensureTrustAccepted } from "./pty-trust-prompt.js";
+import type { OneShotRequest, OneShotResult } from "../oneshot/engine.js";
+import { trustedToolFlags, validateIsolation } from "../oneshot/isolation.js";
+import { validateRouteEngine } from "../oneshot/config.js";
+import { randomUUID } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { getSettings, type SecurityConfig } from "../config.js";
 import { getSession, createSession } from "../sessions.js";
 import { getThreadSession, createThreadSession } from "../sessionManager.js";
@@ -207,6 +214,12 @@ export function injectCleanSpawnEnv(fn: CleanSpawnEnvFn | null): void {
   _cleanSpawnEnv = fn;
 }
 
+let ensureTrust: (cwd: string) => Promise<unknown> = ensureTrustAccepted;
+/** Keep unit tests from changing the operator's Claude trust configuration. */
+export function injectOneShotTrustForTests(fn: ((cwd: string) => Promise<unknown>) | null): void {
+  ensureTrust = fn ?? ensureTrustAccepted;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Types — frozen by SPEC §3.2.
 
@@ -256,6 +269,13 @@ export interface PtyRunScope {
    *  (or, undefined, no flag at all) — never synthesized, rotated or released
    *  by the supervisor. */
   mcpConfig?: { path: string | undefined };
+  /** Ephemeral runs only: resume this conversation (`oneShot` `resumeSessionId`).
+   *  Used as given, without the resumability probe: a conversation that does not
+   *  exist must fail the call, not quietly start a different one. */
+  resumeSessionId?: string;
+  /** One-shot isolation, forwarded to the spawned PTY. `untrusted` also skips
+   *  trust self-healing (the cwd is a throwaway directory). */
+  isolation?: "untrusted" | "trusted-session";
 }
 
 export interface SupervisorSnapshot {
@@ -486,6 +506,10 @@ interface PtyEntry {
   lastSpawnedAt: number;
   /** #546: see `PtyRunScope`. Fixed at entry creation. */
   scope: PtyRunScope;
+  /** Callers currently holding or queued on `lock` (#549). The lock is a promise
+   *  chain and cannot be inspected synchronously; `sendToLiveSession` needs to
+   *  know "idle" without queueing behind a turn. Moves only through `installLock`. */
+  activeTurns: number;
 }
 
 interface SupervisorState {
@@ -857,11 +881,7 @@ async function runOnAdmittedEntry(
   opts: Parameters<typeof runOnPty>[2],
   supervisorOpts: SupervisorOptions,
 ): Promise<RunOnPtyResult> {
-  const previousLock = entry.lock;
-  let release: () => void = () => {};
-  entry.lock = new Promise<void>((resolve) => {
-    release = resolve;
-  });
+  const { previousLock, release } = installLock(entry);
   // The lock is a chain: each caller captures its predecessor, installs its own,
   // awaits the predecessor, and releases in `finally`. Giving up on the wait is
   // therefore delicate — releasing immediately would hand the chain to the next
@@ -900,6 +920,250 @@ async function runOnAdmittedEntry(
   } finally {
     if (releaseOnExit) release();
   }
+}
+
+/**
+ * Take the per-key serial lock: returns the predecessor to wait on and a
+ * `release` that frees the lock exactly once (a second call is a no-op), keeping
+ * `entry.activeTurns` in step with the chain.
+ */
+function installLock(entry: PtyEntry): { previousLock: Promise<void>; release: () => void } {
+  const previousLock = entry.lock;
+  let resolveLock: () => void = () => {};
+  entry.lock = new Promise<void>((resolve) => {
+    resolveLock = resolve;
+  });
+  entry.activeTurns += 1;
+  let released = false;
+  return {
+    previousLock,
+    release: () => {
+      if (released) return;
+      released = true;
+      entry.activeTurns -= 1;
+      resolveLock();
+    },
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Live-session send (#549).
+
+/**
+ * Why `sendToLiveSession` found nothing alive to write to. Every reason here means
+ * NO process holds the session, so the caller may resume it in a one-shot. Anything
+ * else — a turn running, a spawn or retirement in flight, a shutdown with the process
+ * still there — is waited out, or reported as `failed`, never as `not-live`: a
+ * one-shot beside a live process is two writers on one transcript.
+ */
+export type NotLiveReason =
+  /** No entry for the key: nothing tracked, or its retirement has finished. */
+  | "no-entry"
+  /** An entry whose process has exited and that nothing is spawning. */
+  | "no-process"
+  /** A one-shot stand-in (`ephemeral`): a fresh session, never the conversation asked about. */
+  | "ephemeral";
+
+/**
+ * Outcome of `sendToLiveSession`. `not-live` means no process holds the session and
+ * the caller may fall back to a one-shot; `failed` means the live session could not
+ * be used (the turn was attempted, the wait ran out, or the session is being torn
+ * down) and a fallback process on the same transcript would race it.
+ */
+export type LiveSendResult =
+  | { status: "sent"; text: string; sessionId: string; cleanBoundary: boolean }
+  | { status: "not-live"; reason: NotLiveReason }
+  | { status: "failed"; error: string; timedOut: boolean; aborted: boolean };
+
+class LiveSendAborted extends Error {
+  constructor() {
+    super("live send aborted");
+    this.name = "LiveSendAborted";
+  }
+}
+
+/** Resolve with `p`, or reject with `LiveSendAborted` as soon as `signal` fires. */
+function raceAbort<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return p;
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(new LiveSendAborted());
+    signal.addEventListener("abort", onAbort, { once: true });
+    p.then(
+      (v) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(v);
+      },
+      (e) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(e);
+      },
+    );
+  });
+}
+
+/** Wait for `p` to settle (either way), until `deadline` (a `_clock()` time) or `signal`. */
+async function settleBy(
+  p: Promise<unknown>,
+  deadline: number,
+  signal: AbortSignal | undefined,
+): Promise<"settled" | "timeout" | "aborted"> {
+  if (signal?.aborted) return "aborted";
+  const left = deadline - _clock();
+  if (left <= 0) return "timeout";
+  try {
+    await raceAbort(withDeadline(p, left), signal);
+    return "settled";
+  } catch (err) {
+    if (err instanceof DeadlineExceeded) return "timeout";
+    if (err instanceof LiveSendAborted) return "aborted";
+    return "settled"; // `p` rejected: it is over, which is all we wait for
+  }
+}
+
+/**
+ * Write `text` as one turn into the live PTY for `sessionKey` and wait for its end
+ * of turn (#549). Used for `/compact`, memory saves and the rotation summary, which
+ * used to resume the same session in a second `claude -p`.
+ *
+ * The contract is "never a second process on a session a process still holds":
+ *   - a turn running, queued turns, or an in-flight (re)spawn: wait for them on the
+ *     per-key lock, then send. `timeoutMs` is one budget for the wait plus the turn.
+ *   - an entry being retired: wait until its process is gone, then re-evaluate (a
+ *     replacement may have been admitted; otherwise `not-live`/`no-entry`).
+ *   - the supervisor shutting down with the entry still there: `failed`.
+ *   - the wait runs out or `signal` fires: `failed`. The abandoned send is dropped, and
+ *     the lock chain stays intact (our slot is released when the predecessor ends).
+ * Only "no entry", "its process is dead and nothing is spawning" and "a one-shot
+ * stand-in" return `not-live`. Never spawns.
+ *
+ * While the turn runs the entry's lock is held, so a user message arriving meanwhile
+ * waits behind it. An abort stops the WAIT only; the lock is kept until the turn
+ * really ends. A turn timeout retires the entry (the sentinel may be left in claude's
+ * input buffer); the next `runOnPty` on the key resumes from disk.
+ */
+export async function sendToLiveSession(
+  sessionKey: string,
+  text: string,
+  opts: { timeoutMs: number; signal?: AbortSignal },
+): Promise<LiveSendResult> {
+  const deadline = _clock() + opts.timeoutMs;
+  const gaveUp = (what: string, how: "timeout" | "aborted"): LiveSendResult => ({
+    status: "failed",
+    error:
+      how === "aborted"
+        ? `aborted while waiting for ${what}`
+        : `waited ${opts.timeoutMs}ms for ${what} on ${sessionKey}; not writing to it, and not resuming it elsewhere`,
+    timedOut: how === "timeout",
+    aborted: how === "aborted",
+  });
+
+  for (;;) {
+    if (opts.signal?.aborted) {
+      return { status: "failed", error: "aborted before send", timedOut: false, aborted: true };
+    }
+    const entry = state.ptys.get(sessionKey);
+    // No entry: no process (a finished retirement removes it), whatever the
+    // supervisor is doing.
+    if (!entry) return { status: "not-live", reason: "no-entry" };
+    if (entry.scope.ephemeral) return { status: "not-live", reason: "ephemeral" };
+    // The entry is still tracked, so its process may still be alive. A supervisor
+    // shutdown marks every entry `retiring` before its first await, so the wait
+    // below is also what holds a send back during a shutdown.
+    if (entry.retiring) {
+      const w = await settleBy(entry.retiring, deadline, opts.signal);
+      if (w !== "settled") return gaveUp("its retirement to finish", w);
+      continue;
+    }
+    if (entry.spawnInFlight) {
+      const w = await settleBy(entry.spawnInFlight, deadline, opts.signal);
+      if (w !== "settled") return gaveUp("its spawn to finish", w);
+      continue;
+    }
+    // Nothing queued and nothing running: a missing or dead process is nothing alive.
+    if (entry.activeTurns === 0 && (!entry.pty || !entry.pty.isAlive())) {
+      return { status: "not-live", reason: "no-process" };
+    }
+
+    // Queue on the per-key lock behind whatever runs now.
+    const { previousLock, release } = installLock(entry);
+    const waited = await settleBy(previousLock, deadline, opts.signal);
+    if (waited !== "settled") {
+      // Not ours to run, but the chain must stay intact: free our slot only once the
+      // predecessor has actually ended (as `runOnAdmittedEntry` does).
+      void previousLock.then(release, release);
+      return gaveUp("the running turn to end", waited);
+    }
+    // The world may have changed while we queued: re-check under the lock.
+    if (!isCurrentEntry(entry) || entry.spawnInFlight || !entry.pty?.isAlive()) {
+      release();
+      continue;
+    }
+
+    const pty = entry.pty;
+    entry.lastAccessedAt = _clock();
+    let turn: Promise<PtyTurnResult>;
+    try {
+      turn = pty.runTurn(text, { timeoutMs: Math.max(1, deadline - _clock()) });
+    } catch (err) {
+      release();
+      return { status: "failed", error: (err as Error).message, timedOut: false, aborted: false };
+    }
+    // The session id is persisted UNDER the lock, as `runTurnWithRetries` does, and only
+    // while `entry` is still the live entry for its key: once it was retired or replaced
+    // (/kill, reap, /compact) a late write would overwrite the replacement's stored id
+    // (#391). The lock is released when the turn settles and that write is done, whoever
+    // stopped waiting for it. `persisted` never rejects.
+    const persisted: Promise<void> = turn.then(
+      async (result) => {
+        if (!isCurrentEntry(entry)) return;
+        try {
+          await persistSessionId(entry, result.sessionId);
+        } catch {
+          // Best-effort, as on the `runOnPty` path: the turn itself succeeded.
+        }
+      },
+      () => undefined,
+    );
+    persisted.then(release, release);
+
+    try {
+      const result = await raceAbort(turn, opts.signal);
+      await persisted;
+      return {
+        status: "sent",
+        text: result.text,
+        sessionId: result.sessionId,
+        cleanBoundary: result.cleanBoundary,
+      };
+    } catch (err) {
+      if (err instanceof LiveSendAborted) {
+        return { status: "failed", error: "aborted", timedOut: false, aborted: true };
+      }
+      const timedOut = err instanceof PtyTurnTimeoutError;
+      if (timedOut) await retireEntry(entry);
+      return { status: "failed", error: (err as Error).message, timedOut, aborted: false };
+    }
+  }
+}
+
+/**
+ * Keys of the non-ephemeral entries that have a process or may yet get one (sorted):
+ * the sessions a shutdown should ask to save their memory (#549).
+ *
+ * That includes an entry whose spawn or respawn is in flight and one that is retiring.
+ * Leaving them out would let the caller treat the key as having no process and resume
+ * the transcript in a one-shot while the PTY lands or is still being disposed (#561).
+ * `sendToLiveSession` waits those states out and answers `not-live` only once the
+ * process is gone, so the caller goes through it either way.
+ */
+export function liveSessionKeys(): string[] {
+  const keys: string[] = [];
+  for (const entry of state.ptys.values()) {
+    if (entry.scope.ephemeral) continue;
+    if (!entry.retiring && !entry.spawnInFlight && !entry.pty?.isAlive()) continue;
+    keys.push(entry.sessionKey);
+  }
+  return keys.sort();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -955,12 +1219,15 @@ function getOrCreateEntry(
     // Stamped at every (re)spawn site below. 0 until the first spawn lands —
     // `reapIdle` treats that as "still admitting, leave alone".
     lastSpawnedAt: 0,
+    activeTurns: 0,
     scope: {
       sessionStore: opts.sessionStore,
       ephemeral: opts.ephemeral,
       survivesKill: opts.survivesKill,
       cwd: opts.cwd,
       mcpConfig: opts.mcpConfig,
+      resumeSessionId: opts.resumeSessionId,
+      isolation: opts.isolation,
     },
   };
   state.ptys.set(sessionKey, entry);
@@ -1136,7 +1403,7 @@ async function buildSpawnOptions(
   // resumes; a caller-supplied store (#546) replaces the id-based lookup.
   let sessionId = "";
   if (entry.scope.ephemeral) {
-    sessionId = "";
+    sessionId = entry.scope.resumeSessionId ?? "";
   } else if (entry.scope.sessionStore) {
     sessionId = (await entry.scope.sessionStore.load()) ?? "";
   } else if (entry.threadId) {
@@ -1167,7 +1434,7 @@ async function buildSpawnOptions(
   // least one turn). Fail-closed: if we can't confirm, treat as phantom
   // and allocate a fresh session. Worst case we lose continuity for one
   // bad record; far better than user-visible "max retries exhausted".
-  if (sessionId && !(await _isSessionResumable(cwd, sessionId))) {
+  if (sessionId && !entry.scope.resumeSessionId && !(await _isSessionResumable(cwd, sessionId))) {
     sessionId = "";
   }
 
@@ -1238,6 +1505,7 @@ async function buildSpawnOptions(
   const opts: PtyProcessOptions = {
     sessionId,
     newSessionId,
+    ...(entry.scope.isolation ? { isolation: entry.scope.isolation } : {}),
     cwd,
     agentName: entry.agentName,
     modelOverride: modelOverride ?? undefined,
@@ -1369,6 +1637,122 @@ function cloneSecurity(security: SecurityConfig): SecurityConfig {
 // `ANTHROPIC_API_KEY`), which silently re-introduced API-credit billing on
 // every PTY spawn. Don't add a local copy — always go through
 // `getCleanSpawnEnv()`.
+
+/**
+ * A utility turn on its own PTY, through the same spawn path as keyed sessions
+ * (`buildSpawnOptions`, trust self-heal, multiplexer config) with the #546
+ * ephemeral scope: registered in `state.ptys` so shutdown and `/kill` reach it,
+ * never reused, outside the LRU and the `maxConcurrent` cap, retired on return.
+ *
+ * Exit contract matches the `print` engine: timeout and abort resolve with
+ * exitCode 124, a failed spawn or turn with a non-zero code. Never throws on
+ * those; a request that is invalid or already aborted still throws.
+ */
+export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> {
+  validateIsolation(req);
+  validateRouteEngine(
+    "pty",
+    req.route,
+    req.isolation === "untrusted",
+    req.resumeSessionId !== undefined,
+  );
+  req.signal?.throwIfAborted();
+  const settings = getSettings();
+  const untrusted = req.isolation === "untrusted";
+  const model = req.model ?? settings.model;
+  const result = (exitCode: number, text = "", sessionId?: string): OneShotResult => ({
+    text,
+    engine: "pty",
+    model,
+    exitCode,
+    ...(sessionId ? { sessionId } : {}),
+  });
+  // Created inside the try and removed in the finally, so it never depends on
+  // the turn settling (a hung turn or a spawn that never lands).
+  let tempCwd: string | undefined;
+  try {
+    if (untrusted) tempCwd = mkdtempSync(join(tmpdir(), "claudeclaw-oneshot-pty-"));
+    const helpers = await getRunnerHelpers();
+    const { PTY_OUTPUT_FORMAT_CONSTRAINT } = await import("./pty-output-format.js");
+    const exec = await runEphemeralWithDeadline(
+      `oneshot:${req.route}:${randomUUID()}`,
+      req.prompt,
+      {
+        timeoutMs: req.timeoutMs,
+        modelOverride: model,
+        api: settings.api,
+        ...(untrusted
+          ? { mcpConfig: { path: undefined } }
+          : {
+              // Same flags as the `print` engine (`trustedToolFlags`); the default
+              // permission profile only when the caller gave no grant at all.
+              securityArgs: trustedToolFlags(req) ?? helpers.buildSecurityArgs(settings.security),
+              appendSystemPrompt: [req.system, PTY_OUTPUT_FORMAT_CONSTRAINT]
+                .filter(Boolean)
+                .join("\n\n"),
+            }),
+        isolation: req.isolation,
+        cwd: tempCwd ?? req.cwd ?? process.cwd(),
+        resumeSessionId: req.resumeSessionId,
+      },
+      req.signal,
+    );
+    if (exec.timedOut || exec.aborted) return result(124);
+    if (exec.exitCode !== 0) {
+      console.warn(`[pty-supervisor] one-shot ${req.route} failed: ${exec.stderr}`);
+      return result(exec.exitCode);
+    }
+    return result(0, exec.rawStdout, exec.sessionId);
+  } finally {
+    if (tempCwd) {
+      try {
+        rmSync(tempCwd, { recursive: true, force: true });
+      } catch {
+        /* best effort */
+      }
+    }
+  }
+}
+
+/**
+ * `runOnPty` on an ephemeral entry with one wall-clock deadline over admission,
+ * spawn and turn (the supervisor bounds each stage separately). The deadline and
+ * `signal` abort the same controller, which retires the entry mid-turn.
+ */
+export async function runEphemeralWithDeadline(
+  sessionKey: string,
+  prompt: string,
+  opts: Omit<Parameters<typeof runOnPty>[2], "signal" | "ephemeral">,
+  signal?: AbortSignal,
+): Promise<RunOnPtyResult & { timedOut: boolean; aborted: boolean }> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, opts.timeoutMs);
+  const onAbort = (): void => controller.abort();
+  if (signal?.aborted) controller.abort();
+  else signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    const exec = await runOnPty(sessionKey, prompt, {
+      ...opts,
+      ephemeral: true,
+      signal: controller.signal,
+    });
+    // A turn that produced its result stands, even if the timer or a cancel
+    // fired while the PTY was being torn down afterwards.
+    const failed = exec.exitCode !== 0;
+    return {
+      ...exec,
+      timedOut: failed && timedOut,
+      aborted: failed && !timedOut && controller.signal.aborted,
+    };
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+  }
+}
 
 async function ensureSpawnPty(): Promise<SpawnPty> {
   if (_spawnPty) return _spawnPty;
@@ -1503,16 +1887,21 @@ async function spawnEntry(
   // = true` to ~/.claude.json so the prompt is skipped. Best-effort — a
   // failure here doesn't block spawn; if trust isn't acked, the supervisor's
   // existing idle-timeout / sentinel-max-wait paths will surface the stall.
-  try {
-    const heal = await ensureTrustAccepted(spawnOpts.cwd);
-    if (!heal.ok && heal.reason) {
-      // Surface to stderr-equivalent for operator visibility. Don't fail the
-      // spawn — the user can still recover by manually accepting the prompt.
-      console.warn(`[pty-supervisor] trust self-heal failed: ${heal.reason}`);
+  // An untrusted one-shot runs in a throwaway directory: nothing to remember.
+  if (entry.scope.isolation !== "untrusted") {
+    try {
+      const heal = (await ensureTrust(spawnOpts.cwd)) as
+        | { ok?: boolean; reason?: string }
+        | undefined;
+      if (heal && !heal.ok && heal.reason) {
+        // Surface to stderr-equivalent for operator visibility. Don't fail the
+        // spawn — the user can still recover by manually accepting the prompt.
+        console.warn(`[pty-supervisor] trust self-heal failed: ${heal.reason}`);
+      }
+    } catch {
+      // Defensive — the function is meant to never throw, but if it does we
+      // proceed anyway.
     }
-  } catch {
-    // Defensive — the function is meant to never throw, but if it does we
-    // proceed anyway.
   }
 
   try {

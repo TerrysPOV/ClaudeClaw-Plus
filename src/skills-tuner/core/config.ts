@@ -81,9 +81,14 @@ const StorageConfigSchema = z.object({
   git_repo: z.string().optional(),
 });
 
+/** The tuner's `claude` call had no timeout before #548; keep it generous. */
+export const DEFAULT_LLM_TIMEOUT_MS = 600_000;
+
 const LLMConfigSchema = z.object({
-  backend: z.enum(["anthropic_api", "claude_cli"]).default("anthropic_api"),
+  backend: z.enum(["anthropic_api", "claude_cli", "oneshot"]).default("anthropic_api"),
   api_key: z.string().optional(),
+  /** Wall-clock limit for one `claude` CLI call (claude_cli and oneshot backends). */
+  timeout_ms: z.number().int().positive().default(DEFAULT_LLM_TIMEOUT_MS),
 });
 
 export const TunerConfigSchema = z.object({
@@ -197,6 +202,7 @@ scope: all
 
 llm:
   backend: anthropic_api
+  # timeout_ms: 600000   # per-call limit for the claude_cli / oneshot backends
   # api_key: sk-ant-...   # or set ANTHROPIC_API_KEY env var
 
 detection:

@@ -4,13 +4,14 @@ import type { spawn, SpawnOptions } from "node:child_process";
 import { existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { ClaudeCliBackend } from "../llm.js";
-import { TunerConfigSchema } from "../config.js";
+import { DEFAULT_LLM_TIMEOUT_MS, TunerConfigSchema } from "../config.js";
 import { cleanSpawnEnv } from "../../../runner/spawn-env.js";
 
 // Every flag the backend may pass. All exist in `claude --help` (2.1.x); an
 // unknown flag makes the CLI exit 1 before any model call.
 const KNOWN_FLAGS = new Set([
-  "-p",
+  "--print",
+  "--output-format",
   "--model",
   "--tools",
   "--strict-mcp-config",
@@ -25,25 +26,37 @@ interface Captured {
   options: SpawnOptions;
   /** Whether the cwd existed (and was empty) while the child ran. */
   cwdLiveAndEmpty: boolean;
+  /** What was written to the child's stdin. */
+  stdin: string;
 }
 
-function fakeSpawn(captured: Captured[], stdout = "ok", code = 0): typeof spawn {
+function fakeSpawn(captured: Captured[], stdout = "ok", code = 0, stderr = ""): typeof spawn {
   return ((command: string, args: string[], options: SpawnOptions) => {
     const cwd = typeof options?.cwd === "string" ? options.cwd : "";
-    captured.push({
+    const record: Captured = {
       command,
       args,
       options,
       cwdLiveAndEmpty: cwd !== "" && existsSync(cwd) && readdirSync(cwd).length === 0,
-    });
+      stdin: "",
+    };
+    captured.push(record);
     const child = new EventEmitter() as EventEmitter & {
+      stdin: { on: () => void; end: (text: string) => void };
       stdout: EventEmitter;
       stderr: EventEmitter;
+    };
+    child.stdin = {
+      on: () => {},
+      end: (text: string) => {
+        record.stdin = text;
+      },
     };
     child.stdout = new EventEmitter();
     child.stderr = new EventEmitter();
     queueMicrotask(() => {
       child.stdout.emit("data", Buffer.from(stdout));
+      if (stderr) child.stderr.emit("data", Buffer.from(stderr));
       child.emit("close", code);
     });
     return child;
@@ -129,15 +142,15 @@ describe("ClaudeCliBackend — CLI arguments", () => {
     expect(args).toContain("--strict-mcp-config");
   });
 
-  it("keeps the prompt right after -p, before the variadic --tools", async () => {
+  it("delivers the prompt on stdin, never in argv", async () => {
     const captured: Captured[] = [];
-    await backend(captured).call("judge", "SYSTEM", [{ role: "user", content: "TURN" }]);
+    await backend(captured).call("judge", "SYSTEM", [{ role: "user", content: "--settings={}" }]);
     const args = argsAt(captured, 0);
-    const prompt = flagValue(args, "-p");
-    expect(prompt).toContain("SYSTEM");
-    expect(prompt).toContain("TURN");
-    // --tools is variadic: a prompt placed after it would be read as a tool name.
-    expect(args.indexOf("-p") + 1).toBeLessThan(args.indexOf("--tools"));
+    expect(args).toContain("--print");
+    expect(args).not.toContain("-p");
+    expect(args.some((arg) => arg.includes("SYSTEM") || arg.includes("--settings"))).toBe(false);
+    expect(captured[0]?.stdin).toContain("SYSTEM");
+    expect(captured[0]?.stdin).toContain("--settings={}");
   });
 
   it("returns trimmed stdout on exit 0 and rejects on non-zero", async () => {
@@ -216,9 +229,11 @@ describe("ClaudeCliBackend — isolation of the untrusted call", () => {
     const failing = ((_c: string, _a: string[], options: SpawnOptions) => {
       seenCwd = String(options.cwd);
       const child = new EventEmitter() as EventEmitter & {
+        stdin: { on: () => void; end: () => void };
         stdout: EventEmitter;
         stderr: EventEmitter;
       };
+      child.stdin = { on: () => {}, end: () => {} };
       child.stdout = new EventEmitter();
       child.stderr = new EventEmitter();
       queueMicrotask(() => child.emit("error", new Error("spawn claude ENOENT")));
@@ -228,5 +243,87 @@ describe("ClaudeCliBackend — isolation of the untrusted call", () => {
     await expect(b.call("judge", "sys", [])).rejects.toThrow("ENOENT");
     expect(seenCwd.startsWith(tmpdir())).toBe(true);
     expect(existsSync(seenCwd)).toBe(false);
+  });
+});
+
+describe("ClaudeCliBackend — call timeout (#548 review: main had none)", () => {
+  /** setTimeout delays requested while `run` executes. */
+  async function delaysDuring(run: () => Promise<unknown>): Promise<number[]> {
+    const original = globalThis.setTimeout;
+    const delays: number[] = [];
+    globalThis.setTimeout = ((fn: () => void, ms?: number, ...rest: unknown[]) => {
+      if (typeof ms === "number") delays.push(ms);
+      return original(fn, ms, ...rest);
+    }) as typeof setTimeout;
+    try {
+      await run();
+    } finally {
+      globalThis.setTimeout = original;
+    }
+    return delays;
+  }
+
+  it("defaults to ten minutes, not the 60 s that made slow calls exit 124", async () => {
+    expect(DEFAULT_LLM_TIMEOUT_MS).toBe(600_000);
+    expect(TunerConfigSchema.parse({ llm: { backend: "claude_cli" } }).llm.timeout_ms).toBe(
+      DEFAULT_LLM_TIMEOUT_MS,
+    );
+    for (const config of [TunerConfigSchema.parse({}), TunerConfigSchema.parse({ llm: {} })]) {
+      const delays = await delaysDuring(() =>
+        new ClaudeCliBackend(config, fakeSpawn([])).call("judge", "s", []),
+      );
+      expect(delays).toContain(DEFAULT_LLM_TIMEOUT_MS);
+      expect(delays).not.toContain(60_000);
+    }
+  });
+
+  it("honours llm.timeout_ms from the tuner config", async () => {
+    const config = TunerConfigSchema.parse({ llm: { backend: "claude_cli", timeout_ms: 123_456 } });
+    const delays = await delaysDuring(() =>
+      new ClaudeCliBackend(config, fakeSpawn([])).call("judge", "s", []),
+    );
+    expect(delays).toContain(123_456);
+    expect(delays).not.toContain(DEFAULT_LLM_TIMEOUT_MS);
+  });
+
+  it("rejects a non-positive llm.timeout_ms at config load", () => {
+    expect(() => TunerConfigSchema.parse({ llm: { timeout_ms: 0 } })).toThrow();
+  });
+});
+
+describe("ClaudeCliBackend — stderr excerpt on non-zero exit", () => {
+  const failing = (stderr: string) =>
+    new ClaudeCliBackend(TunerConfigSchema.parse({}), fakeSpawn([], "", 1, stderr));
+
+  it("includes the first 200 characters of stderr", async () => {
+    const error = await failing("boom: " + "lorem ipsum ".repeat(50))
+      .call("judge", "s", [])
+      .catch((e: Error) => e);
+    const message = (error as Error).message;
+    expect(message.startsWith("claude CLI exited 1: boom: ")).toBe(true);
+    expect(message.slice("claude CLI exited 1: ".length)).toHaveLength(200);
+  });
+
+  it("masks credentials before they reach the error", async () => {
+    const apiKey = ["sk", "ant", "api03", "A".repeat(30)].join("-");
+    const error = await failing(
+      `auth failed for ${apiKey}; ANTHROPIC_TOKEN=abc123 Bearer tok.en/xyz`,
+    )
+      .call("judge", "s", [])
+      .catch((e: Error) => e);
+    const message = (error as Error).message;
+    expect(message).toContain("auth failed for [redacted]");
+    for (const secret of [apiKey, "abc123", "tok.en/xyz"]) expect(message).not.toContain(secret);
+  });
+
+  it("masks a credential that straddles the 200-character cut", async () => {
+    const apiKey = ["sk", "ant", "api03", "B".repeat(60)].join("-");
+    const stderr = "e".repeat(190) + " " + apiKey;
+    const error = await failing(stderr)
+      .call("judge", "s", [])
+      .catch((e: Error) => e);
+    const message = (error as Error).message;
+    expect(message).not.toContain("sk-ant");
+    expect(message).not.toContain("BBBB");
   });
 });

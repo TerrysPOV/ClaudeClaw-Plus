@@ -28,10 +28,14 @@
  *   Pre-allocate via `--session-id <uuid>` for fresh spawns when
  *   `opts.newSessionId` is provided. The TUI does NOT print a session UUID at
  *   startup. When neither `sessionId` nor `newSessionId` is provided, we spawn
- *   without any session flag and Claude allocates internally.
+ *   without any session flag and Claude allocates internally. An untrusted
+ *   one-shot (`isolation: "untrusted"`) takes neither flag even when an id is
+ *   set: `buildClaudeArgs` returns early with `--no-session-persistence`.
  */
 import { spawn as ptySpawn, type IPty } from "bun-pty";
 import type { SecurityConfig } from "../config";
+import { UNTRUSTED_CLAUDE_ARGS } from "../oneshot/isolation.js";
+import { cliModelFlag } from "../oneshot/model.js";
 import { withCleanProcessEnv } from "../runner";
 import {
   createParser,
@@ -75,6 +79,8 @@ export { sanitizePtyPromptText };
 // ─── Public types (FROZEN per SPEC §3.1) ────────────────────────────────────
 
 export interface PtyProcessOptions {
+  /** One-shot isolation overrides every persona, resume and permission flag. */
+  isolation?: "untrusted" | "trusted-session";
   /** Existing Claude Code session ID to resume via `claude --resume <id>`.
    *  Empty string means "no resume". */
   sessionId: string;
@@ -322,6 +328,13 @@ function buildClaudeArgs(opts: PtyProcessOptions): string[] {
 
   const args: string[] = [];
 
+  if (opts.isolation === "untrusted") {
+    const model = cliModelFlag(opts.modelOverride);
+    if (model) args.push("--model", model);
+    args.push(...UNTRUSTED_CLAUDE_ARGS);
+    return args;
+  }
+
   if (opts.securityArgs && opts.securityArgs.length > 0) {
     args.push(...opts.securityArgs);
   } else {
@@ -348,10 +361,8 @@ function buildClaudeArgs(opts: PtyProcessOptions): string[] {
     args.push("--session-id", opts.newSessionId);
   }
 
-  const model = (opts.modelOverride ?? "").trim();
-  if (model.length > 0 && model.toLowerCase() !== "glm") {
-    args.push("--model", model);
-  }
+  const model = cliModelFlag(opts.modelOverride);
+  if (model) args.push("--model", model);
 
   if (opts.appendSystemPrompt && opts.appendSystemPrompt.length > 0) {
     args.push("--append-system-prompt", opts.appendSystemPrompt);

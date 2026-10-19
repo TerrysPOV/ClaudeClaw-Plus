@@ -17,6 +17,7 @@ import {
   backupSession,
 } from "./sessions";
 import { needsRotation, rotateSession, loadLatestSummary } from "./rotation";
+import { actOnSession, saveMemoryBeforeCompact } from "./runner/live-session-actions";
 import {
   getThreadSession,
   createThreadSession,
@@ -78,9 +79,10 @@ import {
   supervisorEntryCount,
   retirePtySession,
   type PtySessionStore,
-  type RunOnPtyResult,
+  runEphemeralWithDeadline,
 } from "./runner/pty-supervisor";
 import { encodeCwdForProjectsDir } from "./bus/jsonl-line-types";
+import { PTY_OUTPUT_FORMAT_CONSTRAINT } from "./runner/pty-output-format";
 import { SPAWN_ENV_STRIP_KEYS, cleanSpawnEnv, shouldStripSpawnEnvKey } from "./runner/spawn-env";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
@@ -770,46 +772,8 @@ function spawnClaude(
   });
 }
 
-/**
- * A one-shot agent turn on its own PTY (#546): fresh session, nothing
- * persisted, PTY retired when it returns. `timeoutMs` bounds the whole call —
- * admission, spawn and turn — like the wall-clock timer of the `-p` path
- * (the supervisor bounds each stage separately). `signal` aborts it.
- */
-async function runOneShotOnPty(
-  sessionKey: string,
-  prompt: string,
-  opts: Omit<Parameters<typeof runOnPty>[2], "signal" | "ephemeral">,
-  signal?: AbortSignal,
-): Promise<RunOnPtyResult & { timedOut: boolean; aborted: boolean }> {
-  const controller = new AbortController();
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, opts.timeoutMs);
-  const onAbort = (): void => controller.abort();
-  if (signal?.aborted) controller.abort();
-  else signal?.addEventListener("abort", onAbort, { once: true });
-  try {
-    const exec = await runOnPty(sessionKey, prompt, {
-      ...opts,
-      ephemeral: true,
-      signal: controller.signal,
-    });
-    // A turn that produced its result stands, even if the timer or a cancel
-    // fired while the PTY was being torn down afterwards.
-    const failed = exec.exitCode !== 0;
-    return {
-      ...exec,
-      timedOut: failed && timedOut,
-      aborted: failed && !timedOut && controller.signal.aborted,
-    };
-  } finally {
-    clearTimeout(timer);
-    signal?.removeEventListener("abort", onAbort);
-  }
-}
+/** A one-shot agent turn on its own PTY (#546); see `runEphemeralWithDeadline`. */
+const runOneShotOnPty = runEphemeralWithDeadline;
 
 /**
  * The model override as `run()` accepts it: the bare model string production
@@ -1361,26 +1325,6 @@ const DIR_SCOPE_PROMPT = [
   "If a request requires accessing files outside the project, refuse and explain why.",
 ].join("\n");
 
-/**
- * Band-aid for #105 — see the call site in `run()` for full context.
- *
- * Constrains the model's user-facing reply to plain prose so the PTY
- * sentinel-echo parser can extract textual content rather than TUI box
- * chrome from rendered markdown blocks. Temporary; remove with the PTY
- * runtime when the Bus runtime (epic #107, spec PR #106) becomes default.
- */
-const PTY_OUTPUT_FORMAT_CONSTRAINT = [
-  "OUTPUT FORMAT CONSTRAINT (response surface limitation):",
-  "Your final user-facing reply MUST be plain prose. The reply is captured through a text-only transport that cannot render markdown.",
-  "Do NOT use in your final reply:",
-  "  - Backtick code fences (```...``` or single `...`) — write paths and commands plainly, e.g. /home/x/file.png NOT `/home/x/file.png`",
-  "  - Markdown bullets (`*`, `-`, `+`) at the start of lines",
-  "  - Numbered list items (`1.`, `2.`)",
-  "  - Block quotes (`>` at start of lines)",
-  "  - Horizontal rules (`---`)",
-  "This constraint applies ONLY to your final response text. You may still use markdown freely inside tool inputs and internal reasoning.",
-].join("\n");
-
 export async function ensureProjectClaudeMd(): Promise<void> {
   // Preflight-only initialization: never rewrite an existing project CLAUDE.md.
   if (existsSync(PROJECT_CLAUDE_MD)) return;
@@ -1569,35 +1513,41 @@ export async function loadHeartbeatPromptTemplate(): Promise<string> {
   return "";
 }
 
-/** Run /compact on the current session to reduce context size. */
-export async function runCompact(
-  sessionId: string,
-  model: string,
-  api: string,
-  baseEnv: Record<string, string>,
-  securityArgs: string[],
-  timeoutMs: number,
-  cwd?: string,
-): Promise<boolean> {
-  const compactArgs = [
-    CLAUDE_EXECUTABLE,
-    "-p",
-    "/compact",
-    "--output-format",
-    "text",
-    "--resume",
-    sessionId,
-    ...securityArgs,
-  ];
+/**
+ * Run /compact on a session to reduce context size. With a live PTY session for
+ * `sessionKey` the command goes into it (#549); otherwise it is a `trusted-session`
+ * one-shot resume of `sessionId`. `cwd` is where the session was created: `--resume`
+ * finds a session by it.
+ */
+export async function runCompact(opts: {
+  sessionId: string;
+  sessionKey?: string;
+  model: string;
+  timeoutMs: number;
+  cwd?: string;
+  /** The session is wedged (its last turn timed out): retire it, then resume one-shot. */
+  skipLive?: boolean;
+}): Promise<boolean> {
   console.log(
-    `[${new Date().toLocaleTimeString()}] Running /compact on session ${sessionId.slice(0, 8)}...`,
+    `[${new Date().toLocaleTimeString()}] Running /compact on session ${opts.sessionId.slice(0, 8)}...`,
   );
-  const result = await runClaudeOnce(compactArgs, model, api, baseEnv, timeoutMs, cwd);
-  const success = result.exitCode === 0;
+  const result = await actOnSession({
+    route: "compact",
+    prompt: "/compact",
+    sessionKey: opts.sessionKey,
+    sessionId: opts.sessionId,
+    timeoutMs: opts.timeoutMs,
+    skipLive: opts.skipLive,
+    model: opts.model,
+    cwd: opts.cwd,
+    // /compact needs no tools. An empty grant (not an absent one) keeps the one-shot
+    // off the default permission profile, which can include the bypass flag.
+    allowedTools: [],
+  });
   console.log(
-    `[${new Date().toLocaleTimeString()}] Compact ${success ? "succeeded" : `failed (exit ${result.exitCode})`}`,
+    `[${new Date().toLocaleTimeString()}] Compact ${result.ok ? `succeeded (${result.via})` : `failed (${result.detail ?? result.via})`}`,
   );
-  return success;
+  return result.ok;
 }
 
 /**
@@ -1611,20 +1561,14 @@ export async function compactCurrentSession(
   if (!existing) return { success: false, message: "No active session to compact." };
 
   const settings = getSettings();
-  const securityArgs = buildSecurityArgs(settings.security);
-  const baseEnv = cleanSpawnEnv();
-  const timeoutMs = settings.sessionTimeoutMs;
-
   const compactCwd = agentName ? await ensureAgentDir(agentName) : undefined;
-  const ok = await runCompact(
-    existing.sessionId,
-    settings.model,
-    settings.api,
-    baseEnv,
-    securityArgs,
-    timeoutMs,
-    compactCwd,
-  );
+  const ok = await runCompact({
+    sessionId: existing.sessionId,
+    sessionKey: agentName ? `agent:${agentName}` : "global",
+    model: settings.model,
+    timeoutMs: settings.sessionTimeoutMs,
+    cwd: compactCwd,
+  });
 
   return ok
     ? { success: true, message: `✅ Session compact complete (${existing.sessionId.slice(0, 8)})` }
@@ -1741,20 +1685,14 @@ export async function compactCurrentThreadSession(
   if (!existing) return { success: false, message: "No active session to compact." };
 
   const settings = getSettings();
-  const securityArgs = buildSecurityArgs(settings.security);
-  const baseEnv = cleanSpawnEnv();
-  const timeoutMs = settings.sessionTimeoutMs;
-
   const compactCwd = agentName ? await ensureAgentDir(agentName) : undefined;
-  const ok = await runCompact(
-    existing.sessionId,
-    settings.model,
-    settings.api,
-    baseEnv,
-    securityArgs,
-    timeoutMs,
-    compactCwd,
-  );
+  const ok = await runCompact({
+    sessionId: existing.sessionId,
+    sessionKey: `thread:${threadId}`,
+    model: settings.model,
+    timeoutMs: settings.sessionTimeoutMs,
+    cwd: compactCwd,
+  });
 
   return ok
     ? {
@@ -2543,42 +2481,43 @@ async function execClaude(
 
     // --- Auto-compact on timeout (exit 124) ---
     if (COMPACT_TIMEOUT_ENABLED && exitCode === 124 && !isNew && existing && !recoveredFromStale) {
-      // Save memory before compact wipes context
+      // Save memory before compact wipes context. The turn timed out, so the
+      // session is wedged: skip the live path and resume it one-shot (#549). The
+      // compact below skips it too, whether or not the save got as far as retiring it
+      // (a memory path `memoryFileGrant` cannot scope returns before it does).
       try {
         const memPath = getMemoryPath(agentName);
         console.log(
           `[${new Date().toLocaleTimeString()}] Pre-compact: saving memory to ${memPath}`,
         );
-        await runClaudeOnce(
-          [
-            "claude",
-            "-p",
-            `Session is about to compact. Save your current memory to ${memPath} now. Include: current status, what was accomplished, key context for next session. Keep it concise.`,
-            "--output-format",
-            "text",
-            "--resume",
-            existing.sessionId,
-            ...securityArgs,
-          ],
-          primaryConfig.model,
-          primaryConfig.api,
-          baseEnv,
-          30_000,
-        );
+        const saved = await saveMemoryBeforeCompact({
+          memPath,
+          prompt: `Session is about to compact. Save your current memory to ${memPath} now. Include: current status, what was accomplished, key context for next session. Keep it concise.`,
+          sessionKey: ptySessionKey,
+          sessionId: existing.sessionId,
+          skipLive: exitCode === 124,
+          model: primaryConfig.model,
+          cwd: spawnCwd,
+          timeoutMs: 30_000,
+        });
+        if (!saved.ok) {
+          console.warn(
+            `[${new Date().toLocaleTimeString()}] Pre-compact memory save failed: ${saved.detail ?? saved.via}`,
+          );
+        }
       } catch (e) {
         console.warn(`[${new Date().toLocaleTimeString()}] Pre-compact memory save failed:`, e);
       }
 
       emitCompactEvent({ type: "auto-compact-start" });
-      const compactOk = await runCompact(
-        existing.sessionId,
-        primaryConfig.model,
-        primaryConfig.api,
-        baseEnv,
-        securityArgs,
+      const compactOk = await runCompact({
+        sessionId: existing.sessionId,
+        sessionKey: ptySessionKey,
+        skipLive: true,
+        model: primaryConfig.model,
         timeoutMs,
-        spawnCwd,
-      );
+        cwd: spawnCwd,
+      });
       emitCompactEvent({ type: "auto-compact-done", success: compactOk });
       if (compactOk && pm) pm.emitAsync("after_compaction", {}, ctx);
 

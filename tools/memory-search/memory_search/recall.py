@@ -26,8 +26,9 @@ log = logging.getLogger(__name__)
 # The excerpts fed to the summarizer are arbitrary transcript text (pasted
 # emails, web pages, tool output), so the call gets nothing to act with: no
 # built-in tools, no MCP servers, no settings file (no hooks, no user
-# plugins), no saved session and no slash commands. Same set as the Discord
-# classifier's CLASSIFIER_ARGS. The empty strings are flag values, not gaps.
+# plugins), no saved session and no slash commands. Same set as
+# UNTRUSTED_CLAUDE_ARGS in src/oneshot/isolation.ts. The empty strings are flag
+# values, not gaps.
 UNTRUSTED_CLI_FLAGS = [
     "--tools", "",
     "--strict-mcp-config",

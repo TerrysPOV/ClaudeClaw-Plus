@@ -13,8 +13,11 @@ import { describeAllowlist, isUserAllowed } from "../allowlist";
 import { resetSession, resetFallbackSession, peekSession } from "../sessions";
 import { listThreadSessions, removeThreadSession, peekThreadSession } from "../sessionManager";
 import { readFile } from "node:fs/promises";
-import { existsSync, mkdtempSync, realpathSync, rmSync, statSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import type { spawn } from "node:child_process";
+import { runOneShot } from "../oneshot/engine.js";
+import { withPrintRuntime } from "../oneshot/print.js";
 import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt } from "../skills";
 import { cacheSkillOverlayFromContent } from "../policy/skill-overlays";
@@ -577,30 +580,6 @@ interface ThreadIntent {
   names: string[];
 }
 
-/**
- * The classifier reads a message from any allowed guild member. It only has
- * to answer with JSON, so it runs with no tools at all (`--tools ""`), no MCP
- * server (`--strict-mcp-config` with no `--mcp-config`) and no saved session:
- * an instruction hidden in the message has nothing to act with. It also loads
- * no settings file (`--setting-sources ""`: no hooks, no user plugins) and no
- * skills, and runs from an empty temp dir so no CLAUDE.md is in its context —
- * otherwise a message can ask for that context back as "thread names".
- */
-export const CLASSIFIER_ARGS = [
-  "--model",
-  "claude-sonnet-4-20250514",
-  "--print",
-  "--output-format",
-  "text",
-  "--tools",
-  "",
-  "--strict-mcp-config",
-  "--no-session-persistence",
-  "--setting-sources",
-  "",
-  "--disable-slash-commands",
-];
-
 /** Exact keys the classifier's `claude` keeps from the daemon env. */
 const CLASSIFIER_ENV_KEYS = new Set([
   "PATH",
@@ -644,7 +623,21 @@ export function classifierSpawnEnv(
   return out;
 }
 
-async function classifyThreadIntent(text: string): Promise<ThreadIntent | null> {
+/**
+ * The classifier reads a message from any allowed guild member. It only has
+ * to answer with JSON, so `runOneShot` runs it as an untrusted call: no tools at
+ * all (`--tools ""`), no MCP server (`--strict-mcp-config` with no `--mcp-config`)
+ * and no saved session, with the prompt on stdin (the argv comes from
+ * `buildPrintArgs`, the single source of the isolation flags):
+ * an instruction hidden in the message has nothing to act with. It also loads
+ * no settings file (`--setting-sources ""`: no hooks, no user plugins) and no
+ * skills, and runs from an empty temp dir so no CLAUDE.md is in its context —
+ * otherwise a message can ask for that context back as "thread names".
+ */
+export async function classifyThreadIntent(
+  text: string,
+  deps: { spawn?: typeof spawn } = {},
+): Promise<ThreadIntent | null> {
   const systemPrompt = `You classify user messages into thread management intents.
 
 If the user wants to CREATE/SPAWN/DEPLOY threads (e.g. "hire X", "派出 X", "叫 X 出來", "派 X 去打", "開 X", "建立 X"):
@@ -661,22 +654,20 @@ Rules:
 - Return ONLY valid JSON or the word null. No explanation.`;
 
   try {
-    const { execFileSync } = await import("node:child_process");
     const input = `${systemPrompt}\n\n---\nUser message: ${text}`;
-    // Empty cwd: no project CLAUDE.md for the classifier to read back.
-    const cwd = mkdtempSync(join(tmpdir(), "claudeclaw-classify-"));
-    let result: string;
-    try {
-      result = execFileSync("claude", CLASSIFIER_ARGS, {
-        input,
-        encoding: "utf-8",
-        timeout: 15000,
-        env: classifierSpawnEnv(),
-        cwd,
-      }).trim();
-    } finally {
-      rmSync(cwd, { recursive: true, force: true });
-    }
+    const call = await withPrintRuntime(
+      { env: classifierSpawnEnv(), stdinPrompt: true, spawn: deps.spawn },
+      () =>
+        runOneShot({
+          route: "discord.classifier",
+          prompt: input,
+          model: "claude-sonnet-4-20250514",
+          isolation: "untrusted",
+          timeoutMs: 15000,
+        }),
+    );
+    if (call.exitCode !== 0) throw new Error(`classifier exited ${call.exitCode}`);
+    const result = call.text.trim();
 
     if (!result || result === "null") return null;
     // Extract JSON from response (in case there's extra text)

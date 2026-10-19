@@ -1,5 +1,15 @@
 import { writeFile, unlink, readFile } from "fs/promises";
-import { linkSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
+import {
+  linkSync,
+  mkdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "fs";
+import { spawnSync } from "child_process";
 import { dirname, join } from "path";
 
 const PID_FILE = join(process.cwd(), ".claude", "claudeclaw", "daemon.pid");
@@ -95,6 +105,9 @@ export async function waitForPidExit(pid: number, maxMs: number, pollMs = 100): 
  * `--replace-existing` remove its file and start another daemon over it.
  */
 export function isPidAlive(pid: number): boolean {
+  // kill(0, …) probes the caller's process group and kill(-1, …) every process it may
+  // signal: both "succeed", so neither may be mistaken for "a daemon is alive".
+  if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;
@@ -369,12 +382,21 @@ function installExitHook(): void {
 }
 
 /**
+ * The shutdown memory save's own time slot (#549). It is NOT carved out of the drain
+ * window: a turn still running at SIGTERM (the #315 restart case) can use the whole
+ * drain, and `shutdown.drainTurnsMs: 0` ("stop at once") has no drain at all, yet the
+ * save must still run. `claudeclaw stop` used to always run a 30s save of its own.
+ */
+export const SHUTDOWN_MEMORY_SAVE_MS = 30_000;
+
+/**
  * How long `stop` / `--replace-existing` give a daemon to exit after SIGTERM:
- * its drain window plus a margin for the teardown itself. Settings may not be
- * loaded (or may belong to another project's daemon), hence the default.
+ * its drain window, plus the memory save's own slot, plus a margin for the teardown
+ * itself. Settings may not be loaded (or may belong to another project's daemon),
+ * hence the default.
  */
 export function stopGraceMs(drainTurnsMs?: number): number {
-  return (drainTurnsMs ?? 30_000) + 5_000;
+  return (drainTurnsMs ?? 30_000) + SHUTDOWN_MEMORY_SAVE_MS + 5_000;
 }
 
 /**
@@ -396,4 +418,158 @@ export async function readConfiguredDrainMs(projectDir: string): Promise<number 
   } catch {
     return undefined;
   }
+}
+
+/**
+ * A PID from a PID file, strictly: plain decimal digits, an integer in [1, 2^22].
+ * `Number()` would accept "", "0x10", "1e3" and " "; `kill(0)` / `kill(-1)` address
+ * process groups. Anything else is `null`.
+ */
+export function parseDaemonPid(raw: string): number | null {
+  const t = raw.trim();
+  if (!/^\d{1,8}$/.test(t)) return null;
+  const n = Number(t);
+  return Number.isSafeInteger(n) && n >= 1 && n <= 4_194_304 ? n : null;
+}
+
+/**
+ * The command line of `pid` (`ps -o command=`), or null if it cannot be read. Slim
+ * containers (ubuntu:24.04, #526/#527) have no `ps`, so fall back to
+ * `/proc/<pid>/cmdline` (NUL-separated arguments, joined by spaces).
+ */
+export function readProcessCommand(
+  pid: number,
+  readProcCmdline: (pid: number) => string | null = readProcCmdlineFile,
+): string | null {
+  try {
+    const r = spawnSync("ps", ["-o", "command=", "-p", String(pid)], {
+      encoding: "utf-8",
+      timeout: 2_000,
+    });
+    if (!r.error && r.status === 0) {
+      const out = String(r.stdout).trim();
+      if (out !== "") return out;
+    }
+  } catch {
+    // fall through to /proc
+  }
+  return readProcCmdline(pid);
+}
+
+/** `/proc/<pid>/cmdline` -> a command line: arguments are NUL-separated. */
+export function parseProcCmdline(raw: string): string | null {
+  const out = raw.replaceAll("\0", " ").trim();
+  return out === "" ? null : out;
+}
+
+function readProcCmdlineFile(pid: number): string | null {
+  try {
+    return parseProcCmdline(readFileSync(`/proc/${pid}/cmdline`, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What the daemon's command line looks like. `src/index.ts` runs the daemon for `start`
+ * AND for any argument that is not one of the other subcommands it dispatches on (its
+ * final `else` is `start()`), so the real launches carry no `start` token:
+ * `bun run src/index.ts --web` (commands/start.md, docs/deploy-systemd-hardening.md),
+ * `bun run src/index.ts` (package.json `start`), `bun --watch src/index.ts start ...`.
+ * The `claudeclaw` shim follows the same rule (`claudeclaw start`, bare `claudeclaw`),
+ * possibly behind an interpreter (`bun /usr/local/bin/claudeclaw start`,
+ * `/usr/bin/env bun .../claudeclaw start`).
+ *
+ * So the entry (or shim) must be followed by the end of the line or by a first argument
+ * that is NOT a non-daemon subcommand (`NON_DAEMON_SUBCOMMANDS`, mirroring src/index.ts).
+ * Both are anchored at the start of the command line: the entry/shim is argv0 (a shebang
+ * exec) or follows `bun` / `node` / `env` (with flags, or `run`). A bare `bun` is NOT
+ * enough, and neither is the mere appearance of the path: `vim src/index.ts`,
+ * `cat /opt/claudeclaw/src/index.ts` and `rg foo src/index.ts` in the project's cwd are
+ * not the daemon, and an unrelated process that inherits a stale PID must not be
+ * signalled. `src` must be a whole path component (so `fake-src/index.ts` does not
+ * match) and the entry must be exactly `index.ts` (`src/index.tsx start` does not
+ * match). `(?=\S)` makes `\s+` take the whole gap, so extra spaces cannot be
+ * backtracked into to hide a subcommand.
+ */
+const NON_DAEMON_SUBCOMMANDS =
+  "(?:--help|-h|help|--stop-all|--stop|--clear|status|telegram|discord|slack|send|fire)(?:\\s|$)";
+const DAEMON_ARGS = `(?:\\s*$|\\s+(?=\\S)(?!${NON_DAEMON_SUBCOMMANDS}))`;
+const INTERPRETER = "(?:\\S*\\/)?(?:env|bun|node)(?:\\s+(?:-\\S+|run))*\\s+";
+// Run directly (a shebang exec, argv0), or behind an interpreter. Only behind one may the
+// absolute path hold spaces (`bun run /opt/my claw/src/index.ts start`): argv0 is a single
+// token, and letting `/usr/bin/vim /x/src/index.ts` span its space would match it.
+const DAEMON_ENTRY = new RegExp(
+  `^(?:(?:${INTERPRETER})+(?:\\/[^\\n]*\\/|\\S*\\/)?|(?:\\S*\\/)?)src\\/index\\.ts${DAEMON_ARGS}`,
+);
+const DAEMON_SHIM = new RegExp(`^(?:${INTERPRETER})*(?:\\S*\\/)?claudeclaw${DAEMON_ARGS}`);
+
+/** The working directory of `pid` (Linux `/proc`, else `lsof`), or null if unreadable. */
+export function readProcessCwd(pid: number): string | null {
+  try {
+    return readlinkSync(`/proc/${pid}/cwd`);
+  } catch {
+    // no /proc (macOS) or not ours: fall through to lsof
+  }
+  try {
+    const r = spawnSync("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], {
+      encoding: "utf-8",
+      timeout: 2_000,
+    });
+    if (r.error || r.status !== 0) return null;
+    const line = String(r.stdout)
+      .split("\n")
+      .find((l) => l.startsWith("n"));
+    return line ? line.slice(1) : null;
+  } catch {
+    return null;
+  }
+}
+
+function sameDir(a: string, b: string): boolean {
+  if (a === b) return true;
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return false;
+  }
+}
+
+export type StopTarget =
+  | { kind: "ok"; pid: number }
+  /** The PID file does not hold a usable PID. Nothing may be probed or signalled. */
+  | { kind: "invalid" }
+  /** Alive, but not this project's daemon: a recycled PID. */
+  | { kind: "not-daemon"; pid: number; command: string }
+  /** PID 1 with nothing confirming it is ours: init / the service manager. */
+  | { kind: "refuse-pid1"; pid: 1 };
+
+/**
+ * Decide whether a PID file's contents may be treated as the daemon to stop.
+ *
+ * The command line must have the daemon's shape (`DAEMON_ENTRY` / `DAEMON_SHIM`), and,
+ * when the process's working directory can be read, that directory must be `projectDir`:
+ * the PID file lives under the project and the daemon never changes directory, so the
+ * same entry script running elsewhere is another project's app. Where the command line
+ * cannot be read (no `ps`, process gone) this falls back to trusting the PID file, as
+ * before; where only the cwd cannot be read, the command shape alone decides. PID 1 is
+ * the exception: in a container the daemon really is PID 1 (#526), on a host it is init,
+ * so it needs the command line to say so.
+ */
+export function decideStopTarget(
+  raw: string,
+  readCommand: (pid: number) => string | null = readProcessCommand,
+  readCwd: (pid: number) => string | null = readProcessCwd,
+  projectDir: string = process.cwd(),
+): StopTarget {
+  const pid = parseDaemonPid(raw);
+  if (pid === null) return { kind: "invalid" };
+  const command = readCommand(pid);
+  if (command === null) return pid === 1 ? { kind: "refuse-pid1", pid: 1 } : { kind: "ok", pid };
+  if (!DAEMON_ENTRY.test(command) && !DAEMON_SHIM.test(command)) {
+    return { kind: "not-daemon", pid, command };
+  }
+  const cwd = readCwd(pid);
+  if (cwd !== null && !sameDir(cwd, projectDir)) return { kind: "not-daemon", pid, command };
+  return { kind: "ok", pid };
 }
