@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   BINARY_SOURCES,
+  assertSharedLibsStaged,
   binaryIsRunnable,
   isWhisperSharedLib,
   sharedLibTargets,
@@ -96,10 +97,21 @@ describe("runtime shared libraries", () => {
     expect(isWhisperSharedLib("libwhisper.dylib")).toBe(true);
   });
 
+  test("matches Windows DLLs", () => {
+    // The pinned win32-x64 zip ships these next to whisper-cli.exe; Windows loads
+    // DLLs from the executable's directory, so they must be staged.
+    expect(isWhisperSharedLib("ggml.dll")).toBe(true);
+    expect(isWhisperSharedLib("ggml-base.dll")).toBe(true);
+    expect(isWhisperSharedLib("ggml-cpu.dll")).toBe(true);
+    expect(isWhisperSharedLib("whisper.dll")).toBe(true);
+  });
+
   test("ignores non-libraries and unrelated libraries", () => {
     expect(isWhisperSharedLib("whisper-cli")).toBe(false);
     expect(isWhisperSharedLib("LICENSE")).toBe(false);
     expect(isWhisperSharedLib("libparakeet.so.1")).toBe(false);
+    // Shipped in the same zip, but whisper-cli.exe does not need it.
+    expect(isWhisperSharedLib("SDL2.dll")).toBe(false);
   });
 
   test("every library is written beside the binary, not only into lib/", () => {
@@ -111,6 +123,33 @@ describe("runtime shared libraries", () => {
     expect(targets).toHaveLength(2);
     expect(targets.some((t) => t.endsWith(`/lib/libggml-cpu.so`))).toBe(true);
     expect(targets.some((t) => t.endsWith(`/bin/libggml-cpu.so`))).toBe(true);
+  });
+});
+
+describe("zero-library guard", () => {
+  test("rejects a dynamically linked archive that yields no libraries", () => {
+    const arm64 = BINARY_SOURCES["linux-arm64"];
+    expect(() => assertSharedLibsStaged("linux-arm64", arm64, 0)).toThrow(/no shared libraries/);
+  });
+
+  test("accepts a dynamically linked archive that yields libraries", () => {
+    const arm64 = BINARY_SOURCES["linux-arm64"];
+    expect(() => assertSharedLibsStaged("linux-arm64", arm64, 3)).not.toThrow();
+  });
+
+  test("accepts the static linux-x64 archive, which ships no libraries", () => {
+    // The pinned dscripka asset holds only main/server/quantize/bench.
+    const x64 = BINARY_SOURCES["linux-x64"];
+    expect(() => assertSharedLibsStaged("linux-x64", x64, 0)).not.toThrow();
+  });
+
+  test("only linux-x64 is exempt from the guard", () => {
+    // Every other source is dynamically linked; exempting one by mistake would
+    // let a broken archive install and then pass the --help probe.
+    const exempt = Object.entries(BINARY_SOURCES)
+      .filter(([, source]) => source.staticBinary)
+      .map(([platform]) => platform);
+    expect(exempt).toEqual(["linux-x64"]);
   });
 });
 

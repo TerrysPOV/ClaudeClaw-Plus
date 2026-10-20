@@ -36,6 +36,12 @@ interface BinarySource {
    * without this the bytes we execute are whatever the tag currently points at.
    */
   sha256?: string;
+  /**
+   * The archive's binary is statically linked, so it legitimately ships no
+   * shared libraries. Exempts it from the zero-library guard; leave unset for
+   * any dynamically linked build, where zero libraries means a broken archive.
+   */
+  staticBinary?: boolean;
   headers?: Record<string, string>;
 }
 
@@ -47,6 +53,8 @@ export const BINARY_SOURCES: Readonly<Record<string, Readonly<BinarySource>>> = 
     url: "https://github.com/dscripka/whisper.cpp_binaries/releases/download/commit_3d42463/whisper-bin-linux-x64.tar.gz",
     format: "tar.gz",
     sha256: "63f69d39d3ec56a1f6828055d56f0625e0c5871c55578a141090a678c0b9383e",
+    // The archive holds only main/server/quantize/bench and no shared objects.
+    staticBinary: true,
   },
   // The two darwin entries are content-addressed (the sha256 is in the URL
   // path), so a conforming registry can only ever serve those exact bytes —
@@ -126,8 +134,30 @@ async function fileExists(path: string): Promise<boolean> {
  * unloadable, which is how the linux-arm64 install stayed broken.
  */
 export function isWhisperSharedLib(name: string): boolean {
-  const isSharedLib = name.endsWith(".so") || name.endsWith(".dylib") || /\.so\.\d/.test(name);
+  const isSharedLib =
+    name.endsWith(".so") ||
+    name.endsWith(".dylib") ||
+    name.toLowerCase().endsWith(".dll") ||
+    /\.so\.\d/.test(name);
   return isSharedLib && (name.includes("whisper") || name.includes("ggml"));
+}
+
+/**
+ * Refuse to install a dynamically linked binary from an archive that yielded no
+ * libraries: the layout changed, and the `--help` probe would certify an install
+ * that fails every real transcription. A source flagged `staticBinary` is exempt,
+ * because it legitimately has none.
+ */
+export function assertSharedLibsStaged(
+  platformKey: string,
+  source: Readonly<BinarySource>,
+  libCount: number,
+): void {
+  if (libCount > 0 || source.staticBinary) return;
+  throw new Error(
+    `whisper: no shared libraries found in the ${platformKey} archive — ` +
+      `refusing to install a binary that cannot load its backend.`,
+  );
 }
 
 /**
@@ -327,14 +357,7 @@ async function downloadAndExtractBinary(): Promise<void> {
     stagedLibs.push({ name, srcPath: join(entry.parentPath ?? entry.path ?? "", name) });
   }
 
-  // Every supported archive ships its own libwhisper/libggml. Zero matches means
-  // the layout changed and the probe would otherwise certify a broken install.
-  if (stagedLibs.length === 0) {
-    throw new Error(
-      `whisper: no shared libraries found in the ${platformKey} archive — ` +
-        `refusing to install a binary that cannot load its backend.`,
-    );
-  }
+  assertSharedLibsStaged(platformKey, source, stagedLibs.length);
 
   // Replace rather than overwrite: a library present in the previous archive but
   // absent from this one would otherwise survive, and both dirs are on the
