@@ -3,6 +3,8 @@ import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { untrustedFileMentionNeutralizing } from "../runner/pty-process-test-seams.js";
+import { neutralizeFileMentions } from "../runner/pty-prompt-sanitizer.js";
 import { cleanSpawnEnv } from "../runner/spawn-env.js";
 import type { OneShotRequest, OneShotResult } from "./engine.js";
 import { UNTRUSTED_CLAUDE_ARGS, trustedToolFlags, validateIsolation } from "./isolation.js";
@@ -119,7 +121,13 @@ export async function runPrint(req: OneShotRequest): Promise<OneShotResult> {
       });
       if (stdinPrompt) {
         child.stdin!.on("error", () => {}); // EPIPE is reported by child exit.
-        child.stdin!.end(req.prompt);
+        // `claude -p` expands `@path` mentions too (measured, #570 r9), so an untrusted
+        // prompt loses them exactly as on the PTY path. One shared helper.
+        child.stdin!.end(
+          req.isolation === "untrusted" && untrustedFileMentionNeutralizing()
+            ? neutralizeFileMentions(req.prompt)
+            : req.prompt,
+        );
       }
       req.signal?.addEventListener("abort", stop, { once: true });
       if (req.signal?.aborted) stop();

@@ -41,6 +41,22 @@ export function shouldStripSpawnEnvKey(key: string, value: string | undefined): 
   return true;
 }
 
+/**
+ * Apply the strip list to an env that was assembled elsewhere (a caller's policy
+ * env). `cleanSpawnEnv` only scrubs `process.env`; an env handed in by a caller
+ * skips that, so an interactive claude spawned with it would hit the "Detected a
+ * custom API key" gate. Keeps long-lived `sk-ant-oat01-` tokens.
+ */
+export function stripSpawnEnvKeys(env: Record<string, string>): Record<string, string> {
+  const stripped = new Set<string>(SPAWN_ENV_STRIP_KEYS);
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (stripped.has(key) && shouldStripSpawnEnvKey(key, value)) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
 export function cleanSpawnEnv(): Record<string, string> {
   const stripped = new Set<string>(SPAWN_ENV_STRIP_KEYS);
   const out: Record<string, string> = {};

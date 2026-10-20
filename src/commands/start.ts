@@ -27,6 +27,8 @@ import {
   registerGatewayDelivery,
   unregisterGatewayDelivery,
 } from "../event-processor";
+import { applyPtyIsolationVersionGate } from "../oneshot/claude-version.js";
+import { startOneShotSweeper } from "../oneshot/pty-cleanup.js";
 import { writeState, type StateData } from "../statusline";
 import { ensureStatuslineSetting, removeStatuslineSetting } from "../statusline-settings";
 import { nextCronMatch } from "../cron";
@@ -455,6 +457,14 @@ export async function start(args: string[] = []) {
   await initConfig();
   const settings = await loadSettings();
   await ensureProjectClaudeMd();
+  // #570: an untrusted PTY one-shot that crashed mid-call leaves its throwaway config root
+  // and cwd in the tmpdir. Swept now and every 10 minutes while the daemon is up, so a late
+  // cleanup that failed is retried. Only directories older than 10 minutes whose owner is
+  // dead (or that this daemon has finished with) are removed.
+  const sweptOneShotDirs = startOneShotSweeper();
+  if (sweptOneShotDirs > 0) {
+    console.log(`  Removed ${sweptOneShotDirs} stale one-shot temp dir(s)`);
+  }
 
   // #230: per-plugin kill switch on the plugin-tool bridge. Applied before any
   // plugin registers or is called, and again on every hot-reload below.
@@ -851,6 +861,9 @@ export async function start(args: string[] = []) {
   // logs a warning but does NOT block startup — the PTY parser also has
   // a turnIdleTimeoutMs safety net for unknown versions.
   const cliProbe = await probeClaudeCliVersion();
+  // #570: PTY isolation was measured on one claude build; below it, untrusted one-shot
+  // routes stay on print.
+  applyPtyIsolationVersionGate(cliProbe.version);
   if (cliProbe.version === null) {
     console.warn(`  Claude CLI: could not probe (claude --version failed)`);
   } else if (cliProbe.known) {

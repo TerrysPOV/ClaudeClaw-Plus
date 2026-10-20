@@ -2,7 +2,12 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { _setSettingsFileForTests, loadSettings, reloadSettings } from "../config.js";
+import {
+  _setSettingsFileForTests,
+  defaultPtyEnabled,
+  loadSettings,
+  reloadSettings,
+} from "../config.js";
 import {
   RESUME_ROUTES,
   UNTRUSTED_ROUTES,
@@ -59,11 +64,41 @@ describe("#572 trusted route defaults", () => {
     });
   }
   for (const route of UNTRUSTED_ROUTES) {
-    it(`${route}: stays print and rejects PTY`, () => {
-      expect(resolveOneShotEngine(parseOneShotSettings(undefined), route, true)).toBe("print");
-      expect(() => parseOneShotSettings({ routes: { [route]: "pty" } })).toThrow("spike");
+    it(`${route}: pty.enabled selects pty, otherwise print (#570)`, () => {
+      expect(resolveOneShotEngine(parseOneShotSettings(undefined), route, true)).toBe("pty");
+      expect(resolveOneShotEngine(parseOneShotSettings(undefined), route, false)).toBe("print");
+    });
+    it(`${route}: explicit route and default still win over the untrusted default`, () => {
+      for (const enabled of [true, false]) {
+        expect(
+          resolveOneShotEngine(
+            parseOneShotSettings({ routes: { [route]: "print" } }),
+            route,
+            enabled,
+          ),
+        ).toBe("print");
+        expect(
+          resolveOneShotEngine(parseOneShotSettings({ default: "print" }), route, enabled),
+        ).toBe("print");
+        expect(
+          resolveOneShotEngine(
+            parseOneShotSettings({ default: "print", routes: { [route]: "pty" } }),
+            route,
+            enabled,
+          ),
+        ).toBe("pty");
+      }
+    });
+    it(`${route}: settings accept an explicit pty route`, () => {
+      expect(parseOneShotSettings({ routes: { [route]: "pty" } }).routes[route]).toBe("pty");
     });
   }
+  it("the win32 platform default keeps untrusted routes on print", () => {
+    const enabled = defaultPtyEnabled("win32");
+    expect(enabled).toBe(false);
+    for (const route of UNTRUSTED_ROUTES)
+      expect(resolveOneShotEngine(parseOneShotSettings(undefined), route, enabled)).toBe("print");
+  });
   it("explicit family wildcard overrides the implicit default", () => {
     expect(
       resolveOneShotEngine(
@@ -210,5 +245,77 @@ describe("#572 trusted fallback dispatch", () => {
     expect(resumed).toEqual(["stored-stop-session"]);
     expect(disposed).toBe(1);
     expect(performance.now() - start).toBeLessThan(1500);
+  });
+});
+
+describe("#570 untrusted PTY dispatch", () => {
+  let dir: string;
+  let file: string;
+  beforeEach(async () => {
+    dir = mkdtempSync(join(tmpdir(), "570-routes-"));
+    file = join(dir, "settings.json");
+    writeFileSync(file, JSON.stringify({ pty: { enabled: true } }));
+    _setSettingsFileForTests(file);
+    await loadSettings();
+  });
+  afterEach(() => {
+    _setSettingsFileForTests();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  it("runOneShot sends the classifier to the pty engine only when pty.enabled", async () => {
+    const previous = new Map(["print", "pty"].map((id) => [id, engines.get(id)!]));
+    const calls: string[] = [];
+    try {
+      for (const [id, engine] of previous)
+        engines.set(id, {
+          ...engine,
+          run: async () => {
+            calls.push(id);
+            return { text: "null", engine: id, model: "", exitCode: 0 };
+          },
+        });
+      for (const enabled of [true, false, true]) {
+        writeFileSync(file, JSON.stringify({ pty: { enabled } }));
+        await reloadSettings();
+        await runOneShot({
+          route: "discord.classifier",
+          isolation: "untrusted",
+          prompt: "classify",
+          timeoutMs: 1000,
+        });
+      }
+      expect(calls).toEqual(["pty", "print", "pty"]);
+    } finally {
+      for (const [id, engine] of previous) engines.set(id, engine);
+    }
+  });
+  it("an untrusted request still cannot pass cwd, tools or resume to the pty engine", async () => {
+    const previous = engines.get("pty")!;
+    const calls: string[] = [];
+    try {
+      engines.set("pty", {
+        ...previous,
+        run: async () => {
+          calls.push("pty");
+          return { text: "", engine: "pty", model: "", exitCode: 0 };
+        },
+      });
+      const base = {
+        route: "discord.classifier",
+        isolation: "untrusted" as const,
+        prompt: "classify",
+        timeoutMs: 1000,
+      };
+      for (const extra of [
+        { cwd: "/tmp" },
+        { tools: ["Bash"] },
+        { allowedTools: ["Bash"] },
+        { resumeSessionId: "abc" },
+      ])
+        await expect(runOneShot({ ...base, ...extra })).rejects.toThrow("cannot specify");
+      expect(calls).toEqual([]);
+    } finally {
+      engines.set("pty", previous);
+    }
   });
 });

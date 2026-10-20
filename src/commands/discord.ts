@@ -16,7 +16,7 @@ import { readFile } from "node:fs/promises";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import type { spawn } from "node:child_process";
-import { runOneShot } from "../oneshot/engine.js";
+import { type OneShotResult, runOneShot } from "../oneshot/engine.js";
 import { withPrintRuntime } from "../oneshot/print.js";
 import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt } from "../skills";
@@ -623,22 +623,7 @@ export function classifierSpawnEnv(
   return out;
 }
 
-/**
- * The classifier reads a message from any allowed guild member. It only has
- * to answer with JSON, so `runOneShot` runs it as an untrusted call: no tools at
- * all (`--tools ""`), no MCP server (`--strict-mcp-config` with no `--mcp-config`)
- * and no saved session, with the prompt on stdin (the argv comes from
- * `buildPrintArgs`, the single source of the isolation flags):
- * an instruction hidden in the message has nothing to act with. It also loads
- * no settings file (`--setting-sources ""`: no hooks, no user plugins) and no
- * skills, and runs from an empty temp dir so no CLAUDE.md is in its context —
- * otherwise a message can ask for that context back as "thread names".
- */
-export async function classifyThreadIntent(
-  text: string,
-  deps: { spawn?: typeof spawn } = {},
-): Promise<ThreadIntent | null> {
-  const systemPrompt = `You classify user messages into thread management intents.
+const CLASSIFIER_SYSTEM_PROMPT = `You classify user messages into thread management intents.
 
 If the user wants to CREATE/SPAWN/DEPLOY threads (e.g. "hire X", "派出 X", "叫 X 出來", "派 X 去打", "開 X", "建立 X"):
 Return: {"action":"hire","names":["name1","name2"]}
@@ -653,19 +638,88 @@ Rules:
 - Common patterns: 派/派出/出征/上陣/迎戰/出戰 = hire. 撤/撤回/收回/叫回來/滾 = fire.
 - Return ONLY valid JSON or the word null. No explanation.`;
 
-  try {
-    const input = `${systemPrompt}\n\n---\nUser message: ${text}`;
-    const call = await withPrintRuntime(
+/** What the classifier is sent for a member's message. */
+export const classifierInput = (text: string): string =>
+  `${CLASSIFIER_SYSTEM_PROMPT}\n\n---\nUser message: ${text}`;
+
+/** The `haiku` alias: the dated sonnet id this used to name was retired on 15 Jun 2026. */
+export const CLASSIFIER_MODEL = "haiku";
+/** One attempt's bound. With the single retry the whole call is bounded at twice this. */
+export const CLASSIFIER_ATTEMPT_TIMEOUT_MS = 12000;
+
+export interface ClassifierCall {
+  call: OneShotResult;
+  /** 1 when the first attempt answered or its failure was one a retry cannot fix, 2 after the retry. */
+  attempts: number;
+}
+
+/**
+ * Can a second attempt succeed where this failed? Only a timeout or a turn that produced no
+ * reply: those are flaky. Every other failure repeats itself (`not-ready:login-required` and the
+ * other `not-ready:*`, `config-dir`, `config-root`, `turn-error`, `busy`), so retrying it only
+ * spawns a second claude to fail the same way (#570 r15, A3). The print engine reports no
+ * diagnostic: its timeout is exit 124, which is a timeout too.
+ */
+function retryableClassifierFailure(call: OneShotResult): boolean {
+  if (call.exitCode === 0) return false;
+  const reason = call.diagnostic?.reason;
+  if (reason === undefined) return call.exitCode === 124;
+  return reason === "timeout" || reason.startsWith("no-reply");
+}
+
+/**
+ * One classifier call: `CLASSIFIER_ATTEMPT_TIMEOUT_MS` per attempt, and exactly one retry when the
+ * first attempt timed out or produced no reply (`retryableClassifierFailure`). The retry changes
+ * nothing about the call, so it is as isolated as the first. A throw (a cleanup that could not
+ * remove the prompt from disk) is not retried: it is a security signal, not a flaky reply. After
+ * the retry, or after any failure a retry cannot fix, the failure stands: the caller fails closed.
+ */
+export async function runClassifierCall(
+  input: string,
+  deps: { spawn?: typeof spawn; runOneShot?: typeof runOneShot } = {},
+): Promise<ClassifierCall> {
+  const run = deps.runOneShot ?? runOneShot;
+  let call!: OneShotResult;
+  for (let attempts = 1; attempts <= 2; attempts++) {
+    call = await withPrintRuntime(
       { env: classifierSpawnEnv(), stdinPrompt: true, spawn: deps.spawn },
       () =>
-        runOneShot({
+        run({
           route: "discord.classifier",
           prompt: input,
-          model: "claude-sonnet-4-20250514",
+          model: CLASSIFIER_MODEL,
           isolation: "untrusted",
-          timeoutMs: 15000,
+          timeoutMs: CLASSIFIER_ATTEMPT_TIMEOUT_MS,
         }),
     );
+    if (!retryableClassifierFailure(call) || attempts === 2) return { call, attempts };
+  }
+  return { call, attempts: 2 };
+}
+
+/**
+ * The classifier reads a message from any allowed guild member. It only has
+ * to answer with JSON, so `runOneShot` runs it as an untrusted call: no tools at
+ * all (`--tools ""`), no MCP server (`--strict-mcp-config` with no `--mcp-config`),
+ * no settings file (`--setting-sources ""`: no hooks, no user plugins) and no
+ * skills or commands, run from an empty temp dir so no CLAUDE.md is in its context.
+ * Otherwise a message can ask for that context back as "thread names".
+ *
+ * The route's engine decides how: on `print` the prompt goes on stdin (the argv comes
+ * from `buildPrintArgs`, the single source of the isolation flags) and no session is saved.
+ * On `pty`, the default whenever the runner PTY is on and claude is at least the measured
+ * version, the same flags drive an interactive claude (minus `--no-session-persistence`,
+ * which is print-only), the prompt is typed in with every `@` replaced so it cannot name a
+ * file, the reply is read from the transcript, and the whole call runs in a throwaway
+ * Claude config root and cwd that `runOnceOnPty` removes afterwards. The `deps.spawn` seam below is print-only: it
+ * is ignored when the call lands on pty.
+ */
+export async function classifyThreadIntent(
+  text: string,
+  deps: { spawn?: typeof spawn; runOneShot?: typeof runOneShot } = {},
+): Promise<ThreadIntent | null> {
+  try {
+    const { call } = await runClassifierCall(classifierInput(text), deps);
     if (call.exitCode !== 0) throw new Error(`classifier exited ${call.exitCode}`);
     const result = call.text.trim();
 

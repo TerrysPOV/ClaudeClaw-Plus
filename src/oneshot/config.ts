@@ -1,3 +1,4 @@
+import { MIN_PTY_ISOLATION_CLAUDE_VERSION } from "./claude-version.js";
 import { engines } from "./registry.js";
 
 export interface OneShotSettings {
@@ -20,7 +21,10 @@ export const UNTRUSTED_ROUTES = [
   "memory.recall",
 ];
 
-/** Every route a caller passes to `runOneShot`; the only keys `oneShot.routes` accepts. */
+/**
+ * Every route a caller passes to `runOneShot`; the only keys `oneShot.routes` accepts.
+ * `memory.recall` is reserved: it is accepted here but has no `runOneShot` caller yet.
+ */
 export const KNOWN_ROUTES: readonly string[] = [...RESUME_ROUTES, ...UNTRUSTED_ROUTES];
 /** `resolveOneShotEngine` falls back on `<first segment>.*`, so only those wildcards bind. */
 const ROUTE_FAMILIES = new Set(KNOWN_ROUTES.map((route) => route.split(".")[0]));
@@ -35,6 +39,17 @@ export function isUntrustedRoute(route: string): boolean {
   return route.startsWith("tuner.") || UNTRUSTED_ROUTES.includes(route);
 }
 
+/**
+ * The engine a route gets when nothing names one: pty when the runner PTY is on, and, for an
+ * untrusted route, only while pty advertises isolation (the claude version gate, #570).
+ */
+function implicitEngine(route: string, ptyEnabled: boolean): string {
+  if (!ptyEnabled) return "print";
+  if (RESUME_ROUTES.includes(route)) return "pty";
+  if (isUntrustedRoute(route)) return engines.get("pty")?.caps.isolation ? "pty" : "print";
+  return "print";
+}
+
 export function resolveOneShotEngine(
   settings: OneShotSettings,
   route: string,
@@ -44,7 +59,7 @@ export function resolveOneShotEngine(
     settings.routes[route] ??
     settings.routes[`${route.split(".")[0]}.*`] ??
     settings.default ??
-    (ptyEnabled && RESUME_ROUTES.includes(route) ? "pty" : "print")
+    implicitEngine(route, ptyEnabled)
   );
 }
 
@@ -62,6 +77,21 @@ export function engineType(id: string, declarations: OneShotSettings["engines"])
   return type;
 }
 
+/**
+ * Whether load-time validation checks `route`'s isolation against engine `id`. The `pty`
+ * engine's capability is set by the claude version gate AFTER settings load (`start.ts`), so
+ * it is checked at the call (`runOneShot`, `runOnceOnPty`) only; every other engine's
+ * capability is fixed and is checked at load.
+ */
+function isolationCheckedAtLoad(
+  id: string,
+  route: string,
+  declarations: OneShotSettings["engines"],
+): boolean {
+  return isUntrustedRoute(route) && engineType(id, declarations) !== "pty";
+}
+
+/** `untrusted` is checked against the engine's isolation capability, here and at the call. */
 export function validateRouteEngine(
   id: string,
   route: string,
@@ -75,7 +105,10 @@ export function validateRouteEngine(
     throw new Error(`oneShot route '${route}' requires resume; engine '${id}' cannot resume`);
   if (untrusted && !engine.caps.isolation) {
     throw new Error(
-      `oneShot untrusted route '${route}' cannot use '${id}': engine does not advertise isolation (spike is not green)`,
+      `oneShot untrusted route '${route}' cannot use '${id}': engine does not advertise isolation` +
+        (engineType(id, declarations) === "pty"
+          ? ` (the interactive engine is isolated only on claude ${MIN_PTY_ISOLATION_CLAUDE_VERSION} or newer, and not on Windows, checked once at startup)`
+          : ""),
     );
   }
 }
@@ -107,7 +140,7 @@ export function parseOneShotSettings(raw: unknown): OneShotSettings {
     validateRouteEngine(
       id,
       route,
-      isUntrustedRoute(route),
+      isolationCheckedAtLoad(id, route, engineDeclarations),
       RESUME_ROUTES.includes(route),
       engineDeclarations,
     );
@@ -126,14 +159,16 @@ export function parseOneShotSettings(raw: unknown): OneShotSettings {
       true,
       engineDeclarations,
     );
-  for (const route of UNTRUSTED_ROUTES)
+  for (const route of UNTRUSTED_ROUTES) {
+    const id = resolveOneShotEngine(settings, route);
     validateRouteEngine(
-      resolveOneShotEngine(settings, route),
+      id,
       route,
-      true,
+      isolationCheckedAtLoad(id, route, engineDeclarations),
       false,
       engineDeclarations,
     );
+  }
   // Engine settings (base URL, model, ...) are checked for every engine declared
   // or used, so a route to an unconfigured HTTP engine fails here, not on a call.
   for (const id of new Set([

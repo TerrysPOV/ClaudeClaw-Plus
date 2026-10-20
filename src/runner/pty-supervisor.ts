@@ -64,13 +64,21 @@
 import type { PtyProcess, PtyProcessOptions, PtyTurnResult, SpawnPty } from "./pty-process.js";
 import { PtyClosedError, PtyTurnTimeoutError } from "./pty-process.js";
 import { ensureTrustAccepted } from "./pty-trust-prompt.js";
+import { stripSpawnEnvKeys } from "./spawn-env.js";
 import type { OneShotRequest, OneShotResult } from "../oneshot/engine.js";
 import { trustedToolFlags, validateIsolation } from "../oneshot/isolation.js";
 import { validateRouteEngine } from "../oneshot/config.js";
+import * as untrustedCleanup from "../oneshot/pty-cleanup.js";
+import { terminateEscapees } from "./pty-escape-scan.js";
+import type { SurvivorCause } from "./pty-group-kill.js";
+import {
+  TRANSCRIPT_WAIT_MS,
+  awaitLastAssistantReply,
+  transcriptWaitBudget,
+} from "../oneshot/pty-transcript.js";
+import { printRuntime } from "../oneshot/print.js";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { rmSync } from "node:fs";
 import { getSettings, type SecurityConfig } from "../config.js";
 import { getSession, createSession } from "../sessions.js";
 import { getThreadSession, createThreadSession } from "../sessionManager.js";
@@ -245,6 +253,13 @@ export interface RunOnPtyResult {
   stderr: string;
   exitCode: number;
   sessionId?: string;
+  /**
+   * Ephemeral call that gave up on its deadline while the entry was still being admitted or
+   * its claude still starting: settles once that late entry has been retired or its late PTY
+   * disposed. Whatever the claude wrote lands before it settles, so a caller that cleans up
+   * state on the way out cleans up again after it.
+   */
+  lateRetire?: Promise<void>;
 }
 
 /**
@@ -264,8 +279,9 @@ export interface PtySessionStore {
 export interface PtyRunScope {
   /** Session store override. Default: thread / agent / global, from the ids. */
   sessionStore?: PtySessionStore;
-  /** One-shot run: fresh session, nothing persisted, no turn retry, PTY retired
-   *  when the call returns. Outside the `maxConcurrent` cap, LRU eviction and
+  /** One-shot run: fresh session, none saved by the supervisor, no turn retry, PTY retired
+   *  when the call returns. Claude's own on-disk state (transcripts, history) is not the
+   *  supervisor's to remove: an untrusted `runOnceOnPty` does it. Outside the `maxConcurrent` cap, LRU eviction and
    *  the idle reaper — the call itself bounds its life. */
   ephemeral?: boolean;
   /** Not reached by `/kill` (`killAllPtys`, `supervisorEntryCount`). */
@@ -280,9 +296,16 @@ export interface PtyRunScope {
    *  Used as given, without the resumability probe: a conversation that does not
    *  exist must fail the call, not quietly start a different one. */
   resumeSessionId?: string;
-  /** One-shot isolation, forwarded to the spawned PTY. `untrusted` also skips
-   *  trust self-healing (the cwd is a throwaway directory). */
+  /** One-shot isolation, forwarded to the spawned PTY. `untrusted` skips the
+   *  supervisor's trust self-heal: the call runs in a throwaway config root (`untrustedConfig`)
+   *  that `runOnceOnPty` seeds with the trust entry and removes again. */
   isolation?: "untrusted" | "trusted-session";
+  /** Untrusted one-shots only: `req.system`, passed as `--system-prompt`. */
+  systemPrompt?: string;
+  /** Untrusted one-shots only: the child's `CLAUDE_CONFIG_DIR` (a throwaway root owned by
+   *  `runOnceOnPty`) and the directory its credentials are read from
+   *  (`CLAUDE_SECURESTORAGE_CONFIG_DIR`, `""` for the default). */
+  untrustedConfig?: { root: string; secureStorageDir: string };
 }
 
 export interface SupervisorSnapshot {
@@ -860,15 +883,21 @@ export async function runOnPty(
     ({ entry, supervisorOpts } = await withDeadline(admission, opts.timeoutMs));
   } catch (err) {
     if (err instanceof DeadlineExceeded) {
-      // #546: nothing else will ever retire a one-shot entry admitted late.
-      if (opts.ephemeral)
-        void admission.then(
-          ({ entry: e }) => retireEntry(e),
-          () => {},
-        );
-      return errorResult(
-        `[pty-supervisor] admission stage exceeded ${opts.timeoutMs}ms for ${sessionKey} — supervisor init, concurrency admission, or PTY spawn did not settle`,
-      );
+      // #546: nothing else will ever retire a one-shot entry admitted late. The promise is
+      // handed back so a caller that cleans up after the call can clean up again once the
+      // late claude has landed and been retired (#570).
+      const lateRetire = opts.ephemeral
+        ? admission.then(
+            ({ entry: e }) => retireEntry(e),
+            () => {},
+          )
+        : undefined;
+      return {
+        ...errorResult(
+          `[pty-supervisor] admission stage exceeded ${opts.timeoutMs}ms for ${sessionKey} — supervisor init, concurrency admission, or PTY spawn did not settle`,
+        ),
+        ...(lateRetire ? { lateRetire } : {}),
+      };
     }
     if (err instanceof SupervisorShuttingDownError) return errorResult(err.message);
     throw err;
@@ -1251,6 +1280,8 @@ function getOrCreateEntry(
       mcpConfig: opts.mcpConfig,
       resumeSessionId: opts.resumeSessionId,
       isolation: opts.isolation,
+      systemPrompt: opts.systemPrompt,
+      untrustedConfig: opts.untrustedConfig,
     },
   };
   state.ptys.set(sessionKey, entry);
@@ -1490,7 +1521,14 @@ async function buildSpawnOptions(
   // the daemon's raw env regardless of the resolved model/provider.
   const runnerHelpers = await getRunnerHelpers();
   const cleanEnv = runnerHelpers.cleanSpawnEnv();
-  const childEnv = runnerHelpers.buildChildEnv(cleanEnv, modelOverride ?? "", api ?? "");
+  // Untrusted calls use print's caller policy, without trusted provider augmentation
+  // (which can reintroduce secrets excluded by that policy). The strip list still applies:
+  // print admits ANTHROPIC_*, but an interactive claude with ANTHROPIC_API_KEY stops at
+  // its "Detected a custom API key" gate and echoes part of the key to the screen.
+  const childEnv =
+    entry.scope.isolation === "untrusted"
+      ? untrustedChildEnvWithRoot(cleanEnv, entry.scope.untrustedConfig)
+      : runnerHelpers.buildChildEnv(cleanEnv, modelOverride ?? "", api ?? "");
 
   let resolvedSecurityArgs = securityArgs;
   if (!resolvedSecurityArgs) {
@@ -1535,6 +1573,9 @@ async function buildSpawnOptions(
     security: cloneSecurity(security),
     securityArgs: resolvedSecurityArgs,
     appendSystemPrompt,
+    ...(entry.scope.isolation === "untrusted" && entry.scope.systemPrompt
+      ? { systemPrompt: entry.scope.systemPrompt }
+      : {}),
     env: childEnv,
     cols: settings.pty.cols,
     rows: settings.pty.rows,
@@ -1542,6 +1583,9 @@ async function buildSpawnOptions(
     quietWindowMs: settings.pty.quietWindowMs,
     sentinelMaxWaitMs: settings.pty.sentinelMaxWaitMs,
     ...(mcpConfigPath ? { mcpConfigPath } : {}),
+    ...(entry.scope.isolation === "untrusted" && entry.scope.untrustedConfig
+      ? untrustedGroupOptions(entry.scope.untrustedConfig.root, cwd)
+      : {}),
   };
   // Recorded on the entry in the same synchronous step as the synthesis, so a
   // retirement that starts before `spawnEntry` resumes still sees the config
@@ -1661,15 +1705,202 @@ function cloneSecurity(security: SecurityConfig): SecurityConfig {
 // every PTY spawn. Don't add a local copy — always go through
 // `getCleanSpawnEnv()`.
 
+let oneShotTranscriptWaitMs = TRANSCRIPT_WAIT_MS;
+/** Test seam: bound the untrusted reply wait. `null` restores the default. */
+export function injectOneShotTranscriptWaitForTests(ms: number | null): void {
+  oneShotTranscriptWaitMs = ms ?? TRANSCRIPT_WAIT_MS;
+}
+
+/**
+ * The env an untrusted PTY child gets: the caller's policy (print's override, else the
+ * clean default) minus the spawn strip list. One function for the spawn builder and for
+ * `runOnceOnPty`, so the credential directory resolved up front is the one the caller's
+ * env really names.
+ */
+function untrustedChildEnv(cleanEnv: Record<string, string>): Record<string, string> {
+  return stripSpawnEnvKeys({ ...(printRuntime()?.env ?? cleanEnv) });
+}
+
+/**
+ * The untrusted child's env with its throwaway config root. `HOME` stays as the caller's
+ * policy has it; only the config location moves, and the credential store stays the
+ * operator's, so the one write outside the root is claude's own refresh of the operator's
+ * OAuth token (no prompt data). A spawn without a root fails closed: the child would
+ * otherwise write the prompt under the operator's own config root.
+ */
+function untrustedChildEnvWithRoot(
+  cleanEnv: Record<string, string>,
+  config: PtyRunScope["untrustedConfig"],
+): Record<string, string> {
+  if (!config) throw new Error("untrusted PTY spawn requires a throwaway config root");
+  return {
+    ...untrustedChildEnv(cleanEnv),
+    CLAUDE_CONFIG_DIR: config.root,
+    CLAUDE_SECURESTORAGE_CONFIG_DIR: config.secureStorageDir,
+    // A fresh config root would otherwise make claude clone the official plugin marketplace
+    // (~800 files) in the background on every call, and that clone can still be writing when
+    // the root is removed.
+    CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL: "1",
+  };
+}
+
+/**
+ * An untrusted child is retired with its whole process group, and then anything that left the
+ * group is looked for (Linux). When either cannot be made to disappear, the root is recorded:
+ * `cleanupUntrustedOneShot` then keeps it and fails the call, because a survivor may still write
+ * prompt text into it, and the sweeper signals the survivor again until it is gone.
+ */
+function untrustedGroupOptions(
+  root: string,
+  tempCwd: string,
+  reap: typeof terminateEscapees = terminateEscapees,
+): Pick<PtyProcessOptions, "onGroupSurvived" | "reapEscapees"> {
+  const cwds = untrustedCleanup.untrustedCwdForms(tempCwd);
+  return {
+    onGroupSurvived: (pid, startMs, cause) =>
+      untrustedCleanup.markGroupSurvivor(root, pid, { startMs, tempCwd, cwds, cause }),
+    // Processes the scan could not read are kept as a hold on the root, not as a failure: the
+    // reply was already obtained, and the only risk is removing a directory under a live writer.
+    reapEscapees: (leader) =>
+      reap(
+        { root, cwds, leaderStartMs: leader.startMs },
+        {
+          onUnknown: (unknown) =>
+            untrustedCleanup.markUnknownProcs(root, leader, unknown, { tempCwd, cwds }),
+        },
+      ),
+  };
+}
+
+/**
+ * A disposal that rejected leaves it unknown whether the child is gone, so an untrusted one-shot's
+ * root is kept as for a survivor (fail closed), with the leader's start time recorded at spawn so
+ * the sweeper can signal it with an identity check, and `survivor.json` so a daemon restart keeps
+ * it too. With no PTY to name, nothing can be signalled and nothing is recorded: that is logged.
+ */
+function keepRootAfterFailedDispose(
+  entry: PtyEntry,
+  reason: unknown,
+  pty: PtyProcess | null = entry.pty,
+): void {
+  console.error(`[pty-supervisor] ${entry.sessionKey} disposal failed (${errorCode(reason)})`);
+  const config = entry.scope.untrustedConfig;
+  if (entry.scope.isolation !== "untrusted" || !config) return;
+  if (pty === null) {
+    console.error(
+      `[pty-supervisor] ${entry.sessionKey} disposal failed with no PTY to name: its config root is unprotected`,
+    );
+    return;
+  }
+  if (untrustedCleanup.groupSurvivorOf(config.root) === undefined) {
+    untrustedCleanup.markGroupSurvivor(config.root, pty.pid, {
+      startMs: pty.leaderStartMs ?? null,
+      tempCwd: entry.spawnOpts?.cwd,
+      cwds: entry.spawnOpts ? untrustedCleanup.untrustedCwdForms(entry.spawnOpts.cwd) : [],
+      cause: "dispose-rejected",
+    });
+  }
+}
+
+/** Test seam: the options an untrusted call's PTY gets, with the scan replaced. */
+export const __untrustedGroupOptionsForTests = untrustedGroupOptions;
+
+/** Test seams for the failed-disposal paths (#570 r14). */
+export const __keepRootAfterFailedDisposeForTests = keepRootAfterFailedDispose;
+
+/** What a failed untrusted one-shot says about why its root was kept. */
+function survivorReason(pid: number, cause: SurvivorCause | undefined): string {
+  switch (cause) {
+    case "escapee":
+      return `a process outside the process group of pid ${pid} survived retirement`;
+    case "scan-unknown":
+      return `the escape scan after retirement of pid ${pid} could not tell whether a process survived`;
+    case "dispose-rejected":
+      return `disposal of pid ${pid} rejected, so whether it survived is unknown`;
+    default:
+      return `process group of pid ${pid} survived retirement`;
+  }
+}
+
+/** What an untrusted one-shot leaves on disk, and where. Fixed before the spawn. */
+interface UntrustedOneShotState {
+  tempCwd: string;
+  /** The throwaway `CLAUDE_CONFIG_DIR`: holds everything claude writes about the call. */
+  configRoot: string;
+  projectDir: string;
+}
+
+function errorCode(error: unknown): string {
+  return (error as NodeJS.ErrnoException)?.code ?? (error instanceof Error ? error.name : "error");
+}
+
+/**
+ * Remove everything an interactive claude kept about an untrusted one-shot: its throwaway
+ * config root (transcripts, history, paste cache, session files) and the temp cwd.
+ * Idempotent, so it can run again once a late-landing claude has been retired.
+ *
+ * The config root holds prompt text, so its removal fails CLOSED: it is verified, a failure
+ * is logged by error code only, and the error is thrown, so a call never reports an isolated
+ * success while a prompt sits on disk. This is a deliberate divergence from #554's
+ * best-effort cleanup rule: one lost classifier reply costs less than leaving a Discord
+ * message in /tmp. The temp cwd is empty, so its removal stays best-effort.
+ */
+async function cleanupUntrustedOneShot(state: UntrustedOneShotState): Promise<void> {
+  let failure: unknown;
+  const survivor = untrustedCleanup.groupSurvivorOf(state.configRoot);
+  try {
+    if (survivor !== undefined) {
+      // Not removed: the process may still be writing into it. Left for the periodic sweep.
+      const reason = survivorReason(
+        survivor,
+        untrustedCleanup.groupSurvivorCauseOf(state.configRoot),
+      );
+      console.error(
+        `[pty-supervisor] untrusted one-shot cleanup failed: ${reason}; config root kept`,
+      );
+      throw new Error(reason);
+    }
+    if (untrustedCleanup.unknownHoldActive(state.configRoot)) {
+      // The escape scan could not read a process born after the child. The call succeeded; the
+      // root stays, and the sweeper removes it once that process is gone.
+      console.warn(
+        "[pty-supervisor] untrusted one-shot: config root kept while a process the escape scan could not read is alive",
+      );
+      return;
+    }
+    await untrustedCleanup.removeUntrustedConfigRoot(state.configRoot);
+  } catch (error) {
+    console.error(
+      `[pty-supervisor] untrusted one-shot cleanup failed: config root (${errorCode(error)})`,
+    );
+    failure = error;
+  }
+  // The temp cwd stays while a survivor may be running in it: its path is how the escapee scan
+  // recognises such a process, and a removed cwd shows up as "<path> (deleted)".
+  if (survivor === undefined) {
+    try {
+      rmSync(state.tempCwd, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+  if (failure !== undefined) throw failure;
+}
+
 /**
  * A utility turn on its own PTY, through the same spawn path as keyed sessions
- * (`buildSpawnOptions`, trust self-heal, multiplexer config) with the #546
- * ephemeral scope: registered in `state.ptys` so shutdown and `/kill` reach it,
- * never reused, outside the LRU and the `maxConcurrent` cap, retired on return.
+ * (`buildSpawnOptions`, multiplexer config) with the #546 ephemeral scope: registered in
+ * `state.ptys` so shutdown and `/kill` reach it, never reused, outside the LRU and the
+ * `maxConcurrent` cap (an untrusted call has its own, `UNTRUSTED_ONESHOT_MAX_CONCURRENT` in pty-cleanup),
+ * retired on return. A trusted call gets the supervisor's trust
+ * self-heal; an untrusted one runs in a throwaway cwd and a throwaway config root (trusted
+ * there, credentials from the operator's own store), both removed when the call ends.
  *
  * Exit contract matches the `print` engine: timeout and abort resolve with
- * exitCode 124, a failed spawn or turn with a non-zero code. Never throws on
- * those; a request that is invalid or already aborted still throws.
+ * exitCode 124 (including a timeout or abort during the untrusted transcript wait), a
+ * failed spawn or turn with a non-zero code. Never throws on those; a request that is
+ * invalid or already aborted still throws, as does an untrusted call whose prompt-bearing
+ * on-disk state could not be removed (fail closed, see `cleanupUntrustedOneShot`).
  */
 export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> {
   validateIsolation(req);
@@ -1683,20 +1914,79 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
   const settings = getSettings();
   const untrusted = req.isolation === "untrusted";
   const model = req.model ?? settings.model;
-  const result = (exitCode: number, text = "", sessionId?: string): OneShotResult => ({
+  const startedAt = Date.now();
+  const phasesMs: Record<string, number> = {};
+  const result = (
+    exitCode: number,
+    text = "",
+    sessionId?: string,
+    reason?: string,
+  ): OneShotResult => ({
     text,
     engine: "pty",
     model,
     exitCode,
     ...(sessionId ? { sessionId } : {}),
+    ...(exitCode !== 0 && reason
+      ? { diagnostic: { reason, phasesMs: { ...phasesMs, total: Date.now() - startedAt } } }
+      : {}),
   });
+  // Ephemeral entries are outside `maxConcurrent`, and every short guild message starts an
+  // untrusted one-shot, so a burst would start that many interactive claudes at once. Over the
+  // limit the call fails closed here, before anything is created or spawned (#570 r15, A4).
+  const slot = untrusted ? untrustedCleanup.acquireUntrustedOneShotSlot() : undefined;
+  if (untrusted && !slot) {
+    console.warn(
+      `[pty-supervisor] one-shot ${req.route}: ${untrustedCleanup.untrustedOneShotsInFlight()} untrusted one-shots already running; not started`,
+    );
+    return result(1, "", undefined, "busy");
+  }
   // Created inside the try and removed in the finally, so it never depends on
   // the turn settling (a hung turn or a spawn that never lands).
-  let tempCwd: string | undefined;
+  let untrustedState: UntrustedOneShotState | undefined;
+  let untrustedConfig: PtyRunScope["untrustedConfig"];
+  let lateRetire: Promise<void> | undefined;
   try {
-    if (untrusted) tempCwd = mkdtempSync(join(tmpdir(), "claudeclaw-oneshot-pty-"));
     const helpers = await getRunnerHelpers();
+    if (untrusted) {
+      let secureStorageDir: string;
+      try {
+        const daemonEnv = helpers.cleanSpawnEnv();
+        secureStorageDir = untrustedCleanup.operatorSecureStorageDir(
+          untrustedChildEnv(daemonEnv),
+          daemonEnv,
+        );
+      } catch (error) {
+        // Fail closed before anything is created or spawned.
+        console.warn(`[pty-supervisor] one-shot ${req.route}: ${(error as Error).message}`);
+        return result(1, "", undefined, "config-dir");
+      }
+      const tempCwd = untrustedCleanup.createUntrustedTempCwd();
+      untrustedCleanup.markOneShotDirActive(tempCwd);
+      let configRoot: string;
+      try {
+        // A fresh cwd would make claude ask "trust this folder?" with "No, exit" preselected;
+        // the root is seeded with the trust entry, so the dialog never appears.
+        configRoot = untrustedCleanup.createUntrustedConfigRoot(
+          untrustedCleanup.untrustedCwdForms(tempCwd),
+        );
+      } catch (error) {
+        rmSync(tempCwd, { recursive: true, force: true });
+        untrustedCleanup.releaseOneShotDir(tempCwd);
+        console.warn(
+          `[pty-supervisor] one-shot ${req.route}: config root not created (${errorCode(error)})`,
+        );
+        return result(1, "", undefined, "config-root");
+      }
+      untrustedCleanup.markOneShotDirActive(configRoot);
+      // The state exists before anything else can throw, so the `finally` below removes both
+      // directories whatever happens next (the project dir needs a realpath of the cwd).
+      untrustedState = { tempCwd, configRoot, projectDir: "" };
+      untrustedState.projectDir = untrustedCleanup.untrustedPtyProjectDir(tempCwd, configRoot);
+      untrustedConfig = { root: configRoot, secureStorageDir };
+    }
     const { PTY_OUTPUT_FORMAT_CONSTRAINT } = await import("./pty-output-format.js");
+    const execStartedAt = Date.now();
     const exec = await runEphemeralWithDeadline(
       `oneshot:${req.route}:${randomUUID()}`,
       req.prompt,
@@ -1707,7 +1997,11 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
         // Only the compact route sends a REPL command; it is still matched exactly.
         allowReplCommand: req.route === "compact",
         ...(untrusted
-          ? { mcpConfig: { path: undefined } }
+          ? {
+              mcpConfig: { path: undefined },
+              untrustedConfig,
+              ...(req.system ? { systemPrompt: req.system } : {}),
+            }
           : {
               // Same flags as the `print` engine (`trustedToolFlags`); the default
               // permission profile only when the caller gave no grant at all.
@@ -1717,26 +2011,101 @@ export async function runOnceOnPty(req: OneShotRequest): Promise<OneShotResult> 
                 .join("\n\n"),
             }),
         isolation: req.isolation,
-        cwd: tempCwd ?? req.cwd ?? process.cwd(),
+        cwd: untrustedState?.tempCwd ?? req.cwd ?? process.cwd(),
         resumeSessionId: req.resumeSessionId,
       },
       req.signal,
     );
-    if (exec.timedOut || exec.aborted) return result(124);
+    lateRetire = exec.lateRetire;
+    phasesMs.exec = Date.now() - execStartedAt;
+    if (exec.timedOut || exec.aborted) {
+      return result(124, "", undefined, exec.timedOut ? "timeout" : "aborted");
+    }
     if (exec.exitCode !== 0) {
       console.warn(`[pty-supervisor] one-shot ${req.route} failed: ${exec.stderr}`);
-      return result(exec.exitCode);
+      return result(exec.exitCode, "", undefined, execFailureReason(exec.stderr));
     }
+    if (untrustedState) {
+      // The rendered screen carries the echoed prompt (for the classifier, its
+      // example JSON), so an untrusted caller must never parse it. Return the
+      // model's own reply from the transcript, which the finally below removes.
+      // The wait counts against the caller's deadline: what the turn left of timeoutMs,
+      // capped, with a 1 s floor so a turn that used its whole budget still gets one look.
+      const transcriptStartedAt = Date.now();
+      const waited = await awaitLastAssistantReply(untrustedState.projectDir, {
+        waitMs: transcriptWaitBudget(
+          req.timeoutMs,
+          Date.now() - startedAt,
+          oneShotTranscriptWaitMs,
+        ),
+        signal: req.signal,
+      });
+      phasesMs.transcript = Date.now() - transcriptStartedAt;
+      const reply = waited.text;
+      if (reply === undefined) {
+        // Abort, or the caller's own deadline running out during the wait, is a timeout
+        // (124) as on every other path; a turn the CLI ended on an error is a failure (1).
+        const expired = Date.now() - startedAt >= req.timeoutMs;
+        const code = req.signal?.aborted || (waited.failure === "timeout" && expired) ? 124 : 1;
+        console.warn(
+          `[pty-supervisor] one-shot ${req.route}: no assistant reply in transcript (${waited.failure ?? "timeout"})`,
+        );
+        return result(code, "", exec.sessionId, `no-reply:${waited.failure ?? "timeout"}`);
+      }
+      return result(0, reply, exec.sessionId);
+    }
+    // Trusted routes keep the screen text: they carry no untrusted input, no
+    // caller parses it, and a resumed session's transcript path is not fixed.
     return result(0, exec.rawStdout, exec.sessionId);
   } finally {
-    if (tempCwd) {
+    if (untrustedState) {
+      const state = untrustedState;
+      // Interactive claude ignores --no-session-persistence, so its on-disk state is
+      // removed here, on success, failure and abort alike. The PTY is normally retired
+      // before this point; when admission outlived the deadline it is retired later, so
+      // the same cleanup runs again once that late retirement settles. The concurrency slot
+      // follows the child until it is confirmed gone: a late claude keeps it until retired (the
+      // ceiling only logs), and a survivor or an unknown hold keeps it until the sweeper confirms
+      // it gone (`OneShotSlot.settle`).
+      const release = (): void => {
+        untrustedCleanup.releaseOneShotDir(state.configRoot);
+        untrustedCleanup.releaseOneShotDir(state.tempCwd);
+      };
       try {
-        rmSync(tempCwd, { recursive: true, force: true });
-      } catch {
-        /* best effort */
+        await cleanupUntrustedOneShot(state);
+      } finally {
+        slot?.settle(state.configRoot, lateRetire);
+        if (lateRetire) {
+          void lateRetire
+            .catch(() => {})
+            .then(() => cleanupUntrustedOneShot(state))
+            .catch(() => {
+              /* already logged by step; there is no caller left to return to */
+            })
+            .finally(release);
+        } else {
+          release();
+        }
       }
+    } else {
+      slot?.free(); // failed before any state existed (config-dir, helpers): nothing else to release
     }
   }
+}
+
+/**
+ * A code, from a fixed set, for why a one-shot's turn failed: what a harness may print. The
+ * message itself is never forwarded; only the not-ready reason code is lifted out of it, and only
+ * when it has the shape of a code.
+ */
+function execFailureReason(stderr: string): string {
+  const notReady = /untrusted PTY not ready \(([a-z-]{1,40})\)/.exec(stderr);
+  if (notReady) return `not-ready:${notReady[1]}`;
+  if (stderr.includes(" aborted")) return "aborted";
+  if (stderr.includes("respawn failed")) return "spawn-failed";
+  if (stderr.includes("max retries")) return "turn-failed";
+  if (stderr.includes("non-retryable error")) return "turn-error";
+  return "exec-failed";
 }
 
 /**
@@ -1825,11 +2194,15 @@ async function landPty(entry: PtyEntry, pty: PtyProcess): Promise<void> {
   }
   try {
     await pty.dispose();
-  } catch {
-    // best-effort
+  } catch (error) {
+    // The late PTY is not `entry.pty`, so it is named explicitly: a rejected disposal keeps the
+    // root here as on every other path (#570 r14, E).
+    keepRootAfterFailedDispose(entry, error, pty);
   }
   throw new EntryRemovedError(entry.sessionKey, "disposed the late PTY");
 }
+
+export const __landPtyForTests = landPty;
 
 /** True while `entry` is the live entry for its key: tracked in `state.ptys`
  *  and not being retired. Every removal path sets `retiring` synchronously
@@ -1863,11 +2236,12 @@ function retireEntry(entry: PtyEntry): Promise<void> {
     // while the old process is still being torn down.
     try {
       const disposal = entry.disposing ?? entry.pty?.dispose() ?? Promise.resolve();
-      await Promise.allSettled([
+      const [disposed] = await Promise.allSettled([
         disposal,
         // Release multiplexer identity + delete synthesized config (SPEC §4.5).
         releaseMcpIdentityFor(entry),
       ]);
+      if (disposed.status === "rejected") keepRootAfterFailedDispose(entry, disposed.reason);
     } finally {
       // Unconditional: an entry left in the map with `retiring` settled would
       // spin every admission on its key (and the shutdown loop) forever.
@@ -1912,7 +2286,8 @@ async function spawnEntry(
   // = true` to ~/.claude.json so the prompt is skipped. Best-effort — a
   // failure here doesn't block spawn; if trust isn't acked, the supervisor's
   // existing idle-timeout / sentinel-max-wait paths will surface the stall.
-  // An untrusted one-shot runs in a throwaway directory: nothing to remember.
+  // An untrusted one-shot is skipped here: `runOnceOnPty` marks its throwaway cwd trusted
+  // in the child's own config root before the call and removes the entry afterwards.
   if (entry.scope.isolation !== "untrusted") {
     try {
       const heal = (await ensureTrust(spawnOpts.cwd)) as
@@ -2259,9 +2634,23 @@ async function runTurnWithRetries(
       await withDeadline(entry.spawnInFlight, callOpts.timeoutMs);
     } catch (err) {
       if (err instanceof DeadlineExceeded) {
-        return errorResult(
-          `[pty-supervisor] PTY spawn for ${entry.sessionKey} exceeded ${callOpts.timeoutMs}ms — claude or the MCP fleet did not come up`,
-        );
+        // The spawn keeps running: it lands later, finds the entry retired (an ephemeral
+        // call retires it on the way out) and disposes the late PTY. Hand that settling
+        // back so a caller that cleans up on return can clean up again after it (#570).
+        const landing = entry.spawnInFlight;
+        return {
+          ...errorResult(
+            `[pty-supervisor] PTY spawn for ${entry.sessionKey} exceeded ${callOpts.timeoutMs}ms — claude or the MCP fleet did not come up`,
+          ),
+          ...(entry.scope.ephemeral && landing
+            ? {
+                lateRetire: landing.then(
+                  () => {},
+                  () => {},
+                ),
+              }
+            : {}),
+        };
       }
       return errorResult(
         `[pty-supervisor] failed to spawn PTY for ${entry.sessionKey}: ${(err as Error).message}`,

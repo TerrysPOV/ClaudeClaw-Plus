@@ -24,11 +24,16 @@ function buildPrompt(system: string, messages: Message[]): string {
 }
 
 /**
- * One-shot `claude -p` calls carry untrusted text (conversation turns, skill
- * bodies), so they run through `runOneShot` as `untrusted`: no built-in tools,
- * no MCP servers, no settings file (no hooks, no user plugins), no saved session
- * and no slash commands, with the prompt on stdin. The flags live in
- * `oneshot/isolation.ts`. With no configured model, or the env-routed "glm"
+ * One-shot claude calls carry untrusted text (conversation turns, skill bodies), so they
+ * run through `runOneShot` as `untrusted`: no built-in tools, no MCP servers, no settings
+ * file (no hooks, no user plugins) and no slash commands. The flags live in
+ * `oneshot/isolation.ts`. On `print` the prompt goes on stdin and no session is saved. `pty`
+ * applies only to `OneShotBackend` (`llm.backend: "oneshot"`): this class forces print
+ * (`forcePrint`), so `claude_cli` never reaches it. On `pty` (the default for the
+ * `OneShotBackend` routes when the runner PTY is on and claude is at least the measured
+ * version) the same flags drive an interactive claude in a throwaway config root that
+ * `runOnceOnPty` removes after the call. The `spawn` seam is print-only. With no
+ * configured model, or the env-routed "glm"
  * alias, --model is left out and the CLI's default applies (same rule as the
  * runner's spawn sites).
  */

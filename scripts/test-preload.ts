@@ -19,6 +19,28 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  MIN_PTY_ISOLATION_CLAUDE_VERSION,
+  applyPtyIsolationVersionGate,
+} from "../src/oneshot/claude-version.js";
+import {
+  setLateSlotCeilingMsForTests,
+  setRootRemovalQuietMsForTests,
+} from "../src/oneshot/pty-cleanup.js";
+
+// #570: PTY isolation is advertised only after a startup probe finds a measured claude, and
+// starts OFF (fail closed). Unit tests stand in for that probe so the routing they exercise
+// is the one a daemon on the measured build gets. The unprobed default is pinned by
+// src/oneshot/claude-version.test.ts, which reads it in a fresh process.
+applyPtyIsolationVersionGate(MIN_PTY_ISOLATION_CLAUDE_VERSION, () => {});
+// #570 r11: removing an untrusted call's throwaway config root waits 200 ms to see it stay
+// gone. Unit tests do not run a real claude that could write into it, so they wait 5 ms.
+setRootRemovalQuietMsForTests(5);
+// #570 r15e: a call that returned its deadline keeps its concurrency slot until its late claude
+// has landed and been retired; the ceiling only logs that it is still waiting. Unit tests shorten
+// it to 250 ms, and a test whose fake spawn never lands resets the slots in its own `afterEach`
+// (`resetUntrustedSlotsForTests`).
+setLateSlotCeilingMsForTests(250);
 
 const need =
   !process.env.PLUS_PLUGIN_AUDIT_PATH ||

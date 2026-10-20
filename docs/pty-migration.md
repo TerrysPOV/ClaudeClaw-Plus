@@ -54,8 +54,10 @@ PTY holds their session. With `pty.enabled: false` they default to print. Explic
 `oneShot.routes` (including family wildcards) and `oneShot.default` settings take
 precedence; remove an existing `oneShot.default: "print"` to adopt these defaults.
 These choices follow the same approximately 30-second hot reload as runner turns.
-Untrusted classifier, tuner and memory-recall routes still default to print and
-cannot select PTY until its isolation spike is green. See [One-shot engines](oneshot-engines.md).
+Untrusted classifier and tuner routes follow `pty.enabled` too on a
+claude CLI at least 2.1.304 (not on Windows), where the interactive isolation spike is green; on an
+older or unreadable version they stay on print. Memory recall is not one of them: it does not
+reach `runOneShot`, and runs in Python (#545), which still spawns `claude -p`. See [One-shot engines](oneshot-engines.md).
 
 `claude -p` remains supported. Set both the runner opt-out and explicit bus-agent
 supervision overrides in `.claude/claudeclaw/settings.json`:

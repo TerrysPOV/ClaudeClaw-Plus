@@ -40,6 +40,12 @@ export interface OneShotResult {
   exitCode: number;
   sessionId?: string;
   usage?: { inputTokens?: number; outputTokens?: number };
+  /**
+   * Why a non-zero call failed, as a code from a fixed set (`not-ready:login-required`, `timeout`,
+   * `no-reply:timeout`...) with the milliseconds each phase took. Never screen text, a transcript
+   * or an environment: it is what a harness may print (#570 r14, D).
+   */
+  diagnostic?: { reason: string; phasesMs: Record<string, number> };
 }
 
 export interface OneShotEngine {
