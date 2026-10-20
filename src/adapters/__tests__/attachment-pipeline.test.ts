@@ -206,6 +206,75 @@ describe("attachment-pipeline — processAttachments", () => {
     expect(p.savedPath).toBeUndefined();
   });
 
+  describe("streamed downloads without Content-Length", () => {
+    const CHUNK = 100;
+    const MAX = 1000;
+
+    /** Fetch stub whose body is `chunks` x CHUNK bytes of `fill`, no Content-Length. */
+    function streamFetch(chunks: number, fill = 0x61) {
+      const state = { pulled: 0, cancelled: false };
+      const fetchFn = (async () => {
+        const body = new ReadableStream<Uint8Array>({
+          pull(ctrl) {
+            if (state.pulled >= chunks) {
+              ctrl.close();
+              return;
+            }
+            state.pulled++;
+            ctrl.enqueue(new Uint8Array(CHUNK).fill(fill));
+          },
+          cancel() {
+            state.cancelled = true;
+          },
+        });
+        return new Response(body, { status: 200 });
+      }) as unknown as typeof fetch;
+      return { state, fetchFn };
+    }
+
+    it("aborts an oversize stream early instead of buffering the whole body", async () => {
+      const { state, fetchFn } = streamFetch(100); // 10_000 B, 10x the cap
+      const a = att({ filename: "bomb.bin", url: `${URL_BASE}/bomb.bin`, size: 1 });
+      const logs: string[] = [];
+      const [p] = await processAttachments([a], cfg({ maxBytes: MAX }), {
+        fetchFn,
+        log: (m) => logs.push(m),
+      });
+      expect(p.savedPath).toBeUndefined();
+      expect(p.note).toContain("downloaded size");
+      expect(p.note).toContain("exceeds limit");
+      expect(logs.some((l) => l.includes("downloaded") && l.includes("exceeds limit"))).toBe(true);
+      expect(state.cancelled).toBe(true);
+      expect(state.pulled).toBeLessThan(20);
+    });
+
+    it("accepts an under-cap stream byte for byte", async () => {
+      const { fetchFn } = streamFetch(5, 0x42); // 500 B
+      const a = att({ filename: "ok.bin", url: `${URL_BASE}/ok.bin`, size: 1 });
+      const [p] = await processAttachments([a], cfg({ maxBytes: MAX }), { fetchFn });
+      expect(p.note).toBeUndefined();
+      const saved = await readFile(p.savedPath as string);
+      expect(saved.equals(Buffer.alloc(500, 0x42))).toBe(true);
+    });
+
+    it("accepts a body exactly at maxBytes (the check is >)", async () => {
+      const { fetchFn } = streamFetch(10, 0x43); // 1000 B == cap
+      const a = att({ filename: "edge.bin", url: `${URL_BASE}/edge.bin`, size: 1 });
+      const [p] = await processAttachments([a], cfg({ maxBytes: MAX }), { fetchFn });
+      expect(p.note).toBeUndefined();
+      const saved = await readFile(p.savedPath as string);
+      expect(saved.length).toBe(MAX);
+    });
+
+    it("handles a null body without throwing", async () => {
+      const fetchFn = (async () => new Response(null, { status: 200 })) as unknown as typeof fetch;
+      const a = att({ filename: "empty.bin", url: `${URL_BASE}/empty.bin`, size: 1 });
+      const [p] = await processAttachments([a], cfg({ maxBytes: MAX }), { fetchFn });
+      expect(p.note).toBeUndefined();
+      expect((await readFile(p.savedPath as string)).length).toBe(0);
+    });
+  });
+
   it("records HTTP errors and network throws fail-soft", async () => {
     const http404 = att({ id: "a1", filename: "gone.bin", url: `${URL_BASE}/missing`, size: 5 });
     const good = att({

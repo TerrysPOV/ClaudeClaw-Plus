@@ -116,6 +116,35 @@ export function formatBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/**
+ * Read a response body chunk by chunk, stopping as soon as the running total
+ * passes `maxBytes`: the download is aborted and the reader cancelled, so an
+ * oversize body without a Content-Length is never fully buffered. A null body
+ * (e.g. empty response) yields zero bytes.
+ */
+async function readBodyCapped(
+  res: Response,
+  maxBytes: number,
+  controller: AbortController,
+): Promise<{ bytes: Buffer; overflow?: undefined } | { overflow: number }> {
+  if (!res.body) return { bytes: Buffer.alloc(0) };
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > maxBytes) {
+      controller.abort();
+      await reader.cancel().catch(() => {});
+      return { overflow: total };
+    }
+    chunks.push(value);
+  }
+  return { bytes: Buffer.concat(chunks, total) };
+}
+
 /** Truncate a UTF-8 buffer to <= maxBytes without splitting a codepoint. */
 export function truncateUtf8(
   bytes: Buffer,
@@ -235,7 +264,16 @@ export async function processAttachments(
         });
         continue;
       }
-      bytes = Buffer.from(await res.arrayBuffer());
+      const read = await readBodyCapped(res, cfg.maxBytes, controller);
+      if (read.overflow !== undefined) {
+        log(`attachment '${att.filename}' skipped: downloaded ${read.overflow} exceeds limit`);
+        out.push({
+          ...base,
+          note: `skipped: downloaded size ${formatBytes(read.overflow)} exceeds limit`,
+        });
+        continue;
+      }
+      bytes = read.bytes;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       log(`attachment '${att.filename}' download failed: ${msg}`);
