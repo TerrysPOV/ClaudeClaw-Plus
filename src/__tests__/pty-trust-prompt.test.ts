@@ -12,9 +12,11 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  rmdirSync,
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -250,5 +252,97 @@ describe("ensureTrustAccepted", () => {
     };
     expect(raw.projects[cwd]?.hasTrustDialogAccepted).toBe(true);
     expect(statSync(real).mode & 0o777).toBe(0o600);
+  });
+
+  // A running claude rewrites ~/.claude.json under `<file>.lock` (mkdir lock,
+  // read, write, rmdir). A heal that skips the lock lands between claude's
+  // read and its write and is dropped — measured against claude 2.1.296 and
+  // 2.1.303 with four live REPLs: 9-12 of 200 heals lost.
+  test("waits for claude's .lock and keeps its entry when claude writes a stale snapshot", async () => {
+    writeFileSync(configPath, JSON.stringify({ numStartups: 1, projects: {} }, null, 2));
+    const lockPath = `${configPath}.lock`;
+    // claude takes the lock and reads the file...
+    mkdirSync(lockPath);
+    const snapshot = JSON.parse(readFileSync(configPath, "utf-8")) as Record<string, unknown>;
+    const cwd = "/tmp/ccaw-probe-lock";
+    const heal = ensureTrustAccepted(cwd, { homedir: () => tmpHome });
+    // Held past the re-check window, so only the lock (not the re-check)
+    // can keep the heal from landing before claude's write.
+    await Bun.sleep(700);
+    // ...then writes its (stale) snapshot back and releases the lock.
+    writeFileSync(configPath, JSON.stringify({ ...snapshot, numStartups: 2 }, null, 2));
+    rmdirSync(lockPath);
+    const res = await heal;
+    expect(res.ok).toBe(true);
+    const raw = JSON.parse(readFileSync(configPath, "utf-8")) as {
+      numStartups: number;
+      projects: Record<string, { hasTrustDialogAccepted: boolean }>;
+    };
+    expect(raw.numStartups).toBe(2);
+    expect(raw.projects[cwd]?.hasTrustDialogAccepted).toBe(true);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+  test("removes a stale .lock left by a crashed writer and still heals", async () => {
+    const lockPath = `${configPath}.lock`;
+    mkdirSync(lockPath);
+    const old = (Date.now() - 60_000) / 1000;
+    utimesSync(lockPath, old, old);
+    const cwd = "/home/test/project";
+    const res = await ensureTrustAccepted(cwd, { homedir: () => tmpHome });
+    expect(res.ok).toBe(true);
+    const raw = JSON.parse(readFileSync(configPath, "utf-8")) as {
+      projects: Record<string, { hasTrustDialogAccepted: boolean }>;
+    };
+    expect(raw.projects[cwd]?.hasTrustDialogAccepted).toBe(true);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+  test("a stale .lock it cannot remove does not hang the heal", async () => {
+    const lockPath = `${configPath}.lock`;
+    mkdirSync(lockPath);
+    writeFileSync(join(lockPath, "keep"), ""); // rmdir fails: ENOTEMPTY
+    const old = (Date.now() - 60_000) / 1000;
+    utimesSync(lockPath, old, old);
+    const cwd = "/home/test/project";
+    const res = await ensureTrustAccepted(cwd, { homedir: () => tmpHome });
+    expect(res.ok).toBe(true);
+    const raw = JSON.parse(readFileSync(configPath, "utf-8")) as {
+      projects: Record<string, { hasTrustDialogAccepted: boolean }>;
+    };
+    expect(raw.projects[cwd]?.hasTrustDialogAccepted).toBe(true);
+    expect(existsSync(join(lockPath, "keep"))).toBe(true);
+  }, 3000);
+  // claude's exit path rewrites ~/.claude.json without the lock (read, then
+  // write): a heal landing in between is dropped and must be put back.
+  test("re-heals when an unlocked writer drops the entry right after the heal", async () => {
+    writeFileSync(configPath, JSON.stringify({ numStartups: 1, projects: {} }, null, 2));
+    const snapshot = readFileSync(configPath, "utf-8"); // read before the heal
+    const cwd = "/tmp/ccaw-probe-exit";
+    const heal = ensureTrustAccepted(cwd, { homedir: () => tmpHome });
+    for (let i = 0; i < 200 && !readFileSync(configPath, "utf-8").includes(cwd); i++) {
+      await Bun.sleep(5);
+    }
+    writeFileSync(configPath, snapshot); // ...written back after it
+    const res = await heal;
+    expect(res.ok).toBe(true);
+    const raw = JSON.parse(readFileSync(configPath, "utf-8")) as {
+      projects: Record<string, { hasTrustDialogAccepted: boolean }>;
+    };
+    expect(raw.projects[cwd]?.hasTrustDialogAccepted).toBe(true);
+  });
+  test("reports ok:false when another writer keeps dropping the flag", async () => {
+    writeFileSync(configPath, JSON.stringify({ projects: {} }, null, 2));
+    const snapshot = readFileSync(configPath, "utf-8");
+    const cwd = "/tmp/ccaw-probe-dropped";
+    let done = false;
+    const heal = ensureTrustAccepted(cwd, { homedir: () => tmpHome }).finally(() => {
+      done = true;
+    });
+    while (!done) {
+      if (readFileSync(configPath, "utf-8").includes(cwd)) writeFileSync(configPath, snapshot);
+      await Bun.sleep(5);
+    }
+    const res = await heal;
+    expect(res.ok).toBe(false);
+    expect(res.reason).toContain("dropped");
   });
 });

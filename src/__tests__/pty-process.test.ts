@@ -1,4 +1,7 @@
 import { describe, test, expect } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   spawnPty,
   sanitizePtyPromptText,
@@ -289,37 +292,132 @@ describe("PtyProcess — lifecycle", () => {
 // first byte. The tests below simulate a slow paint with /bin/sh and assert
 // spawnPty doesn't resolve until the paint goes quiet.
 
+/** Manual clock for the settle timers: nothing fires until `advance`. */
+function manualClock() {
+  let now = 0;
+  let nextId = 0;
+  const timers = new Map<number, { due: number; ms: number; cb: () => void }>();
+  const armed: number[] = [];
+  return {
+    setTimeout: ((cb: () => void, ms: number) => {
+      const id = ++nextId;
+      timers.set(id, { due: now + ms, ms, cb });
+      armed.push(ms);
+      return id;
+    }) as unknown as (cb: () => void, ms: number) => ReturnType<typeof setTimeout>,
+    clearTimeout: ((id: number) => {
+      timers.delete(id);
+    }) as unknown as (handle: ReturnType<typeof setTimeout>) => void,
+    advance(ms: number) {
+      now += ms;
+      const due = [...timers].filter(([, t]) => t.due <= now).sort((a, b) => a[1].due - b[1].due);
+      for (const [id, t] of due) {
+        if (!timers.delete(id)) continue;
+        t.cb();
+      }
+    },
+    /** Resolves once `count` timers of `ms` have been armed (real time, 3s cap). */
+    async untilArmed(ms: number, count: number) {
+      const deadline = Date.now() + 3000;
+      while (armed.filter((m) => m === ms).length < count) {
+        if (Date.now() > deadline) throw new Error(`timer of ${ms}ms not armed ${count} time(s)`);
+        await Bun.sleep(5);
+      }
+    },
+  };
+}
+
 describe("PtyProcess — _waitForReadySettle two-phase (issue #84)", () => {
   test("does NOT resolve on first byte — waits for quiet window after paint", async () => {
-    // Script: emit bytes immediately, again at 200ms, again at 400ms, then
-    // stay silent. With quietWindowMs=300, the quiet timer should reset on
-    // each chunk and only fire ~300ms after the last (400ms) chunk — so
-    // spawnPty should resolve at ~700ms, NOT at first-byte (~0ms).
-    const t0 = Date.now();
-    const proc = await spawnPty(
+    // The settle timers run on a manual clock and the child paints only when
+    // the test lets it, so the assertion is about ordering, not wall time:
+    // every chunk restarts the quiet window, and only a full window after
+    // the LAST chunk resolves. Against wall time this flaked (issue #567):
+    // with paints 200ms apart and a 300ms window, a child delayed by ~100ms
+    // on a loaded runner let the window expire after the first paint.
+    const clock = manualClock();
+    const dir = mkdtempSync(join(tmpdir(), "pty-settle-"));
+    const go2 = join(dir, "go2");
+    const go3 = join(dir, "go3");
+    const exit = join(dir, "exit");
+    // Each paint after the first waits for its go-file ($1, $2), and the child
+    // stays alive until cleanup creates $3 — spawnPty rejects if the child
+    // exits before settle, and the settle timers do not run on real time.
+    const waitFor = (arg: string) => `while [ ! -e "${arg}" ]; do sleep 0.01; done`;
+    let settled = false;
+    const spawning = spawnPty(
       baseOpts({
         _commandOverride: "/bin/sh",
         _argsOverride: [
           "-c",
-          // Trailing `sleep 5` keeps the process alive past the quiet
-          // window — spawnPty rejects if the child exits before settle.
-          "printf paint1; sleep 0.2; printf paint2; sleep 0.2; printf paint3; sleep 5",
+          `printf paint1; ${waitFor("$1")}; printf paint2; ${waitFor("$2")}; printf paint3; ${waitFor("$3")}`,
+          "sh",
+          go2,
+          go3,
+          exit,
         ],
         _skipReadySettle: false,
         quietWindowMs: 300,
+        _setTimeout: clock.setTimeout,
+        _clearTimeout: clock.clearTimeout,
       }),
-    );
-    const elapsed = Date.now() - t0;
+    ).then((p) => {
+      settled = true;
+      return p;
+    });
 
-    // Quiet timer fires 300ms after the last chunk (paint3 at ~400ms) →
-    // expect ≥ ~600ms total. Pre-fix this resolved at ~0ms.
-    // Loose bound to avoid flakiness across CI environments.
-    expect(elapsed).toBeGreaterThanOrEqual(500);
-    // And not absurdly long either — the hard timeout is 3s.
-    expect(elapsed).toBeLessThan(3000);
+    try {
+      // paint1 → a quiet window is armed. Pre-fix this already resolved.
+      await clock.untilArmed(300, 1);
+      await Bun.sleep(20);
+      expect(settled).toBe(false);
+      clock.advance(299);
+      await Bun.sleep(20);
+      expect(settled).toBe(false);
 
-    await proc.dispose();
-  });
+      // paint2 at t=299 restarts the window: the old one, due at t=300, must
+      // not resolve.
+      writeFileSync(go2, "");
+      await clock.untilArmed(300, 2);
+      clock.advance(299);
+      await Bun.sleep(20);
+      expect(settled).toBe(false);
+
+      // paint3, the last chunk, then a full quiet window → resolves.
+      writeFileSync(go3, "");
+      await clock.untilArmed(300, 3);
+      clock.advance(299);
+      await Bun.sleep(20);
+      expect(settled).toBe(false);
+      clock.advance(1);
+      // Real-time cap so a settle that never resolves fails here, not on the
+      // test timeout, and the cleanup below still runs.
+      let cap: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        spawning,
+        new Promise((_, reject) => {
+          cap = setTimeout(
+            () => reject(new Error("not settled after the last quiet window")),
+            3000,
+          );
+        }),
+      ]).finally(() => clearTimeout(cap));
+      expect(settled).toBe(true);
+    } finally {
+      // On an early failure, release the child and fire the hard timeout so
+      // the spawn settles and the PTY is disposed.
+      writeFileSync(go2, "");
+      writeFileSync(go3, "");
+      clock.advance(10_000);
+      const proc = await Promise.race([
+        spawning.catch(() => null),
+        Bun.sleep(1000).then(() => null),
+      ]);
+      await proc?.dispose();
+      writeFileSync(exit, "");
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15000);
 
   test("hard timeout fires when the TUI never paints", async () => {
     // Script: silent for 2s then exit. With _waitForReadySettle's 3s hard

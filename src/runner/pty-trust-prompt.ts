@@ -23,8 +23,8 @@
  * without breaking PTY startup. A failing self-heal still lets the runtime
  * try (it just means the trust prompt may stall the first invocation).
  */
-import { existsSync, lstatSync, readlinkSync, statSync } from "node:fs";
-import { chmod, rename, unlink, writeFile } from "node:fs/promises";
+import { existsSync, lstatSync, readlinkSync, realpathSync, statSync } from "node:fs";
+import { chmod, mkdir, rename, rmdir, unlink, writeFile } from "node:fs/promises";
 import { homedir as defaultHomedir } from "node:os";
 import { dirname, resolve as resolvePath } from "node:path";
 
@@ -126,10 +126,111 @@ export async function ensureTrustAccepted(
   return next;
 }
 
+/**
+ * claude serialises most of its writes to `~/.claude.json` with a directory
+ * lock next to the file (`<file>.lock`, created with mkdir, removed after the
+ * rename) and re-reads the file under it. A running claude rewrites the file
+ * many times at startup; a heal that skips the lock lands between one of its
+ * reads and its write and is silently dropped, so the next claude in that cwd
+ * opens the trust dialog with "No, exit" preselected. Taking the same lock
+ * makes the two writers queue instead of race.
+ *
+ * claude's exit path writes the file WITHOUT the lock (read, then write), so
+ * a heal can still be dropped by a claude exiting at that moment — the case
+ * when a spawn follows another session's shutdown. After a write that changed
+ * the file, the flag is read back after VERIFY_DELAY_MS and re-healed if it
+ * is gone, up to VERIFY_ATTEMPTS times; still gone after that is reported
+ * as `ok: false`.
+ *
+ * A lock older than LOCK_STALE_MS is a crashed holder's and is removed (the
+ * lock library claude uses treats 10 s as stale). If the lock stays busy for
+ * LOCK_WAIT_MS, the write goes ahead unlocked: a possibly lost entry is
+ * better than never writing one.
+ */
+const LOCK_STALE_MS = 10_000;
+const LOCK_WAIT_MS = 2_000;
+const LOCK_POLL_MS = 25;
+const VERIFY_DELAY_MS = 200;
+const VERIFY_ATTEMPTS = 3;
+
+function lockPathFor(configPath: string): string {
+  const target = writeTarget(configPath);
+  let real = target;
+  try {
+    real = realpathSync(target);
+  } catch {
+    // not created yet: lock next to where it will be created
+  }
+  return `${real}.lock`;
+}
+
+async function acquireConfigLock(lockPath: string): Promise<boolean> {
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      await mkdir(lockPath);
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") return false;
+    }
+    if (Date.now() >= deadline) return false;
+    let stale = false;
+    try {
+      stale = Date.now() - statSync(lockPath).mtimeMs > LOCK_STALE_MS;
+    } catch (err) {
+      // released between mkdir and stat: retry now
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+      return false;
+    }
+    if (stale) {
+      try {
+        await rmdir(lockPath);
+      } catch (err) {
+        // cannot remove it (not ours, not empty): stop waiting on it
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false;
+      }
+      continue;
+    }
+    await Bun.sleep(LOCK_POLL_MS);
+  }
+}
+
 async function _doEnsureTrustAccepted(
   configPath: string,
   absoluteCwd: string,
 ): Promise<TrustHealResult> {
+  const first = await _healLocked(configPath, absoluteCwd);
+  if (!first.ok || !first.changed) return first;
+  for (let i = 0; i < VERIFY_ATTEMPTS; i++) {
+    await Bun.sleep(VERIFY_DELAY_MS);
+    const again = await _healLocked(configPath, absoluteCwd);
+    if (!again.ok) return again;
+    if (!again.changed) return first; // the flag survived
+  }
+  return {
+    ok: false,
+    changed: true,
+    configPath,
+    reason: `trust flag dropped by another writer of ~/.claude.json ${VERIFY_ATTEMPTS} times`,
+  };
+}
+
+async function _healLocked(configPath: string, absoluteCwd: string): Promise<TrustHealResult> {
+  let lockPath: string | null = null;
+  try {
+    lockPath = lockPathFor(configPath);
+    if (!(await acquireConfigLock(lockPath))) lockPath = null;
+  } catch {
+    lockPath = null;
+  }
+  try {
+    return await _readModifyWrite(configPath, absoluteCwd);
+  } finally {
+    if (lockPath) await rmdir(lockPath).catch(() => undefined);
+  }
+}
+
+async function _readModifyWrite(configPath: string, absoluteCwd: string): Promise<TrustHealResult> {
   try {
     let raw: Record<string, unknown> = {};
     if (existsSync(configPath)) {
