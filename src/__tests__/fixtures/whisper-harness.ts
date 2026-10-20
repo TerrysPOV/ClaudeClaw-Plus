@@ -19,7 +19,13 @@ const mode = process.env.HARNESS_MODE;
 
 const { loadSettings } = await import(join(repo, "src", "config.ts"));
 await loadSettings();
-const { transcribeAudioToText } = await import(join(repo, "src", "whisper.ts"));
+const { transcribeAudioToText, warmupWhisperAssets } = await import(join(repo, "src", "whisper.ts"));
+
+// Warmup runs the async `--help` runnability probe, which takes tens of ms. Left
+// inside the measured window it lets the 50 ms timer fire during the probe, so a
+// blocking spawn later in the run would go unseen (the timer test then passes
+// on a race, not on the property). Measure only the run itself.
+await warmupWhisperAssets();
 
 const t0 = performance.now();
 
