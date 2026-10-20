@@ -143,6 +143,41 @@ export function isWhisperSharedLib(name: string): boolean {
 }
 
 /**
+ * Every runtime shared object in an extracted archive, by the name the loader asks for.
+ *
+ * Symlinks count. The linux-arm64 tarball ships `libggml.so.0 -> libggml.so.0.20.2`
+ * and `libwhisper.so.1 -> libwhisper.so.1.9.3`, and `whisper-cli` is linked
+ * against the SONAME names, not the fully versioned files. Dirent.isFile() is
+ * false for a symlink, so filtering on it stages only the versioned targets and
+ * leaves a binary that cannot find its libraries. A symlink is staged under its
+ * own name; Bun.write(dest, Bun.file(src)) copies the target's bytes.
+ *
+ * Deliberately NOT wrapped in .catch(() => []). Swallowing a readdir failure
+ * would stage zero libraries; combined with the binary write that yields an
+ * install which passes every `--help` probe (which does not exercise ggml's
+ * dlopen) while failing every real transcription. A throw is recoverable; a
+ * silent empty copy is not. A dangling symlink throws from stat() for the same reason.
+ */
+export async function collectSharedLibs(
+  extractDir: string,
+): Promise<Array<{ name: string; srcPath: string }>> {
+  const entries = await readdir(extractDir, { withFileTypes: true, recursive: true });
+  const libs: Array<{ name: string; srcPath: string }> = [];
+  for (const entry of entries) {
+    const name = entry.name;
+    if (!isWhisperSharedLib(name)) continue;
+    const srcPath = join(entry.parentPath ?? entry.path ?? "", name);
+    if (entry.isSymbolicLink()) {
+      if (!(await stat(srcPath)).isFile()) continue;
+    } else if (!entry.isFile()) {
+      continue;
+    }
+    libs.push({ name, srcPath });
+  }
+  return libs;
+}
+
+/**
  * Refuse to install a dynamically linked binary from an archive that yielded no
  * libraries: the layout changed, and the `--help` probe would certify an install
  * that fails every real transcription. A source flagged `staticBinary` is exempt,
@@ -342,20 +377,7 @@ async function downloadAndExtractBinary(): Promise<void> {
   // failure (memory pressure, fd exhaustion). Wiping before the replacement is
   // proven good would turn a bad probe plus an unreachable download host into a
   // destroyed install, where previously a failed download was a harmless no-op.
-  // Deliberately NOT wrapped in .catch(() => []). Swallowing a readdir failure
-  // here would stage zero libraries; combined with the binary write below that
-  // yields an install which passes every `--help` probe (which does not
-  // exercise ggml's dlopen) while failing every real transcription. A throw is
-  // recoverable; a silent empty copy is not.
-  const entries = await readdir(extractDir, { withFileTypes: true, recursive: true });
-
-  const stagedLibs: Array<{ name: string; srcPath: string }> = [];
-  for (const entry of entries) {
-    if (!entry.isFile()) continue;
-    const name = entry.name;
-    if (!isWhisperSharedLib(name)) continue;
-    stagedLibs.push({ name, srcPath: join(entry.parentPath ?? entry.path ?? "", name) });
-  }
+  const stagedLibs = await collectSharedLibs(extractDir);
 
   assertSharedLibsStaged(platformKey, source, stagedLibs.length);
 
@@ -411,15 +433,33 @@ export async function decideWarmupAction(binaryPath: string): Promise<WarmupActi
   return (await fileExists(binaryPath)) ? "repair" : "install";
 }
 
+/**
+ * Whether the "this platform's binary will not run" latch still holds.
+ *
+ * One failed probe cannot tell a wrong BINARY_SOURCES entry from a transient
+ * spawn failure (memory pressure, descriptor exhaustion). Latching for the life
+ * of the daemon would keep voice transcription off after the condition clears,
+ * so each warmup re-probes the binary that is already on disk. The probe is cheap
+ * and never downloads; the latch only exists to stop re-downloading per message.
+ */
+export async function reprobeUnsupportedLatch(
+  latch: string | null,
+  binaryPath: string,
+): Promise<string | null> {
+  if (!latch) return null;
+  return (await binaryIsRunnable(binaryPath)) ? null : latch;
+}
+
 async function prepareWhisperAssets(printOutput: boolean): Promise<void> {
   const startedAt = Date.now();
+  const binaryPath = getWhisperBinaryPath();
   // Fail fast instead of re-downloading a known-bad archive on every message.
+  unsupportedPlatform = await reprobeUnsupportedLatch(unsupportedPlatform, binaryPath);
   if (unsupportedPlatform) throw new Error(unsupportedPlatform);
   console.log(`whisper warmup: start root=${WHISPER_ROOT} model=${getWhisperModel()}`);
   await mkdir(WHISPER_ROOT, { recursive: true });
   await mkdir(TMP_FOLDER, { recursive: true });
 
-  const binaryPath = getWhisperBinaryPath();
   const action = await decideWarmupAction(binaryPath);
   if (action === "ok") {
     console.log("whisper warmup: binary exists");

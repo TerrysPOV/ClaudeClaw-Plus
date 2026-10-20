@@ -1,12 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { chmod, mkdtemp, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   BINARY_SOURCES,
   assertSharedLibsStaged,
   binaryIsRunnable,
+  collectSharedLibs,
   isWhisperSharedLib,
+  reprobeUnsupportedLatch,
   sharedLibTargets,
   decideWarmupAction,
 } from "../whisper";
@@ -123,6 +125,72 @@ describe("runtime shared libraries", () => {
     expect(targets).toHaveLength(2);
     expect(targets.some((t) => t.endsWith(`/lib/libggml-cpu.so`))).toBe(true);
     expect(targets.some((t) => t.endsWith(`/bin/libggml-cpu.so`))).toBe(true);
+  });
+});
+
+describe("collectSharedLibs", () => {
+  // Mirrors the pinned linux-arm64 tarball: whisper-cli is linked against
+  // libggml.so.0 and libwhisper.so.1, which are symlinks to the versioned files.
+  async function arm64Layout(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "whisper-libs-"));
+    const root = join(dir, "whisper-bin-ubuntu-arm64");
+    await mkdir(root);
+    await writeFile(join(root, "libggml.so.0.20.2"), "ggml-bytes");
+    await symlink("libggml.so.0.20.2", join(root, "libggml.so.0"));
+    await symlink("libggml.so.0", join(root, "libggml.so"));
+    await writeFile(join(root, "libwhisper.so.1.9.3"), "whisper-bytes");
+    await symlink("libwhisper.so.1.9.3", join(root, "libwhisper.so.1"));
+    await writeFile(join(root, "libggml-cpu.so"), "cpu-bytes");
+    await writeFile(join(root, "libparakeet.so.1.9.3"), "unrelated");
+    await writeFile(join(root, "whisper-cli"), "bin");
+    return dir;
+  }
+
+  test("stages the SONAME symlinks the loader asks for, not only the versioned files", async () => {
+    const libs = await collectSharedLibs(await arm64Layout());
+    const names = libs.map((l) => l.name).sort();
+    expect(names).toContain("libggml.so.0");
+    expect(names).toContain("libwhisper.so.1");
+    expect(names).toContain("libggml.so.0.20.2");
+    expect(names).toContain("libwhisper.so.1.9.3");
+    expect(names).toContain("libggml-cpu.so");
+  });
+
+  test("a staged symlink reads as its target's bytes", async () => {
+    const libs = await collectSharedLibs(await arm64Layout());
+    const soname = libs.find((l) => l.name === "libggml.so.0");
+    expect(soname).toBeDefined();
+    expect(await readFile(soname?.srcPath as string, "utf8")).toBe("ggml-bytes");
+  });
+
+  test("leaves out unrelated libraries and the binary", async () => {
+    const names = (await collectSharedLibs(await arm64Layout())).map((l) => l.name);
+    expect(names).not.toContain("libparakeet.so.1.9.3");
+    expect(names).not.toContain("whisper-cli");
+  });
+
+  test("a dangling library symlink fails loudly instead of being skipped", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "whisper-libs-"));
+    await symlink("libggml.so.0.20.2", join(dir, "libggml.so.0"));
+    await expect(collectSharedLibs(dir)).rejects.toThrow();
+  });
+});
+
+describe("unsupported-platform latch", () => {
+  const LATCH = "whisper: downloaded binary is not runnable";
+
+  test("stays unset when nothing was latched", async () => {
+    expect(await reprobeUnsupportedLatch(null, join(tmpdir(), "no-such-whisper-cli"))).toBeNull();
+  });
+
+  test("releases once the binary on disk runs again", async () => {
+    // A single failed probe can be transient (memory pressure, fd exhaustion).
+    // process.execPath is present and exits 0 on --help.
+    expect(await reprobeUnsupportedLatch(LATCH, process.execPath)).toBeNull();
+  });
+
+  test("holds while the binary still will not run", async () => {
+    expect(await reprobeUnsupportedLatch(LATCH, join(tmpdir(), "no-such-whisper-cli"))).toBe(LATCH);
   });
 });
 
