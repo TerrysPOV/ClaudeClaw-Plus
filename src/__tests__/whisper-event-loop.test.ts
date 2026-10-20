@@ -31,9 +31,11 @@ beforeEach(async () => {
   await writeFile(join(root, "settings.json"), "{}");
   await writeFile(join(whisper, "models", "ggml-base.en.bin"), "model");
   const stub = join(whisper, "bin", "whisper-cli");
+  // `--help` is the warmup runnability probe (binaryIsRunnable). Like the real
+  // whisper-cli it answers at once, so it must not count as a transcription run.
   await writeFile(
     stub,
-    `#!/bin/sh\necho start >> "$STUB_LOG"\nsleep ${STUB_SLEEP_S}\necho end >> "$STUB_LOG"\necho " hello world"\n`,
+    `#!/bin/sh\n[ "$1" = "--help" ] && exit 0\necho start >> "$STUB_LOG"\nsleep ${STUB_SLEEP_S}\necho end >> "$STUB_LOG"\necho " hello world"\n`,
   );
   await chmod(stub, 0o755);
   await writeFile(join(cwd, "in.wav"), "RIFF");
