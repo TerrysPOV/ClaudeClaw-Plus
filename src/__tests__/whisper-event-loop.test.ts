@@ -67,7 +67,10 @@ async function runHarness(
     proc.exited,
   ]);
   if (code !== 0) throw new Error(`harness exited ${code}: ${err}`);
-  const line = out.split("\n").filter((l) => l.startsWith("{")).pop() as string;
+  const line = out
+    .split("\n")
+    .filter((l) => l.startsWith("{"))
+    .pop() as string;
   return JSON.parse(line);
 }
 
@@ -76,6 +79,7 @@ describe("whisper transcription off the event loop (#279)", () => {
     const r = (await runHarness("loop")) as { timerMs: number; totalMs: number; text: string };
     expect(r.text).toBe("hello world");
     expect(r.totalMs).toBeGreaterThan(STUB_SLEEP_S * 1000 * 0.9);
+    // With Bun.spawnSync on the whisper run the timer waits out the whole run (seen RED: ~1270 ms).
     expect(r.timerMs).toBeLessThan(400);
   });
 
@@ -84,10 +88,7 @@ describe("whisper transcription off the event loop (#279)", () => {
     const fakeBin = join(cwd, "fakebin");
     await mkdir(fakeBin);
     const fakeNode = join(fakeBin, "node");
-    await writeFile(
-      fakeNode,
-      `#!/bin/sh\nsleep ${STUB_SLEEP_S}\necho boom >&2\nexit 3\n`,
-    );
+    await writeFile(fakeNode, `#!/bin/sh\nsleep ${STUB_SLEEP_S}\necho boom >&2\nexit 3\n`);
     await chmod(fakeNode, 0o755);
     const ogg = join(cwd, "in.ogg");
     await writeFile(ogg, "OggS");
@@ -97,6 +98,7 @@ describe("whisper transcription off the event loop (#279)", () => {
     })) as { timerMs: number; totalMs: number; message: string };
     expect(r.message).toBe("node decode failed (exit 3): boom");
     expect(r.totalMs).toBeGreaterThan(STUB_SLEEP_S * 1000 * 0.9);
+    // With spawnSync on the node converter the timer waits out the decode (seen RED: ~1190 ms).
     expect(r.timerMs).toBeLessThan(400);
   });
 
@@ -104,8 +106,10 @@ describe("whisper transcription off the event loop (#279)", () => {
     const r = (await runHarness("queue")) as { ticks: number; totalMs: number; texts: string[] };
     expect(r.texts).toEqual(["hello world", "hello world"]);
     const events = (await readFile(logPath, "utf8")).trim().split("\n");
+    // Without the queue the runs overlap: start, start, end, end (seen RED).
     expect(events).toEqual(["start", "end", "start", "end"]);
     expect(r.totalMs).toBeGreaterThan(STUB_SLEEP_S * 1000 * 1.8);
+    // A blocking spawn leaves the interval almost silent (seen RED: 1 tick, want > 20).
     expect(r.ticks).toBeGreaterThan(20);
   });
 });

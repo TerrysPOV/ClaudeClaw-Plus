@@ -438,11 +438,14 @@ async function transcribeLocal(inputPath: string, log: WhisperDebugLog): Promise
   const modelPath = getModelPath();
 
   const runTranscription = async () => {
-    const proc = await spawnCaptured([binaryPath, "-m", modelPath, "-f", wavPath, "--no-timestamps"], {
-      ...process.env,
-      LD_LIBRARY_PATH: [LIB_DIR, process.env.LD_LIBRARY_PATH].filter(Boolean).join(":"),
-      DYLD_LIBRARY_PATH: [LIB_DIR, process.env.DYLD_LIBRARY_PATH].filter(Boolean).join(":"),
-    });
+    const proc = await spawnCaptured(
+      [binaryPath, "-m", modelPath, "-f", wavPath, "--no-timestamps"],
+      {
+        ...process.env,
+        LD_LIBRARY_PATH: [LIB_DIR, process.env.LD_LIBRARY_PATH].filter(Boolean).join(":"),
+        DYLD_LIBRARY_PATH: [LIB_DIR, process.env.DYLD_LIBRARY_PATH].filter(Boolean).join(":"),
+      },
+    );
 
     if (proc.exitCode !== 0) {
       throw new Error(
