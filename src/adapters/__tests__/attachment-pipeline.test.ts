@@ -212,8 +212,9 @@ describe("attachment-pipeline — processAttachments", () => {
 
     /** Fetch stub whose body is `chunks` x CHUNK bytes of `fill`, no Content-Length. */
     function streamFetch(chunks: number, fill = 0x61) {
-      const state = { pulled: 0, cancelled: false };
-      const fetchFn = (async () => {
+      const state = { pulled: 0, cancelled: false, signal: undefined as AbortSignal | undefined };
+      const fetchFn = (async (_input: string | URL | Request, init?: RequestInit) => {
+        state.signal = init?.signal ?? undefined;
         const body = new ReadableStream<Uint8Array>({
           pull(ctrl) {
             if (state.pulled >= chunks) {
@@ -244,8 +245,12 @@ describe("attachment-pipeline — processAttachments", () => {
       expect(p.note).toContain("downloaded size");
       expect(p.note).toContain("exceeds limit");
       expect(logs.some((l) => l.includes("downloaded") && l.includes("exceeds limit"))).toBe(true);
-      expect(state.cancelled).toBe(true);
+      // Without the cap check all 100 chunks are pulled (seen RED: Received 100).
       expect(state.pulled).toBeLessThan(20);
+      // Without controller.abort() the download signal stays live (seen RED).
+      expect(state.signal?.aborted).toBe(true);
+      // Without reader.cancel() the source stream is never told to stop (seen RED).
+      expect(state.cancelled).toBe(true);
     });
 
     it("accepts an under-cap stream byte for byte", async () => {

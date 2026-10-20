@@ -126,7 +126,7 @@ async function readBodyCapped(
   res: Response,
   maxBytes: number,
   controller: AbortController,
-): Promise<{ bytes: Buffer; overflow?: undefined } | { overflow: number }> {
+): Promise<{ bytes: Buffer } | { overflow: number }> {
   if (!res.body) return { bytes: Buffer.alloc(0) };
   const reader = res.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -265,7 +265,7 @@ export async function processAttachments(
         continue;
       }
       const read = await readBodyCapped(res, cfg.maxBytes, controller);
-      if (read.overflow !== undefined) {
+      if ("overflow" in read) {
         log(`attachment '${att.filename}' skipped: downloaded ${read.overflow} exceeds limit`);
         out.push({
           ...base,
