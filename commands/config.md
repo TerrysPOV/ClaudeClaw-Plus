@@ -300,7 +300,8 @@ Location: `.claude/claudeclaw/settings.json`
 | `heartbeat.excludeWindows[].end`   | string | Window end time in `HH:MM` 24h format         |
 | `heartbeat.forwardToTelegram`      | boolean | Forward heartbeat output to Telegram (`false` suppresses `HEARTBEAT_OK`) |
 | `telegram.token`           | string     | Bot token from @BotFather                      |
-| `telegram.allowedUserIds`  | number[]   | Telegram user IDs allowed to interact          |
+| `telegram.allowedUserIds`  | number[]   | Telegram user IDs allowed to interact (empty = nobody) |
+| `telegram.allowAllUsers`   | boolean    | Accept every Telegram user (default `false`)   |
 | `security.level`           | string     | `locked` \| `strict` \| `moderate` \| `unrestricted` |
 | `security.allowedTools`    | string[]   | Extra tools to allow                           |
 | `security.disallowedTools` | string[]   | Tools to block                                 |

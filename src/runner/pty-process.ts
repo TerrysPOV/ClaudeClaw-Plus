@@ -28,10 +28,14 @@
  *   Pre-allocate via `--session-id <uuid>` for fresh spawns when
  *   `opts.newSessionId` is provided. The TUI does NOT print a session UUID at
  *   startup. When neither `sessionId` nor `newSessionId` is provided, we spawn
- *   without any session flag and Claude allocates internally.
+ *   without any session flag and Claude allocates internally. An untrusted
+ *   one-shot (`isolation: "untrusted"`) takes neither flag even when an id is
+ *   set: `buildClaudeArgs` returns early with `--no-session-persistence`.
  */
 import { spawn as ptySpawn, type IPty } from "bun-pty";
 import type { SecurityConfig } from "../config";
+import { UNTRUSTED_CLAUDE_ARGS } from "../oneshot/isolation.js";
+import { cliModelFlag } from "../oneshot/model.js";
 import { withCleanProcessEnv } from "../runner";
 import {
   createParser,
@@ -42,6 +46,7 @@ import {
   markSentinelWritten,
   resetTurn,
   startTurn,
+  stripAnsi,
   tick,
   type Parser,
 } from "./pty-output-parser";
@@ -49,11 +54,33 @@ import {
 // pull it from `pty-process` (and through `runner/index`) keep working without
 // loading bun-pty just to get the helper.
 import { sanitizePtyPromptText } from "./pty-prompt-sanitizer";
+import { appendFileSync } from "node:fs";
+
+/**
+ * Raw PTY trace, off unless `CLAUDECLAW_PTY_DUMP=<file>` is set. Every chunk
+ * claude emits and every write we make lands in the file, timestamped, with
+ * the parser state at that instant. Issue #369 was found this way: a
+ * standalone capture harness reproduces claude's boot but not our input
+ * protocol, so its silence says nothing about the daemon (see the issue's
+ * caveat) — this trace is the daemon's own bytes. Best-effort: a failed write
+ * never touches the turn.
+ */
+function dumpPtyTrace(tag: string, payload: string): void {
+  const file = process.env.CLAUDECLAW_PTY_DUMP;
+  if (!file) return;
+  try {
+    appendFileSync(file, `\n@@${new Date().toISOString()} ${tag}\n${payload}`, { mode: 0o600 });
+  } catch {
+    /* diagnostic only */
+  }
+}
 export { sanitizePtyPromptText };
 
 // ─── Public types (FROZEN per SPEC §3.1) ────────────────────────────────────
 
 export interface PtyProcessOptions {
+  /** One-shot isolation overrides every persona, resume and permission flag. */
+  isolation?: "untrusted" | "trusted-session";
   /** Existing Claude Code session ID to resume via `claude --resume <id>`.
    *  Empty string means "no resume". */
   sessionId: string;
@@ -244,6 +271,12 @@ const DEFAULT_QUIET_TICK_MS = 50;
 const DEFAULT_COLS = 100;
 const DEFAULT_ROWS = 30;
 const DEFAULT_PERMISSION_MODE_ARGS = ["--dangerously-skip-permissions"];
+/** Bracketed-paste markers (xterm mode 2004, which claude's TUI turns on) (#559). */
+const PASTE_START = "\x1b[200~";
+const PASTE_END = "\x1b[201~";
+
+/** Delay between the project MCP server dialog showing and its Esc (#469). */
+const MCP_DIALOG_ANSWER_DELAY_MS = 500;
 /**
  * Hard cap on the tail ring buffer that captures pre-settle PTY output for
  * the issue #176 diagnostic snapshot. 8 KiB is enough to hold a typical
@@ -295,6 +328,13 @@ function buildClaudeArgs(opts: PtyProcessOptions): string[] {
 
   const args: string[] = [];
 
+  if (opts.isolation === "untrusted") {
+    const model = cliModelFlag(opts.modelOverride);
+    if (model) args.push("--model", model);
+    args.push(...UNTRUSTED_CLAUDE_ARGS);
+    return args;
+  }
+
   if (opts.securityArgs && opts.securityArgs.length > 0) {
     args.push(...opts.securityArgs);
   } else {
@@ -321,10 +361,8 @@ function buildClaudeArgs(opts: PtyProcessOptions): string[] {
     args.push("--session-id", opts.newSessionId);
   }
 
-  const model = (opts.modelOverride ?? "").trim();
-  if (model.length > 0 && model.toLowerCase() !== "glm") {
-    args.push("--model", model);
-  }
+  const model = cliModelFlag(opts.modelOverride);
+  if (model) args.push("--model", model);
 
   if (opts.appendSystemPrompt && opts.appendSystemPrompt.length > 0) {
     args.push("--append-system-prompt", opts.appendSystemPrompt);
@@ -506,6 +544,10 @@ class PtyProcessImpl implements PtyProcess {
     // bun-pty delivers strings; re-encode for the byte-level parser.
     const bytes = new TextEncoder().encode(data);
     const now = this._now();
+    dumpPtyTrace(
+      `<< pid=${this._pid} state=${this._parser.state} turn=${this._turnInProgress} n=${bytes.length}`,
+      data,
+    );
     if (this._firstDataAt === 0) this._firstDataAt = now;
 
     // Buffer for the current turn (so idle-fallback can return content).
@@ -628,8 +670,18 @@ class PtyProcessImpl implements PtyProcess {
 
     // Write prompt + CR (TUI submits on Enter). Sanitize embedded CR/LF so
     // they don't submit mid-prompt.
+    //
+    // Issue #559: the prompt goes in as a bracketed paste. claude's TUI reads
+    // a burst of input as a paste when it is long enough (64+ bytes with CLI
+    // 2.1.296), and a CR inside that paste is kept as text, not Enter: the
+    // prompt sits in the input box and the turn times out. The clock prefix
+    // `runUserMessage` adds pushes nearly every chat prompt past that size.
+    // With explicit paste markers the TUI knows where the text ends, so the
+    // CR after them is a keypress whatever the length. The sanitizer strips
+    // ESC, so the prompt cannot close the paste early.
     try {
-      this._pty.write(sanitizePtyPromptText(prompt) + "\r");
+      dumpPtyTrace(`>> pid=${this._pid} write prompt`, `${JSON.stringify(prompt).slice(0, 80)}+CR`);
+      this._pty.write(`${PASTE_START}${sanitizePtyPromptText(prompt)}${PASTE_END}\r`);
     } catch (err) {
       this._turnInProgress = false;
       this._activeSentinelBytes = null;
@@ -674,6 +726,7 @@ class PtyProcessImpl implements PtyProcess {
     if (!this._turnInProgress || !this._activeSentinelBytes) return;
     if (this._parser.state !== "accumulating") return;
     try {
+      dumpPtyTrace(`>> pid=${this._pid} write sentinel`, "");
       this._pty.write(this._activeSentinelString);
     } catch (err) {
       this._rejectTurn(err instanceof Error ? err : new Error(String(err)));
@@ -887,12 +940,35 @@ class PtyProcessImpl implements PtyProcess {
    *   2. Wait for `quietWindowMs` of NO new data (TUI finished painting
    *      and is silent at the input prompt).
    * On every incoming chunk after phase 1, reset the quiet timer.
+   *
+   * Issue #460: on a fresh HOME, `--dangerously-skip-permissions` opens the
+   * "Bypass Permissions mode" warning before the REPL, with "No, exit"
+   * PRESELECTED. It goes quiet like a painted REPL, so pre-fix this resolved,
+   * the first runTurn's CR confirmed "No, exit", and claude exited 1. Answer
+   * it here the way the bus does (#193): Down, then Enter, once — never a
+   * blind Enter. After answering, settle waits for the REPL footer ("tab to
+   * cycle") instead of the first quiet gap, with a fresh hard-timeout window
+   * — so a spawn that hits the dialog can take up to 2 × `timeoutMs`. Only a
+   * dialog painted inside the settle window is answered.
+   *
+   * Issue #469: a cwd whose project has an unapproved `.mcp.json` opens "New
+   * MCP server found in this project" before that warning. Pre-fix, settle
+   * resolved on it and the first prompt's CR dismissed it, so the prompt was
+   * lost to the bypass dialog behind it and the turn timed out. Reject it with
+   * Esc, once: "continue without" in the single-server dialog and "reject all"
+   * in the multi-select, whose servers are all pre-checked (an Enter there
+   * would enable every one), 500 ms after it shows. Then wait for the REPL
+   * as above, in a fresh hard-timeout window opened when the dialog showed.
    */
   _waitForReadySettle(timeoutMs: number): Promise<void> {
     return new Promise<void>((resolve) => {
       let resolved = false;
       let quietTimer: ReturnType<typeof setTimeout> | null = null;
       const originalHandler = this._handleData.bind(this);
+      let bootRaw = "";
+      let answeredBypass = false;
+      let mcpTimer: ReturnType<typeof setTimeout> | null = null;
+      let awaitingRepl = false;
 
       const done = () => {
         if (resolved) return;
@@ -905,15 +981,39 @@ class PtyProcessImpl implements PtyProcess {
         resolve();
       };
 
+      const onQuiet = () => {
+        // Dialog answered but the REPL has not painted yet: a quiet gap here
+        // is the TUI switching screens, not a settled REPL. The hard timer
+        // still bounds the wait; an exit (no more data) falls through to it.
+        if (awaitingRepl && this._alive) {
+          scheduleQuiet();
+          return;
+        }
+        done();
+      };
+
       const scheduleQuiet = () => {
         if (quietTimer) this._clearTimeout(quietTimer);
-        quietTimer = this._setTimeout(done, this._quietWindowMs);
+        quietTimer = this._setTimeout(onQuiet, this._quietWindowMs);
       };
 
       // Hard timeout: if the TUI never paints AT ALL within timeoutMs,
       // resolve anyway and let the caller proceed. This also guards
       // against a TUI that paints forever without ever going quiet.
-      const hardTimer = this._setTimeout(done, timeoutMs);
+      let hardTimer = this._setTimeout(done, timeoutMs);
+
+      const sendKey = (key: string) => {
+        try {
+          this._pty.write(key);
+        } catch {
+          /* pty may have exited — the settle check after resolve reports it */
+        }
+      };
+
+      const rejectMcp = () => {
+        dumpPtyTrace(`>> pid=${this._pid} reject project MCP server dialog`, "Esc");
+        sendKey("\x1b");
+      };
 
       // Patch _handleData to reset the quiet timer on every incoming
       // chunk. The quiet timer only starts firing after the first chunk
@@ -921,6 +1021,33 @@ class PtyProcessImpl implements PtyProcess {
       // elapsed with no further chunks (paint finished).
       this._handleData = (data: string) => {
         originalHandler(data);
+        // Strip the accumulated raw text, not each chunk: an escape sequence
+        // can straddle chunks. stripAnsi expands the cursor moves claude
+        // uses as word gaps (CHA, CUF) so "Yes, I accept" stays matchable.
+        bootRaw = (bootRaw + data).slice(-4000);
+        const bootText = stripAnsi(bootRaw);
+        // REPL footer first, so a key is never injected into a live REPL.
+        if (/tab\s*to\s*cycle/.test(bootText)) {
+          awaitingRepl = false;
+          // The REPL is up: an Esc still pending would land in it. The timer
+          // stays set so the dialog is never answered after this.
+          if (mcpTimer) this._clearTimeout(mcpTimer);
+        } else if (!mcpTimer && /MCP\s*servers?\s*found\s*in\s*this\s*project/.test(bootText)) {
+          // Not straight away: claude 2.1.300 swallows an Esc sent while the
+          // dialog paints (lost at 100 ms, taken from 200 ms).
+          awaitingRepl = true;
+          mcpTimer = this._setTimeout(rejectMcp, MCP_DIALOG_ANSWER_DELAY_MS);
+          this._clearTimeout(hardTimer);
+          hardTimer = this._setTimeout(done, timeoutMs);
+        } else if (!answeredBypass && /Yes,\s*I\s*accept/.test(bootText)) {
+          answeredBypass = true;
+          awaitingRepl = true;
+          dumpPtyTrace(`>> pid=${this._pid} answer bypass-permissions dialog`, "Down+CR");
+          sendKey("\x1b[B");
+          this._setTimeout(() => sendKey("\r"), 200);
+          this._clearTimeout(hardTimer);
+          hardTimer = this._setTimeout(done, timeoutMs);
+        }
         scheduleQuiet();
       };
 

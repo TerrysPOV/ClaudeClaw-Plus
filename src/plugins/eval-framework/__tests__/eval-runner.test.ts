@@ -1,9 +1,23 @@
-import { describe, it, expect, beforeEach, afterEach, mock } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, mock, afterAll } from "bun:test";
 import { randomUUID } from "node:crypto";
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
 
 const auditEvents: { event: string; payload: unknown }[] = [];
+
+// #304: `mock.module` is process-global and outlives this file — every test
+// file bun loads after it would see these fakes in place of the real modules
+// (the mcp-multiplexer suites failed 10+ tests in the pack and 0 alone).
+// Keep the real exports so `afterAll` can put them back.
+const real0 = { ...(await import("../../mcp-bridge.js")) };
+const real1 = { ...(await import("../../http-gateway.js")) };
+const real2 = { ...(await import("@anthropic-ai/sdk")) };
+
+afterAll(() => {
+  mock.module("../../mcp-bridge.js", () => real0);
+  mock.module("../../http-gateway.js", () => real1);
+  mock.module("@anthropic-ai/sdk", () => real2);
+});
 
 mock.module("../../mcp-bridge.js", () => ({
   getMcpBridge: () => ({

@@ -210,6 +210,12 @@ export class McpServerProcess {
     }
     const content = (result as { content?: Array<{ text?: string }> }).content?.[0];
     const text = content?.text ?? "";
+    // A tool that ran and failed answers with a normal result carrying
+    // `isError: true` (MCP spec), not a JSON-RPC error. Surface it as one,
+    // so callers record, count and return it as a failure rather than a value.
+    if ((result as { isError?: unknown }).isError === true) {
+      throw new Error(text || `Tool ${tool} returned an error result`);
+    }
     try {
       return JSON.parse(text);
     } catch {

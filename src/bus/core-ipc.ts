@@ -148,6 +148,8 @@ export interface IpcServer {
   send(agentId: string, msg: IpcMessage): boolean;
   /** Number of live connections. */
   connectionCount(): number;
+  /** Whether a live connection is registered for this agent_id. */
+  hasConnection(agentId: string): boolean;
 }
 
 /**
@@ -341,6 +343,9 @@ export async function bindUdsServer(path: string, handlers: IpcServerHandlers): 
     },
     connectionCount() {
       return allSockets.size;
+    },
+    hasConnection(agentId) {
+      return connectionsByAgent.has(agentId);
     },
   };
 }

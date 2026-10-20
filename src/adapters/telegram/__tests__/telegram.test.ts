@@ -15,14 +15,16 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { TelegramAdapter, extractReactionDirectives } from "../index";
+import { TelegramOutbox } from "../../../telegram-outbox";
+import type { QuietHoursState } from "../../../quiet-hours";
 import type { BusCore, SendPromptRequest } from "../../../bus/core";
 import type {
   Subscription,
   SubscriptionFilter,
   SubscriptionHandler,
 } from "../../../bus/core-subscription";
-import { type BusEvent, TAILER_EVENT_SOURCE } from "../../../bus/types";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { type BusEvent, type BusEventTopic, TAILER_EVENT_SOURCE } from "../../../bus/types";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -157,7 +159,9 @@ class FakeTelegramApi implements TelegramApi {
     message_id: number;
     text: string;
     parse_mode?: "HTML";
+    reply_markup?: { inline_keyboard: TelegramInlineKeyboardButton[][] };
   }> = [];
+  public readonly deletes: Array<{ chat_id: number; message_id: number }> = [];
   public readonly reactions: SetReactionCall[] = [];
   public readonly callbackAcks: AnswerCallbackCall[] = [];
   /** #201: count inbound polls so send-only configs can assert zero. */
@@ -209,9 +213,15 @@ class FakeTelegramApi implements TelegramApi {
     message_id: number;
     text: string;
     parse_mode?: "HTML";
+    reply_markup?: { inline_keyboard: TelegramInlineKeyboardButton[][] };
   }): Promise<{ ok: boolean; result?: { message_id: number } | true }> {
     this.editMessages.push(params);
     return { ok: true, result: true };
+  }
+
+  async deleteMessage(params: { chat_id: number; message_id: number }): Promise<{ ok: boolean }> {
+    this.deletes.push(params);
+    return { ok: true };
   }
 
   async setMessageReaction(params: SetReactionCall): Promise<{ ok: boolean }> {
@@ -645,11 +655,12 @@ describe("TelegramAdapter — response.text outbound", () => {
     );
   });
 
-  it("converts markdown on an in-place edit too (progress → final)", async () => {
+  it("converts markdown on a final that follows a progress reply too", async () => {
     adapter = await startAdapter();
     await feedInbound();
 
-    // Progress opens a live turn (fresh send); final edits it in place.
+    // Progress opens a live turn (fresh send); the final goes out as a new
+    // message (so it notifies) and the progress message is deleted.
     bus.emit({
       ts: Date.now(),
       agent_id: "triage",
@@ -665,9 +676,9 @@ describe("TelegramAdapter — response.text outbound", () => {
       topic: "response.text",
       payload: { text: "**done**", intent: "final" },
     });
-    await waitFor(() => api.editMessages.some((e) => e.text === "<b>done</b>"));
-    const edit = api.editMessages.find((e) => e.text === "<b>done</b>");
-    expect(edit?.parse_mode).toBe("HTML");
+    await waitFor(() => api.sendMessages.length === 2);
+    expect(api.sendMessages[1]?.text).toBe("<b>done</b>");
+    expect(api.sendMessages[1]?.parse_mode).toBe("HTML");
   });
 
   it("prefixes a synthesized (safety-net) final with the uncurated-output notice (#240)", async () => {
@@ -704,13 +715,13 @@ describe("TelegramAdapter — response.text outbound", () => {
     expect(api.sendMessages[0]?.text).toBe("curated answer");
   });
 
-  it("prefixes the notice on the edit-in-place path when a turn is live (#240)", async () => {
+  it("prefixes the notice on a final that closes a live turn (#240)", async () => {
     adapter = await startAdapter();
     await feedInbound();
 
-    // Progress reply opens a live turn (fresh message + spinner) so the
-    // following final edits in place instead of sending fresh — the dominant
-    // path for a normal prompted turn, distinct from the send-fresh tests above.
+    // Progress reply opens a live turn (fresh message + spinner); the final
+    // then replaces it as a new message — the dominant path for a normal
+    // prompted turn, distinct from the no-live-turn tests above.
     bus.emit({
       ts: Date.now(),
       agent_id: "triage",
@@ -727,10 +738,11 @@ describe("TelegramAdapter — response.text outbound", () => {
       topic: "response.text",
       payload: { text: "raw turn output", intent: "final", synthesized: true },
     });
-    await waitFor(() => api.editMessages.some((e) => e.text.startsWith("⚠️")));
-    const edit = api.editMessages.find((e) => e.text.startsWith("⚠️"));
-    expect(edit?.text).toContain("without sending a reply");
-    expect(edit?.text).toContain("raw turn output");
+    await waitFor(() => api.sendMessages.length === 2);
+    const sent = api.sendMessages[1];
+    expect(sent?.text.startsWith("⚠️")).toBe(true);
+    expect(sent?.text).toContain("without sending a reply");
+    expect(sent?.text).toContain("raw turn output");
   });
 
   it("does not emit a lone notice for a reaction-only synthesized final (#240)", async () => {
@@ -832,7 +844,7 @@ describe("TelegramAdapter — response.text outbound", () => {
     });
     await waitFor(() => api.sendMessages.length === 1);
 
-    // Final reply edits the live message in place, then evicts the entry.
+    // Final reply goes out as a new message and evicts the live entry.
     bus.emit({
       ts: Date.now(),
       agent_id: "triage",
@@ -840,7 +852,7 @@ describe("TelegramAdapter — response.text outbound", () => {
       topic: "response.text",
       payload: { text: "done", intent: "final" },
     });
-    await waitFor(() => api.editMessages.some((e) => e.text === "done"));
+    await waitFor(() => api.sendMessages.length === 2 && api.deletes.length === 1);
     const editsAfterFinal = api.editMessages.length;
 
     // edit_message now: the entry was evicted, so it must NOT edit a stale
@@ -852,9 +864,9 @@ describe("TelegramAdapter — response.text outbound", () => {
       topic: "response.edit_text",
       payload: { text: "afterthought" },
     });
-    await waitFor(() => api.sendMessages.length === 2);
+    await waitFor(() => api.sendMessages.length === 3);
     expect(api.editMessages.length).toBe(editsAfterFinal);
-    expect(api.sendMessages[1]?.text).toBe("afterthought");
+    expect(api.sendMessages[2]?.text).toBe("afterthought");
   });
 
   it("routes response.text to origin_id when origin is telegram (issue #139)", async () => {
@@ -1081,6 +1093,181 @@ describe("TelegramAdapter — permission flow", () => {
     expect(api.callbackAcks[0]?.text).toBe("Unauthorized.");
     expect(bus.permissionDecisions).toHaveLength(0);
   });
+
+  it("rejects a permission button from anyone when allowedUserIds is empty", async () => {
+    adapter = await startAdapter({ allowedUserIds: [] });
+    api.enqueueUpdates([
+      {
+        callback_query: {
+          id: "cb3",
+          from: { id: 42 },
+          data: "perm:allow:qwert",
+        },
+      },
+    ]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("Unauthorized.");
+    expect(bus.permissionDecisions).toHaveLength(0);
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* pending-action buttons (pending:<id>:<value> from the operator's pending.py) */
+/* ────────────────────────────────────────────────────────────────────── */
+
+describe("TelegramAdapter — pending-action buttons", () => {
+  let libDir: string;
+  let savedLibPath: string | undefined;
+
+  beforeEach(() => {
+    savedLibPath = process.env.CLAUDECLAW_PENDING_LIB_PATH;
+    libDir = mkdtempSync(join(tmpdir(), "cc-pending-lib-"));
+    // A stand-in for the operator's pending.py: records the call, answers "ok".
+    writeFileSync(
+      join(libDir, "pending.py"),
+      [
+        "import os, sys",
+        "def resolve_pending_ex(action_id, decision):",
+        "    with open(os.path.join(os.path.dirname(__file__), 'calls.txt'), 'a') as f:",
+        "        f.write(f'{action_id} {decision}\\n')",
+        "    return 'ok'",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  afterEach(() => {
+    if (savedLibPath === undefined) delete process.env.CLAUDECLAW_PENDING_LIB_PATH;
+    else process.env.CLAUDECLAW_PENDING_LIB_PATH = savedLibPath;
+    rmSync(libDir, { recursive: true, force: true });
+  });
+
+  it("hands a pending:<id>:<value> tap to the resolver, acks, and strips the keyboard", async () => {
+    process.env.CLAUDECLAW_PENDING_LIB_PATH = libDir;
+    adapter = await startAdapter();
+    api.enqueueUpdates([
+      {
+        callback_query: {
+          id: "cb-pending",
+          from: { id: 42 },
+          data: "pending:2623:pay",
+          message: {
+            message_id: 19090,
+            chat: { id: 100, type: "private" },
+            text: "Avis de jugement — 154 $",
+          },
+        },
+      },
+    ]);
+    await waitFor(() => api.callbackAcks.length > 0);
+
+    // The operator's resolver saw exactly the id and value from the button.
+    const calls = readFileSync(join(libDir, "calls.txt"), "utf8").trim();
+    expect(calls).toBe("2623 pay");
+
+    // The ack names the decision instead of a spinner-only silent drop.
+    expect(api.callbackAcks[0]?.callback_query_id).toBe("cb-pending");
+    expect(api.callbackAcks[0]?.text).toBe("↩︎ Décision enregistrée — pay");
+
+    // The message records the decision and loses its buttons.
+    const edit = api.editMessages[0];
+    expect(edit?.message_id).toBe(19090);
+    expect(edit?.text).toBe("Avis de jugement — 154 $\n\n› ↩︎ Décision enregistrée — pay");
+    expect(edit?.reply_markup?.inline_keyboard).toEqual([]);
+    // And it never masquerades as a permission decision.
+    expect(bus.permissionDecisions).toHaveLength(0);
+  });
+
+  it("acks `not_found` and strips the keyboard — the buttons point at nothing", async () => {
+    writeFileSync(
+      join(libDir, "pending.py"),
+      "def resolve_pending_ex(action_id, decision):\n    return 'not_found'\n",
+    );
+    process.env.CLAUDECLAW_PENDING_LIB_PATH = libDir;
+    adapter = await startAdapter();
+    api.enqueueUpdates([
+      {
+        callback_query: {
+          id: "cb-gone",
+          from: { id: 42 },
+          data: "pending:99999:approve",
+          message: { message_id: 7, chat: { id: 100, type: "private" }, text: "old" },
+        },
+      },
+    ]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("⚠️ Action introuvable");
+    expect(api.editMessages[0]?.text).toBe("old\n\n› ⚠️ Action introuvable");
+    expect(api.editMessages[0]?.reply_markup?.inline_keyboard).toEqual([]);
+  });
+
+  it("asks for a retry and keeps the buttons when the resolver crashes (no verdict)", async () => {
+    writeFileSync(
+      join(libDir, "pending.py"),
+      "def resolve_pending_ex(action_id, decision):\n    raise RuntimeError('database is locked')\n",
+    );
+    process.env.CLAUDECLAW_PENDING_LIB_PATH = libDir;
+    adapter = await startAdapter();
+    api.enqueueUpdates([
+      {
+        callback_query: {
+          id: "cb-crash",
+          from: { id: 42 },
+          data: "pending:2623:approve",
+          message: { message_id: 7, chat: { id: 100, type: "private" }, text: "x" },
+        },
+      },
+    ]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("⚠️ Erreur — réessaie");
+    // No verdict → no edit: the retry ack must not delete the buttons it points at.
+    expect(api.editMessages).toHaveLength(0);
+  });
+
+  it("keeps the keyboard on a `details` tap — the action stays pending (#375)", async () => {
+    process.env.CLAUDECLAW_PENDING_LIB_PATH = libDir;
+    adapter = await startAdapter();
+    api.enqueueUpdates([
+      {
+        callback_query: {
+          id: "cb-details",
+          from: { id: 42 },
+          data: "pending:2623:details",
+          message: {
+            message_id: 19090,
+            chat: { id: 100, type: "private" },
+            text: "Avis de jugement — 154 $",
+          },
+        },
+      },
+    ]);
+    await waitFor(() => api.callbackAcks.length > 0);
+
+    // The resolver still ran and answered ok …
+    expect(readFileSync(join(libDir, "calls.txt"), "utf8").trim()).toBe("2623 details");
+    expect(api.callbackAcks[0]?.text).toBe("👀 Consulté");
+    // … but the message is not edited: editing would strip the buttons and
+    // strand an action the resolver deliberately left pending.
+    expect(api.editMessages).toHaveLength(0);
+  });
+
+  it("acks with a configuration error and keeps the buttons when no resolver is configured", async () => {
+    delete process.env.CLAUDECLAW_PENDING_LIB_PATH;
+    adapter = await startAdapter();
+    api.enqueueUpdates([
+      {
+        callback_query: {
+          id: "cb-noconf",
+          from: { id: 42 },
+          data: "pending:1:approve",
+          message: { message_id: 5, chat: { id: 100, type: "private" }, text: "x" },
+        },
+      },
+    ]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("⚠️ Pending action handler not configured");
+    expect(api.editMessages).toHaveLength(0);
+  });
 });
 
 /* ────────────────────────────────────────────────────────────────────── */
@@ -1088,8 +1275,24 @@ describe("TelegramAdapter — permission flow", () => {
 /* ────────────────────────────────────────────────────────────────────── */
 
 describe("TelegramAdapter — allow-list semantics (PR #113 review)", () => {
-  it("empty allowedUserIds = allow all (legacy parity)", async () => {
+  it("empty allowedUserIds = refuse everyone", async () => {
     adapter = await startAdapter({ allowedUserIds: [] });
+    api.enqueueUpdates([
+      {
+        message: {
+          message_id: 1,
+          from: { id: 9999 },
+          chat: { id: 100, type: "private" },
+          text: "anyone home?",
+        },
+      },
+    ]);
+    await waitFor(() => api.sendMessages.some((m) => m.text === "Unauthorized."));
+    expect(bus.prompts).toHaveLength(0);
+  });
+
+  it("allowAllUsers = accept anyone, even with an empty list", async () => {
+    adapter = await startAdapter({ allowedUserIds: [], allowAllUsers: true });
     api.enqueueUpdates([
       {
         message: {
@@ -1100,7 +1303,7 @@ describe("TelegramAdapter — allow-list semantics (PR #113 review)", () => {
         },
       },
     ]);
-    // Should reach the bus (allowed because list is empty), NOT bounce
+    // Should reach the bus (allowAllUsers), NOT bounce
     // with "Unauthorized.".
     await waitFor(() => bus.prompts.length > 0);
     expect(bus.prompts).toHaveLength(1);
@@ -1123,6 +1326,147 @@ describe("TelegramAdapter — allow-list semantics (PR #113 review)", () => {
     await waitFor(() => api.sendMessages.length > 0);
     expect(api.sendMessages[0]?.text).toBe("Unauthorized.");
     expect(bus.prompts).toHaveLength(0);
+  });
+});
+
+describe("TelegramAdapter — allow-list follows a settings reload (#520)", () => {
+  const dm = (message_id: number, from: number) => ({
+    message: { message_id, from: { id: from }, chat: { id: 100, type: "private" }, text: "hi" },
+  });
+
+  it("refuses a user removed from the list after mount, without a restart", async () => {
+    const live = { allowedUserIds: [42, 7], allowAllUsers: false };
+    adapter = await startAdapter({ allowedUserIds: [42, 7], allowlist: () => live });
+    api.enqueueUpdates([dm(1, 7)]);
+    await waitFor(() => bus.prompts.length === 1);
+
+    live.allowedUserIds = [42];
+    api.enqueueUpdates([dm(2, 7)]);
+    await waitFor(() => api.sendMessages.some((m) => m.text === "Unauthorized."));
+    expect(bus.prompts).toHaveLength(1);
+  });
+
+  it("accepts a user added to the list after mount, without a restart", async () => {
+    const live = { allowedUserIds: [42] };
+    adapter = await startAdapter({ allowedUserIds: [42], allowlist: () => live });
+    live.allowedUserIds = [42, 7];
+    api.enqueueUpdates([dm(1, 7)]);
+    await waitFor(() => bus.prompts.length === 1);
+    expect(api.sendMessages.filter((m) => m.text === "Unauthorized.")).toHaveLength(0);
+  });
+
+  it("refuses everyone once allowAllUsers is switched back off", async () => {
+    const live = { allowedUserIds: [] as number[], allowAllUsers: true };
+    adapter = await startAdapter({
+      allowedUserIds: [],
+      allowAllUsers: true,
+      allowlist: () => live,
+    });
+    live.allowAllUsers = false;
+    api.enqueueUpdates([dm(1, 9999)]);
+    await waitFor(() => api.sendMessages.some((m) => m.text === "Unauthorized."));
+    expect(bus.prompts).toHaveLength(0);
+  });
+
+  it("refuses a permission button from a user removed after mount", async () => {
+    const live = { allowedUserIds: [42] };
+    adapter = await startAdapter({ allowlist: () => live });
+    live.allowedUserIds = [];
+    api.enqueueUpdates([
+      { callback_query: { id: "cb4", from: { id: 42 }, data: "perm:allow:qwert" } },
+    ]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("Unauthorized.");
+    expect(bus.permissionDecisions).toHaveLength(0);
+  });
+});
+
+describe("TelegramAdapter — chat-less output re-checks the allow-list (#521)", () => {
+  // Chat 500 is not in routing.chats: it reaches "triage" through
+  // defaultAgentId, so only the last-chat cache can send there. Chat 100 is
+  // the configured fallback.
+  const routing = { chats: { "100": "triage" }, defaultAgentId: "triage" };
+  const msg = (from: number, chat: { id: number; type: string }) => ({
+    message: { message_id: 1, from: { id: from }, chat, text: "hi" },
+  });
+  const cronReply = (text: string) =>
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text, origin: "cron", origin_id: "nightly" },
+    });
+  const sentTo = (chatId: number, text: string) =>
+    api.sendMessages.some((m) => m.chat_id === chatId && m.text.includes(text)) ||
+    api.editMessages.some((m) => m.chat_id === chatId && m.text.includes(text));
+
+  it("stops sending cron output to the last chat once its user is removed", async () => {
+    const warnings: string[] = [];
+    const live = { allowedUserIds: [42, 7] };
+    adapter = await startAdapter({
+      routing,
+      allowlist: () => live,
+      logger: { ...SILENT_LOGGER, warn: (m: string) => warnings.push(m) },
+    });
+    const dropLogs = () =>
+      warnings.filter((w) => w.includes("no longer in telegram.allowedUserIds")).length;
+    api.enqueueUpdates([msg(7, { id: 500, type: "private" })]);
+    await waitFor(() => bus.prompts.length === 1);
+
+    live.allowedUserIds = [42];
+    cronReply("tick one");
+    await waitFor(() => sentTo(100, "tick one"));
+    expect(sentTo(500, "tick one")).toBe(false);
+    expect(dropLogs()).toBe(1);
+
+    // The entry is purged: re-adding the user does not bring the chat back
+    // until they write again, and the drop is logged once.
+    live.allowedUserIds = [42, 7];
+    cronReply("tick two");
+    await waitFor(() => sentTo(100, "tick two"));
+    expect(sentTo(500, "tick two")).toBe(false);
+    expect(dropLogs()).toBe(1);
+  });
+
+  it("keeps sending cron output to the last chat while its user is allowed", async () => {
+    const live = { allowedUserIds: [42, 7] };
+    adapter = await startAdapter({ routing, allowlist: () => live });
+    api.enqueueUpdates([msg(7, { id: 500, type: "private" })]);
+    await waitFor(() => bus.prompts.length === 1);
+    cronReply("tick kept");
+    await waitFor(() => sentTo(500, "tick kept"));
+    expect(sentTo(100, "tick kept")).toBe(false);
+  });
+
+  it("stops once allowAllUsers is switched off (operator alert)", async () => {
+    const live = { allowedUserIds: [42], allowAllUsers: true };
+    adapter = await startAdapter({ routing, allowlist: () => live });
+    api.enqueueUpdates([msg(9999, { id: 500, type: "private" })]);
+    await waitFor(() => bus.prompts.length === 1);
+
+    live.allowAllUsers = false;
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: { level: "critical", text: "watchdog: stalled", source: "stall-watchdog" },
+    });
+    await waitFor(() => sentTo(100, "stalled"));
+    expect(sentTo(500, "stalled")).toBe(false);
+  });
+
+  it("drops a group cached by a removed user, falling back to routed chats", async () => {
+    const live = { allowedUserIds: [42, 7] };
+    adapter = await startAdapter({ routing, allowlist: () => live });
+    api.enqueueUpdates([msg(7, { id: -300, type: "group" })]);
+    await waitFor(() => bus.prompts.length === 1);
+
+    live.allowedUserIds = [42];
+    cronReply("group tick");
+    await waitFor(() => sentTo(100, "group tick"));
+    expect(sentTo(-300, "group tick")).toBe(false);
   });
 });
 
@@ -1542,6 +1886,7 @@ describe("TelegramAdapter — poll loop recovers from a timed-out getUpdates", (
       },
       sendMessage: (p) => inner.sendMessage(p),
       editMessageText: (p) => inner.editMessageText(p),
+      deleteMessage: (p) => inner.deleteMessage(p),
       setMessageReaction: (p) => inner.setMessageReaction(p),
       answerCallbackQuery: (p) => inner.answerCallbackQuery(p),
     };
@@ -1710,6 +2055,8 @@ describe("TelegramAdapter — inbound receipts (#211)", () => {
     const r = closedReceipts().find((r) => r.message_id === "tg-1");
     expect(r?.final_state).toBe("timeout");
     expect(r?.notes?.superseded).toBe(true);
+    // A timeout always says why: `superseded` is a reason, not only a flag.
+    expect(r?.notes?.reason).toBe("superseded");
   });
 
   it("drains open receipts as timeout(adapter_stopped) on stop()", async () => {
@@ -1739,5 +2086,1067 @@ describe("TelegramAdapter — inbound receipts (#211)", () => {
     expect(closedReceipts().find((r) => r.message_id === "tg-1")?.final_state).toBe(
       "turn_observed",
     );
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* Final reply after a live turn message: new message, not an edit          */
+/* ────────────────────────────────────────────────────────────────────── */
+
+/**
+ * The base fake has no `sendChatAction`, so `handleMessage` throws before it
+ * posts the per-turn placeholder and every older test runs without one. This
+ * subclass completes the real interface (still nothing beyond it) so the
+ * production flow — placeholder → progress edit → final — runs end to end, and
+ * lets a test make one API method reject for chosen calls.
+ */
+class TurnApi extends FakeTelegramApi {
+  failSend: ((p: SendMessageCall) => Error | undefined) | null = null;
+  failEdit: ((p: { message_id: number; text: string }) => Error | undefined) | null = null;
+  failDelete: Error | null = null;
+  /** While set, every editMessageText waits on it — holds an edit in flight. */
+  gateEdit: Promise<void> | null = null;
+
+  async sendChatAction(_p: { chat_id: number; action: "typing" }): Promise<{ ok: boolean }> {
+    return { ok: true };
+  }
+
+  override async sendMessage(
+    params: SendMessageCall,
+  ): Promise<{ ok: boolean; result?: { message_id: number } }> {
+    const err = this.failSend?.(params);
+    if (err) throw err;
+    return super.sendMessage(params);
+  }
+
+  override async editMessageText(params: {
+    chat_id: number;
+    message_id: number;
+    text: string;
+    parse_mode?: "HTML";
+    reply_markup?: { inline_keyboard: TelegramInlineKeyboardButton[][] };
+  }): Promise<{ ok: boolean; result?: { message_id: number } | true }> {
+    if (this.gateEdit) await this.gateEdit;
+    const err = this.failEdit?.(params);
+    if (err) throw err;
+    return super.editMessageText(params);
+  }
+
+  override async deleteMessage(params: {
+    chat_id: number;
+    message_id: number;
+  }): Promise<{ ok: boolean }> {
+    if (this.failDelete) throw this.failDelete;
+    return super.deleteMessage(params);
+  }
+}
+
+describe("TelegramAdapter — final reply is a new message (notifies), placeholder cleaned up", () => {
+  let turnApi: TurnApi;
+  let logs: { warn: string[]; error: string[] };
+
+  function recordingLogger() {
+    return {
+      info: () => {},
+      warn: (...a: unknown[]) => void logs.warn.push(a.map(String).join(" ")),
+      error: (...a: unknown[]) => void logs.error.push(a.map(String).join(" ")),
+    };
+  }
+
+  function emitReply(text: string, intent: "progress" | "final"): void {
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text, intent, origin: "telegram", origin_id: "100" },
+    });
+  }
+
+  /** Inbound in forum topic 7 → the adapter posts its placeholder (id 1001). */
+  async function startTurn(): Promise<number> {
+    turnApi = new TurnApi();
+    api = turnApi;
+    logs = { warn: [], error: [] };
+    adapter = await startAdapter({ api: turnApi, logger: recordingLogger() });
+    turnApi.enqueueUpdates([
+      {
+        message: {
+          message_id: 50,
+          from: { id: 42 },
+          chat: { id: 100, type: "supergroup" },
+          message_thread_id: 7,
+          text: "check my mail",
+        },
+      },
+    ]);
+    await waitFor(() => turnApi.sendMessages.length === 1);
+    const placeholder = turnApi.sendMessages[0];
+    expect(placeholder?.text.endsWith("...")).toBe(true);
+    // Let handleMessage finish its post-send bookkeeping (turnActive + spinner).
+    await new Promise((r) => setTimeout(r, 10));
+    return 1001;
+  }
+
+  const parseError = () =>
+    new Error("Telegram API sendMessage: 400 Bad Request: can't parse entities: unsupported tag");
+
+  it("progress edits the placeholder; the final is SENT as a new message in the thread, placeholder deleted", async () => {
+    const placeholderId = await startTurn();
+
+    emitReply("Looking at your mail…", "progress");
+    await waitFor(() => turnApi.editMessages.length === 1);
+    expect(turnApi.editMessages[0]?.message_id).toBe(placeholderId);
+
+    emitReply("**3 new mails**", "final");
+    await waitFor(() => turnApi.deletes.length === 1);
+
+    expect(turnApi.sendMessages).toHaveLength(2);
+    const final = turnApi.sendMessages[1];
+    expect(final?.text).toBe("<b>3 new mails</b>");
+    expect(final?.parse_mode).toBe("HTML");
+    expect(final?.chat_id).toBe(100);
+    expect(final?.message_thread_id).toBe(7);
+    // The final never went through an edit.
+    expect(turnApi.editMessages.some((e) => e.text.includes("3 new mails"))).toBe(false);
+    expect(turnApi.deletes[0]).toEqual({ chat_id: 100, message_id: placeholderId });
+    expect(logs.error).toHaveLength(0);
+  });
+
+  it("a DIRECT final (no progress) also goes out as a new message and deletes the placeholder", async () => {
+    const placeholderId = await startTurn();
+
+    emitReply("done", "final");
+    await waitFor(() => turnApi.deletes.length === 1);
+
+    expect(turnApi.sendMessages[1]?.text).toBe("done");
+    expect(turnApi.editMessages).toHaveLength(0);
+    expect(turnApi.deletes[0]?.message_id).toBe(placeholderId);
+  });
+
+  it("a silent final (bare acknowledgement) deletes the placeholder, sends nothing, closes the receipt", async () => {
+    const placeholderId = await startTurn();
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: {
+        text: "",
+        intent: "final",
+        origin: "telegram",
+        origin_id: "100",
+        synthesized: true,
+        silent: true,
+      },
+    });
+    await waitFor(() => turnApi.deletes.length === 1);
+
+    expect(turnApi.deletes[0]).toEqual({ chat_id: 100, message_id: placeholderId });
+    // Only the placeholder was ever sent: nothing visible for the silent final.
+    expect(turnApi.sendMessages).toHaveLength(1);
+    expect(turnApi.editMessages).toHaveLength(0);
+    await waitFor(
+      () => existsSync(receiptPath) && readFileSync(receiptPath, "utf8").includes("tg-1"),
+    );
+    const closed = readFileSync(receiptPath, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((l) => JSON.parse(l) as ReceiptRecord);
+    const receipt = closed.find((r) => r.message_id === "tg-1");
+    expect(receipt?.final_state).toBe("turn_observed");
+    expect(receipt?.notes).toMatchObject({ silent: true });
+    expect(logs.error).toHaveLength(0);
+  });
+
+  it("a silent final keeps a turn message the agent wrote progress into, without the spinner", async () => {
+    const placeholderId = await startTurn();
+
+    emitReply("rerunning at 22:00", "progress");
+    await waitFor(() => turnApi.editMessages.length === 1);
+    // Let the progress path restart the spinner on the edited message.
+    await new Promise((r) => setTimeout(r, 10));
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: {
+        text: "",
+        intent: "final",
+        origin: "telegram",
+        origin_id: "100",
+        synthesized: true,
+        silent: true,
+      },
+    });
+    await waitFor(() => turnApi.editMessages.length === 2);
+
+    // The progress text is the agent's answer: it stays, the spinner frame goes.
+    expect(turnApi.deletes).toHaveLength(0);
+    expect(turnApi.sendMessages).toHaveLength(1);
+    expect(turnApi.editMessages[1]).toMatchObject({
+      message_id: placeholderId,
+      text: "rerunning at 22:00",
+    });
+    expect(logs.error).toHaveLength(0);
+  });
+
+  it("a failed placeholder delete still delivers the final, and is logged", async () => {
+    await startTurn();
+    turnApi.failDelete = new Error(
+      "Telegram API deleteMessage: 400 Bad Request: message can't be deleted",
+    );
+
+    emitReply("the answer", "final");
+    await waitFor(() => logs.warn.length > 0);
+
+    expect(turnApi.sendMessages[1]?.text).toBe("the answer");
+    expect(logs.warn.some((l) => l.includes("could not delete the turn placeholder"))).toBe(true);
+    expect(logs.error).toHaveLength(0);
+  });
+
+  it("a failed final send is logged and falls back to editing the placeholder", async () => {
+    const placeholderId = await startTurn();
+    turnApi.failSend = (p) =>
+      p.text.includes("the answer")
+        ? new Error("Telegram API sendMessage: 429 Too Many Requests (retry_after 3s)")
+        : undefined;
+
+    emitReply("the answer", "final");
+    await waitFor(() => turnApi.editMessages.length === 1);
+
+    expect(turnApi.editMessages[0]?.message_id).toBe(placeholderId);
+    expect(turnApi.editMessages[0]?.text).toBe("the answer");
+    // Not sent, so the placeholder now carrying the answer must NOT be deleted.
+    expect(turnApi.deletes).toHaveLength(0);
+    expect(logs.error.some((l) => l.includes("final sendMessage failed"))).toBe(true);
+  });
+
+  it("when both the final send and the edit fallback fail, the loss is logged", async () => {
+    await startTurn();
+    turnApi.failSend = (p) =>
+      p.text.includes("the answer")
+        ? new Error("Telegram API sendMessage: 502 Bad Gateway")
+        : undefined;
+    turnApi.failEdit = () => new Error("Telegram API editMessageText: 502 Bad Gateway");
+
+    emitReply("the answer", "final");
+    await waitFor(() => logs.error.length === 2);
+
+    expect(logs.error[1]).toContain("final reply lost");
+    expect(turnApi.deletes).toHaveLength(0);
+  });
+
+  it("a malformed-HTML final is re-sent as plain text (new message), not edited", async () => {
+    await startTurn();
+    turnApi.failSend = (p) =>
+      p.parse_mode === "HTML" && p.text.includes("answer") ? parseError() : undefined;
+
+    emitReply("the answer", "final");
+    await waitFor(() => turnApi.deletes.length === 1);
+
+    const final = turnApi.sendMessages[1];
+    expect(final?.text).toBe("the answer");
+    expect(final?.parse_mode).toBeUndefined();
+    expect(final?.message_thread_id).toBe(7);
+    expect(turnApi.editMessages).toHaveLength(0);
+  });
+
+  it("progress alone still edits in place: no new message, no delete", async () => {
+    const placeholderId = await startTurn();
+
+    emitReply("step 1", "progress");
+    await waitFor(() => turnApi.editMessages.length === 1);
+    emitReply("step 2", "progress");
+    await waitFor(() => turnApi.editMessages.length === 2);
+
+    expect(turnApi.sendMessages).toHaveLength(1);
+    expect(turnApi.deletes).toHaveLength(0);
+    expect(turnApi.editMessages.every((e) => e.message_id === placeholderId)).toBe(true);
+    expect(turnApi.editMessages[1]?.text.endsWith("step 2")).toBe(true);
+  });
+
+  it("a non-format progress edit failure is logged instead of swallowed", async () => {
+    await startTurn();
+    turnApi.failEdit = () =>
+      new Error("Telegram API editMessageText: 400 Bad Request: message to edit not found");
+
+    emitReply("step 1", "progress");
+    await waitFor(() => logs.warn.length > 0);
+
+    expect(logs.warn.some((l) => l.includes("progress edit failed"))).toBe(true);
+    // Not a parse error → no plain-text re-edit, no resend.
+    expect(turnApi.sendMessages).toHaveLength(1);
+  });
+
+  it("a final landing while a progress edit is in flight does not re-arm the spinner", async () => {
+    await startTurn();
+
+    // Back-to-back: the progress handler is suspended on its edit when the
+    // final runs. Once the edit settles it must not restart the spinner on the
+    // (now deleted) turn message.
+    emitReply("working", "progress");
+    emitReply("done", "final");
+    await waitFor(() => turnApi.deletes.length === 1);
+    await new Promise((r) => setTimeout(r, 10));
+
+    const spinners = (adapter as unknown as { spinnerState: Map<string, unknown> }).spinnerState;
+    expect(spinners.size).toBe(0);
+    expect(turnApi.sendMessages[1]?.text).toBe("done");
+  });
+
+  function emitEdit(text: string): void {
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.edit_text",
+      payload: { text },
+    });
+  }
+
+  function spinnerFor(): { message_id: number } | undefined {
+    const spinners = (adapter as unknown as { spinnerState: Map<string, { message_id: number }> })
+      .spinnerState;
+    return Array.from(spinners.values())[0];
+  }
+
+  function hold(): () => void {
+    let release: () => void = () => {};
+    turnApi.gateEdit = new Promise<void>((r) => {
+      release = r;
+    });
+    return () => {
+      turnApi.gateEdit = null;
+      release();
+    };
+  }
+
+  it("a stale progress edit settling after the next turn started does not take over its spinner", async () => {
+    await startTurn();
+    const release = hold();
+
+    // Progress edit on placeholder 1001 is held in flight; the final lands
+    // (new message 1002, 1001 deleted) and the next inbound posts placeholder
+    // 1003, which is now the live turn message with its own spinner.
+    emitReply("working", "progress");
+    emitReply("done", "final");
+    await waitFor(() => turnApi.deletes.length === 1);
+    turnApi.enqueueUpdates([
+      {
+        message: {
+          message_id: 51,
+          from: { id: 42 },
+          chat: { id: 100, type: "supergroup" },
+          message_thread_id: 7,
+          text: "and now?",
+        },
+      },
+    ]);
+    await waitFor(() => turnApi.sendMessages.length === 3);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(spinnerFor()?.message_id).toBe(1003);
+
+    release();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(spinnerFor()?.message_id).toBe(1003);
+  });
+
+  it("a final after the turn is closed does not delete an edit_message fallback message", async () => {
+    await startTurn();
+    emitReply("done", "final");
+    await waitFor(() => turnApi.deletes.length === 1);
+
+    // No live message any more: edit_message sends fresh (1003) and keeps it
+    // for later edits, but it carries real content and is not a turn message.
+    emitEdit("afterthought");
+    await waitFor(() => turnApi.sendMessages.length === 3);
+    // Let the edit_message handler record 1003 before the next final runs.
+    await new Promise((r) => setTimeout(r, 10));
+
+    emitReply("scheduled report", "final");
+    await waitFor(() => turnApi.sendMessages.length === 4);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(turnApi.deletes).toHaveLength(1);
+  });
+
+  it("a final landing while an edit_message edit is in flight does not re-arm the spinner", async () => {
+    await startTurn();
+    const release = hold();
+
+    emitEdit("reading mail");
+    emitReply("done", "final");
+    await waitFor(() => turnApi.deletes.length === 1);
+    release();
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(spinnerFor()).toBeUndefined();
+  });
+
+  it("a non-format edit_message edit failure is logged instead of swallowed", async () => {
+    await startTurn();
+    turnApi.failEdit = () =>
+      new Error("Telegram API editMessageText: 400 Bad Request: message to edit not found");
+
+    emitEdit("reading mail");
+    await waitFor(() => logs.warn.length > 0);
+
+    expect(logs.warn.some((l) => l.includes("edit_message edit failed"))).toBe(true);
+    expect(turnApi.sendMessages).toHaveLength(1);
+  });
+});
+
+describe("TelegramAdapter — lost proactive sends go to the durable outbox", () => {
+  let turnApi: TurnApi;
+  let outboxDir: string;
+  let outbox: TelegramOutbox;
+
+  beforeEach(() => {
+    turnApi = new TurnApi();
+    outboxDir = mkdtempSync(join(tmpdir(), "tg-adapter-outbox-"));
+    outbox = new TelegramOutbox({
+      path: join(outboxDir, "telegram-outbox.json"),
+      send: async () => {},
+      logger: SILENT_LOGGER,
+    });
+  });
+
+  afterEach(() => {
+    outbox.stop();
+    rmSync(outboxDir, { recursive: true, force: true });
+  });
+
+  const blocked = () =>
+    new Error("Telegram API sendMessage: 403 Forbidden: Forbidden: bot was blocked by the user");
+
+  it("a cron reply that fails is queued, then delivered by a drain", async () => {
+    turnApi.failSend = blocked;
+    adapter = await startAdapter({ api: turnApi, outbox });
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload: { text: "job **done**", origin: "cron", origin_id: "nightly" },
+    });
+    await waitFor(() => outbox.list().length === 1);
+    const entry = outbox.list()[0];
+    expect(entry.chatId).toBe(100);
+    expect(entry.lastError).toContain("403");
+    expect(entry.chunks[0]).toMatchObject({ parseMode: "HTML", plain: "job **done**" });
+
+    turnApi.failSend = null;
+    await outbox.drain(Date.now() + 3 * 60_000);
+    expect(turnApi.sendMessages.at(-1)).toMatchObject({ chat_id: 100, parse_mode: "HTML" });
+    expect(turnApi.sendMessages.at(-1)?.text).toContain("<b>done</b>");
+    expect(outbox.list()).toHaveLength(0);
+  });
+
+  it("an operator alert that fails is queued", async () => {
+    turnApi.failSend = blocked;
+    adapter = await startAdapter({ api: turnApi, outbox });
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: { level: "critical", text: "watchdog: stalled", source: "stall-watchdog" },
+    });
+    await waitFor(() => outbox.list().length === 1);
+    expect(outbox.list()[0].chunks[0].plain).toBe("watchdog: stalled");
+  });
+});
+
+describe("TelegramAdapter — quiet hours hold proactive messages (#512)", () => {
+  // Wednesday 2026-10-07 23:00 UTC, inside a 22:00-07:00 window that ends Thursday 07:00.
+  const NIGHT = Date.UTC(2026, 9, 7, 23, 0);
+  const MORNING = Date.UTC(2026, 9, 8, 7, 0);
+  let turnApi: TurnApi;
+  let outboxDir: string;
+  let outbox: TelegramOutbox;
+  let clock: number;
+  let quiet: QuietHoursState;
+
+  beforeEach(() => {
+    turnApi = new TurnApi();
+    clock = NIGHT;
+    quiet = {
+      windows: [{ start: "22:00", end: "07:00" }],
+      urgentBypass: false,
+      timezoneOffsetMinutes: 0,
+    };
+    outboxDir = mkdtempSync(join(tmpdir(), "tg-adapter-quiet-"));
+    outbox = new TelegramOutbox({
+      path: join(outboxDir, "telegram-outbox.json"),
+      send: async () => {},
+      now: () => clock,
+      logger: SILENT_LOGGER,
+    });
+  });
+
+  afterEach(() => {
+    outbox.stop();
+    rmSync(outboxDir, { recursive: true, force: true });
+  });
+
+  const emitReply = (payload: Record<string, unknown>) =>
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "response.text",
+      payload,
+    });
+
+  it("a cron reply inside the window is held, then delivered at its end", async () => {
+    adapter = await startAdapter({ api: turnApi, outbox, quietHours: () => quiet });
+
+    emitReply({ text: "job **done**", origin: "cron", origin_id: "nightly" });
+    await waitFor(() => outbox.list().length === 1);
+    expect(turnApi.sendMessages).toHaveLength(0);
+    expect(outbox.list()[0]).toMatchObject({ chatId: 100, nextAttemptAt: MORNING, attempts: 0 });
+
+    clock = MORNING;
+    await outbox.drain();
+    expect(turnApi.sendMessages).toHaveLength(1);
+    expect(turnApi.sendMessages[0].text).toContain("<b>done</b>");
+    expect(outbox.list()).toHaveLength(0);
+  });
+
+  it("a heartbeat's progress inside the window is not shown", async () => {
+    adapter = await startAdapter({ api: turnApi, outbox, quietHours: () => quiet });
+
+    emitReply({ text: "checking", intent: "progress", origin: "heartbeat", origin_id: "hb" });
+    emitReply({ text: "all good", origin: "heartbeat", origin_id: "hb" });
+    await waitFor(() => outbox.list().length === 1);
+    expect(turnApi.sendMessages).toHaveLength(0);
+  });
+
+  it("a reply to the user's message is never held", async () => {
+    adapter = await startAdapter({ api: turnApi, outbox, quietHours: () => quiet });
+
+    emitReply({ text: "here you go", origin: "telegram", origin_id: "100" });
+    await waitFor(() => turnApi.sendMessages.length === 1);
+    expect(outbox.list()).toHaveLength(0);
+  });
+
+  it("without quiet hours a cron reply goes out at once", async () => {
+    adapter = await startAdapter({ api: turnApi, outbox });
+
+    emitReply({ text: "job done", origin: "cron", origin_id: "nightly" });
+    await waitFor(() => turnApi.sendMessages.length === 1);
+    expect(outbox.list()).toHaveLength(0);
+  });
+
+  it("an operator alert inside the window is held, a critical one too unless bypassed", async () => {
+    adapter = await startAdapter({ api: turnApi, outbox, quietHours: () => quiet });
+    const alert = (level: string, text: string) =>
+      bus.emit({
+        ts: Date.now(),
+        agent_id: "triage",
+        session_id: "",
+        topic: "system.operator_alert",
+        payload: { level, text, source: "stall-watchdog" },
+      });
+
+    alert("warn", "slow");
+    alert("critical", "stalled");
+    await waitFor(() => outbox.list().length === 2);
+    expect(turnApi.sendMessages).toHaveLength(0);
+
+    quiet = { ...quiet, urgentBypass: true };
+    alert("critical", "stalled again");
+    alert("warn", "slow again");
+    await waitFor(() => outbox.list().length === 3);
+    expect(turnApi.sendMessages).toHaveLength(1);
+    expect(turnApi.sendMessages[0].text).toContain("stalled again");
+  });
+
+  it("right after the window, a cron reply goes out after the held one", async () => {
+    adapter = await startAdapter({ api: turnApi, outbox, quietHours: () => quiet });
+
+    emitReply({ text: "night run", origin: "cron", origin_id: "nightly" });
+    await waitFor(() => outbox.list().length === 1);
+
+    clock = MORNING + 10_000;
+    emitReply({ text: "morning run", origin: "cron", origin_id: "nightly" });
+    await waitFor(() => turnApi.sendMessages.length === 2);
+    expect(turnApi.sendMessages.map((m) => m.text)).toEqual(["night run", "morning run"]);
+  });
+
+  const userWrites = async (text: string) => {
+    const before = bus.prompts.length;
+    turnApi.enqueueUpdates([
+      {
+        message: {
+          message_id: 1,
+          from: { id: 42, is_bot: false },
+          chat: { id: 100, type: "private" },
+          text,
+        },
+      },
+    ]);
+    await waitFor(() => bus.prompts.length > before);
+  };
+
+  it("a user waiting on an answer is never held, even when the reply carries a cron origin", async () => {
+    adapter = await startAdapter({ api: turnApi, outbox, quietHours: () => quiet });
+    await userWrites("are you there?");
+    const before = turnApi.sendMessages.length;
+
+    // A queued cron prompt took the origin slot before the user's turn answered.
+    emitReply({ text: "yes, here", origin: "cron", origin_id: "nightly" });
+    await waitFor(() => turnApi.sendMessages.length > before);
+    expect(turnApi.sendMessages.at(-1)?.text).toContain("yes, here");
+    expect(outbox.list()).toHaveLength(0);
+  });
+
+  it("a stall alert in a chat where the user is waiting goes out", async () => {
+    adapter = await startAdapter({ api: turnApi, outbox, quietHours: () => quiet });
+    await userWrites("long task");
+    const before = turnApi.sendMessages.length;
+
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "",
+      topic: "system.operator_alert",
+      payload: { level: "warn", text: "turn stalled", source: "stall-watchdog" },
+    });
+    await waitFor(() => turnApi.sendMessages.length > before);
+    expect(turnApi.sendMessages.at(-1)?.text).toContain("turn stalled");
+    expect(outbox.list()).toHaveLength(0);
+  });
+});
+
+describe("TelegramAdapter — queued output re-checks the allow-list at drain (#525)", () => {
+  // Wednesday 2026-10-07 23:00 UTC, inside a 22:00-07:00 window that ends Thursday 07:00.
+  const NIGHT = Date.UTC(2026, 9, 7, 23, 0);
+  const REMOVAL = Date.UTC(2026, 9, 8, 2, 0);
+  const MORNING = Date.UTC(2026, 9, 8, 7, 0);
+  // Chat 500 is not in routing.chats: only the last-chat cache sends there.
+  const routing = { chats: { "100": "triage" }, defaultAgentId: "triage" };
+  let turnApi: TurnApi;
+  let outboxDir: string;
+  let outbox: TelegramOutbox;
+  let clock: number;
+  let quiet: QuietHoursState;
+  let warnings: string[];
+  const logger = { ...SILENT_LOGGER, warn: (m: string) => void warnings.push(m) };
+
+  beforeEach(() => {
+    turnApi = new TurnApi();
+    clock = NIGHT;
+    warnings = [];
+    quiet = {
+      windows: [{ start: "22:00", end: "07:00" }],
+      urgentBypass: false,
+      timezoneOffsetMinutes: 0,
+    };
+    outboxDir = mkdtempSync(join(tmpdir(), "tg-adapter-525-"));
+    outbox = new TelegramOutbox({
+      path: join(outboxDir, "telegram-outbox.json"),
+      send: async () => {},
+      now: () => clock,
+      logger,
+    });
+  });
+
+  afterEach(() => {
+    outbox.stop();
+    rmSync(outboxDir, { recursive: true, force: true });
+  });
+
+  const sentTo = (chatId: number, text: string) =>
+    turnApi.sendMessages.some((m) => m.chat_id === chatId && m.text.includes(text));
+  const emit = (topic: BusEventTopic, payload: Record<string, unknown>) =>
+    bus.emit({ ts: Date.now(), agent_id: "triage", session_id: "s1", topic, payload });
+  const cronReply = (text: string) =>
+    emit("response.text", { text, origin: "cron", origin_id: "nightly" });
+
+  /** User `from` writes in private chat 500 and gets their answer: the cache now points there. */
+  const userTalks = async (from: number) => {
+    turnApi.enqueueUpdates([
+      {
+        message: {
+          message_id: 1,
+          from: { id: from, is_bot: false },
+          chat: { id: 500, type: "private" },
+          text: "hi",
+        },
+      },
+    ]);
+    await waitFor(() => bus.prompts.length === 1);
+    emit("response.text", { text: "answer", origin: "telegram", origin_id: "500" });
+    await waitFor(() => sentTo(500, "answer"));
+  };
+
+  it("a cron reply held at 23:00 is not delivered at 07:00 to a user removed at 02:00", async () => {
+    // Replaced, not mutated: a settings reload hands the getter a new object.
+    let live = { allowedUserIds: [42, 7] };
+    adapter = await startAdapter({
+      api: turnApi,
+      outbox,
+      routing,
+      allowlist: () => live,
+      quietHours: () => quiet,
+    });
+    await userTalks(7);
+    cronReply("night report");
+    await waitFor(() => outbox.list().length === 1);
+    expect(outbox.list()[0]).toMatchObject({ chatId: 500 });
+
+    clock = REMOVAL;
+    live = { allowedUserIds: [42] };
+    clock = MORNING;
+    await outbox.drain();
+    expect(sentTo(500, "night report")).toBe(false);
+    expect(outbox.list()).toHaveLength(0);
+    expect(warnings.filter((w) => w.includes("user 7 is no longer allowed"))).toHaveLength(1);
+  });
+
+  it("a held cron reply is delivered at 07:00 while its user is still allowed", async () => {
+    const live = { allowedUserIds: [42, 7] };
+    adapter = await startAdapter({
+      api: turnApi,
+      outbox,
+      routing,
+      allowlist: () => live,
+      quietHours: () => quiet,
+    });
+    await userTalks(7);
+    cronReply("night report");
+    await waitFor(() => outbox.list().length === 1);
+
+    clock = MORNING;
+    await outbox.drain();
+    expect(sentTo(500, "night report")).toBe(true);
+    expect(outbox.list()).toHaveLength(0);
+  });
+
+  it("a held operator alert is dropped once allowAllUsers is switched off", async () => {
+    const live = { allowedUserIds: [42], allowAllUsers: true };
+    adapter = await startAdapter({
+      api: turnApi,
+      outbox,
+      routing,
+      allowlist: () => live,
+      quietHours: () => quiet,
+    });
+    await userTalks(9999);
+    emit("system.operator_alert", { level: "warn", text: "slow turn", source: "stall-watchdog" });
+    await waitFor(() => outbox.list().length === 1);
+
+    live.allowAllUsers = false;
+    clock = MORNING;
+    await outbox.drain();
+    expect(sentTo(500, "slow turn")).toBe(false);
+    expect(outbox.list()).toHaveLength(0);
+  });
+
+  it("a failed cron reply queued for retry is not delivered to a user removed meanwhile", async () => {
+    const live = { allowedUserIds: [42, 7] };
+    adapter = await startAdapter({ api: turnApi, outbox, routing, allowlist: () => live });
+    await userTalks(7);
+    turnApi.failSend = () => new Error("Telegram API sendMessage: 502 Bad Gateway: Bad Gateway");
+    cronReply("job result");
+    await waitFor(() => outbox.list().length === 1);
+    expect(outbox.list()[0]).toMatchObject({ chatId: 500, attempts: 1 });
+
+    turnApi.failSend = null;
+    live.allowedUserIds = [42];
+    await outbox.drain(clock + 3 * 60_000);
+    expect(sentTo(500, "job result")).toBe(false);
+    expect(outbox.list()).toHaveLength(0);
+  });
+
+  it("output held for a chat from routing.chats carries no sender and is delivered", async () => {
+    const live = { allowedUserIds: [42] };
+    adapter = await startAdapter({
+      api: turnApi,
+      outbox,
+      routing,
+      allowlist: () => live,
+      quietHours: () => quiet,
+    });
+    cronReply("routed report");
+    await waitFor(() => outbox.list().length === 1);
+    expect(outbox.list()[0].chatId).toBe(100);
+    expect(outbox.list()[0].userId).toBeUndefined();
+
+    live.allowedUserIds = [];
+    clock = MORNING;
+    await outbox.drain();
+    expect(sentTo(100, "routed report")).toBe(true);
+  });
+
+  /** User `from` writes in group 100, listed in routing.chats: the cache now points there too. */
+  const userTalksInRoutedGroup = async (from: number) => {
+    turnApi.enqueueUpdates([
+      {
+        message: {
+          message_id: 1,
+          from: { id: from, is_bot: false },
+          chat: { id: 100, type: "group" },
+          text: "hi",
+        },
+      },
+    ]);
+    await waitFor(() => bus.prompts.length === 1);
+    emit("response.text", { text: "answer", origin: "telegram", origin_id: "100" });
+    await waitFor(() => sentTo(100, "answer"));
+  };
+
+  it("a group listed in routing.chats keeps its held output after its last writer is removed", async () => {
+    const live = { allowedUserIds: [42, 7] };
+    adapter = await startAdapter({
+      api: turnApi,
+      outbox,
+      routing,
+      allowlist: () => live,
+      quietHours: () => quiet,
+    });
+    await userTalksInRoutedGroup(7);
+    cronReply("group report");
+    await waitFor(() => outbox.list().length === 1);
+    expect(outbox.list()[0].chatId).toBe(100);
+    expect(outbox.list()[0].userId).toBeUndefined();
+
+    live.allowedUserIds = [42];
+    clock = MORNING;
+    await outbox.drain();
+    expect(sentTo(100, "group report")).toBe(true);
+  });
+
+  it("a held operator alert for a group listed in routing.chats survives its last writer's removal", async () => {
+    const live = { allowedUserIds: [42, 7] };
+    adapter = await startAdapter({
+      api: turnApi,
+      outbox,
+      routing,
+      allowlist: () => live,
+      quietHours: () => quiet,
+    });
+    await userTalksInRoutedGroup(7);
+    emit("system.operator_alert", { level: "warn", text: "slow turn", source: "stall-watchdog" });
+    await waitFor(() => outbox.list().length === 1);
+    expect(outbox.list()[0].chatId).toBe(100);
+    expect(outbox.list()[0].userId).toBeUndefined();
+
+    live.allowedUserIds = [42];
+    clock = MORNING;
+    await outbox.drain();
+    expect(sentTo(100, "slow turn")).toBe(true);
+  });
+
+  it("a failed operator alert to a group listed in routing.chats is retried after its last writer is removed", async () => {
+    const live = { allowedUserIds: [42, 7] };
+    adapter = await startAdapter({ api: turnApi, outbox, routing, allowlist: () => live });
+    await userTalksInRoutedGroup(7);
+    turnApi.failSend = () => new Error("Telegram API sendMessage: 502 Bad Gateway: Bad Gateway");
+    emit("system.operator_alert", { level: "warn", text: "slow turn", source: "stall-watchdog" });
+    await waitFor(() => outbox.list().length === 1);
+    expect(outbox.list()[0]).toMatchObject({ chatId: 100, attempts: 1 });
+    expect(outbox.list()[0].userId).toBeUndefined();
+
+    turnApi.failSend = null;
+    live.allowedUserIds = [42];
+    await outbox.drain(clock + 3 * 60_000);
+    expect(sentTo(100, "slow turn")).toBe(true);
+  });
+
+  it("a reply to a routed group whose send and edit fallback both fail carries no sender", async () => {
+    const live = { allowedUserIds: [42, 7] };
+    adapter = await startAdapter({ api: turnApi, outbox, routing, allowlist: () => live });
+    // User 7's turn is still open in group 100: its placeholder is the live message.
+    turnApi.enqueueUpdates([
+      {
+        message: {
+          message_id: 1,
+          from: { id: 7, is_bot: false },
+          chat: { id: 100, type: "group" },
+          text: "hi",
+        },
+      },
+    ]);
+    await waitFor(() => bus.prompts.length === 1);
+    await waitFor(() => turnApi.sendMessages.some((m) => m.chat_id === 100));
+    turnApi.failSend = (p) =>
+      p.text.includes("late report")
+        ? new Error("Telegram API sendMessage: 502 Bad Gateway")
+        : undefined;
+    turnApi.failEdit = () => new Error("Telegram API editMessageText: 502 Bad Gateway");
+    cronReply("late report");
+    await waitFor(() => outbox.list().length === 1);
+    expect(outbox.list()[0].chatId).toBe(100);
+    expect(outbox.list()[0].userId).toBeUndefined();
+
+    turnApi.failSend = null;
+    turnApi.failEdit = null;
+    live.allowedUserIds = [42];
+    await outbox.drain(clock + 3 * 60_000);
+    expect(sentTo(100, "late report")).toBe(true);
+  });
+
+  it("a failed reply to a group listed in routing.chats is retried after its last writer is removed", async () => {
+    const live = { allowedUserIds: [42, 7] };
+    adapter = await startAdapter({ api: turnApi, outbox, routing, allowlist: () => live });
+    await userTalksInRoutedGroup(7);
+    turnApi.failSend = () => new Error("Telegram API sendMessage: 502 Bad Gateway: Bad Gateway");
+    cronReply("group job result");
+    await waitFor(() => outbox.list().length === 1);
+    expect(outbox.list()[0]).toMatchObject({ chatId: 100, attempts: 1 });
+    expect(outbox.list()[0].userId).toBeUndefined();
+
+    turnApi.failSend = null;
+    live.allowedUserIds = [42];
+    await outbox.drain(clock + 3 * 60_000);
+    expect(sentTo(100, "group job result")).toBe(true);
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────── */
+/* Who may press a button (#442): one allow-list rule for every kind       */
+/* ────────────────────────────────────────────────────────────────────── */
+
+describe("TelegramAdapter — callback authorization on every button kind (#442)", () => {
+  const OPERATOR = 42;
+  const GROUP_MEMBER = 7;
+  const GROUP = { id: 100, type: "supergroup" };
+  let libDir: string;
+  let savedLibPath: string | undefined;
+
+  beforeEach(() => {
+    savedLibPath = process.env.CLAUDECLAW_PENDING_LIB_PATH;
+    libDir = mkdtempSync(join(tmpdir(), "cc-cb-auth-"));
+    writeFileSync(
+      join(libDir, "pending.py"),
+      [
+        "import os",
+        "def resolve_pending_ex(action_id, decision):",
+        "    with open(os.path.join(os.path.dirname(__file__), 'calls.txt'), 'a') as f:",
+        "        f.write(f'{action_id} {decision}\\n')",
+        "    return 'ok'",
+        "",
+      ].join("\n"),
+    );
+    process.env.CLAUDECLAW_PENDING_LIB_PATH = libDir;
+  });
+
+  afterEach(() => {
+    if (savedLibPath === undefined) delete process.env.CLAUDECLAW_PENDING_LIB_PATH;
+    else process.env.CLAUDECLAW_PENDING_LIB_PATH = savedLibPath;
+    rmSync(libDir, { recursive: true, force: true });
+  });
+
+  const resolverCalls = (): string => {
+    const f = join(libDir, "calls.txt");
+    return existsSync(f) ? readFileSync(f, "utf8").trim() : "";
+  };
+
+  const tap = (id: string, from: number, data: string, chat = GROUP) => ({
+    callback_query: { id, from: { id: from }, data, message: { message_id: 5, chat } },
+  });
+
+  /** A live permission request in the group, posted while the operator was listed. */
+  async function armPermission(live: {
+    allowedUserIds: number[];
+    allowAllUsers?: boolean;
+  }): Promise<void> {
+    adapter = await startAdapter({ allowlist: () => live });
+    api.enqueueUpdates([
+      { message: { message_id: 1, from: { id: OPERATOR }, chat: GROUP, text: "ping" } },
+    ]);
+    await waitFor(() => bus.prompts.length > 0);
+    bus.emit({
+      ts: Date.now(),
+      agent_id: "triage",
+      session_id: "s1",
+      topic: "channel.permission_request",
+      payload: { request_id: "r442", tool_name: "bash", description: "", input_preview: "" },
+    });
+    await waitFor(() => api.sendMessages.length >= 1);
+  }
+
+  it("empty list, group chat: a perm: tap is refused and the request stays open", async () => {
+    const live = { allowedUserIds: [OPERATOR] };
+    await armPermission(live);
+    live.allowedUserIds = [];
+    api.enqueueUpdates([tap("cb-g", GROUP_MEMBER, "perm:allow:r442")]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("Unauthorized.");
+    expect(bus.permissionDecisions).toHaveLength(0);
+
+    // Not consumed: once the operator is listed again, their tap decides it.
+    live.allowedUserIds = [OPERATOR];
+    api.enqueueUpdates([tap("cb-op", OPERATOR, "perm:deny:r442")]);
+    await waitFor(() => bus.permissionDecisions.length > 0);
+    expect(bus.permissionDecisions[0]?.behavior).toBe("deny");
+  });
+
+  it("empty list, private chat (sender = chat): a perm: tap is still refused", async () => {
+    const live = { allowedUserIds: [OPERATOR] };
+    await armPermission(live);
+    live.allowedUserIds = [];
+    api.enqueueUpdates([
+      tap("cb-p", OPERATOR, "perm:allow:r442", { id: OPERATOR, type: "private" }),
+    ]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("Unauthorized.");
+    expect(bus.permissionDecisions).toHaveLength(0);
+  });
+
+  it("listed operator, group chat: an unlisted member's perm: tap is refused", async () => {
+    await armPermission({ allowedUserIds: [OPERATOR] });
+    api.enqueueUpdates([tap("cb-m", GROUP_MEMBER, "perm:allow:r442")]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("Unauthorized.");
+    expect(bus.permissionDecisions).toHaveLength(0);
+  });
+
+  it("empty list, group chat: a pending: tap is refused and the resolver never runs", async () => {
+    adapter = await startAdapter({ allowedUserIds: [] });
+    api.enqueueUpdates([tap("cb-pg", GROUP_MEMBER, "pending:2623:pay")]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("Unauthorized.");
+    expect(resolverCalls()).toBe("");
+    expect(api.editMessages).toHaveLength(0);
+  });
+
+  it("empty list, private chat (sender = chat): a pending: tap is still refused", async () => {
+    adapter = await startAdapter({ allowedUserIds: [] });
+    api.enqueueUpdates([
+      tap("cb-pp", OPERATOR, "pending:2623:pay", { id: OPERATOR, type: "private" }),
+    ]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("Unauthorized.");
+    expect(resolverCalls()).toBe("");
+  });
+
+  it("listed operator, group chat: pending: from the operator resolves, from a member is refused", async () => {
+    adapter = await startAdapter({ allowedUserIds: [OPERATOR] });
+    api.enqueueUpdates([tap("cb-pm", GROUP_MEMBER, "pending:2623:pay")]);
+    await waitFor(() => api.callbackAcks.length > 0);
+    expect(api.callbackAcks[0]?.text).toBe("Unauthorized.");
+    expect(resolverCalls()).toBe("");
+
+    api.enqueueUpdates([tap("cb-po", OPERATOR, "pending:2623:pay")]);
+    await waitFor(() => api.callbackAcks.length > 1);
+    expect(resolverCalls()).toBe("2623 pay");
+    expect(api.callbackAcks[1]?.text).not.toBe("Unauthorized.");
+  });
+
+  it("allowAllUsers: true, group chat: any member's perm: tap decides (documented)", async () => {
+    const live = { allowedUserIds: [OPERATOR], allowAllUsers: false };
+    await armPermission(live);
+    live.allowedUserIds = [];
+    live.allowAllUsers = true;
+    api.enqueueUpdates([tap("cb-all", GROUP_MEMBER, "perm:allow:r442")]);
+    await waitFor(() => bus.permissionDecisions.length > 0);
+    expect(bus.permissionDecisions[0]?.behavior).toBe("allow");
   });
 });

@@ -107,6 +107,14 @@ Two non-obvious points:
   `web.enabled`. If you want to compare behaviour, do it across
   daemon restarts (flip `runtime`, restart, compare) rather than in
   one process.
+- The adapter refuses any browser request (one carrying an `Origin`
+  header) from a foreign origin with `403 origin_not_allowed`, on
+  `POST /prompt` and on the `/ws` upgrade, token or not. A browser
+  client served from another origin must be listed in
+  `web.bus.allowedOrigins` (e.g. `["https://console.example"]`).
+  curl and native clients send no `Origin` and are unaffected.
+- `web.bus.token` can be left out of `settings.json` and supplied as
+  the `CCAW_WEBUI_TOKEN` environment variable instead.
 
 ## Step 2 — restart the daemon
 
@@ -147,7 +155,7 @@ within a few seconds.
 | 2 | Send a Discord message in a routed guild channel | Same as DM but in the channel. |
 | 3 | Send a message in an UNROUTED channel (or one not in `busRouting.channels`) | Silently dropped. No legacy fallback. |
 | 4 | Open the Bus Web UI at `http://127.0.0.1:4632` with the `web.bus.token` | Conversation view shows agent activity; subscribing to `default` works. |
-| 5 | Toggle a cron job's `enabled: true → false` in its `.md` frontmatter | Within 30s daemon logs `Bus scheduler reloaded — N trigger(s)`; job stops firing. |
+| 5 | Toggle a cron job's `enabled: true → false` in its `.md` frontmatter | Within 30s daemon logs `Jobs reloaded: N job(s)`; job stops firing. Jobs run from the 60 s job loop under every runtime, so the bus scheduler's trigger count covers the heartbeat only. |
 | 6 | Change `heartbeat.interval` in `settings.json` | Same — within 30s daemon logs the reload. |
 | 7 | Add an `excludeWindows` entry (e.g. `"22:00"–"07:00"`) for quiet hours | Heartbeat skips inside that window. Verifies PR #126 wiring. |
 | 8 | Send SIGTERM (`kill <pid>`) | Banner logs `[bus-runtime] mounted; …` order in reverse: adapters → scheduler → agents → bus. No orphan `claude` children (`pgrep claude` empty). |
@@ -180,10 +188,14 @@ don't waste time investigating:
   a daemon restart. The scheduler reloads on heartbeat / jobs changes
   (PR #126), but adapter reload would invalidate pending permission /
   ask maps — deferred until a session-migration story exists.
-- **Per-job model / timeout overrides not honoured.** Under Bus, route
-  the job to a different agent instead (declare a second agent with the
-  model you want, set `job.agent: "<that-id>"`). Cleaner architectural
-  fit; documented in PR #126. The global per-session cap defaults to
+  Allow-lists are the exception: `allowedUserIds` and `allowAllUsers`
+  are read on every inbound event, so an edit applies to incoming messages
+  and button taps within 30 s (#520).
+- **Jobs run outside the bus agents' sessions.** Under Bus the 60 s job
+  loop still runs each job as its own `claude -p`, so per-job
+  `model:`, `timeoutSeconds`, `retry` / `retryDelay` and `notify` apply
+  as on the legacy runtime, and `job.agent` does not route a job to a
+  bus agent (see *Multi-agent fan-out*). The global per-session cap defaults to
   **120 minutes** (`sessionTimeoutMs`); override in the daemon's
   project-local settings file (`<cwd>/.claude/claudeclaw/settings.json`
   — for the Hetzner staging flow that's
@@ -262,13 +274,13 @@ look like:
 Once the single-global soak is stable, you can split topics across
 agents by adding more entries to `settings.agents` and mapping channels
 to them. The first agent in the array is still the default for the
-heartbeat + jobs lacking an explicit `job.agent`. Example: a haiku agent
-for cheap routine cron work + a sonnet agent for inbound traffic:
+heartbeat. Example: a plan-mode agent for inbound traffic + a second
+agent for other channels:
 
 ```jsonc
 "agents": [
   { "id": "inbound", "permission_mode": "plan" },
-  { "id": "cron-haiku", "permission_mode": "default" }
+  { "id": "ops", "permission_mode": "default" }
 ],
 "discord": {
   "busRouting": {
@@ -278,5 +290,63 @@ for cheap routine cron work + a sonnet agent for inbound traffic:
 }
 ```
 
-Set `job.agent: "cron-haiku"` in each job's frontmatter to route cron
-to the cheap agent.
+Jobs do not run in these agents' sessions: the 60 s job loop runs each
+job as its own `claude -p` under every runtime. `job.agent` names a
+legacy agent directory (`agents/<name>/`, its persona and model), not an
+entry of `settings.agents`; when it names a bus agent with no such
+directory, the daemon logs a warning and the job runs on the default
+model. To run routine cron work on a cheap model, set `model:` in each
+job's frontmatter, e.g. `model: haiku`.
+
+## Allow-lists: an empty list now refuses everyone
+
+`telegram.allowedUserIds`, `discord.allowedUserIds` and `slack.allowedUserIds`
+used to mean "everyone" when left empty. A bot token plus a skipped optional
+field therefore exposed the agent, and every tool it has, to any user of the
+platform. An empty list now refuses every user, on the Bus runtime and on the
+legacy runtime alike.
+
+**Migration.** If your bot answered people while the list was empty, it stops
+answering them after this upgrade. The daemon says so at startup:
+
+```
+  WARNING: telegram.allowedUserIds is empty, so every telegram user is REFUSED (an empty list used to allow everyone). ...
+```
+
+Fix it one of two ways:
+
+- list the people who may talk to the bot (recommended):
+  `"telegram": { "allowedUserIds": [12345678] }`
+- or, for a bot that is meant to be public, opt in explicitly:
+  `"telegram": { "allowAllUsers": true }` (same key under `discord` / `slack`).
+
+Slack bot traffic admitted through `allowBots` is unaffected.
+
+Both keys are hot-reloaded on both runtimes: removing an id, or switching
+`allowAllUsers` back off, refuses that user's next message or button tap
+within 30 s, without a restart (#520). On the Bus runtime, Telegram output
+that is not tied to a chat (heartbeat, alerts, scheduled tasks) goes to the
+last chat that wrote to the agent; that chat is re-checked against the
+current list before each such send, so a removed user stops receiving it
+too, and it falls back to the `telegram.busRouting.chats` entries (#521). A
+group is treated the same way: its cache entry belongs to the user who last
+wrote there. A chat listed in `busRouting.chats` is configuration and keeps
+receiving: remove a revoked user's DM from it too. Output already waiting in
+the outbox (held by quiet hours, or a failed send queued for retry) is
+re-checked the same way when it drains (Bus runtime): a message sent to the
+last chat, or a job result sent to a listed user, is dropped with a `[telegram-outbox]
+dropped message to chat …` warning if that user was removed meanwhile
+(#525). Output for a chat listed in `busRouting.chats` is not tied to its
+last writer and is delivered (#542). Entries queued before this check existed carry no user and drain as
+before. Discord and Slack send such output to their configured channels,
+not to the last sender.
+
+**Buttons follow the same rule.** A Telegram button press — a tool permission
+prompt (`perm:allow|deny`, Bus runtime), a pending action
+(`pending:<id>:<value>`, both runtimes), a reply button (`btn:`, legacy
+runtime) — is accepted only from a user the list accepts, in a private chat
+and in a group alike; anyone else gets "Unauthorized." and the press has no
+effect. With `allowAllUsers: true`, anyone who can reach the bot — in a DM or
+in any group it is in — can approve a tool permission request: on a bot that
+sits in a group, list the people who should answer the agent's prompts
+instead.

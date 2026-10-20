@@ -18,6 +18,7 @@
 
 import type { BusCore } from "../../bus/core";
 import type { AttachmentsConfig } from "../../config";
+import type { AllowlistState } from "../../allowlist";
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* Public adapter options                                                 */
@@ -27,8 +28,16 @@ export interface DiscordAdapterOptions {
   bus: BusCore;
   /** Bot token (same source as `settings.discord.token` in legacy). */
   token: string;
-  /** Discord user ID allow-list. Empty → silent-deny everything. */
+  /** Discord user ID allow-list. Empty → deny everyone unless `allowAllUsers`. */
   allowedUserIds: string[];
+  /** Accept every user regardless of `allowedUserIds`. Default false. */
+  allowAllUsers?: boolean;
+  /**
+   * Current allow-list, read on every inbound event so a settings reload
+   * applies without a restart (#520). Absent = `allowedUserIds` /
+   * `allowAllUsers` above, fixed at construction.
+   */
+  allowlist?: () => AllowlistState<string>;
   /**
    * Routing: which agent owns each Discord channel / thread / DM.
    *

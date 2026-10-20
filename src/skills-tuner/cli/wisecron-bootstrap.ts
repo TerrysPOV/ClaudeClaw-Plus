@@ -27,7 +27,7 @@ import { homedir } from "node:os";
 import yaml from "js-yaml";
 import { Registry } from "../core/registry.js";
 import { AuditLog } from "../core/audit-log.js";
-import { AUDIT_PATH } from "../core/security.js";
+import { auditPath } from "../core/security.js";
 import { DEFAULT_CONFIG_PATH, loadConfig } from "../core/config.js";
 import { makeLLMClient, type LLMClient } from "../core/llm.js";
 import { ExternalProcessSubject } from "../subjects/external_process.js";
@@ -93,7 +93,7 @@ export interface BootstrapWisecronOpts {
  */
 export function bootstrapWisecron(opts: BootstrapWisecronOpts = {}): WisecronBundle {
   const settings = opts.settings ?? loadWisecronSettings(opts.configPath);
-  const audit = opts.audit ?? new AuditLog(AUDIT_PATH);
+  const audit = opts.audit ?? new AuditLog(auditPath());
   const provider = opts.telemetry ?? buildHostTelemetryProvider({});
 
   // Best-effort LLM: subjects that propose via the SDK need it, but cron-run

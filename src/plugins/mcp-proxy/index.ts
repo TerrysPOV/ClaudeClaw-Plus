@@ -119,6 +119,7 @@ export class McpProxyPlugin {
               getMcpBridge().registerPluginTool("mcp-proxy", {
                 name: fqn,
                 description: tool.description,
+                upstream: { server: name, tool: tool.name },
                 schema: z.object({
                   arguments: z.record(z.string(), z.unknown()).optional().default({}),
                   mode: z.enum(["direct", "reasoned"]).optional().default("direct"),
@@ -129,7 +130,21 @@ export class McpProxyPlugin {
                   if (mode === "reasoned") {
                     return this._invokeReasoned(fqn, args);
                   }
-                  const result = await proc.call(tool.name, args);
+                  let result: unknown;
+                  try {
+                    result = await proc.call(tool.name, args);
+                  } catch (err) {
+                    // A child's error result is thrown with its text: same cap
+                    // as a result, so an oversized one cannot slip past it.
+                    const message = err instanceof Error ? err.message : String(err);
+                    const errorBytes = Buffer.byteLength(message, "utf8");
+                    if (errorBytes > MAX_RESULT_BYTES) {
+                      throw new Error(
+                        `Tool error exceeds ${MAX_RESULT_BYTES} bytes (got ${errorBytes})`,
+                      );
+                    }
+                    throw err;
+                  }
                   const resultStr = JSON.stringify(result);
                   const resultBytes = Buffer.byteLength(resultStr, "utf8");
                   if (resultBytes > MAX_RESULT_BYTES) {

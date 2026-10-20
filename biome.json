@@ -8,6 +8,7 @@
   "files": {
     "includes": [
       "src/**",
+      "tests/**",
       "scripts/**",
       "commands/**",
       "skills/**",

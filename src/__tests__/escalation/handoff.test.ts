@@ -28,6 +28,8 @@ const HANDOFFS_DIR = join(ESCALATION_DIR, "handoffs");
 describe("Handoff Manager - Initialization", () => {
   beforeEach(async () => {
     await mkdir(ESCALATION_DIR, { recursive: true });
+    // #304: start from an empty index whatever an earlier file left behind.
+    await rm(HANDOFFS_DIR, { recursive: true, force: true }).catch(() => undefined);
     await resetHandoffManager();
   });
 

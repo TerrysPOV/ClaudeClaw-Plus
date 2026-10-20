@@ -30,12 +30,14 @@ import type { ReceiptRecord } from "../receipt";
 import {
   buildClaudeArgs,
   defaultSupervisionFor,
+  detectSessionIdCollision,
   resolveAgentCwd,
   SessionManager,
   type AgentProcess,
 } from "../session-manager";
 import type { AgentConfig, BusOrigin } from "../types";
 import { createBusCore, type BusCore } from "../core";
+import { createPromptStreamHandler } from "../receipt-wiring";
 
 const IS_DARWIN = process.platform === "darwin";
 const IS_UNIX = process.platform !== "win32";
@@ -248,6 +250,27 @@ describe("pty-stdin supervision", () => {
     await waitFor(() => !mgr._list().includes("pty-exit"), 5000);
     expect(mgr._list()).not.toContain("pty-exit");
   }, 10000);
+
+  // Issue #528: a container recreate resets ~/.claude.json, so the agent cwd
+  // is untrusted and an interactive claude sits on the trust dialog forever.
+  it("pre-accepts the trust dialog for the agent cwd before spawning", async () => {
+    const prev = process.env.PLUS_CLAUDE_CONFIG_PATH;
+    const cfgDir = mkdtempSync(join(tmpdir(), "ccaw-trust-"));
+    const cfgPath = join(cfgDir, "claude.json");
+    writeFileSync(cfgPath, JSON.stringify({ projects: {} }));
+    process.env.PLUS_CLAUDE_CONFIG_PATH = cfgPath;
+    try {
+      const agent = mkAgent({ id: "pty-trust" });
+      const proc = await mgr.spawnAgent(agent, "discord");
+      spawned.push(proc);
+      const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
+      expect(cfg.projects[realpathSync(agent.cwd)]?.hasTrustDialogAccepted).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.PLUS_CLAUDE_CONFIG_PATH;
+      else process.env.PLUS_CLAUDE_CONFIG_PATH = prev;
+      rmSync(cfgDir, { recursive: true, force: true });
+    }
+  });
 });
 
 /* ───────────────────────────────────────────────────────────────────── */
@@ -284,7 +307,16 @@ describe("process-stream-json supervision", () => {
     expect(proc.supervision).toBe("process-stream-json");
   });
 
-  it("accepts JSON-line stdin and crash-data observer sees it via /bin/cat echo", async () => {
+  // `claude -p --input-format=stream-json` parses every stdin line as JSON and
+  // rejects anything else ("Error parsing streaming input line"). /bin/cat
+  // echoes stdin back, so each echoed line is what the CLI would have parsed.
+  const stdinLines = (captured: string) =>
+    captured
+      .split("\n")
+      .filter((l) => l.length > 0)
+      .map((l) => JSON.parse(l) as { type: string; message: { role: string; content: string } });
+
+  it("send_prompt_stream writes the prompt as one stream-json user message", async () => {
     const agent = mkAgent({ id: "psj-stream" });
     const proc = await mgr.spawnAgent(agent, "cron");
     spawned.push(proc);
@@ -292,10 +324,47 @@ describe("process-stream-json supervision", () => {
     proc.onData((chunk) => {
       captured += chunk;
     });
-    const turn = JSON.stringify({ type: "user", content: "hi" });
-    await proc.send_prompt_stream(turn);
-    await waitFor(() => captured.includes('"content":"hi"'));
-    expect(captured).toContain(turn);
+    const prompt = 'line one\nline "two" <tag>';
+    await proc.send_prompt_stream(prompt);
+    await waitFor(() => captured.endsWith("\n"));
+    expect(stdinLines(captured)).toEqual([
+      { type: "user", message: { role: "user", content: prompt } },
+    ]);
+  });
+
+  it("a bus prompt reaches a process-stream-json agent as a parseable user message", async () => {
+    const bus = createBusCore({ eventLogAppend: (async () => ({})) as never, replyNudge: false });
+    const busMgr = new SessionManager({
+      commandOverride: "/bin/cat",
+      argsOverride: [],
+      busSocketPath: "/tmp/test-bus.sock",
+      bus,
+    });
+    bus.setStreamPromptHandler(createPromptStreamHandler((id) => busMgr.getAgent(id)));
+    const proc = await busMgr.spawnAgent(mkAgent({ id: "psj-bus" }), "cron");
+    try {
+      let captured = "";
+      proc.onData((chunk) => {
+        captured += chunk;
+      });
+      await bus.sendPrompt({
+        agent_id: "psj-bus",
+        origin: "cron",
+        origin_id: "job-1",
+        user_id: "u1",
+        text: "run the nightly report",
+      });
+      await waitFor(() => captured.endsWith("\n"));
+      const lines = stdinLines(captured);
+      expect(lines).toHaveLength(1);
+      expect(lines[0].type).toBe("user");
+      expect(lines[0].message.role).toBe("user");
+      expect(lines[0].message.content).toMatch(
+        /^<channel source="cron" chat_id="job-1"[^>]*>run the nightly report<\/channel>$/,
+      );
+    } finally {
+      await busMgr.stop("psj-bus");
+    }
   });
 
   it("slash commands are written to stdin (Probe 0.6 Q5)", async () => {
@@ -307,15 +376,35 @@ describe("process-stream-json supervision", () => {
       captured += chunk;
     });
     await proc.send_slash("compact");
-    await waitFor(() => captured.includes("/compact"));
-    expect(captured).toContain("/compact\n");
+    await waitFor(() => captured.endsWith("\n"));
+    expect(stdinLines(captured)).toEqual([
+      { type: "user", message: { role: "user", content: "/compact" } },
+    ]);
+  });
+
+  it("stop() ends the agent through /quit, not the 2 s SIGTERM fallback", async () => {
+    // `-p` refuses "/quit" and keeps running; /bin/cat, like the CLI, exits on EOF.
+    const agent = mkAgent({ id: "psj-quit" });
+    const proc = await mgr.spawnAgent(agent, "cron");
+    spawned.push(proc);
+    let exitCode: number | undefined;
+    proc.onExit((code) => {
+      exitCode = code;
+    });
+    const started = Date.now();
+    await mgr.stop(agent.id);
+    expect(Date.now() - started).toBeLessThan(1500);
+    expect(exitCode).toBe(0);
   });
 
   it("propagates CCAW_AGENT_ID and CCAW_BUS_SOCK to child env", async () => {
     // Use `/usr/bin/env` (no args) to introspect the child env.
+    // #304: `env` alone exits before `onData` below is attached, so on a
+    // loaded runner the dump was already gone (flaky in CI). The child now
+    // waits for a line on stdin; the test attaches its listener, THEN says go.
     const localMgr = new SessionManager({
-      commandOverride: "/usr/bin/env",
-      argsOverride: [],
+      commandOverride: "/bin/sh",
+      argsOverride: ["-c", "read x; /usr/bin/env"],
       busSocketPath: "/tmp/test-bus-env.sock",
     });
     const agent = mkAgent({ id: "psj-env-prop" });
@@ -324,6 +413,7 @@ describe("process-stream-json supervision", () => {
     proc.onData((chunk) => {
       captured += chunk;
     });
+    await proc.send_slash("go");
     // `env` exits immediately after dumping the environment.
     await waitForExit(proc, 5000);
     expect(captured).toContain("CCAW_AGENT_ID=psj-env-prop");
@@ -758,6 +848,7 @@ describe("session-id collision rotation", () => {
   });
 
   it("gives up after one retry if the collision persists", async () => {
+    const warned: string[] = [];
     // Always-fail-with-marker stand-in.
     const STALE = "11111111-1111-1111-1111-111111111bad";
     const mgr = new SessionManager({
@@ -773,23 +864,35 @@ describe("session-id collision rotation", () => {
       // THAT EXITS WITHIN IT — the sibling at the top of this describe keeps
       // 500ms deliberately, because its retry stand-in `sleep 60`s and so
       // burns the whole window; do not "fix the inconsistency" by raising it.
-      // `detectSessionIdCollision` resolves as soon as `proc.onExit` fires,
-      // so a fast stand-in still finishes in ~ms and the suite pays nothing.
+      // `detectSessionIdCollision` resolves on `proc.onExit` — at once when
+      // the exit is clean or the marker is already seen, after a short drain
+      // (250ms, #326) when a non-zero exit arrives ahead of its own marker.
       // Observed: at 300ms these tests flaked under the CPU contention of
       // concurrently running test files; at 2000ms they passed 10/10 in
-      // isolation and across repeated full-suite runs.
-      // NOT claimed: that the window is the only race here. The detector
-      // also depends on the marker chunk arriving before `onExit`
-      // (session-manager.ts:421-435), which no window size fixes. If these
-      // flake again, suspect that ordering rather than raising the bound.
+      // isolation and across repeated full-suite runs. The remaining flake
+      // was the marker/exit ordering, closed in #326 (drain + output tail).
       sessionCollisionDetectMs: 2000,
       persistRotatedSessionId: async () => {},
-      logger: { warn: () => {}, info: () => {}, error: () => {} },
+      logger: {
+        warn: (...a: unknown[]) => warned.push(a.map(String).join(" ")),
+        info: () => {},
+        error: () => {},
+      },
     });
     const agent = mkAgent({ id: "rot-loop", session_id: STALE });
     await expect(mgr.spawnAgent(agent, "cron")).rejects.toThrow(
       /collision persisted after rotation/,
     );
+    // Issue #393: both collision exits are logged, and the verdict tells the
+    // first (retried) from the second (given up on) — `retry` is per spawn.
+    // The line is written once the detector has spoken (#326), so poll.
+    const exitLines = () =>
+      warned.filter((l) => l.includes("agent=rot-loop") && l.includes("exited outside stop()"));
+    await waitFor(() => exitLines().length === 2);
+    const exits = exitLines();
+    expect(exits).toHaveLength(2);
+    expect(exits[0]).toContain("retried with a fresh id");
+    expect(exits[1]).toContain("collision persisted after rotation");
   });
 
   it("does NOT rotate on non-collision exit-1 (no marker in output)", async () => {
@@ -805,15 +908,13 @@ describe("session-id collision rotation", () => {
       // THAT EXITS WITHIN IT — the sibling at the top of this describe keeps
       // 500ms deliberately, because its retry stand-in `sleep 60`s and so
       // burns the whole window; do not "fix the inconsistency" by raising it.
-      // `detectSessionIdCollision` resolves as soon as `proc.onExit` fires,
-      // so a fast stand-in still finishes in ~ms and the suite pays nothing.
+      // `detectSessionIdCollision` resolves on `proc.onExit` — at once when
+      // the exit is clean or the marker is already seen, after a short drain
+      // (250ms, #326) when a non-zero exit arrives ahead of its own marker.
       // Observed: at 300ms these tests flaked under the CPU contention of
       // concurrently running test files; at 2000ms they passed 10/10 in
-      // isolation and across repeated full-suite runs.
-      // NOT claimed: that the window is the only race here. The detector
-      // also depends on the marker chunk arriving before `onExit`
-      // (session-manager.ts:421-435), which no window size fixes. If these
-      // flake again, suspect that ordering rather than raising the bound.
+      // isolation and across repeated full-suite runs. The remaining flake
+      // was the marker/exit ordering, closed in #326 (drain + output tail).
       sessionCollisionDetectMs: 2000,
       persistRotatedSessionId: async (agentId, sessionId) => {
         persisted.push({ agentId, sessionId });
@@ -844,15 +945,13 @@ describe("session-id collision rotation", () => {
       // THAT EXITS WITHIN IT — the sibling at the top of this describe keeps
       // 500ms deliberately, because its retry stand-in `sleep 60`s and so
       // burns the whole window; do not "fix the inconsistency" by raising it.
-      // `detectSessionIdCollision` resolves as soon as `proc.onExit` fires,
-      // so a fast stand-in still finishes in ~ms and the suite pays nothing.
+      // `detectSessionIdCollision` resolves on `proc.onExit` — at once when
+      // the exit is clean or the marker is already seen, after a short drain
+      // (250ms, #326) when a non-zero exit arrives ahead of its own marker.
       // Observed: at 300ms these tests flaked under the CPU contention of
       // concurrently running test files; at 2000ms they passed 10/10 in
-      // isolation and across repeated full-suite runs.
-      // NOT claimed: that the window is the only race here. The detector
-      // also depends on the marker chunk arriving before `onExit`
-      // (session-manager.ts:421-435), which no window size fixes. If these
-      // flake again, suspect that ordering rather than raising the bound.
+      // isolation and across repeated full-suite runs. The remaining flake
+      // was the marker/exit ordering, closed in #326 (drain + output tail).
       sessionCollisionDetectMs: 2000,
       logger: { warn: () => {}, info: () => {}, error: () => {} },
     });
@@ -975,6 +1074,34 @@ describe("JSONL tailer wiring (issue #215)", () => {
     expect(replies[0].origin).toBe("telegram");
   });
 
+  it("announces the tailer generation to the bus BEFORE the record goes live, with the number the tailer carries (#412 item 1)", async () => {
+    // From `agents.set` on, the bus resolves this proc as the delivery target
+    // and the collision wait takes 2 s on a healthy spawn: the announce must
+    // already have happened, or a prompt typed in that window is tagged with
+    // the generation being replaced.
+    const calls: Array<{ agent: string; generation: number; recordLive: boolean }> = [];
+    const b = bus as unknown as { noteSpawnedGeneration?: (a: string, g: number) => void };
+    const original = b.noteSpawnedGeneration?.bind(bus);
+    b.noteSpawnedGeneration = (a: string, g: number) => {
+      calls.push({ agent: a, generation: g, recordLive: mgr.getAgent(a) !== undefined });
+      original?.(a, g);
+    };
+    try {
+      const agent = mkAgent({ id: "gen-agent", cwd: agentCwd, session_id: SID });
+      await mgr.spawnAgent(agent, "telegram");
+      spawned.push(agent.id);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toEqual({ agent: "gen-agent", generation: 1, recordLive: false });
+      const record = (
+        mgr as unknown as { agents: Map<string, { tailer?: { generation?: number } }> }
+      ).agents.get("gen-agent");
+      // the tailer built for this process carries the announced number
+      expect(record?.tailer?.generation).toBe(1);
+    } finally {
+      if (original) b.noteSpawnedGeneration = original;
+    }
+  });
+
   it("spawns cleanly when no bus is configured (tailer wiring is opt-in)", async () => {
     const noBus = new SessionManager({
       commandOverride: "/bin/cat",
@@ -987,5 +1114,174 @@ describe("JSONL tailer wiring (issue #215)", () => {
     const proc = await noBus.spawnAgent(agent, "telegram");
     expect(proc.agent_id).toBe("nobus-agent");
     await noBus.stop(agent.id);
+  });
+});
+
+/* ───────────────────────────────────────────────────────────────────── */
+/* Issue #393 — an exit the daemon did not ask for is logged             */
+/* ───────────────────────────────────────────────────────────────────── */
+
+describe("exit outside stop() is logged with code, uptime and the last output (issue #393)", () => {
+  let pmDir: string;
+  let warned: string[];
+  const origWarn = console.warn;
+
+  beforeEach(() => {
+    pmDir = mkdtempSync(join(tmpdir(), "ccaw-pm-"));
+    warned = [];
+    console.warn = (...args: unknown[]) => {
+      warned.push(args.map(String).join(" "));
+    };
+  });
+
+  afterEach(() => {
+    console.warn = origWarn;
+    rmSync(pmDir, { recursive: true, force: true });
+  });
+
+  function mgrRunning(script: string): SessionManager {
+    return new SessionManager({
+      commandOverride: "/bin/sh",
+      argsOverride: ["-c", script],
+      busSocketPath: "/tmp/test-bus.sock",
+      persistRotatedSessionId: async () => {},
+      postMortemDir: pmDir,
+    });
+  }
+
+  it("a process that dies on its own is reported: agent id, exit code, uptime, boot-failure flag, screen tail", async () => {
+    // #390: claude printed its startup screen and went away; before #393 the
+    // registry was cleaned up and nothing was written anywhere.
+    const mgr = mgrRunning("echo 'Select login method:'; echo '1. Claude account'; exit 3");
+    const agent = mkAgent({ id: "dies-at-boot" });
+    const proc = await mgr.spawnAgent(agent, "discord");
+    await waitForExit(proc);
+    await waitFor(() => warned.some((l) => l.includes("[bus-session] agent=dies-at-boot")));
+    const line = warned.find((l) => l.includes("[bus-session] agent=dies-at-boot")) ?? "";
+    expect(line).toContain("exited outside stop()");
+    expect(line).toContain("code=3");
+    expect(line).toMatch(/uptime=\d+\.\d+s/);
+    expect(line).toContain("startup failure");
+    expect(line).toContain("Select login method");
+    expect(line).toContain("1. Claude account");
+    expect(mgr.getAgent(agent.id)).toBeUndefined();
+  });
+
+  it("an exit that stop() asked for stays quiet", async () => {
+    const mgr = mgrRunning("cat");
+    const agent = mkAgent({ id: "stopped-on-purpose" });
+    const proc = await mgr.spawnAgent(agent, "discord");
+    const exited = waitForExit(proc, 6000);
+    await mgr.stop(agent.id);
+    await exited;
+    await new Promise((r) => setTimeout(r, 50));
+    expect(warned.filter((l) => l.includes("[bus-session] agent=stopped-on-purpose"))).toEqual([]);
+  });
+});
+
+// #326: the marker chunk and the exit ride two independent PTY channels; the
+// exit may arrive first. These drive the detector with a scripted stand-in so
+// the ordering is chosen, not left to the scheduler.
+describe("detectSessionIdCollision — exit ahead of its own output (#326)", () => {
+  function scripted(opts: { tail?: string; replayExit?: number } = {}) {
+    const data: Array<(c: string) => void> = [];
+    const exit: Array<(code: number) => void> = [];
+    return {
+      proc: {
+        onData: (h: (c: string) => void) => {
+          data.push(h);
+        },
+        onExit: (h: (code: number) => void) => {
+          exit.push(h);
+          // #393: a past exit is replayed synchronously at registration.
+          if (opts.replayExit !== undefined) h(opts.replayExit);
+        },
+        recentOutputTail: opts.tail === undefined ? undefined : () => opts.tail as string,
+      },
+      emitData: (c: string) => {
+        for (const h of data) h(c);
+      },
+      emitExit: (code: number) => {
+        for (const h of exit) h(code);
+      },
+    };
+  }
+  const MARKER = "Error: Session ID 99999999-9999-9999-9999-999999999bad is already in use.\n";
+  // Timing is asserted through the DRAIN ARGUMENT, never the wall clock: a
+  // verdict that comes back with a 10s drain still pending proves it was the
+  // marker (or the exit) that resolved it, whatever the scheduler did.
+  const NEVER = 10_000;
+  const settled = (p: Promise<boolean>, ms = 1500) =>
+    Promise.race([p, new Promise<"pending">((r) => setTimeout(() => r("pending"), ms))]);
+
+  it("marker then non-zero exit → collision (the ordering the detector always handled)", async () => {
+    const s = scripted();
+    const verdict = detectSessionIdCollision(s.proc, 20_000, NEVER);
+    s.emitData(MARKER);
+    s.emitExit(1);
+    expect(await settled(verdict)).toBe(true);
+  });
+
+  it("non-zero exit then the marker inside the drain → collision, resolved on the marker", async () => {
+    const s = scripted();
+    const verdict = detectSessionIdCollision(s.proc, 20_000, NEVER);
+    s.emitExit(1);
+    setTimeout(() => s.emitData(MARKER), 20);
+    expect(await settled(verdict)).toBe(true);
+  });
+
+  it("non-zero exit with no marker at all → no collision once the drain ends", async () => {
+    const s = scripted();
+    const verdict = detectSessionIdCollision(s.proc, 20_000, 30);
+    s.emitExit(1);
+    expect(await settled(verdict)).toBe(false);
+  });
+
+  it("clean exit → no collision at once, even if a marker-like line follows", async () => {
+    const s = scripted();
+    const verdict = detectSessionIdCollision(s.proc, 20_000, NEVER);
+    s.emitExit(0);
+    s.emitData(MARKER);
+    expect(await settled(verdict)).toBe(false);
+  });
+
+  it("the drain never outlives the detection window", async () => {
+    const s = scripted();
+    const verdict = detectSessionIdCollision(s.proc, 60, NEVER);
+    setTimeout(() => s.emitExit(1), 10);
+    expect(await settled(verdict)).toBe(false);
+  });
+
+  it("marker AND exit both delivered before attach: the process's tail carries the marker", async () => {
+    // The loaded-host ordering: the child printed and died before the spawn
+    // `await` resumed. `onData` cannot replay the chunk; `onExit` replays the
+    // code; the tail is the only place the marker still exists.
+    const s = scripted({ tail: `boot noise\n${MARKER}`, replayExit: 1 });
+    expect(await settled(detectSessionIdCollision(s.proc, 20_000, NEVER))).toBe(true);
+  });
+
+  it("a replayed clean exit at attach resolves false immediately (no TDZ, no hang)", async () => {
+    const s = scripted({ replayExit: 0 });
+    expect(await settled(detectSessionIdCollision(s.proc, 20_000, NEVER))).toBe(false);
+  });
+
+  it("a replayed crash at attach with no marker anywhere → false after the drain", async () => {
+    const s = scripted({ tail: "segfault\n", replayExit: 1 });
+    expect(await settled(detectSessionIdCollision(s.proc, 20_000, 30))).toBe(false);
+  });
+
+  it("a marker split across two chunks after the exit still counts (rolling window, not per chunk)", async () => {
+    const s = scripted();
+    const verdict = detectSessionIdCollision(s.proc, 20_000, NEVER);
+    s.emitExit(1);
+    const cut = MARKER.indexOf("is already");
+    s.emitData(MARKER.slice(0, cut));
+    setTimeout(() => s.emitData(MARKER.slice(cut)), 10);
+    expect(await settled(verdict)).toBe(true);
+  });
+
+  it("windowMs 0 short-circuits to false", async () => {
+    const s = scripted();
+    expect(await detectSessionIdCollision(s.proc, 0)).toBe(false);
   });
 });

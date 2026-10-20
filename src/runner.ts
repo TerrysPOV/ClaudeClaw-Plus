@@ -17,6 +17,7 @@ import {
   backupSession,
 } from "./sessions";
 import { needsRotation, rotateSession, loadLatestSummary } from "./rotation";
+import { actOnSession, saveMemoryBeforeCompact } from "./runner/live-session-actions";
 import {
   getThreadSession,
   createThreadSession,
@@ -37,6 +38,7 @@ import {
   selectModel as governanceSelectModel,
   configureRouter as configureGovernanceRouter,
 } from "./governance/model-router";
+import { setModeDispatchSink, fileModeDispatchSink } from "./governance/mode-dispatch-journal";
 import {
   recordInvocationStart,
   recordInvocationCompletion,
@@ -71,7 +73,17 @@ import { validateModelString } from "./jobs";
 import { selectModel } from "./model-router";
 import { recordResult, abortReason, clearSession, startSession } from "./watchdog";
 import { getPluginManager, type EventContext } from "./plugins";
-import { runOnPty, killAllPtys, snapshotSupervisor } from "./runner/pty-supervisor";
+import {
+  runOnPty,
+  killAllPtys,
+  supervisorEntryCount,
+  retirePtySession,
+  type PtySessionStore,
+  runEphemeralWithDeadline,
+} from "./runner/pty-supervisor";
+import { encodeCwdForProjectsDir } from "./bus/jsonl-line-types";
+import { PTY_OUTPUT_FORMAT_CONSTRAINT } from "./runner/pty-output-format";
+import { SPAWN_ENV_STRIP_KEYS, cleanSpawnEnv, shouldStripSpawnEnvKey } from "./runner/spawn-env";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
 
@@ -85,6 +97,9 @@ function ensureGovernanceRouter(modes?: AgenticMode[], defaultMode?: string): vo
       defaultProvider: "anthropic",
       defaultModel: "claude-3-5-sonnet",
     });
+    // Activate mode_dispatch telemetry: from here, each keyword/phrase route is
+    // journalled for the tuner's routing_reclassify_rate (inert until now).
+    setModeDispatchSink(fileModeDispatchSink());
     governanceInitialized = true;
   }
 }
@@ -195,51 +210,8 @@ const COMPACT_TIMEOUT_ENABLED = true;
  * object — no shell, no OS-specific calls. The `claude` CLI it spawns then
  * resolves credentials using its own per-platform code path.
  */
-/**
- * Canonical strip list shared by `cleanSpawnEnv` and `withCleanProcessEnv`.
- * Keep these in sync — both helpers MUST agree, or one will reintroduce a
- * leak the other prevents.
- *
- * Exception: `CLAUDE_CODE_OAUTH_TOKEN` values that start with `sk-ant-oat01-`
- * are 1-year long-lived tokens minted via `claude setup-token`. These do NOT
- * carry the frozen-session refresh-failure risk that motivated stripping
- * short-lived OAuth tokens, so they are preserved into spawned PTY claudes
- * (intentional: operators wire the token via the daemon env file and expect
- * it to flow through to the subscription-pool claudes). The exception is
- * implemented by `shouldStripSpawnEnvKey` below.
- */
-const SPAWN_ENV_STRIP_KEYS = [
-  "CLAUDECODE",
-  "CLAUDE_CODE_OAUTH_TOKEN",
-  "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
-  "ANTHROPIC_API_KEY", // see comment above — prevents accidental API-key billing
-] as const;
-
-/**
- * Decide whether a strip-list key should actually be stripped for the given
- * value. Long-lived `sk-ant-oat01-*` OAuth tokens are kept; everything else
- * on the strip list is removed unconditionally.
- */
-export function shouldStripSpawnEnvKey(key: string, value: string | undefined): boolean {
-  if (
-    key === "CLAUDE_CODE_OAUTH_TOKEN" &&
-    typeof value === "string" &&
-    value.startsWith("sk-ant-oat01-")
-  ) {
-    return false;
-  }
-  return true;
-}
-
-export function cleanSpawnEnv(): Record<string, string> {
-  const stripped = new Set<string>(SPAWN_ENV_STRIP_KEYS);
-  const out: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (stripped.has(key) && shouldStripSpawnEnvKey(key, value)) continue;
-    if (typeof value === "string") out[key] = value;
-  }
-  return out;
-}
+// Moved to a leaf module; re-exported for existing importers.
+export { cleanSpawnEnv, shouldStripSpawnEnvKey };
 
 /**
  * Run `fn` with `SPAWN_ENV_STRIP_KEYS` temporarily deleted from `process.env`,
@@ -404,6 +376,20 @@ export interface RunResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+  /**
+   * #376: the Claude session this run used or created — taken from the CLI's
+   * own `system/init` / `result` events on the stream, the documented source
+   * (never from the transcript file, whose format is internal). Absent when the
+   * stream carried no id (a rate-limit fallback, an exec that died before
+   * `init`). The gateway records it so `--resume` can be emitted.
+   */
+  sessionId?: string;
+  /**
+   * #546: set when the response came from the rate-limit fallback. The
+   * fallback turn runs without onChunk, so a caller that streamed the
+   * primary's output must still deliver this stdout.
+   */
+  usedFallback?: true;
 }
 
 export interface AgentStreamEvent {
@@ -583,7 +569,10 @@ export function killActive(): boolean {
   // Best-effort async PTY disposal. We don't await because killActive is
   // historically synchronous; PTY callers see PtyClosedError on their next
   // tick which surfaces as a structured error via the supervisor's lock.
-  const ptyCountBefore = snapshotSupervisor().ptys.length;
+  // #394: count entries, not live PTYs — an entry whose spawn has not landed
+  // yet has no pid and is absent from the snapshot, and `/kill` must reach it
+  // (the retirement refuses its late landing) rather than skip it.
+  const ptyCountBefore = supervisorEntryCount();
   if (ptyCountBefore > 0) {
     void killAllPtys();
     killed = true;
@@ -739,6 +728,67 @@ export interface RunOptions {
   modelOverride?: string;
 }
 
+/**
+ * Which engine runs an agent turn (#546). The single decision the agent-turn
+ * call sites go through — primary turn, rate-limit fallback, dashboard chat,
+ * fork, agent job — so a new call site cannot quietly skip `pty.enabled`.
+ * The recovery retries (stale session, corrupted primary session, post-compact)
+ * stay on `claude -p` by SPEC §5.3 and do not consult it.
+ *
+ *   - `name === "bootstrap"` → legacy `claude -p` (SPEC §7.1).
+ *   - `settings.pty.enabled === false` → legacy `claude -p` (SPEC §5.2).
+ *   - otherwise → the PTY supervisor.
+ */
+export function resolveAgentTurnRoute(name?: string): "legacy" | "pty" {
+  if (name === "bootstrap") return "legacy";
+  return getSettings().pty.enabled ? "pty" : "legacy";
+}
+
+type ClaudeProc = Bun.Subprocess<"ignore", "pipe", "pipe">;
+type ClaudeSpawn = (
+  args: string[],
+  opts: { env: Record<string, string>; cwd?: string },
+) => ClaudeProc;
+let _claudeSpawnForTests: ClaudeSpawn | null = null;
+/**
+ * Test seam (#546): replaces the `Bun.spawn` of the legacy `claude -p` call
+ * sites, so a test can tell which route a path took without a real `claude`.
+ * Production never sets it.
+ */
+export function _setClaudeSpawnForTests(fn: ClaudeSpawn | null): void {
+  _claudeSpawnForTests = fn;
+}
+function spawnClaude(
+  args: string[],
+  opts: { env: Record<string, string>; cwd?: string },
+): ClaudeProc {
+  if (_claudeSpawnForTests) return _claudeSpawnForTests(args, opts);
+  return Bun.spawn(args, {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    env: opts.env,
+    ...(opts.cwd ? { cwd: opts.cwd } : {}),
+  });
+}
+
+/** A one-shot agent turn on its own PTY (#546); see `runEphemeralWithDeadline`. */
+const runOneShotOnPty = runEphemeralWithDeadline;
+
+/**
+ * The model override as `run()` accepts it: the bare model string production
+ * passes today (`start.ts` job tick), or the `RunOptions` object the original
+ * wiring (7e6dae9) intended and the tests always used (#330). Anything else
+ * is treated as "no override" rather than reaching `primaryConfig.model`.
+ */
+export function resolveModelOverride(value: string | RunOptions | undefined): string | undefined {
+  if (typeof value === "string") return value.trim() || undefined;
+  if (value && typeof value === "object" && typeof value.modelOverride === "string") {
+    return value.modelOverride.trim() || undefined;
+  }
+  return undefined;
+}
+
 export async function runClaudeOnce(
   baseArgs: string[],
   model: string,
@@ -753,12 +803,7 @@ export async function runClaudeOnce(
   if (model.trim() && normalizedModel !== "glm" && normalizedModel !== "kimi-k2p6")
     args.push("--model", model.trim());
 
-  const proc = Bun.spawn(args, {
-    stdout: "pipe",
-    stderr: "pipe",
-    env: buildChildEnv(baseEnv, model, api),
-    ...(cwd ? { cwd } : {}),
-  });
+  const proc = spawnClaude(args, { env: buildChildEnv(baseEnv, model, api), cwd });
 
   mainActiveProcs.add(proc);
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
@@ -851,6 +896,8 @@ export async function runAgentJobHeadless(input: {
   model?: string;
   timeoutMs: number;
   signal: AbortSignal;
+  /** Bus job id, used to name the job's PTY session. */
+  jobId?: string;
   /**
    * Absolute path to a synthesized `--mcp-config` for this job, or omitted
    * when the MCP multiplexer is dormant. Minted and released by the caller
@@ -873,6 +920,37 @@ export async function runAgentJobHeadless(input: {
     mcpConfigPath: input.mcpConfigPath,
   });
   const model = input.model?.trim() || settings.model;
+  if (resolveAgentTurnRoute() === "pty") {
+    // #546: one PTY per job, retired when the job ends. Cancel (the signal)
+    // and the job timeout both dispose it mid-turn.
+    const exec = await runOneShotOnPty(
+      `job:${input.agent}:${input.jobId ?? crypto.randomUUID()}`,
+      input.prompt,
+      {
+        timeoutMs: input.timeoutMs,
+        agentName: input.agent,
+        cwd: ctx.dir,
+        modelOverride: model,
+        api: settings.api,
+        securityArgs: buildSecurityArgs(settings.security),
+        // The reply is read off the rendered TUI: plain prose only (see execClaude).
+        appendSystemPrompt: [persona, PTY_OUTPUT_FORMAT_CONSTRAINT].filter(Boolean).join("\n\n"),
+        // The bus owns the job's MCP config, absent included: the supervisor
+        // must not synthesize one the `-p` job would not have had.
+        mcpConfig: { path: input.mcpConfigPath },
+      },
+      input.signal,
+    );
+    // Same mapping as the `-p` path: timeout and abort both end as exit 124.
+    if (exec.timedOut || exec.aborted) {
+      const reason = exec.timedOut ? `timed out after ${input.timeoutMs / 1000}s` : "aborted";
+      return { exitCode: 124, timedOut: true, error: reason };
+    }
+    if (exec.exitCode !== 0) {
+      return { exitCode: exec.exitCode, error: exec.stderr || `claude exited ${exec.exitCode}` };
+    }
+    return { exitCode: 0, resultText: exec.rawStdout.trim() };
+  }
   const { rawStdout, stderr, exitCode } = await runClaudeOnce(
     args,
     model,
@@ -907,12 +985,7 @@ async function runClaudeStream(
   const normalizedModel = model.trim().toLowerCase();
   if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
 
-  const proc = Bun.spawn(args, {
-    stdout: "pipe",
-    stderr: "pipe",
-    env: buildChildEnv(baseEnv, model, api),
-    ...(cwd ? { cwd } : {}),
-  });
+  const proc = spawnClaude(args, { env: buildChildEnv(baseEnv, model, api), cwd });
 
   mainActiveProcs.add(proc);
   let sessionId: string | undefined;
@@ -1252,26 +1325,6 @@ const DIR_SCOPE_PROMPT = [
   "If a request requires accessing files outside the project, refuse and explain why.",
 ].join("\n");
 
-/**
- * Band-aid for #105 — see the call site in `run()` for full context.
- *
- * Constrains the model's user-facing reply to plain prose so the PTY
- * sentinel-echo parser can extract textual content rather than TUI box
- * chrome from rendered markdown blocks. Temporary; remove with the PTY
- * runtime when the Bus runtime (epic #107, spec PR #106) becomes default.
- */
-const PTY_OUTPUT_FORMAT_CONSTRAINT = [
-  "OUTPUT FORMAT CONSTRAINT (response surface limitation):",
-  "Your final user-facing reply MUST be plain prose. The reply is captured through a text-only transport that cannot render markdown.",
-  "Do NOT use in your final reply:",
-  "  - Backtick code fences (```...``` or single `...`) — write paths and commands plainly, e.g. /home/x/file.png NOT `/home/x/file.png`",
-  "  - Markdown bullets (`*`, `-`, `+`) at the start of lines",
-  "  - Numbered list items (`1.`, `2.`)",
-  "  - Block quotes (`>` at start of lines)",
-  "  - Horizontal rules (`---`)",
-  "This constraint applies ONLY to your final response text. You may still use markdown freely inside tool inputs and internal reasoning.",
-].join("\n");
-
 export async function ensureProjectClaudeMd(): Promise<void> {
   // Preflight-only initialization: never rewrite an existing project CLAUDE.md.
   if (existsSync(PROJECT_CLAUDE_MD)) return;
@@ -1460,35 +1513,41 @@ export async function loadHeartbeatPromptTemplate(): Promise<string> {
   return "";
 }
 
-/** Run /compact on the current session to reduce context size. */
-export async function runCompact(
-  sessionId: string,
-  model: string,
-  api: string,
-  baseEnv: Record<string, string>,
-  securityArgs: string[],
-  timeoutMs: number,
-  cwd?: string,
-): Promise<boolean> {
-  const compactArgs = [
-    CLAUDE_EXECUTABLE,
-    "-p",
-    "/compact",
-    "--output-format",
-    "text",
-    "--resume",
-    sessionId,
-    ...securityArgs,
-  ];
+/**
+ * Run /compact on a session to reduce context size. With a live PTY session for
+ * `sessionKey` the command goes into it (#549); otherwise it is a `trusted-session`
+ * one-shot resume of `sessionId`. `cwd` is where the session was created: `--resume`
+ * finds a session by it.
+ */
+export async function runCompact(opts: {
+  sessionId: string;
+  sessionKey?: string;
+  model: string;
+  timeoutMs: number;
+  cwd?: string;
+  /** The session is wedged (its last turn timed out): retire it, then resume one-shot. */
+  skipLive?: boolean;
+}): Promise<boolean> {
   console.log(
-    `[${new Date().toLocaleTimeString()}] Running /compact on session ${sessionId.slice(0, 8)}...`,
+    `[${new Date().toLocaleTimeString()}] Running /compact on session ${opts.sessionId.slice(0, 8)}...`,
   );
-  const result = await runClaudeOnce(compactArgs, model, api, baseEnv, timeoutMs, cwd);
-  const success = result.exitCode === 0;
+  const result = await actOnSession({
+    route: "compact",
+    prompt: "/compact",
+    sessionKey: opts.sessionKey,
+    sessionId: opts.sessionId,
+    timeoutMs: opts.timeoutMs,
+    skipLive: opts.skipLive,
+    model: opts.model,
+    cwd: opts.cwd,
+    // /compact needs no tools. An empty grant (not an absent one) keeps the one-shot
+    // off the default permission profile, which can include the bypass flag.
+    allowedTools: [],
+  });
   console.log(
-    `[${new Date().toLocaleTimeString()}] Compact ${success ? "succeeded" : `failed (exit ${result.exitCode})`}`,
+    `[${new Date().toLocaleTimeString()}] Compact ${result.ok ? `succeeded (${result.via})` : `failed (${result.detail ?? result.via})`}`,
   );
-  return success;
+  return result.ok;
 }
 
 /**
@@ -1502,20 +1561,14 @@ export async function compactCurrentSession(
   if (!existing) return { success: false, message: "No active session to compact." };
 
   const settings = getSettings();
-  const securityArgs = buildSecurityArgs(settings.security);
-  const baseEnv = cleanSpawnEnv();
-  const timeoutMs = settings.sessionTimeoutMs;
-
   const compactCwd = agentName ? await ensureAgentDir(agentName) : undefined;
-  const ok = await runCompact(
-    existing.sessionId,
-    settings.model,
-    settings.api,
-    baseEnv,
-    securityArgs,
-    timeoutMs,
-    compactCwd,
-  );
+  const ok = await runCompact({
+    sessionId: existing.sessionId,
+    sessionKey: agentName ? `agent:${agentName}` : "global",
+    model: settings.model,
+    timeoutMs: settings.sessionTimeoutMs,
+    cwd: compactCwd,
+  });
 
   return ok
     ? { success: true, message: `✅ Session compact complete (${existing.sessionId.slice(0, 8)})` }
@@ -1632,20 +1685,14 @@ export async function compactCurrentThreadSession(
   if (!existing) return { success: false, message: "No active session to compact." };
 
   const settings = getSettings();
-  const securityArgs = buildSecurityArgs(settings.security);
-  const baseEnv = cleanSpawnEnv();
-  const timeoutMs = settings.sessionTimeoutMs;
-
   const compactCwd = agentName ? await ensureAgentDir(agentName) : undefined;
-  const ok = await runCompact(
-    existing.sessionId,
-    settings.model,
-    settings.api,
-    baseEnv,
-    securityArgs,
-    timeoutMs,
-    compactCwd,
-  );
+  const ok = await runCompact({
+    sessionId: existing.sessionId,
+    sessionKey: `thread:${threadId}`,
+    model: settings.model,
+    timeoutMs: settings.sessionTimeoutMs,
+    cwd: compactCwd,
+  });
 
   return ok
     ? {
@@ -1661,6 +1708,38 @@ export async function compactCurrentThreadSession(
 interface PolicyIdentity {
   userId?: string;
   skillName?: string;
+}
+
+/**
+ * Injectable seam for the PRIMARY exec of `execClaude` (#330): the step that
+ * runs the resolved `primaryConfig.model` through `runClaudeStream` (legacy)
+ * or `runOnPty` (supervisor). The modelOverride tests used to
+ * `spyOn(module, "runClaudeOnce")` — a function `execClaude` never calls for
+ * the primary run, and a module spy cannot intercept a local binding anyway —
+ * so eleven tests ran for three months without executing one assertion.
+ * When set, the seam receives the resolved model/api, the legacy-shaped args,
+ * cwd, timeout and which route the real call would have taken; PTY-only
+ * inputs (prompt, securityArgs, appendSystemPrompt) and the spawn env are not
+ * part of it. Only the PRIMARY exec is seamed: the result flows into the
+ * unchanged downstream (rate-limit fallback, corruption and stale-session
+ * recovery), which still spawns claude — so a seam should return a clean
+ * result or throw. Production never sets it.
+ */
+export interface PrimaryExecCall {
+  name: string;
+  args: string[];
+  model: string;
+  api: string;
+  cwd: string | undefined;
+  timeoutMs: number;
+  route: "legacy" | "pty";
+}
+type PrimaryExec = (
+  call: PrimaryExecCall,
+) => Promise<{ rawStdout: string; stderr: string; exitCode: number; sessionId?: string }>;
+let _primaryExecForTests: PrimaryExec | null = null;
+export function _setPrimaryExecForTests(fn: PrimaryExec | null): void {
+  _primaryExecForTests = fn;
 }
 
 async function execClaude(
@@ -1749,7 +1828,12 @@ async function execClaude(
           type: "budget-blocked",
           message: `Budget state: ${routing.budgetState}`,
         });
-        return { stdout: "", stderr: "Execution blocked: budget limit exceeded", exitCode: 0 };
+        return {
+          stdout: "",
+          stderr: "Execution blocked: budget limit exceeded",
+          exitCode: 0,
+          ...(existing?.sessionId ? { sessionId: existing.sessionId } : {}),
+        };
       }
       console.log(
         `[${new Date().toLocaleTimeString()}] Agentic routing: ${routing.selectedModel} (${routing.reason})`,
@@ -1921,10 +2005,25 @@ async function execClaude(
     // recovery) is unchanged — it consumes `exec` with the same shape regardless.
     // Per §5.3 the stale-session retry path explicitly uses runClaudeStream
     // directly, so we don't compound supervisor recovery with downstream recovery.
-    const isInfraCall = name === "bootstrap";
-    const useLegacyPath = !settings.pty.enabled || isInfraCall;
+    const useLegacyPath = resolveAgentTurnRoute(name) === "legacy";
+    const ptySessionKey = threadId
+      ? `thread:${threadId}`
+      : agentName
+        ? `agent:${agentName}`
+        : "global";
+    const appendSystemPrompt = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
     let exec: { rawStdout: string; stderr: string; exitCode: number; sessionId?: string };
-    if (useLegacyPath) {
+    if (_primaryExecForTests) {
+      exec = await _primaryExecForTests({
+        name,
+        args,
+        model: primaryConfig.model,
+        api: primaryConfig.api,
+        cwd: spawnCwd,
+        timeoutMs,
+        route: useLegacyPath ? "legacy" : "pty",
+      });
+    } else if (useLegacyPath) {
       exec = await runClaudeStream(
         args,
         primaryConfig.model,
@@ -1936,11 +2035,6 @@ async function execClaude(
         onToolEvent,
       );
     } else {
-      const sessionKey = threadId
-        ? `thread:${threadId}`
-        : agentName
-          ? `agent:${agentName}`
-          : "global";
       // Phase D fixes #2 (CRITICAL-1) and #3 (MAJOR-2/3): thread the assembled
       // --append-system-prompt payload AND the canonical securityArgs through
       // to the PTY path so named agents keep their identity/memory and the
@@ -1954,8 +2048,7 @@ async function execClaude(
       //     applying ANTHROPIC_AUTH_TOKEN, the GLM/Kimi base-URL shims, etc.
       // Without these, settings.api / agentic-router model choices / GLM /
       // Kimi configuration silently drop on the PTY path.
-      const appendSystemPrompt = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
-      exec = await runOnPty(sessionKey, prompt, {
+      exec = await runOnPty(ptySessionKey, prompt, {
         timeoutMs,
         threadId,
         agentName,
@@ -1969,6 +2062,9 @@ async function execClaude(
     }
     const primaryRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
     let usedFallback = false;
+    // The fallback session the response came from, when the stream carried no
+    // id of its own (CodeRabbit on #376): resumed, so the CLI may omit it.
+    let fallbackSessionId: string | undefined;
 
     if (
       primaryRateLimit &&
@@ -1979,6 +2075,7 @@ async function execClaude(
         `[${new Date().toLocaleTimeString()}] Claude limit reached; retrying with fallback${fallbackConfig.model ? ` (${fallbackConfig.model})` : ""}...`,
       );
       const fallbackSession = await getFallbackSession(agentName, threadId);
+      fallbackSessionId = fallbackSession?.sessionId;
       const fallbackArgs = [
         CLAUDE_EXECUTABLE,
         "-p",
@@ -1994,14 +2091,35 @@ async function execClaude(
       if (appendParts.length > 0) {
         fallbackArgs.push("--append-system-prompt", appendParts.join("\n\n"));
       }
-      exec = await runClaudeStream(
-        fallbackArgs,
-        fallbackConfig.model,
-        fallbackConfig.api,
-        baseEnv,
-        timeoutMs,
-        spawnCwd,
-      );
+      // #546: the fallback follows the primary's route. On PTY it runs on its
+      // own key and resumes from the fallback session store only, so it never
+      // resumes the primary transcript.
+      const fallbackPtyKey = `fallback:${ptySessionKey}`;
+      const fallbackStore: PtySessionStore = {
+        load: async () => (await getFallbackSession(agentName, threadId))?.sessionId,
+        save: (id) => createFallbackSession(id, agentName, threadId),
+      };
+      const execFallback = (legacyArgs: string[]) =>
+        useLegacyPath
+          ? runClaudeStream(
+              legacyArgs,
+              fallbackConfig.model,
+              fallbackConfig.api,
+              baseEnv,
+              timeoutMs,
+              spawnCwd,
+            )
+          : runOnPty(fallbackPtyKey, prompt, {
+              timeoutMs,
+              threadId,
+              agentName,
+              modelOverride: fallbackConfig.model,
+              api: fallbackConfig.api,
+              securityArgs,
+              appendSystemPrompt,
+              sessionStore: fallbackStore,
+            });
+      exec = await execFallback(fallbackArgs);
       usedFallback = true;
       let fallbackRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
 
@@ -2024,14 +2142,10 @@ async function execClaude(
         const freshFallbackArgs = fallbackArgs.filter(
           (a) => a !== "--resume" && a !== fallbackSession.sessionId,
         );
-        exec = await runClaudeStream(
-          freshFallbackArgs,
-          fallbackConfig.model,
-          fallbackConfig.api,
-          baseEnv,
-          timeoutMs,
-          spawnCwd,
-        );
+        // The PTY on the fallback key still holds the corrupted session; drop
+        // it so the retry spawns fresh from the store just reset.
+        if (!useLegacyPath) await retirePtySession(fallbackPtyKey);
+        exec = await execFallback(freshFallbackArgs);
         fallbackRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
         if (!fallbackRateLimit && exec.sessionId) {
           await createFallbackSession(exec.sessionId, agentName, threadId);
@@ -2208,6 +2322,13 @@ async function execClaude(
       stdout,
       stderr,
       exitCode,
+      // The id of the exec that produced THIS response: on a rate-limit
+      // fallback that is the fallback session, not the primary (#376).
+      ...(() => {
+        const reported = usedFallback ? (exec.sessionId ?? fallbackSessionId) : sessionId;
+        return reported && reported !== "unknown" ? { sessionId: reported } : {};
+      })(),
+      ...(usedFallback ? { usedFallback: true as const } : {}),
     };
 
     // Record successful completion WITH the real token usage + cost so the
@@ -2360,42 +2481,43 @@ async function execClaude(
 
     // --- Auto-compact on timeout (exit 124) ---
     if (COMPACT_TIMEOUT_ENABLED && exitCode === 124 && !isNew && existing && !recoveredFromStale) {
-      // Save memory before compact wipes context
+      // Save memory before compact wipes context. The turn timed out, so the
+      // session is wedged: skip the live path and resume it one-shot (#549). The
+      // compact below skips it too, whether or not the save got as far as retiring it
+      // (a memory path `memoryFileGrant` cannot scope returns before it does).
       try {
         const memPath = getMemoryPath(agentName);
         console.log(
           `[${new Date().toLocaleTimeString()}] Pre-compact: saving memory to ${memPath}`,
         );
-        await runClaudeOnce(
-          [
-            "claude",
-            "-p",
-            `Session is about to compact. Save your current memory to ${memPath} now. Include: current status, what was accomplished, key context for next session. Keep it concise.`,
-            "--output-format",
-            "text",
-            "--resume",
-            existing.sessionId,
-            ...securityArgs,
-          ],
-          primaryConfig.model,
-          primaryConfig.api,
-          baseEnv,
-          30_000,
-        );
+        const saved = await saveMemoryBeforeCompact({
+          memPath,
+          prompt: `Session is about to compact. Save your current memory to ${memPath} now. Include: current status, what was accomplished, key context for next session. Keep it concise.`,
+          sessionKey: ptySessionKey,
+          sessionId: existing.sessionId,
+          skipLive: exitCode === 124,
+          model: primaryConfig.model,
+          cwd: spawnCwd,
+          timeoutMs: 30_000,
+        });
+        if (!saved.ok) {
+          console.warn(
+            `[${new Date().toLocaleTimeString()}] Pre-compact memory save failed: ${saved.detail ?? saved.via}`,
+          );
+        }
       } catch (e) {
         console.warn(`[${new Date().toLocaleTimeString()}] Pre-compact memory save failed:`, e);
       }
 
       emitCompactEvent({ type: "auto-compact-start" });
-      const compactOk = await runCompact(
-        existing.sessionId,
-        primaryConfig.model,
-        primaryConfig.api,
-        baseEnv,
-        securityArgs,
+      const compactOk = await runCompact({
+        sessionId: existing.sessionId,
+        sessionKey: ptySessionKey,
+        skipLive: true,
+        model: primaryConfig.model,
         timeoutMs,
-        spawnCwd,
-      );
+        cwd: spawnCwd,
+      });
       emitCompactEvent({ type: "auto-compact-done", success: compactOk });
       if (compactOk && pm) pm.emitAsync("after_compaction", {}, ctx);
 
@@ -2413,6 +2535,9 @@ async function execClaude(
           stdout: retryExec.rawStdout,
           stderr: retryExec.stderr,
           exitCode: retryExec.exitCode,
+          ...(retryExec.sessionId || existing?.sessionId
+            ? { sessionId: retryExec.sessionId || existing?.sessionId }
+            : {}),
         };
         emitCompactEvent({
           type: "auto-compact-retry",
@@ -2505,7 +2630,7 @@ export async function run(
   name: string,
   prompt: string,
   threadId?: string,
-  modelOverride?: string,
+  modelOverride?: string | RunOptions,
   timeoutMs?: number,
   agentName?: string,
   timeoutCategory?: string,
@@ -2519,7 +2644,7 @@ export async function run(
         name,
         prompt,
         threadId,
-        modelOverride,
+        resolveModelOverride(modelOverride),
         timeoutMs,
         agentName,
         timeoutCategory,
@@ -2538,6 +2663,46 @@ async function streamClaude(
   onUnblock: () => void,
   onAgentEvent?: (ev: AgentStreamEvent) => void,
 ): Promise<void> {
+  if (resolveAgentTurnRoute(name) === "pty") {
+    // #546: on PTY the chat is a turn on the shared global PTY, so it goes
+    // through execClaude — the same prompt assembly (identity, memory, the
+    // PTY output-format constraint), rotation and session handling as every
+    // other global turn. A chat that spawned the global PTY with this
+    // function's shorter prompt would fix it for all later turns. The PTY has
+    // no structured Agent tool events, so onAgentEvent stays silent here.
+    let unblocked = false;
+    const unblock = (): void => {
+      if (!unblocked) {
+        unblocked = true;
+        onUnblock();
+      }
+    };
+    let textEmitted = false;
+    try {
+      const result = await execClaude(
+        name,
+        prompt,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        (text) => {
+          textEmitted = true;
+          onChunk(text);
+          unblock();
+        },
+        () => unblock(),
+      );
+      // The fallback turn streams nothing: what the primary streamed (the
+      // rate-limit notice) is not the answer, so deliver the fallback's stdout.
+      if ((!textEmitted || result.usedFallback) && result.stdout) onChunk(result.stdout);
+    } finally {
+      unblock();
+    }
+    return;
+  }
+
   await mkdir(LOGS_DIR, { recursive: true });
 
   // Rotate the global session if thresholds are exceeded (mirrors the check in execClaude).
@@ -2605,11 +2770,7 @@ async function streamClaude(
     `[${new Date().toLocaleTimeString()}] Running: ${name} (stream-json, session: ${existing?.sessionId?.slice(0, 8) ?? "new"})`,
   );
 
-  const proc = Bun.spawn(args, {
-    stdout: "pipe",
-    stderr: "pipe",
-    env: childEnv,
-  });
+  const proc = spawnClaude(args, { env: childEnv });
 
   // Collect stderr in the background so it doesn't back-pressure the process.
   // We need it after proc.exited for stale session detection.
@@ -2820,7 +2981,7 @@ const CLAUDE_SESSIONS_DIR = join(
   process.env.HOME ?? "/root",
   ".claude",
   "projects",
-  PROJECT_DIR.replace(/\//g, "-"),
+  encodeCwdForProjectsDir(PROJECT_DIR), // #368: the CLI's rule, not `/`-only
 );
 
 const FORK_SYSTEM_PROMPT = [
@@ -2866,6 +3027,23 @@ export async function runFork(prompt: string): Promise<RunResult> {
   const baseEnv = cleanSpawnEnv();
   const securityArgs = buildSecurityArgs(security);
 
+  if (resolveAgentTurnRoute() === "pty") {
+    // #546: an ephemeral PTY, outside the LRU and out of `/kill`'s reach like
+    // the `-p` fork (never in mainActiveProcs).
+    const exec = await runOneShotOnPty(`fork:${crypto.randomUUID()}`, prompt, {
+      timeoutMs: FORK_TIMEOUT_MS,
+      modelOverride: FORK_MODEL,
+      api,
+      securityArgs,
+      appendSystemPrompt: `${FORK_SYSTEM_PROMPT}\n\n${PTY_OUTPUT_FORMAT_CONSTRAINT}`,
+      survivesKill: true,
+    });
+    if (exec.timedOut) {
+      return { stdout: "", stderr: `Fork timed out after ${FORK_TIMEOUT_MS / 1000}s`, exitCode: 1 };
+    }
+    return { stdout: exec.rawStdout, stderr: exec.stderr, exitCode: exec.exitCode };
+  }
+
   const args = [
     CLAUDE_EXECUTABLE,
     "-p",
@@ -2879,11 +3057,7 @@ export async function runFork(prompt: string): Promise<RunResult> {
     FORK_SYSTEM_PROMPT,
   ];
 
-  const proc = Bun.spawn(args, {
-    stdout: "pipe",
-    stderr: "pipe",
-    env: buildChildEnv(baseEnv, FORK_MODEL, api),
-  });
+  const proc = spawnClaude(args, { env: buildChildEnv(baseEnv, FORK_MODEL, api) });
 
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
   const timeoutPromise = new Promise<never>((_, reject) => {

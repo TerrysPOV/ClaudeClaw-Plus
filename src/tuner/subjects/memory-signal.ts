@@ -10,7 +10,9 @@
  *   bun memory-signal.ts <MEMORY.md> [--record]
  */
 import { existsSync, readFileSync, appendFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { encodeCwdForProjectsDir } from "../../bus/jsonl-line-types.js";
 
 export interface MemorySample {
   ts: string;
@@ -100,9 +102,22 @@ export function memorySignalSummary(
 }
 
 if (import.meta.main) {
+  // Default to the memory index of the current working directory's project,
+  // named by the CLI's own rule (#368) — no operator path baked in.
+  // `homedir()`, not `$HOME` (#416): the variable is empty on Windows and in
+  // some service environments.
+  const home = homedir();
   const indexPath =
-    process.argv[2] ?? `${process.env.HOME}/.claude/projects/-home-simon-agent/memory/MEMORY.md`;
-  const historyPath = `${process.env.HOME}/.config/tuner/memory-signal-history.jsonl`;
+    process.argv[2] ??
+    join(
+      home,
+      ".claude",
+      "projects",
+      encodeCwdForProjectsDir(process.cwd()),
+      "memory",
+      "MEMORY.md",
+    );
+  const historyPath = join(home, ".config", "tuner", "memory-signal-history.jsonl");
   const nowIso = new Date().toISOString();
   const { sample, trend, degraded } = memorySignalSummary(indexPath, historyPath, nowIso, {
     maxLoadMs: 50,

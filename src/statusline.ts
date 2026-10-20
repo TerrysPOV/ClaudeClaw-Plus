@@ -7,7 +7,8 @@ export interface StateData {
   heartbeat?: { nextAt: number };
   jobs: {
     name: string;
-    nextAt: number;
+    /** Unix timestamp (ms) of the next run, or `null` when the schedule has no upcoming match. */
+    nextAt: number | null;
     /** Outcome of the most recent run. Absent until the job runs at least once. */
     lastResult?: "ok" | "error" | "skipped";
     /** Unix timestamp (ms) of the most recent completion. Absent until first run. */

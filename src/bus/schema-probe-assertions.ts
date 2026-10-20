@@ -15,8 +15,13 @@
  *                                correction: tool_result is a content block
  *                                inside a user line, NOT top-level)
  *  7. clear_rotation_detected  - "/clear" rotated to a new JSONL (Spike 0.5)
- *  8. exit_envelope_present    - <command-name>/exit</command-name> user
- *                                envelope written before process exit
+ *
+ * There used to be an 8th, `exit_envelope_present` (a `/exit` local_command
+ * line on `/quit`, Spike 0.5). claude 2.1.286 writes no such line on `/quit`
+ * or `/exit` (#441, measured), and nothing in the Bus reads it — process
+ * exit is the authoritative end signal (session-manager.ts header), which
+ * the probe checks as `process_exit`. Asserting a shape no consumer reads
+ * would make the probe fail on every current CLI and protect nothing.
  *
  * Field-name match against the Tailer's parser is implicit in checks 2-6.
  * If the Tailer expects `message.content[].text` and the probe doesn't
@@ -58,10 +63,6 @@ function fail(name: string, reason: string): AssertionResult {
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
-}
-
-function asString(v: unknown): string | null {
-  return typeof v === "string" ? v : null;
 }
 
 function getContentArray(line: Record<string, unknown>): unknown[] | null {
@@ -238,33 +239,6 @@ export const ASSERTION_DEFS: AssertionDef[] = [
       return pass("clear_rotation_detected");
     },
   },
-
-  {
-    name: "exit_envelope_present",
-    check(collected, ctx) {
-      // Spike 0.5: /quit translates to /exit; envelope is a system
-      // line with subtype "local_command" whose content carries
-      // <command-name>/exit</command-name>. NB: the envelope lands in
-      // the post-/clear JSONL (the rotated-to file), so we also search
-      // siblings.
-      const allCandidates: Record<string, unknown>[] = [...collected.lines];
-      for (const sib of ctx.siblingJsonls) {
-        for (const line of readJsonlSync(sib)) allCandidates.push(line);
-      }
-      for (const line of allCandidates) {
-        if (line.type !== "system") continue;
-        if (line.subtype !== "local_command") continue;
-        const content = asString(line.content) ?? "";
-        if (content.includes("<command-name>/exit</command-name>")) {
-          return pass("exit_envelope_present");
-        }
-      }
-      return fail(
-        "exit_envelope_present",
-        "no <command-name>/exit</command-name> envelope in primary or sibling JSONLs",
-      );
-    },
-  },
 ];
 
 /* ───────────────────────────────────────────────────────────────────── */
@@ -279,28 +253,4 @@ export function runAssertions(collected: CollectedJsonl, ctx: AssertionContext):
       return fail(def.name, err instanceof Error ? err.message : String(err));
     }
   });
-}
-
-/* ───────────────────────────────────────────────────────────────────── */
-/* Sibling JSONL reader (small, sync; only called for assertion 8)       */
-/* ───────────────────────────────────────────────────────────────────── */
-
-function readJsonlSync(path: string): Record<string, unknown>[] {
-  try {
-    const { readFileSync } = require("node:fs") as typeof import("node:fs");
-    const raw = readFileSync(path, "utf8");
-    const lines: Record<string, unknown>[] = [];
-    for (const line of raw.split(/\r?\n/)) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        lines.push(JSON.parse(trimmed) as Record<string, unknown>);
-      } catch {
-        /* ignore */
-      }
-    }
-    return lines;
-  } catch {
-    return [];
-  }
 }

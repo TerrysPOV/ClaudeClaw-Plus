@@ -11,6 +11,7 @@ import { mkdir, readdir, readFile, writeFile, stat, unlink, rm } from "fs/promis
 import { ensureMemoryFile } from "./memory";
 import { cronMatches } from "./cron";
 import { validateModelString } from "./jobs";
+import { AGENT_NAME_RE } from "./agent-name";
 
 // Resolve dirs at call time (not module load) so tests and runtime
 // pick up the current working directory.
@@ -236,7 +237,7 @@ export function validateJobLabel(label: string): { valid: boolean; error?: strin
 
 // ─── Validation ──────────────────────────────────────────────────────────────
 
-const NAME_RE = /^[a-z]([a-z0-9-]*[a-z0-9])?$/;
+const NAME_RE = AGENT_NAME_RE;
 
 export function validateAgentName(name: string): { valid: boolean; error?: string } {
   if (!name || typeof name !== "string") {
@@ -744,6 +745,27 @@ export function agentExists(name: string): boolean {
     NAME_RE.test(name) &&
     existsSync(join(agentsDir(), name))
   );
+}
+
+/**
+ * Whether `agents/<name>/` holds a persona file (IDENTITY.md, SOUL.md or
+ * CLAUDE.md) with content. `ensureAgentDir` creates the directory on a job's
+ * first run, so its existence alone says nothing.
+ */
+export async function agentHasPersona(name: string): Promise<boolean> {
+  // Not agentExists(): its NAME_RE is narrower than a bus agent id (`_`, a
+  // leading digit), and the runner loads such a persona all the same.
+  if (typeof name !== "string" || !name || name === "." || name === "..") return false;
+  if (name.includes("/") || name.includes("\\")) return false;
+  if (!existsSync(join(agentsDir(), name))) return false;
+  for (const file of ["IDENTITY.md", "SOUL.md", "CLAUDE.md"]) {
+    try {
+      if ((await readFile(join(agentsDir(), name, file), "utf8")).trim()) return true;
+    } catch {
+      // missing file: try the next one
+    }
+  }
+  return false;
 }
 
 export async function loadAgent(name: string): Promise<AgentContext> {

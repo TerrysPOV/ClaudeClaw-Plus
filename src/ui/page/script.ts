@@ -1825,6 +1825,7 @@ if (kanbanAddBtn) kanbanAddBtn.addEventListener("click", openKanbanModal);
 if (kanbanCancelBtn) kanbanCancelBtn.addEventListener("click", closeKanbanModal);
 if (kanbanModalClose) kanbanModalClose.addEventListener("click", closeKanbanModal);
 if (kanbanSaveBtn) kanbanSaveBtn.addEventListener("click", addKanbanTask);
+if ($("kanban-clear-btn")) $("kanban-clear-btn").addEventListener("click", clearKanbanDone);
 if ($("kanban-input-title")) {
   $("kanban-input-title").addEventListener("keydown", function(e) {
     if (e.key === "Enter") { e.preventDefault(); addKanbanTask(); }
@@ -1879,7 +1880,7 @@ setInterval(loadKanban, 10000);
           "<td class='usage-td usage-td-num'>" + s.cacheHitPct + "%</td>" +
           "<td class='usage-td usage-td-cost'>" +
             "<div class='usage-cost-wrap'>" +
-              "<div class='usage-cost-bar' style='width:" + barPct + "%'></div>" +
+              "<div class='usage-cost-bar' data-pct='" + barPct + "'></div>" +
               "<span class='usage-cost-label'>~" + fmtCost(s.estimatedCostUsd) + "</span>" +
             "</div>" +
           "</td>" +
@@ -1901,6 +1902,11 @@ setInterval(loadKanban, 10000);
         "</tr></thead>" +
         "<tbody>" + rows + "</tbody>" +
         "</table>";
+      // Width set through the CSSOM: the page CSP blocks style attributes
+      // in markup, not element.style.
+      usageWrap.querySelectorAll(".usage-cost-bar[data-pct]").forEach(function(bar) {
+        bar.style.width = bar.getAttribute("data-pct") + "%";
+      });
     }
 
     function fetchUsage() {

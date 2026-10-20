@@ -1,4 +1,7 @@
 import { describe, test, expect } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   spawnPty,
   sanitizePtyPromptText,
@@ -289,37 +292,132 @@ describe("PtyProcess — lifecycle", () => {
 // first byte. The tests below simulate a slow paint with /bin/sh and assert
 // spawnPty doesn't resolve until the paint goes quiet.
 
+/** Manual clock for the settle timers: nothing fires until `advance`. */
+function manualClock() {
+  let now = 0;
+  let nextId = 0;
+  const timers = new Map<number, { due: number; ms: number; cb: () => void }>();
+  const armed: number[] = [];
+  return {
+    setTimeout: ((cb: () => void, ms: number) => {
+      const id = ++nextId;
+      timers.set(id, { due: now + ms, ms, cb });
+      armed.push(ms);
+      return id;
+    }) as unknown as (cb: () => void, ms: number) => ReturnType<typeof setTimeout>,
+    clearTimeout: ((id: number) => {
+      timers.delete(id);
+    }) as unknown as (handle: ReturnType<typeof setTimeout>) => void,
+    advance(ms: number) {
+      now += ms;
+      const due = [...timers].filter(([, t]) => t.due <= now).sort((a, b) => a[1].due - b[1].due);
+      for (const [id, t] of due) {
+        if (!timers.delete(id)) continue;
+        t.cb();
+      }
+    },
+    /** Resolves once `count` timers of `ms` have been armed (real time, 3s cap). */
+    async untilArmed(ms: number, count: number) {
+      const deadline = Date.now() + 3000;
+      while (armed.filter((m) => m === ms).length < count) {
+        if (Date.now() > deadline) throw new Error(`timer of ${ms}ms not armed ${count} time(s)`);
+        await Bun.sleep(5);
+      }
+    },
+  };
+}
+
 describe("PtyProcess — _waitForReadySettle two-phase (issue #84)", () => {
   test("does NOT resolve on first byte — waits for quiet window after paint", async () => {
-    // Script: emit bytes immediately, again at 200ms, again at 400ms, then
-    // stay silent. With quietWindowMs=300, the quiet timer should reset on
-    // each chunk and only fire ~300ms after the last (400ms) chunk — so
-    // spawnPty should resolve at ~700ms, NOT at first-byte (~0ms).
-    const t0 = Date.now();
-    const proc = await spawnPty(
+    // The settle timers run on a manual clock and the child paints only when
+    // the test lets it, so the assertion is about ordering, not wall time:
+    // every chunk restarts the quiet window, and only a full window after
+    // the LAST chunk resolves. Against wall time this flaked (issue #567):
+    // with paints 200ms apart and a 300ms window, a child delayed by ~100ms
+    // on a loaded runner let the window expire after the first paint.
+    const clock = manualClock();
+    const dir = mkdtempSync(join(tmpdir(), "pty-settle-"));
+    const go2 = join(dir, "go2");
+    const go3 = join(dir, "go3");
+    const exit = join(dir, "exit");
+    // Each paint after the first waits for its go-file ($1, $2), and the child
+    // stays alive until cleanup creates $3 — spawnPty rejects if the child
+    // exits before settle, and the settle timers do not run on real time.
+    const waitFor = (arg: string) => `while [ ! -e "${arg}" ]; do sleep 0.01; done`;
+    let settled = false;
+    const spawning = spawnPty(
       baseOpts({
         _commandOverride: "/bin/sh",
         _argsOverride: [
           "-c",
-          // Trailing `sleep 5` keeps the process alive past the quiet
-          // window — spawnPty rejects if the child exits before settle.
-          "printf paint1; sleep 0.2; printf paint2; sleep 0.2; printf paint3; sleep 5",
+          `printf paint1; ${waitFor("$1")}; printf paint2; ${waitFor("$2")}; printf paint3; ${waitFor("$3")}`,
+          "sh",
+          go2,
+          go3,
+          exit,
         ],
         _skipReadySettle: false,
         quietWindowMs: 300,
+        _setTimeout: clock.setTimeout,
+        _clearTimeout: clock.clearTimeout,
       }),
-    );
-    const elapsed = Date.now() - t0;
+    ).then((p) => {
+      settled = true;
+      return p;
+    });
 
-    // Quiet timer fires 300ms after the last chunk (paint3 at ~400ms) →
-    // expect ≥ ~600ms total. Pre-fix this resolved at ~0ms.
-    // Loose bound to avoid flakiness across CI environments.
-    expect(elapsed).toBeGreaterThanOrEqual(500);
-    // And not absurdly long either — the hard timeout is 3s.
-    expect(elapsed).toBeLessThan(3000);
+    try {
+      // paint1 → a quiet window is armed. Pre-fix this already resolved.
+      await clock.untilArmed(300, 1);
+      await Bun.sleep(20);
+      expect(settled).toBe(false);
+      clock.advance(299);
+      await Bun.sleep(20);
+      expect(settled).toBe(false);
 
-    await proc.dispose();
-  });
+      // paint2 at t=299 restarts the window: the old one, due at t=300, must
+      // not resolve.
+      writeFileSync(go2, "");
+      await clock.untilArmed(300, 2);
+      clock.advance(299);
+      await Bun.sleep(20);
+      expect(settled).toBe(false);
+
+      // paint3, the last chunk, then a full quiet window → resolves.
+      writeFileSync(go3, "");
+      await clock.untilArmed(300, 3);
+      clock.advance(299);
+      await Bun.sleep(20);
+      expect(settled).toBe(false);
+      clock.advance(1);
+      // Real-time cap so a settle that never resolves fails here, not on the
+      // test timeout, and the cleanup below still runs.
+      let cap: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        spawning,
+        new Promise((_, reject) => {
+          cap = setTimeout(
+            () => reject(new Error("not settled after the last quiet window")),
+            3000,
+          );
+        }),
+      ]).finally(() => clearTimeout(cap));
+      expect(settled).toBe(true);
+    } finally {
+      // On an early failure, release the child and fire the hard timeout so
+      // the spawn settles and the PTY is disposed.
+      writeFileSync(go2, "");
+      writeFileSync(go3, "");
+      clock.advance(10_000);
+      const proc = await Promise.race([
+        spawning.catch(() => null),
+        Bun.sleep(1000).then(() => null),
+      ]);
+      await proc?.dispose();
+      writeFileSync(exit, "");
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15000);
 
   test("hard timeout fires when the TUI never paints", async () => {
     // Script: silent for 2s then exit. With _waitForReadySettle's 3s hard
@@ -361,6 +459,231 @@ describe("PtyProcess — _waitForReadySettle two-phase (issue #84)", () => {
     expect(elapsed).toBeLessThan(1500);
     await proc.dispose();
   });
+});
+
+// ─── Bypass Permissions boot dialog (issue #460) ───────────────────────────
+//
+// On a fresh HOME, `claude --dangerously-skip-permissions` opens a warning
+// dialog before the REPL with "No, exit" PRESELECTED. Pre-fix, readySettle
+// resolved once that dialog went quiet, the first runTurn wrote prompt + CR,
+// the CR confirmed "No, exit" and claude exited 1 — every real-claude PTY
+// test in the nightly failed this way. The fake CLI below mirrors that: any
+// line other than a bare Down arrow exits 1; Down then Enter "accepts" and
+// the REPL (here: cat) comes up. The match is exact so the Enter has to come
+// from settle — a prompt's CR finishing the line does not count.
+
+// Words are separated by CHA cursor moves (`ESC[<n>G`), as the real CLI
+// renders them, so a matcher that only strips escapes sees "Yes,Iaccept".
+const FAKE_BYPASS_DIALOG_CLI = [
+  "printf 'WARNING: Claude\\033[13GCode\\033[18Grunning\\033[26Gin\\033[29GBypass\\033[36GPermissions\\033[48Gmode\\r\\n'",
+  "printf '\\342\\235\\257 No,\\033[7Gexit\\r\\n  Yes,\\033[8GI\\033[10Gaccept\\r\\n\\r\\nEnter to confirm \\302\\267 Esc to cancel\\r\\n'",
+  "IFS= read -r key",
+  'case "$key" in "$(printf "\\033[B")") ;; *) exit 1 ;; esac',
+  "printf 'bypass\\033[8Gpermissions\\033[20Gon\\033[23G(shift+tab\\033[34Gto\\033[37Gcycle)\\r\\n'",
+  "exec cat",
+].join("; ");
+
+describe("PtyProcess — Bypass Permissions boot dialog (issue #460)", () => {
+  test("accepts the dialog during settle so the first turn reaches the REPL", async () => {
+    const proc = await spawnPty(
+      baseOpts({
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", FAKE_BYPASS_DIALOG_CLI],
+        _skipReadySettle: false,
+        quietWindowMs: 200,
+        sentinelMaxWaitMs: 5000,
+      }),
+    );
+    expect(proc.isAlive()).toBe(true);
+    const result = await proc.runTurn("✻ after-dialog shift+tab to cycle", { timeoutMs: 5000 });
+    expect(proc.isAlive()).toBe(true);
+    expect(result.text).toContain("after-dialog");
+    await proc.dispose();
+  });
+
+  test("after answering, settle waits for the REPL instead of the next quiet gap", async () => {
+    // The REPL paints 600ms after the answer — three quiet windows later.
+    // Resolving on that gap would hand the first prompt to a TUI that is
+    // still switching screens.
+    const slowRepl = FAKE_BYPASS_DIALOG_CLI.replace(
+      "; printf 'bypass",
+      "; sleep 0.6; printf 'bypass",
+    );
+    expect(slowRepl).not.toBe(FAKE_BYPASS_DIALOG_CLI);
+    const t0 = Date.now();
+    const proc = await spawnPty(
+      baseOpts({
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", slowRepl],
+        _skipReadySettle: false,
+        quietWindowMs: 200,
+      }),
+    );
+    // 200ms Down→Enter gap + 600ms REPL paint + one quiet window.
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(800);
+    expect(proc.isAlive()).toBe(true);
+    await proc.dispose();
+  });
+});
+
+// ─── Project MCP server approval dialog (issue #469) ───────────────────────
+//
+// A cwd whose project carries a `.mcp.json` that the user has not approved
+// opens "New MCP server found in this project" before the Bypass Permissions
+// dialog (#460). It goes quiet like a painted REPL, so pre-fix settle resolved
+// on it, the first prompt's CR dismissed it, the bypass dialog came up with
+// "No, exit" preselected, and the turn sat out its full timeout — ~130 s and
+// the #177 escape hatch on every cold nightly. With two or more servers the
+// dialog is a multi-select with every server PRE-CHECKED, so an Enter there
+// enables them all. Esc is "continue without" in the single variant and
+// "reject all" in the multi-select, and never exits. The fake CLI reads one
+// raw byte: anything but Esc exits 1, so the key has to come from settle. It
+// discards input received in its first 150 ms, as claude 2.1.300 does with
+// keys sent while the dialog paints.
+// Echo stays off until the next screen paints: a prompt typed too early
+// must not come back as the reply.
+
+function fakeMcpDialogCli(dialog: string, gapAfterAnswer = ""): string {
+  return [
+    `printf '${dialog}'`,
+    "stty raw -echo",
+    // Like the real CLI, drop what arrives while the dialog is painting.
+    "sleep 0.15",
+    "stty min 0 time 0",
+    "dd bs=4096 count=1 >/dev/null 2>&1",
+    "stty min 1",
+    "key=$(dd bs=1 count=1 2>/dev/null)",
+    "stty sane -echo",
+    '[ "$key" = "$(printf "\\033")" ] || exit 1',
+    gapAfterAnswer,
+    "stty echo",
+    FAKE_BYPASS_DIALOG_CLI,
+  ]
+    .filter(Boolean)
+    .join("; ");
+}
+
+// Words separated by CHA moves, as the real CLI renders them.
+const MCP_DIALOG_SINGLE =
+  "New\\033[5GMCP\\033[9Gserver\\033[16Gfound\\033[22Gin\\033[25Gthis\\033[30Gproject:\\033[39Gplus-bus\\r\\n" +
+  "  Use this MCP server\\r\\n  Use this and all future MCP servers in this project\\r\\n" +
+  "\\342\\235\\257 Continue without using this MCP server\\r\\n\\r\\nEnter to confirm \\302\\267 Esc to cancel\\r\\n";
+const MCP_DIALOG_MULTI =
+  "2\\033[3Gnew\\033[7GMCP\\033[11Gservers\\033[19Gfound\\033[25Gin\\033[28Gthis\\033[33Gproject\\r\\n" +
+  "Select any you wish to enable.\\r\\n\\342\\235\\257 [\\342\\234\\224] srv0\\r\\n  [\\342\\234\\224] srv1\\r\\n" +
+  "  Enable selected\\r\\nSpace to select \\302\\267 Esc to reject all\\r\\n";
+
+describe("PtyProcess — project MCP server approval dialog (issue #469)", () => {
+  for (const [variant, dialog] of [
+    ["single server", MCP_DIALOG_SINGLE],
+    ["multi-select, all pre-checked", MCP_DIALOG_MULTI],
+  ] as const) {
+    test(`${variant}: rejected with Esc during settle, then the bypass dialog is answered and the first turn reaches the REPL`, async () => {
+      const proc = await spawnPty(
+        baseOpts({
+          _commandOverride: "/bin/sh",
+          _argsOverride: ["-c", fakeMcpDialogCli(dialog)],
+          _skipReadySettle: false,
+          quietWindowMs: 200,
+          sentinelMaxWaitMs: 5000,
+        }),
+      );
+      expect(proc.isAlive()).toBe(true);
+      const result = await proc.runTurn("✻ after-mcp-dialog shift+tab to cycle", {
+        timeoutMs: 5000,
+      });
+      expect(proc.isAlive()).toBe(true);
+      expect(result.text).toContain("after-mcp-dialog");
+      await proc.dispose();
+    });
+  }
+
+  test("after rejecting, settle waits for the next screen instead of the next quiet gap", async () => {
+    // The bypass dialog paints 600ms after the Esc — three quiet windows
+    // later. Resolving on that gap would type the first prompt into it.
+    const proc = await spawnPty(
+      baseOpts({
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", fakeMcpDialogCli(MCP_DIALOG_SINGLE, "sleep 0.6")],
+        _skipReadySettle: false,
+        quietWindowMs: 200,
+        sentinelMaxWaitMs: 5000,
+      }),
+    );
+    const result = await proc.runTurn("✻ slow-next-screen shift+tab to cycle", {
+      timeoutMs: 5000,
+    });
+    expect(proc.isAlive()).toBe(true);
+    expect(result.text).toContain("slow-next-screen");
+    await proc.dispose();
+  });
+
+  test("a dialog that paints late gets a fresh hard-timeout window for the screen behind it", async () => {
+    // Boot output streams for ~2.5s (never a quiet window), so the dialog
+    // lands near the end of the 3s hard timeout; the bypass dialog follows
+    // 1s after the Esc. Without a fresh window, settle resolves at 3s and
+    // the first prompt lands in the bypass dialog.
+    const lateDialog =
+      "i=0; while [ $i -lt 25 ]; do printf .; sleep 0.1; i=$((i+1)); done; " +
+      fakeMcpDialogCli(MCP_DIALOG_SINGLE, "sleep 1");
+    const proc = await spawnPty(
+      baseOpts({
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", lateDialog],
+        _skipReadySettle: false,
+        quietWindowMs: 200,
+        sentinelMaxWaitMs: 5000,
+      }),
+    );
+    const result = await proc.runTurn("✻ late-dialog shift+tab to cycle", { timeoutMs: 5000 });
+    expect(proc.isAlive()).toBe(true);
+    expect(result.text).toContain("late-dialog");
+    await proc.dispose();
+  }, 15_000);
+
+  test("a dialog the CLI leaves on its own before the Esc is due gets no key", async () => {
+    // Dialog, then the REPL 50ms later; any byte that reaches the CLI in the
+    // next second (no prompt is sent) exits it.
+    const leavesEarly = [
+      `printf '${MCP_DIALOG_SINGLE}'`,
+      "sleep 0.05",
+      "printf 'bypass permissions on (shift+tab to cycle)\\r\\n'",
+      "stty raw -echo",
+      "sleep 1",
+      "stty min 0 time 0",
+      "got=$(dd bs=4096 count=1 2>/dev/null | od -An -c)",
+      '[ -z "$got" ] || exit 1',
+      "sleep 30",
+    ].join("; ");
+    const proc = await spawnPty(
+      baseOpts({
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", leavesEarly],
+        _skipReadySettle: false,
+        // The production default: the REPL footer is followed by a full
+        // quiet window, so settle ends after the Esc would be due.
+        quietWindowMs: 500,
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 1500));
+    expect(proc.isAlive()).toBe(true);
+    await proc.dispose();
+  }, 10_000);
+
+  test("a CLI that never paints the screen after the dialog still settles within the fresh window", async () => {
+    const t0 = Date.now();
+    const proc = await spawnPty(
+      baseOpts({
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", fakeMcpDialogCli(MCP_DIALOG_SINGLE, "sleep 30")],
+        _skipReadySettle: false,
+        quietWindowMs: 200,
+      }),
+    );
+    // One fresh 3s hard-timeout window from the Esc, not an open-ended wait.
+    expect(Date.now() - t0).toBeLessThan(4500);
+    await proc.dispose();
+  }, 15_000);
 });
 
 // ─── runTurn: sentinel-echo round-trip against /bin/cat ─────────────────────
@@ -459,7 +782,16 @@ describe("PtyProcess — runTurn sentinel max-wait fallback", () => {
     const proc = await spawnPty(
       baseOpts({
         _commandOverride: "/bin/sh",
-        _argsOverride: ["-c", "stty -echo; printf '\\xe2\\x9c\\xbb shift+tab to cycle'; sleep 5"],
+        // #304: two reasons this used to time out. The output must arrive
+        // DURING the turn — the parser's quiet gate ignores bytes seen before
+        // `runTurn` (#87) — so the shell waits for our prompt line (`read`)
+        // before painting. And `/bin/sh` is dash on Debian/Ubuntu (CI too),
+        // whose `printf` has no `\xHH` escapes — the spinner glyph the
+        // activity gate looks for never appeared; octal is portable.
+        _argsOverride: [
+          "-c",
+          "stty -echo; read _; printf '\\342\\234\\273 shift+tab to cycle'; sleep 5",
+        ],
         quietWindowMs: 50,
         sentinelMaxWaitMs: 250,
       }),
@@ -492,7 +824,7 @@ describe("PtyProcess — runTurn sentinel max-wait fallback", () => {
         _commandOverride: "/bin/sh",
         _argsOverride: [
           "-c",
-          "echo BANNER_BANNER_BANNER_PRETURN; stty -echo; printf '\\xe2\\x9c\\xbb response-bytes-during-turn shift+tab to cycle'; sleep 5",
+          "echo BANNER_BANNER_BANNER_PRETURN; stty -echo; read _; printf '\\342\\234\\273 response-bytes-during-turn shift+tab to cycle'; sleep 5",
         ],
         quietWindowMs: 100,
         sentinelMaxWaitMs: 400,

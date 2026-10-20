@@ -35,12 +35,13 @@ import {
   type ToolCallIntent,
 } from "./tool-call.js";
 
-export const DEFAULT_TOOL_CALL_LOG = join(
-  homedir(),
-  ".claudeclaw",
-  "telemetry",
-  "mcp-tool-calls.jsonl",
-);
+/** `PLUS_TOOL_CALL_LOG_PATH` overrides the location — same seam as
+ *  `PLUS_PLUGIN_AUDIT_PATH` (#304): the test preload points it at a temp file
+ *  so suites that dispatch through the multiplexer never append to the
+ *  operator's live chain. */
+export const DEFAULT_TOOL_CALL_LOG =
+  process.env.PLUS_TOOL_CALL_LOG_PATH ||
+  join(homedir(), ".claudeclaw", "telemetry", "mcp-tool-calls.jsonl");
 
 /** The single method the sink needs from its backing chain. Narrowing to this
  *  lets tests inject a chain whose `append` throws (to exercise enforce's
@@ -63,9 +64,22 @@ export interface ToolCallSinkOptions {
   logFactory?: (path: string | null) => AuditLogLike;
 }
 
+interface PendingPolicyRecord {
+  policy: AuditPolicy;
+  /** Absent on the boot record. */
+  previous?: AuditPolicy;
+  changed_at: string;
+}
+
 export class ToolCallSink {
   private enabled = true;
   private policy: AuditPolicy;
+  /** Set by the first `applyPolicy` (boot); later calls are reloads. */
+  private policyApplied = false;
+  /** Policy records (boot under enforce, later changes) not written yet. */
+  private pendingPolicyRecords: PendingPolicyRecord[] = [];
+  private droppedPolicyRecords = 0;
+  private static readonly MAX_PENDING_POLICY_RECORDS = 64;
   private buffer: ToolCallEvent[] = [];
   private flushArmed = false;
   private log: AuditLogLike | null = null;
@@ -86,6 +100,10 @@ export class ToolCallSink {
    *  arbitrarily large (echoed bodies, paths). Truncate before it is retained on
    *  disk + in memory. */
   private static readonly MAX_ERROR_LEN = 2_000;
+  /** Cap the tool name the same way: on a refused call it is whatever the
+   *  caller sent (bounded only by the request body cap), and one oversized name
+   *  per call would force the chain to rotate away its own history. */
+  private static readonly MAX_TOOL_LEN = 256;
 
   constructor(opts: ToolCallSinkOptions = {}) {
     this.path = opts.path === undefined ? DEFAULT_TOOL_CALL_LOG : opts.path;
@@ -139,11 +157,17 @@ export class ToolCallSink {
    */
   recordIntent(intent: ToolCallIntent): void {
     if (this.policy !== "enforce") return;
+    // A policy change waiting for the chain goes in before what it governs;
+    // if it still cannot, neither can this intent.
+    this.drainPolicyRecords();
+    if (this.pendingPolicyRecords.length > 0) {
+      throw new Error("audit chain unavailable (policy record pending)");
+    }
     this.ensureLog().append({
       event: MCP_TOOL_CALL_INTENT_EVENT,
       subject: intent.plugin,
       detail: {
-        tool: intent.tool,
+        tool: ToolCallSink.clamp(intent.tool, ToolCallSink.MAX_TOOL_LEN),
         agent_id: intent.agent_id,
         event_ts: intent.ts,
       },
@@ -158,13 +182,74 @@ export class ToolCallSink {
    */
   recordPolicy(): void {
     if (this.policy !== "enforce") return;
+    this.queuePolicyRecord({ policy: this.policy, changed_at: new Date().toISOString() });
+    this.drainPolicyRecords();
+  }
+
+  /**
+   * Apply the policy resolved from settings (`settings.mcp.audit`), at boot and
+   * on every settings reload. The first application records the boot
+   * provenance (enforce only, so best-effort stays write-free). Every later
+   * CHANGE is recorded in either direction: a switch from enforce to
+   * best-effort is exactly the window an auditor needs to see, and without it
+   * the chain would read "enforce" across calls that were never gated.
+   * A record that cannot be written (chain down at that moment) is kept and
+   * written, in order, before the next intent, result batch or reload that
+   * reaches the chain; past the queue bound the oldest is dropped and the
+   * next record carries the count. Unchanged and nothing pending → nothing.
+   */
+  applyPolicy(policy: AuditPolicy): void {
+    const now = new Date().toISOString();
+    if (!this.policyApplied) {
+      this.policyApplied = true;
+      this.policy = policy;
+      if (policy === "enforce") this.queuePolicyRecord({ policy, changed_at: now });
+    } else if (policy !== this.policy) {
+      this.queuePolicyRecord({ policy, previous: this.policy, changed_at: now });
+      this.policy = policy;
+    }
+    this.drainPolicyRecords();
+  }
+
+  private queuePolicyRecord(record: PendingPolicyRecord): void {
+    if (this.pendingPolicyRecords.length >= ToolCallSink.MAX_PENDING_POLICY_RECORDS) {
+      this.pendingPolicyRecords.shift();
+      this.droppedPolicyRecords++;
+    }
+    this.pendingPolicyRecords.push(record);
+  }
+
+  /** Write pending policy records in order; stop at the first failure and
+   *  keep the rest. Never throws. */
+  private drainPolicyRecords(): void {
+    while (this.pendingPolicyRecords.length > 0) {
+      if (!this.appendPolicyRecord(this.pendingPolicyRecords[0])) return;
+      this.pendingPolicyRecords.shift();
+    }
+  }
+
+  /** Swallows its own failure (reported as `false`): a policy record must
+   *  never crash daemon start, a settings reload or a call — the per-call
+   *  gate is what enforces. Without `record`, the active policy (boot). */
+  private appendPolicyRecord(record?: PendingPolicyRecord): boolean {
     try {
       this.ensureLog().append({
         event: MCP_AUDIT_POLICY_EVENT,
-        detail: { policy: this.policy, recorded_at: new Date().toISOString() },
+        detail: {
+          policy: record ? record.policy : this.policy,
+          ...(record?.previous !== undefined ? { previous: record.previous } : {}),
+          ...(record ? { changed_at: record.changed_at } : {}),
+          ...(record && this.droppedPolicyRecords > 0
+            ? { dropped_before: this.droppedPolicyRecords }
+            : {}),
+          recorded_at: new Date().toISOString(),
+        },
       });
+      if (record) this.droppedPolicyRecords = 0;
+      return true;
     } catch {
       // Provenance is documentation; the per-call gate is what enforces.
+      return false;
     }
   }
 
@@ -205,6 +290,10 @@ export class ToolCallSink {
     } catch {
       return;
     }
+    // A policy change waiting for the chain goes in before what it governs;
+    // until it does, the results stay buffered (bounded by MAX_BUFFER).
+    this.drainPolicyRecords();
+    if (this.pendingPolicyRecords.length > 0) return;
     const batch = this.buffer;
     this.buffer = [];
     try {
@@ -213,12 +302,14 @@ export class ToolCallSink {
           event: MCP_TOOL_CALL_EVENT,
           subject: e.plugin,
           detail: {
-            tool: e.tool,
+            tool: ToolCallSink.clamp(e.tool, ToolCallSink.MAX_TOOL_LEN),
             agent_id: e.agent_id,
             status: e.status,
             duration_ms: e.duration_ms,
             event_ts: e.ts,
-            ...(e.error !== undefined ? { error: ToolCallSink.clampError(e.error) } : {}),
+            ...(e.error !== undefined
+              ? { error: ToolCallSink.clamp(e.error, ToolCallSink.MAX_ERROR_LEN) }
+              : {}),
           },
         });
       }
@@ -227,12 +318,10 @@ export class ToolCallSink {
     }
   }
 
-  /** Bound an unredacted tool-error string before it is persisted + retained. */
-  private static clampError(error: string): string {
-    if (error.length <= ToolCallSink.MAX_ERROR_LEN) return error;
-    return `${error.slice(0, ToolCallSink.MAX_ERROR_LEN)}…[truncated ${
-      error.length - ToolCallSink.MAX_ERROR_LEN
-    } chars]`;
+  /** Bound a caller- or child-supplied string before it is persisted + retained. */
+  private static clamp(value: string, max: number): string {
+    if (value.length <= max) return value;
+    return `${value.slice(0, max)}…[truncated ${value.length - max} chars]`;
   }
 
   /** Test helper — events buffered but not yet flushed. */

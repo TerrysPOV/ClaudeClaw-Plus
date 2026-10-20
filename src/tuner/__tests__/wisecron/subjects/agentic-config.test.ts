@@ -77,3 +77,14 @@ describe("agentic-config — real settings.json reconciliation (#292)", () => {
     expect(setAgenticModel("{bad", "planning", "x")).toBe("{bad");
   });
 });
+
+describe("setAgenticModel keeps integers past 2^53", () => {
+  it("writes a numeric Discord id back as it was", () => {
+    const content =
+      '{"discord":{"allowedUserIds":[123456789012345678901]},"agentic":{"modes":[{"name":"m","model":"sonnet"}]}}';
+    const out = setAgenticModel(content, "m", "opus");
+    expect(out).toContain("123456789012345678901");
+    expect(out).not.toContain(String(Number("123456789012345678901")));
+    expect(JSON.parse(out).agentic.modes[0].model).toBe("opus");
+  });
+});

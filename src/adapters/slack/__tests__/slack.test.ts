@@ -15,8 +15,8 @@
  *     inbound envelopes deterministically.
  *
  * Coverage targets (spec §5.5.3):
- *   - allow-list: empty = allow all; populated + match = allow; populated
- *     + miss = silent skip
+ *   - allow-list: empty = refuse all; populated + match = allow; populated
+ *     + miss = silent skip; allowAllUsers = allow all
  *   - Channel routing → correct agent_id
  *   - Thread routing
  *   - bus.sendPrompt shape correct
@@ -340,8 +340,15 @@ describe("buildPermissionBlocks", () => {
 /* ────────────────────────────────────────────────────────────────────── */
 
 describe("SlackAdapter — allow-list semantics", () => {
-  it("empty allowedUserIds = allow all (legacy parity)", async () => {
+  it("empty allowedUserIds = refuse everyone", async () => {
     adapter = await startAdapter({ allowedUserIds: [] });
+    socket.push(eventsEnvelope(msg({ user: "U-stranger", text: "anyone home?" })));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(bus.prompts).toHaveLength(0);
+  });
+
+  it("allowAllUsers = accept anyone, even with an empty list", async () => {
+    adapter = await startAdapter({ allowedUserIds: [], allowAllUsers: true });
     socket.push(eventsEnvelope(msg({ user: "U-stranger", text: "anyone home?" })));
     await flushMicrotasks();
     await waitFor(() => bus.prompts.length > 0);
@@ -365,6 +372,19 @@ describe("SlackAdapter — allow-list semantics", () => {
     // Crucially, NO chat.postMessage reply — Slack is multi-channel so
     // we can't safely DM-bomb every unauthorised user.
     expect(api.sent).toHaveLength(0);
+  });
+
+  // #520: the Bus runtime passes a getter so a settings reload applies.
+  it("follows the allowlist getter: removal refuses, addition accepts, no restart", async () => {
+    const live = { allowedUserIds: ["U42"] };
+    adapter = await startAdapter({ allowlist: () => live });
+    live.allowedUserIds = ["U-new"];
+    socket.push(eventsEnvelope(msg({ user: "U42", text: "still here?" })));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(bus.prompts).toHaveLength(0);
+    socket.push(eventsEnvelope(msg({ user: "U-new", text: "hi" })));
+    await waitFor(() => bus.prompts.length > 0);
+    expect(bus.prompts[0]?.user_id).toBe("U-new");
   });
 
   it("drops bot messages", async () => {

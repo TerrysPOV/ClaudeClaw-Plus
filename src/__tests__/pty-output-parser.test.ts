@@ -422,6 +422,160 @@ describe("pty-output-parser — sentinel flow (synthetic)", () => {
     expect(qEvs[0]!.type).toBe("quiet");
   });
 
+  test("issue #369: claude 2.1.269 never repaints the idle footer after a turn — the turn-summary line (`for 1s · done 16:36`) opens the gate instead", () => {
+    const enc = new TextEncoder();
+    const parser = createParser({ quietWindowMs: 100 });
+    const uuid = "uuid-369-summary";
+    const sentinelBytes = encodeSentinel(buildSentinel(uuid));
+
+    let now = 1000;
+    // Boot banner, painted BEFORE the prompt: carries the footer hint. On
+    // 2.1.269 this is the only time the hint is ever painted.
+    feed(
+      parser,
+      enc.encode(
+        "\x1b[2C\x1b[1B⏵⏵\x1b[6Gbypass\x1b[13Gpermissions\x1b[25Gon\x1b[28G(shift+tab\x1b[39Gto\x1b[42Gcycle)",
+      ),
+      now,
+    );
+    startTurn(parser, uuid, sentinelBytes, now); // #316: footerTail emptied here
+
+    // Bytes captured verbatim from a real 2.1.269 PTY (issue #369 repro):
+    // spinner + mid-turn verb — activity gate opens, turn is NOT done.
+    feed(
+      parser,
+      enc.encode(
+        "❯ Reply with exactly the word ACK and nothing else.\n✻ Swooping…\n\n· esc to interrupt",
+      ),
+      now,
+    );
+    feed(
+      parser,
+      enc.encode("\x1b[?25l\x1b[H\n\x1b[2C\x1b[23BGalloping…\x1b[30;1H\x1b[27;3H\x1b[?25h"),
+      now,
+    );
+    expect(parser.sawActivityIndicatorThisTurn).toBe(true);
+    now += 200;
+    expect(tick(parser, now)).toEqual([]); // mid-turn quiet stays withheld (#316)
+
+    // The answer, then the turn-summary line claude paints on completion —
+    // words positioned by CHA, exactly as 2.1.269 emits them. No footer
+    // repaint follows, ever.
+    feed(parser, enc.encode("ACK\n"), now);
+    feed(
+      parser,
+      enc.encode(
+        "\x1b]0;✳ Ack response\x07\x1b[?25l\x1b[H\n\x1b[10B✻\x1b[3GSautéed\x1b[11Gfor\x1b[15G1s\x1b[18G·\x1b[20Gdone\x1b[25G16:36\n\x1b[13B\x1b[K\n\x1b[48C\x1b[6B\x1b[K\x1b[30;1H\x1b[27;3H\x1b[?25h",
+      ),
+      now,
+    );
+    expect(tick(parser, now + 50)).toEqual([]); // still inside the quiet window
+
+    // Pre-fix: withheld forever (no "tab to cycle" since startTurn) → the
+    // turn only died on the 120 s hard timeout, three times over (~369 s).
+    const qEvs = tick(parser, now + 200);
+    expect(qEvs.length).toBe(1);
+    expect(qEvs[0]!.type).toBe("quiet");
+  });
+
+  test("issue #369: the bare word 'done' in prose does NOT open the gate — only the full summary shape does", () => {
+    const enc = new TextEncoder();
+    const parser = createParser({ quietWindowMs: 100 });
+    const uuid = "uuid-369-prose";
+    startTurn(parser, uuid, encodeSentinel(buildSentinel(uuid)), 1000);
+    feed(parser, enc.encode("✻ Working… esc to interrupt"), 1000);
+    feed(
+      parser,
+      enc.encode("The migration is done. It ran for 3s and is done now at 16:36."),
+      1000,
+    );
+    expect(tick(parser, 1500)).toEqual([]);
+    // `done` next to a clock, and `done` between middle dots — still prose.
+    feed(parser, enc.encode("Ticket marked done 16:36 by the bot. Status · done · next up."), 1000);
+    expect(tick(parser, 1500)).toEqual([]);
+    // A mid-turn status with duration + tokens (tool wait) is not a summary either.
+    feed(parser, enc.encode("✻ Galloping… (12s · ↓ 40 tokens) esc to interrupt"), 1500);
+    expect(tick(parser, 2000)).toEqual([]);
+    // Longer turns and a 12 h clock: `for 1h 5m · done 4:36 PM` is the same
+    // shape and must open it.
+    feed(
+      parser,
+      enc.encode(
+        "✻\x1b[3GBaked\x1b[9Gfor\x1b[13G1h\x1b[16G5m\x1b[19G·\x1b[21Gdone\x1b[26G4:36\x1b[31GPM",
+      ),
+      2000,
+    );
+    const qEvs = tick(parser, 2200);
+    expect(qEvs.length).toBe(1);
+    expect(qEvs[0]!.type).toBe("quiet");
+  });
+
+  test("issue #369: the renderer skipped cells inside 'done' (`do\\x1b[22Ge`) — the ✳ window title still opens the gate", () => {
+    const enc = new TextEncoder();
+    const parser = createParser({ quietWindowMs: 100 });
+    const uuid = "uuid-369-celldiff";
+    startTurn(parser, uuid, encodeSentinel(buildSentinel(uuid)), 1000);
+    feed(parser, enc.encode("✻ Cooking…\n· esc to interrupt"), 1000);
+    expect(parser.sawActivityIndicatorThisTurn).toBe(true);
+    // Captured verbatim (pty-dump-full, second turn of one process): the `n`
+    // of `done` was already on screen, so the renderer did not paint it. The
+    // summary regex cannot match this — and pre-fix nothing else could either.
+    feed(
+      parser,
+      enc.encode(
+        "\x1b]0;✳ Alpha then bravo\x07\x1b[?25l\x1b[H\n\x1b[10B✻\x1b[3GCooked for 4s · do\x1b[22Ge 16:47\n\x1b[?25h",
+      ),
+      1000,
+    );
+    const qEvs = tick(parser, 1200);
+    expect(qEvs.length).toBe(1);
+    expect(qEvs[0]?.type).toBe("quiet");
+  });
+
+  test("issue #369: a ◐/◑ window title (turn running) does NOT open the gate; only the ✳ one does", () => {
+    const enc = new TextEncoder();
+    const parser = createParser({ quietWindowMs: 100 });
+    const uuid = "uuid-369-title";
+    startTurn(parser, uuid, encodeSentinel(buildSentinel(uuid)), 1000);
+    feed(parser, enc.encode("\x1b]0;◐ Alpha\x07✻ Burrowing… esc to interrupt"), 1000);
+    expect(tick(parser, 1200)).toEqual([]);
+    feed(parser, enc.encode("\x1b]0;◑ Alpha\x07 (3s · ↓ 12 tokens)"), 1200);
+    expect(tick(parser, 1400)).toEqual([]);
+    feed(parser, enc.encode("\x1b]0;✳ Alpha\x07"), 1400);
+    const qEvs = tick(parser, 1600);
+    expect(qEvs.length).toBe(1);
+    expect(qEvs[0]?.type).toBe("quiet");
+  });
+
+  test("issue #369: the classic renderer repaints `(shift+tab to cycle) · esc to interrupt` every frame mid-turn — that line must NOT count as the idle footer", () => {
+    const enc = new TextEncoder();
+    const parser = createParser({ quietWindowMs: 100 });
+    const uuid = "uuid-369-classic";
+    startTurn(parser, uuid, encodeSentinel(buildSentinel(uuid)), 1000);
+    // First frame after the prompt, captured from a classic-renderer session:
+    // spinner + the footer line carrying BOTH hints. Pre-fix this opened the
+    // gate on the first byte of the turn (the #316 hole, again).
+    feed(
+      parser,
+      enc.encode(
+        "❯ Reply with the single word: alpha\r\n✶ Burrowing…\r\n⏵⏵ bypass permissions on (shift+tab\x1b[39Gto\x1b[42Gcycle)\x1b[49G·\x1b[51Gesc\x1b[55Gto\x1b[58Ginterrupt\r",
+      ),
+      1000,
+    );
+    expect(parser.sawActivityIndicatorThisTurn).toBe(true);
+    expect(tick(parser, 1200)).toEqual([]);
+    expect(tick(parser, 6000)).toEqual([]);
+    // Turn completes: the same line is repainted with the hint alone.
+    feed(
+      parser,
+      enc.encode("alpha\r\n⏵⏵ bypass permissions on (shift+tab\x1b[39Gto\x1b[42Gcycle)\x1b[83G●\r"),
+      6000,
+    );
+    const qEvs = tick(parser, 6200);
+    expect(qEvs.length).toBe(1);
+    expect(qEvs[0]?.type).toBe("quiet");
+  });
+
   test("issue #316: idle footer is detected even when CUF sequences render the inter-word space", () => {
     const enc = new TextEncoder();
     const parser = createParser({ quietWindowMs: 100 });

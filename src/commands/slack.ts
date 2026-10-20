@@ -5,6 +5,7 @@ import {
   agentDirKey,
 } from "../runner";
 import { getSettings, loadSettings } from "../config";
+import { describeAllowlist, isUserAllowed } from "../allowlist";
 import { resetSession, resetFallbackSession, peekSession } from "../sessions";
 import { extractErrorDetail } from "../messaging";
 import { listThreadSessions, peekThreadSession, removeThreadSession } from "../sessionManager";
@@ -972,11 +973,7 @@ async function handleMessage(event: SlackMessage): Promise<void> {
   }
 
   // Authorization check — bot messages in allowBots channels bypass user-level auth
-  if (
-    !isBotAllowed &&
-    config.allowedUserIds.length > 0 &&
-    !config.allowedUserIds.includes(userId ?? "")
-  ) {
+  if (!isBotAllowed && !isUserAllowed(config.allowedUserIds, userId ?? "", config.allowAllUsers)) {
     if (isDirectMessage) {
       await sendMessage(config.botToken, channelId, "Unauthorized.");
     }
@@ -1467,7 +1464,7 @@ async function handleBlockAction(payload: any): Promise<void> {
   if (!actions?.length || !channelId || !user?.id) return;
 
   // Authorization check
-  if (config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(user.id)) {
+  if (!isUserAllowed(config.allowedUserIds, user.id, config.allowAllUsers)) {
     return;
   }
 
@@ -1579,7 +1576,7 @@ async function handleSlashCommand(
 ): Promise<string> {
   const config = getSettings().slack;
 
-  if (config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(userId)) {
+  if (!isUserAllowed(config.allowedUserIds, userId, config.allowAllUsers)) {
     return "Unauthorized.";
   }
 
@@ -1636,7 +1633,7 @@ async function handleSlashCommand(
       }
 
       lines.push("");
-      lines.push(`Security: \`${config.allowedUserIds.length === 0 ? "open" : "restricted"}\``);
+      lines.push(`Security: \`${config.allowAllUsers ? "open" : "restricted"}\``);
 
       return lines.join("\n");
     }
@@ -1891,9 +1888,7 @@ export function startSlack(debug = false): void {
   running = true;
 
   console.log("Slack bot started (Socket Mode)");
-  console.log(
-    `  Allowed users: ${config.allowedUserIds.length === 0 ? "all" : config.allowedUserIds.join(", ")}`,
-  );
+  console.log(`  Allowed users: ${describeAllowlist(config.allowedUserIds, config.allowAllUsers)}`);
   if (config.listenChannels.length > 0) {
     console.log(`  Listen channels: ${config.listenChannels.join(", ")}`);
   }

@@ -3,7 +3,8 @@
  *
  * A change is `improved` iff its TARGET metric moved in the metric's
  * `direction` beyond noise AND no `guardrails` companion metric regressed
- * beyond noise. No-regression, NOT maximise — single-number maximisation is
+ * beyond noise. A target that did not move is `neutral`, whatever the
+ * guardrails did. No-regression, NOT maximise — single-number maximisation is
  * the gameable shape and is forbidden. (Reward Hacking Benchmark
  * arXiv:2605.02964: Goodhart exploit rates 0–13.9% are real.)
  */
@@ -97,37 +98,71 @@ function underpowered(d: MetricDelta, minSamples: number): boolean {
   return d.count === undefined || d.count < minSamples;
 }
 
+/** Why `decideVerdictDetailed` reached its verdict (written to the audit). */
+export type VerdictReason =
+  | "target_improved"
+  | "target_regressed"
+  | "target_flat"
+  | "target_underpowered"
+  | "guardrail_regressed";
+
+export interface VerdictDecision {
+  verdict: Verdict;
+  reason: VerdictReason;
+  /** Guardrails with enough samples that moved against their direction. */
+  regressedGuardrails: string[];
+}
+
 /**
- * Decide the verdict for one applied change.
+ * Decide the verdict for one applied change, with the reason.
  *
  * @param target   delta for the metric the change was meant to improve
  * @param guardrails deltas for companion metrics that must not regress
  * @param opts     sample-size guard (`minSamples`)
  *
- * - a guardrail with enough samples that regressed (`down`) → `regressed`
- *   (no-regression overrides; an underpowered guardrail can't CLAIM a regression)
- * - else target underpowered (too few samples / empty window) → `neutral`
- * - else target improved (`up`) → `improved`
- * - else target regressed (`down`) → `regressed`
- * - else → `neutral`
+ * Guardrails VETO an improvement; they do not judge a change on their own.
+ * - target underpowered (too few samples / empty window) → `neutral`
+ * - target improved (`up`) and a guardrail with enough samples regressed →
+ *   `regressed` (the gain was paid for elsewhere — anti-Goodhart)
+ * - target improved, guardrails hold → `improved`
+ * - target regressed (`down`) → `regressed`
+ * - target flat (within noise, including baseline == post) → `neutral`, even
+ *   when a guardrail moved: with no measured effect on the target, a guardrail
+ *   move in the same window is not attributable to the change, and calling it a
+ *   regression auto-reverts low-risk changes on unrelated drift. The moved
+ *   guardrails are still reported in `regressedGuardrails`.
  */
+export function decideVerdictDetailed(
+  target: MetricDelta,
+  guardrails: MetricDelta[] = [],
+  opts: VerdictOptions = {},
+): VerdictDecision {
+  const minSamples = opts.minSamples ?? 1;
+  // An underpowered guardrail can't CLAIM a regression.
+  const regressedGuardrails = guardrails
+    .filter((g) => !underpowered(g, minSamples) && classifyMove(g) === "down")
+    .map((g) => g.metric);
+  if (underpowered(target, minSamples)) {
+    return { verdict: "neutral", reason: "target_underpowered", regressedGuardrails };
+  }
+  const t = classifyMove(target);
+  if (t === "up") {
+    return regressedGuardrails.length > 0
+      ? { verdict: "regressed", reason: "guardrail_regressed", regressedGuardrails }
+      : { verdict: "improved", reason: "target_improved", regressedGuardrails };
+  }
+  if (t === "down")
+    return { verdict: "regressed", reason: "target_regressed", regressedGuardrails };
+  return { verdict: "neutral", reason: "target_flat", regressedGuardrails };
+}
+
+/** `decideVerdictDetailed` without the explanation. */
 export function decideVerdict(
   target: MetricDelta,
   guardrails: MetricDelta[] = [],
   opts: VerdictOptions = {},
 ): Verdict {
-  const minSamples = opts.minSamples ?? 1;
-  for (const g of guardrails) {
-    // Too few samples to trust the guardrail as evidence of a regression.
-    if (underpowered(g, minSamples)) continue;
-    if (classifyMove(g) === "down") return "regressed";
-  }
-  // Too few samples on the target (or an empty window) → inconclusive.
-  if (underpowered(target, minSamples)) return "neutral";
-  const t = classifyMove(target);
-  if (t === "up") return "improved";
-  if (t === "down") return "regressed";
-  return "neutral";
+  return decideVerdictDetailed(target, guardrails, opts).verdict;
 }
 
 /** Pull a metric's guardrail metric objects from a subject's declared signals. */

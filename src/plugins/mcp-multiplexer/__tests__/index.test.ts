@@ -596,6 +596,11 @@ class FakeStore {
     return [...this.records.values()].filter((r) => r.serverName === serverName);
   }
 
+  /** #326: `stop()` drains the write queue; an in-memory double has nothing queued. */
+  async flush(_serverName?: string): Promise<{ settled: number; failed: number }> {
+    return { settled: 0, failed: 0 };
+  }
+
   async garbageCollect(): Promise<{ scanned: number; kept: number; dropped: number }> {
     this.gcCalls += 1;
     const now = Date.now();

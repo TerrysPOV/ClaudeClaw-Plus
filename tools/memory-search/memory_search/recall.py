@@ -12,14 +12,30 @@ works without an Anthropic API key (handy for Claude Max users).
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import subprocess
+import tempfile
 from typing import Optional
 
 from . import config, db
 
 log = logging.getLogger(__name__)
+
+# The excerpts fed to the summarizer are arbitrary transcript text (pasted
+# emails, web pages, tool output), so the call gets nothing to act with: no
+# built-in tools, no MCP servers, no settings file (no hooks, no user
+# plugins), no saved session and no slash commands. Same set as
+# UNTRUSTED_CLAUDE_ARGS in src/oneshot/isolation.ts. The empty strings are flag
+# values, not gaps.
+UNTRUSTED_CLI_FLAGS = [
+    "--tools", "",
+    "--strict-mcp-config",
+    "--setting-sources", "",
+    "--no-session-persistence",
+    "--disable-slash-commands",
+]
 
 
 def summarize(query: str, hits: list[dict]) -> Optional[str]:
@@ -49,14 +65,26 @@ def summarize(query: str, hits: list[dict]) -> Optional[str]:
     )
 
     try:
-        result = subprocess.run(
-            [cli, "--print", "--model", config.summarizer_model()],
-            input=prompt,
-            capture_output=True,
-            text=True,
-            timeout=config.summarizer_timeout_sec(),
-            cwd=config.summarizer_cwd(),
-        )
+        with contextlib.ExitStack() as stack:
+            cwd = config.summarizer_cwd()
+            if cwd is None:
+                # Empty cwd, so no project dir is ever in reach of the call.
+                # A cleanup error (Windows file lock) must not replace the
+                # result.
+                cwd = stack.enter_context(
+                    tempfile.TemporaryDirectory(
+                        prefix="memory-search-summary-", ignore_cleanup_errors=True
+                    )
+                )
+            result = subprocess.run(
+                [cli, "--print", "--model", config.summarizer_model(),
+                 *UNTRUSTED_CLI_FLAGS],
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=config.summarizer_timeout_sec(),
+                cwd=cwd,
+            )
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         log.warning("claude --print failed: %s", e)
         return None

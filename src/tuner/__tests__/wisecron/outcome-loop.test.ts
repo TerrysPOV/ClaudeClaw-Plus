@@ -295,6 +295,47 @@ describe("OutcomeRecorder — baseline → maturation → verdict", () => {
     expect(results[0]?.verdict).toBe("regressed");
   });
 
+  it("a flat target is neutral and not reverted when a guardrail drifts (low tier)", async () => {
+    const registry = new Registry();
+    const provider: TelemetryProvider = {
+      contractVersion: () => "1.0.0",
+      capabilities: () => [
+        { stream: "session_cost", schemaVersion: "1.0.0", available: true },
+        { stream: "cron_run", schemaVersion: "1.0.0", available: true },
+      ],
+      query: async () => [],
+    };
+    // cost unchanged 100→100 (no effect) while guardrail drifts 1.0→0.4
+    const subj = new ScriptedSubject(
+      "cron",
+      "low",
+      [cost, guardrail],
+      [
+        { cron_cost: 100, critical_fire_success: 1.0 },
+        { cron_cost: 100, critical_fire_success: 0.4 },
+      ],
+    );
+    registry.registerSubject(subj);
+    const audit = new AuditLog();
+    let t = new Date("2026-05-01T00:00:00Z");
+    const rec = new OutcomeRecorder(registry, db, provider, audit, () => t);
+    await rec.snapshotBaseline(proposal(5, "cron"));
+    t = new Date("2026-05-10T00:00:00Z");
+    const reverts: string[] = [];
+    const results = await rec.runMaturation({
+      revert: async (id) => {
+        reverts.push(id);
+        return true;
+      },
+    });
+    expect(results[0]?.verdict).toBe("neutral");
+    expect(reverts).toEqual([]);
+    // The drift is not attributed to the change, but it stays visible.
+    const v = audit.all().find((r) => r.event === "verdict");
+    expect(v?.detail?.reason).toBe("target_flat");
+    expect(v?.detail?.regressed_guardrails).toEqual(["critical_fire_success"]);
+  });
+
   it("does not mature rows before their window_end", async () => {
     const registry = new Registry();
     const provider: TelemetryProvider = {
@@ -478,5 +519,154 @@ describe("OutcomeRecorder — baseline → maturation → verdict", () => {
     const results = await rec.runMaturation({});
     expect(results[0]?.target_metric).toBe("beta");
     expect(results[0]?.verdict).toBe("improved");
+  });
+});
+
+describe("OutcomeRecorder — a guardrail never becomes the verdict target", () => {
+  const artifactProvider: TelemetryProvider = {
+    contractVersion: () => "1.0.0",
+    capabilities: () => [
+      { stream: "session_cost", schemaVersion: "1.0.0", available: true },
+      { stream: "cron_run", schemaVersion: "1.0.0", available: true },
+    ],
+    query: async () => [],
+  };
+
+  it("a guardrail that matures without its target is not judged or reverted", async () => {
+    const registry = new Registry();
+    // The target is un-measurable this pass; only the guardrail has a post value.
+    const subj = new ScriptedSubject(
+      "cron",
+      "low",
+      [cost, guardrail],
+      [{ cron_cost: 100, critical_fire_success: 171 }, { critical_fire_success: 102 }],
+    );
+    registry.registerSubject(subj);
+    let t = new Date("2026-05-01T00:00:00Z");
+    const rec = new OutcomeRecorder(registry, db, artifactProvider, new AuditLog(), () => t);
+    await rec.snapshotBaseline(proposal(21, "cron"));
+    t = new Date("2026-05-10T00:00:00Z");
+    const reverted: string[] = [];
+    const results = await rec.runMaturation({
+      revert: async (id) => {
+        reverted.push(id);
+        return true;
+      },
+    });
+    expect(results).toEqual([]);
+    expect(reverted).toEqual([]);
+    // The target is still inside its grace period: the guardrail waits for it.
+    const g = db.getOutcomes("21").find((r) => r.metric === "critical_fire_success");
+    expect(g?.verdict).toBeNull();
+  });
+
+  it("judges the target with a guardrail that matured on an earlier pass", async () => {
+    const registry = new Registry();
+    const longCost: Metric = { ...cost, windowDays: 14 };
+    const subj = new ScriptedSubject(
+      "cron",
+      "low",
+      [longCost, guardrail],
+      [
+        { cron_cost: 100, critical_fire_success: 1.0 },
+        { cron_cost: 100, critical_fire_success: 0.4 },
+        { cron_cost: 50, critical_fire_success: 0.4 },
+      ],
+    );
+    registry.registerSubject(subj);
+    let t = new Date("2026-05-01T00:00:00Z");
+    const rec = new OutcomeRecorder(registry, db, artifactProvider, new AuditLog(), () => t);
+    await rec.snapshotBaseline(proposal(40, "cron"));
+    t = new Date("2026-05-09T00:00:00Z"); // guardrail (7 d) matured, target (14 d) not yet
+    expect(await rec.runMaturation({})).toEqual([]);
+    const g = db.getOutcomes("40").find((r) => r.metric === "critical_fire_success");
+    expect(g?.verdict).toBeNull();
+    t = new Date("2026-05-16T00:00:00Z");
+    const results = await rec.runMaturation({});
+    expect(results[0]?.target_metric).toBe("cron_cost");
+    expect(results[0]?.verdict).toBe("regressed"); // improved target, vetoed by the guardrail
+  });
+
+  it("does not fall back to another metric while the isTarget metric is pending", async () => {
+    const registry = new Registry();
+    const alpha: Metric = { ...cost, name: "alpha", guardrails: undefined };
+    const beta: Metric & { isTarget?: boolean } = {
+      ...cost,
+      name: "beta",
+      guardrails: undefined,
+      windowDays: 14,
+      isTarget: true,
+    };
+    const subj = new ScriptedSubject(
+      "cron",
+      "low",
+      [alpha, beta],
+      [
+        { alpha: 100, beta: 100 },
+        { alpha: 150, beta: 100 }, // alpha (not the target) regressed
+      ],
+    );
+    registry.registerSubject(subj);
+    let t = new Date("2026-05-01T00:00:00Z");
+    const rec = new OutcomeRecorder(registry, db, artifactProvider, new AuditLog(), () => t);
+    await rec.snapshotBaseline(proposal(42, "cron"));
+    t = new Date("2026-05-09T00:00:00Z"); // alpha (7 d) matured, beta (14 d) not yet
+    expect(await rec.runMaturation({})).toEqual([]);
+    expect(db.getOutcomes("42").every((r) => r.verdict === null)).toBe(true);
+  });
+
+  it("says so when a proposal's rows matured but none of them is a target", async () => {
+    const registry = new Registry();
+    const bare: Metric = { ...guardrail, name: "only_guard" };
+    const owner: Metric = { ...cost, name: "owner", guardrails: ["only_guard"] };
+    // `owner` is declared but never measured → its row never exists.
+    const subj = new ScriptedSubject(
+      "cron",
+      "low",
+      [owner, bare],
+      [{ only_guard: 1 }, { only_guard: 1 }],
+    );
+    registry.registerSubject(subj);
+    const audit = new AuditLog();
+    let t = new Date("2026-05-01T00:00:00Z");
+    const rec = new OutcomeRecorder(registry, db, artifactProvider, audit, () => t);
+    await rec.snapshotBaseline(proposal(41, "cron"));
+    t = new Date("2026-05-10T00:00:00Z");
+    expect(await rec.runMaturation({})).toEqual([]);
+    const v = audit.all().filter((r) => r.event === "verdict" && r.proposal_id === "41");
+    expect((v[0]?.detail as Record<string, unknown>).reason).toBe("no_target");
+    expect(db.getOutcomes("41").every((r) => r.verdict === "neutral")).toBe(true);
+  });
+
+  it("closes a held guardrail without a verdict once its target times out", async () => {
+    const registry = new Registry();
+    // The target is never measurable after apply; the guardrail regressed.
+    const subj = new ScriptedSubject(
+      "cron",
+      "low",
+      [cost, guardrail],
+      [{ cron_cost: 100, critical_fire_success: 171 }, { critical_fire_success: 102 }],
+    );
+    registry.registerSubject(subj);
+    const audit = new AuditLog();
+    let t = new Date("2026-05-01T00:00:00Z");
+    const rec = new OutcomeRecorder(registry, db, artifactProvider, audit, () => t);
+    await rec.snapshotBaseline(proposal(43, "cron"));
+    const reverted: string[] = [];
+    const revert = async (id: string): Promise<boolean> => {
+      reverted.push(id);
+      return true;
+    };
+    t = new Date("2026-05-10T00:00:00Z"); // inside the 7 d grace: guardrail held
+    expect(await rec.runMaturation({ revert })).toEqual([]);
+    t = new Date("2026-05-16T00:00:00Z"); // past window_end + grace: target closed
+    expect(await rec.runMaturation({ revert })).toEqual([]);
+    expect(reverted).toEqual([]);
+    expect(db.getOutcomes("43").every((r) => r.verdict === "neutral")).toBe(true);
+    const reasons = audit
+      .all()
+      .filter((r) => r.event === "verdict" && r.proposal_id === "43")
+      .map((r) => (r.detail as Record<string, unknown>).reason);
+    expect(reasons).toEqual(["unmeasurable_after_grace", "no_target"]);
   });
 });

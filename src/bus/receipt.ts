@@ -97,6 +97,20 @@ export interface ReceiptStore {
    *  seam, where only the prompt text is available (no message_id). Returns
    *  undefined if no receipt is currently open for that hash. */
   findByPromptHash(prompt_hash: string): OpenReceipt | undefined;
+  /**
+   * #212: the JSONL tailer saw the turn boundary for the prompt with this
+   * hash. An open receipt is patched with `claude_jsonl_path` +
+   * `turn_event_offset` (the bridge's `turn_observed` close then carries the
+   * tailer's proof). A receipt already closed — the bridge timed out first, or
+   * closed `turn_observed` a moment earlier — is not reopened: the fact goes
+   * to the append-only side table `receipt-turns.jsonl` next to the log,
+   * keyed by the message_id the hash last belonged to, so the join stays
+   * possible without relaxing "close is the end". Returns where it went.
+   */
+  confirmTurn(
+    prompt_hash: string,
+    proof: { claude_jsonl_path: string; turn_event_offset: number; message_id?: string },
+  ): Promise<"patched" | "side-table" | "unknown">;
   /** Close every still-open receipt with the given terminal state (e.g. on
    *  daemon shutdown, mark them as `timeout`). */
   drain(state: ReceiptFinalState): Promise<void>;
@@ -137,6 +151,16 @@ export function createReceiptStore(opts: ReceiptStoreOptions = {}): ReceiptStore
   // turn_observed since the alternative (collision-free uuid plumbing
   // through every adapter) is invasive.
   const byPromptHash = new Map<string, OpenReceipt>();
+  // #212: the message_id a prompt hash last belonged to, kept after close so a
+  // tailer confirmation that lands after the bridge closed the receipt can
+  // still be joined to it. Bounded (insertion order, oldest evicted).
+  const recentlyClosedByHash = new Map<string, string>();
+  const RECENTLY_CLOSED_MAX = 500;
+  const turnsPath = join(dirname(logPath), "receipt-turns.jsonl");
+  let turnsModeEnsured = false;
+  // A thinking+text message yields two boundary lines: one side-table row per
+  // (hash, transcript message), not per line.
+  const lastSideRowByHash = new Map<string, string | undefined>();
 
   // Best-effort ensure parent directory exists. Synchronous (one-shot) so we
   // don't race the first append.
@@ -223,8 +247,22 @@ export function createReceiptStore(opts: ReceiptStoreOptions = {}): ReceiptStore
         rec.final_state = state;
         rec.duration_ms = now().getTime() - startedAt.getTime();
         if (notes) rec.notes = { ...(rec.notes ?? {}), ...notes };
+        // Several causes share `timeout`; only `notes.reason` tells them
+        // apart. A caller that forgot one still lands as a countable reason.
+        const reason = rec.notes?.reason;
+        if (state === "timeout" && (typeof reason !== "string" || reason === "")) {
+          rec.notes = { ...(rec.notes ?? {}), reason: "unspecified" };
+        }
         openReceipts.delete(message_id);
         deindexHash(rec.prompt_hash);
+        if (rec.prompt_hash) {
+          recentlyClosedByHash.delete(rec.prompt_hash);
+          recentlyClosedByHash.set(rec.prompt_hash, message_id);
+          if (recentlyClosedByHash.size > RECENTLY_CLOSED_MAX) {
+            const oldest = recentlyClosedByHash.keys().next().value;
+            if (oldest !== undefined) recentlyClosedByHash.delete(oldest);
+          }
+        }
         await appendRecord(rec);
       },
     };
@@ -252,9 +290,57 @@ export function createReceiptStore(opts: ReceiptStoreOptions = {}): ReceiptStore
     findByPromptHash(prompt_hash: string): OpenReceipt | undefined {
       return byPromptHash.get(prompt_hash);
     },
+    async confirmTurn(prompt_hash, proof) {
+      const open = byPromptHash.get(prompt_hash);
+      if (open) {
+        open.patch({
+          claude_jsonl_path: proof.claude_jsonl_path,
+          turn_event_offset: proof.turn_event_offset,
+          ...(proof.message_id
+            ? { notes: { ...open.record.notes, transcript_message_id: proof.message_id } }
+            : {}),
+        });
+        return "patched";
+      }
+      const message_id = recentlyClosedByHash.get(prompt_hash);
+      if (
+        proof.message_id !== undefined &&
+        lastSideRowByHash.get(prompt_hash) === proof.message_id
+      ) {
+        return message_id ? "side-table" : "unknown";
+      }
+      lastSideRowByHash.set(prompt_hash, proof.message_id);
+      if (lastSideRowByHash.size > RECENTLY_CLOSED_MAX) {
+        const oldest = lastSideRowByHash.keys().next().value;
+        if (oldest !== undefined) lastSideRowByHash.delete(oldest);
+      }
+      const row = {
+        kind: "turn_confirmed",
+        message_id: message_id ?? null,
+        prompt_hash,
+        claude_jsonl_path: proof.claude_jsonl_path,
+        turn_event_offset: proof.turn_event_offset,
+        transcript_message_id: proof.message_id ?? null,
+        confirmed_at: now().toISOString(),
+      };
+      try {
+        await appendFile(turnsPath, `${JSON.stringify(row)}\n`, "utf8");
+        if (!turnsModeEnsured) {
+          try {
+            await chmod(turnsPath, 0o600);
+          } catch (err) {
+            onError(err as Error, "chmod");
+          }
+          turnsModeEnsured = true;
+        }
+      } catch (err) {
+        onError(err as Error, "append");
+      }
+      return message_id ? "side-table" : "unknown";
+    },
     async drain(state: ReceiptFinalState): Promise<void> {
       const pending = [...openReceipts.values()];
-      await Promise.all(pending.map((r) => r.close(state, { drained: true })));
+      await Promise.all(pending.map((r) => r.close(state, { drained: true, reason: "drained" })));
     },
   };
 }

@@ -45,6 +45,7 @@ import {
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
+import { isAgentName } from "../agent-name.js";
 import { BUS_MCP_TOOLS } from "./mcp-tools.js";
 import {
   REQUEST_ID_PATTERN,
@@ -260,14 +261,40 @@ const PermissionRequestNotificationSchema = NotificationSchema.extend({
 /* Tool input schemas                                                    */
 /* ───────────────────────────────────────────────────────────────────── */
 
-const ReplyArgsSchema = z.object({
-  message: z.string(),
-  metadata: z
-    .object({
-      intent: z.enum(["final", "progress", "tool_status"]).optional(),
-    })
-    .optional(),
-});
+const ReplyIntentSchema = z.enum(["final", "progress", "tool_status"]);
+// #224: the chat_id of the <channel> block this reply answers.
+// A numeric id must be a safe integer: a fraction is no chat id, and a
+// Discord snowflake written as a JSON number has already lost precision by
+// the time it is parsed (ids belong in strings) — refuse, do not misroute.
+const ReplyInReplyToSchema = z
+  .union([z.string(), z.number().int()])
+  .transform(String)
+  // An empty (or blank) string would be dropped as "unnamed" further down and
+  // the reply would fall back to whichever chat wrote last — refuse it here.
+  .pipe(z.string().trim().min(1).max(200));
+
+// `intent` / `in_reply_to` are accepted at the top level AND under `metadata`
+// (the historical form). Both objects are strict: an unknown key — a typo, or a
+// field placed at the wrong level — is refused with a message naming it. `null`
+// on any optional means "not set", as a model routinely writes it. Before
+// this, a top-level `intent: "final"` (the form the tool description itself
+// showed) was dropped by the non-strict parse and the reply went out as
+// `progress`: the surface kept editing one live message in place, no final ever
+// landed, and the turn was nudged and synthesized on top of it.
+const ReplyArgsSchema = z
+  .object({
+    message: z.string(),
+    intent: ReplyIntentSchema.nullish(),
+    in_reply_to: ReplyInReplyToSchema.nullish(),
+    metadata: z
+      .object({
+        intent: ReplyIntentSchema.nullish(),
+        in_reply_to: ReplyInReplyToSchema.nullish(),
+      })
+      .strict()
+      .nullish(),
+  })
+  .strict();
 
 const AskArgsSchema = z.object({
   question: z.string(),
@@ -433,7 +460,7 @@ export class BusMcpServer {
     this.agentId = opts.agentId;
     this.ipc = opts.ipc;
     this.permissionMode = opts.permissionMode;
-    this.mcp = opts.mcp ?? buildMcpServer();
+    this.mcp = opts.mcp ?? buildMcpServer(opts.agentId);
     this.wireMcp();
     this.wireIpc();
   }
@@ -671,12 +698,34 @@ export class BusMcpServer {
   /* ── Tool handlers ──────────────────────────────────────────────── */
 
   private handleReply(raw: unknown) {
-    const args = ReplyArgsSchema.parse(raw ?? {});
+    const parsed = ReplyArgsSchema.safeParse(raw ?? {});
+    if (!parsed.success) {
+      // Refuse loudly: a reply the agent believes is final must not be
+      // delivered as something else because one of its keys was not read.
+      const issues = parsed.error.issues
+        .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
+        .join("; ");
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `reply refused — ${issues}. Accepted: { message, intent?, in_reply_to?, ` +
+              `metadata?: { intent?, in_reply_to? } }`,
+          },
+        ],
+        isError: true,
+      };
+    }
+    const args = parsed.data;
+    const intent = args.metadata?.intent ?? args.intent ?? "progress";
+    const inReplyTo = args.metadata?.in_reply_to ?? args.in_reply_to;
     const ipcMsg: IpcReply = {
       type: "reply",
       agent_id: this.agentId,
       text: args.message,
-      intent: args.metadata?.intent ?? "progress",
+      intent,
+      ...(inReplyTo ? { in_reply_to: inReplyTo } : {}),
     };
     this.ipc.send(ipcMsg);
     return {
@@ -874,11 +923,43 @@ export class BusMcpServer {
 /* ───────────────────────────────────────────────────────────────────── */
 
 /**
+ * The long-work rule of the channel instructions. These instructions are the
+ * only default text the bus runtime is guaranteed to put in front of every
+ * agent (prompts/*.md reach a session only through the project CLAUDE.md,
+ * written once), so this is where the agent learns to hand long work to
+ * `dispatch_job` instead of doing it inside the turn the user is waiting on.
+ * `agentId` names the dispatcher so it can dispatch to itself: a fresh install
+ * has a single agent. `dispatch_job` accepts a kebab-case name whose
+ * `agents/<id>/` exists; a bus agent's does (its session.json is written there
+ * before the spawn), so only the name is checked here. A bus id with `_` or a
+ * leading digit is refused by `dispatch_job`, so it gets no hint.
+ */
+export function longWorkInstructions(agentId?: string): string {
+  const id = agentId?.trim() ?? "";
+  const self = isAgentName(id) ? ` To run it as yourself, pass agent:${JSON.stringify(id)}.` : "";
+  return (
+    "Long work (more than ~30s, or several steps such as a build, a test run, research or a " +
+    "batch of edits): do not do it inside the turn the user is waiting on.\n" +
+    "  1. `reply` intent:'progress' with a one-line ack.\n" +
+    "  2. `dispatch_job` with a self-contained prompt: the job is a fresh headless run with " +
+    "none of this conversation, so say what to do, where, and what to return." +
+    self +
+    "\n" +
+    "  3. End the turn with `reply` intent:'final' saying what is running. Never end a turn " +
+    "on 'I'm waiting' or 'still working'.\n" +
+    "  4. When the 'Agent job … finished' message arrives, report the result with " +
+    "`reply` intent:'final' (or use `job_status`).\n" +
+    "A job cannot use `reply` or any tool only this session has; work that needs them " +
+    "stays in your turn."
+  );
+}
+
+/**
  * Build the underlying MCP Server with the §5.1 capabilities. Exported so
  * tests can construct a server, wire it to InMemoryTransport, and inject
  * into BusMcpServer without standing up a real stdio pipe.
  */
-export function buildMcpServer(): Server {
+export function buildMcpServer(agentId?: string): Server {
   return new Server(
     { name: "plus-bus", version: "0.1.0" },
     {
@@ -902,7 +983,8 @@ export function buildMcpServer(): Server {
         "    and finish with `reply` intent:'final' for the user-visible answer (this " +
         "    push-notifies).\n" +
         "Default to PROGRESSIVE whenever you use ANY tool; DIRECT only for pure chat. " +
-        "Use `ask` for non-blocking clarifying questions; `request_human` blocks the loop.",
+        "Use `ask` for non-blocking clarifying questions; `request_human` blocks the loop.\n\n" +
+        longWorkInstructions(agentId),
     },
   );
 }

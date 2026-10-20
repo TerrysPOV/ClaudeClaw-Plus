@@ -1,4 +1,4 @@
-import { execSync, spawnSync } from "node:child_process";
+import { execSync } from "node:child_process";
 import { chmod, mkdir, rename, rm, stat, access, readdir, open, readFile } from "node:fs/promises";
 import { statSync } from "node:fs";
 import { basename, extname, join } from "node:path";
@@ -153,11 +153,9 @@ export function sharedLibTargets(name: string): string[] {
 export async function binaryIsRunnable(binaryPath: string): Promise<boolean> {
   if (!(await fileExists(binaryPath))) return false;
   try {
-    const proc = Bun.spawnSync([binaryPath, "--help"], {
-      env: withLibraryPath(process.env),
-      stdout: "ignore",
-      stderr: "ignore",
-    });
+    // Async so the probe never stalls the event loop: warmup runs on the first
+    // voice message and again on the ENOENT retry, both on the live message path.
+    const proc = await spawnCaptured([binaryPath, "--help"], withLibraryPath(process.env));
     return proc.exitCode === 0;
   } catch {
     return false;
@@ -438,22 +436,52 @@ function ensureOggDeps(): void {
   }
 }
 
-function decodeOggOpusToWavViaNode(inputPath: string, wavPath: string, log: WhisperDebugLog): void {
+/**
+ * Run a command off the event loop. stdout and stderr are drained concurrently
+ * with the wait for exit, so a full pipe cannot deadlock the child.
+ */
+async function spawnCaptured(
+  cmd: string[],
+  env?: Record<string, string | undefined>,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const proc = Bun.spawn(cmd, { stdout: "pipe", stderr: "pipe", env });
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { exitCode, stdout, stderr };
+}
+
+/** Concurrency-1 queue: one local transcription at a time, other traffic keeps flowing. */
+let transcribeQueue: Promise<unknown> = Promise.resolve();
+
+function runExclusive<T>(task: () => Promise<T>): Promise<T> {
+  const run = transcribeQueue.then(task, task);
+  transcribeQueue = run.catch(() => {});
+  return run;
+}
+
+async function decodeOggOpusToWavViaNode(
+  inputPath: string,
+  wavPath: string,
+  log: WhisperDebugLog,
+): Promise<void> {
   ensureOggDeps();
   log(`voice decode: running node converter`);
-  const result = spawnSync("node", [OGG_MJS_CONVERTER, inputPath, wavPath], {
-    encoding: "utf8",
-  });
+  const result = await spawnCaptured(["node", OGG_MJS_CONVERTER, inputPath, wavPath]).catch(
+    () => null,
+  );
 
-  if (result.status !== 0) {
-    const stderr = result.stderr?.trim() || "";
-    const stdout = result.stdout?.trim() || "";
+  if (result?.exitCode !== 0) {
+    const stderr = result?.stderr.trim() || "";
+    const stdout = result?.stdout.trim() || "";
     throw new Error(
-      `node decode failed (exit ${result.status ?? "unknown"})${stderr ? `: ${stderr}` : stdout ? `: ${stdout}` : ""}`,
+      `node decode failed (exit ${result?.exitCode ?? "unknown"})${stderr ? `: ${stderr}` : stdout ? `: ${stdout}` : ""}`,
     );
   }
 
-  if (result.stderr?.trim()) log(`voice decode(node): ${result.stderr.trim()}`);
+  if (result.stderr.trim()) log(`voice decode(node): ${result.stderr.trim()}`);
   log(`voice decode: node converter completed`);
 }
 
@@ -469,7 +497,7 @@ async function ensureWavInput(inputPath: string, log: WhisperDebugLog): Promise<
   }
 
   const wavPath = join(TMP_FOLDER, `${basename(inputPath, extname(inputPath))}-${Date.now()}.wav`);
-  decodeOggOpusToWavViaNode(inputPath, wavPath, log);
+  await decodeOggOpusToWavViaNode(inputPath, wavPath, log);
   return wavPath;
 }
 
@@ -536,6 +564,10 @@ export async function transcribeAudioToText(
   if (stt?.baseUrl) {
     return transcribeViaApi(inputPath, stt.baseUrl, stt.model, log);
   }
+  return runExclusive(() => transcribeLocal(inputPath, log));
+}
+
+async function transcribeLocal(inputPath: string, log: WhisperDebugLog): Promise<string> {
   await warmupWhisperAssets();
   log(`voice transcribe: warmup ready cwd=${process.cwd()} input=${inputPath}`);
   try {
@@ -554,32 +586,32 @@ export async function transcribeAudioToText(
   const binaryPath = getWhisperBinaryPath();
   const modelPath = getModelPath();
 
-  const runTranscription = () => {
-    const proc = Bun.spawnSync([binaryPath, "-m", modelPath, "-f", wavPath, "--no-timestamps"], {
-      stdout: "pipe",
-      stderr: "pipe",
-      env: withLibraryPath(process.env),
-    });
+  const runTranscription = async () => {
+    const proc = await spawnCaptured(
+      [binaryPath, "-m", modelPath, "-f", wavPath, "--no-timestamps"],
+      withLibraryPath(process.env),
+    );
 
     if (proc.exitCode !== 0) {
-      const stderr = proc.stderr.toString().trim();
-      throw new Error(`whisper transcription failed (exit ${proc.exitCode}): ${stderr}`);
+      throw new Error(
+        `whisper transcription failed (exit ${proc.exitCode}): ${proc.stderr.trim()}`,
+      );
     }
 
-    return proc.stdout.toString();
+    return proc.stdout;
   };
 
   try {
     let rawOutput: string;
     try {
-      rawOutput = runTranscription();
+      rawOutput = await runTranscription();
     } catch (err) {
       if (!(err instanceof Error) || !err.message.includes("ENOENT")) throw err;
       log("voice transcribe: missing whisper executable, forcing re-download and retry");
       warmupPromise = null;
       await rm(BIN_DIR, { recursive: true, force: true });
       await warmupWhisperAssets();
-      rawOutput = runTranscription();
+      rawOutput = await runTranscription();
     }
 
     const transcript = rawOutput

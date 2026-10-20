@@ -306,7 +306,85 @@ export function feed(parser: Parser, chunk: Uint8Array, now: number): ParserEven
 function hasIdleReplFooter(parser: Parser): boolean {
   if (parser.footerTail.length === 0) return false;
   const text = stripAnsi(expandCursorForwardToSpaces(_footerDecoder.decode(parser.footerTail)));
-  return text.toLowerCase().includes("tab to cycle");
+  // Issue #369 (adversarial pass): claude's *classic* renderer — the one it
+  // falls back to after a fullscreen boot strike — repaints the footer every
+  // frame, and while a turn runs that line reads
+  // `(shift+tab to cycle) · esc to interrupt`. Taken as the idle hint, that
+  // opened the gate from the first byte of the turn, i.e. the #316 hole again.
+  // The idle line carries the hint alone; the busy line carries both. Judge
+  // per line, not on the whole tail: the fullscreen renderer's prompt-time
+  // `· esc to interrupt` paint is a *different* line that can still sit in
+  // the 2048-byte tail when the turn completes.
+  for (const line of text.split(/[\r\n]+/)) {
+    const lower = line.toLowerCase();
+    if (lower.includes("tab to cycle") && !lower.includes("esc to interrupt")) return true;
+  }
+  return false;
+}
+
+/**
+ * claude's window title (OSC 0, `\x1b]0;<glyph> <summary>\x07`) — the glyph is
+ * ◐/◑ while a turn is running and ✳ once the turn has completed (and once at
+ * boot, which `startTurn` discards with the rest of the pre-turn tail).
+ * Measured on 2.1.269 over 12 real turns: the ✳ title lands in the same chunk
+ * as the turn-summary line, 12/12, and never mid-turn.
+ *
+ * Why a third signal: the renderer paints only the cells that changed, and
+ * one summary out of twelve was emitted as `… · do\x1b[22Ge 16:47` — the
+ * `n` was already on screen — which `TURN_DONE_SUMMARY_RE` cannot see. An
+ * OSC string is emitted whole; it is not subject to cell diffing. The parser
+ * header records that OSC 0 was unreliable as a turn signal on 2.1.89 (#81);
+ * that was re-measured on 2.1.269 for this, not assumed. Raw bytes on purpose:
+ * `stripAnsi` removes OSC sequences, so this looks before normalisation.
+ */
+const IDLE_TITLE_BYTES = new TextEncoder().encode("\x1b]0;✳");
+
+function hasIdleTitle(parser: Parser): boolean {
+  const tail = parser.footerTail;
+  const n = IDLE_TITLE_BYTES.length;
+  if (tail.length < n) return false;
+  outer: for (let i = 0; i <= tail.length - n; i++) {
+    for (let j = 0; j < n; j++) {
+      if (tail[i + j] !== IDLE_TITLE_BYTES[j]) continue outer;
+    }
+    return true;
+  }
+  return false;
+}
+
+/**
+ * The turn-summary line claude paints when a turn genuinely completes —
+ * `✻ Sautéed for 1s · done 16:36` (the verb varies per turn; the shape does
+ * not). Issue #369: claude ≥ 2.1.246 paints the mode-cycler footer ONCE at
+ * boot and never repaints it after a turn — it redraws in place, by absolute
+ * cursor position, touching only the lines that changed. `startTurn` empties
+ * `footerTail` on purpose (#316), so on those CLIs `hasIdleReplFooter` can
+ * never open again: `quiet` never fires, the sentinel is never written, and
+ * the turn only ends on the hard `timeoutMs` — three retries later, ~369 s.
+ * Measured on 2.1.269: the answer lands in ~2 s, the summary line 12/12 turns,
+ * the footer 0/12 after the prompt.
+ *
+ * This summary is the completion signal the modern TUI does emit. It is absent
+ * during a mid-turn tool/sub-agent wait, which paints `<verb>… (Ns · ↓N tokens)
+ * esc to interrupt` instead — so it cannot re-open the #316 hole.
+ *
+ * The match is deliberately the whole shape — duration, the middle dot, `done`
+ * and a clock — not the bare word `done`, which appears in ordinary prose (the
+ * #316 fixture itself contains "done."). Words are separated by CHA/CUF moves
+ * on 2.1.220+, so the tail is normalised the same way the footer gate does it.
+ * Prose can still forge it (`ran for 45s · done 14:02`) — the same class of
+ * risk #316 accepted for "tab to cycle"; the ✳ title below does not share it.
+ */
+// Duration shapes seen or plausible: `1s`, `2.5s`, `1m 20s`, `1h 5m`. The
+// clock may be 24 h (`16:36`) or 12 h (`4:36 PM`); the boundary after the
+// minutes covers both.
+const TURN_DONE_SUMMARY_RE =
+  /\bfor \d+(?:[.,]\d+)?\s?(?:s|m|h|min)(?:\s\d+\s?(?:s|m|min))* · done \d{1,2}:\d{2}\b/;
+
+function hasTurnDoneSummary(parser: Parser): boolean {
+  if (parser.footerTail.length === 0) return false;
+  const text = stripAnsi(expandCursorForwardToSpaces(_footerDecoder.decode(parser.footerTail)));
+  return TURN_DONE_SUMMARY_RE.test(text);
 }
 
 /**
@@ -346,7 +424,12 @@ export function tick(parser: Parser, now: number): ParserEvent[] {
   // treat quiet as turn-completion once the idle REPL footer is showing, so a
   // mid-turn tool-wait quiet no longer completes the turn prematurely. The
   // outer turn timeout remains the backstop if a future CLI renames the hint.
-  if (!hasIdleReplFooter(parser)) return [];
+  // Issue #369: on claude ≥ 2.1.246 the idle footer is never repainted after a
+  // turn; the turn-summary line (`… for 1s · done 16:36`) and the ✳ window
+  // title are the completion signals those CLIs do paint. Any one opens the gate.
+  if (!hasIdleReplFooter(parser) && !hasTurnDoneSummary(parser) && !hasIdleTitle(parser)) {
+    return [];
+  }
   if (now - parser.lastByteAt < parser.quietWindowMs) return [];
   parser.quietEmitted = true;
   return [{ type: "quiet", offset: parser.totalBytes }];

@@ -1,6 +1,16 @@
-import { describe, it, expect, mock } from "bun:test";
+import { describe, it, expect, mock, afterAll } from "bun:test";
 
 // Mock provider SDKs
+// #304: `mock.module` is process-global and outlives this file — every test
+// file bun loads after it would see these fakes in place of the real modules
+// (the mcp-multiplexer suites failed 10+ tests in the pack and 0 alone).
+// Keep the real exports so `afterAll` can put them back.
+const real0 = { ...(await import("@anthropic-ai/sdk")) };
+
+afterAll(() => {
+  mock.module("@anthropic-ai/sdk", () => real0);
+});
+
 mock.module("@anthropic-ai/sdk", () => ({
   default: class MockAnthropic {
     messages = {

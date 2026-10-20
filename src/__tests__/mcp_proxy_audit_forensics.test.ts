@@ -11,16 +11,22 @@ import {
   chmodSync,
   mkdirSync,
 } from "node:fs";
-import { tmpdir, homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { createHmac } from "node:crypto";
 import { PluginMcpBridge, _resetMcpBridge, _setMcpBridge } from "../plugins/mcp-bridge.js";
 import { McpProxyPlugin, _resetMcpProxy } from "../plugins/mcp-proxy/index.js";
 import { getHttpGateway, _resetHttpGateway } from "../plugins/http-gateway.js";
 import type { PluginHttpGateway } from "../plugins/http-gateway.js";
+import { __setToolCallSinkForTest, ToolCallSink } from "../observability/tool-call-sink.js";
 
 const MOCK_SERVER = fileURLToPath(new URL("./fixtures/mock-mcp-server.ts", import.meta.url));
 const BUN_BIN = process.execPath;
-const DEFAULT_AUDIT_PATH = join(homedir(), ".config", "plus", "plugin-audit.jsonl");
+// #304: the bridge's default audit path is the OPERATOR's live journal
+// (`~/.config/plus/plugin-audit.jsonl`). Reading it made the assertions race
+// against whatever the daemon on the host was writing, and running the test
+// left `test-server__*` entries in it. The bridge takes a path: each test
+// gets its own, inside its tmp dir.
+let auditPath = "";
 
 function signRequest(token: Buffer, body: string, ts: string): string {
   return createHmac("sha256", token).update(`${ts}\n${body}`).digest("hex");
@@ -51,8 +57,8 @@ async function invokeViaTool(
 }
 
 function readNewAuditEvents(offsetBytes: number): Record<string, unknown>[] {
-  if (!existsSync(DEFAULT_AUDIT_PATH)) return [];
-  const content = readFileSync(DEFAULT_AUDIT_PATH, "utf8").slice(offsetBytes);
+  if (!existsSync(auditPath)) return [];
+  const content = readFileSync(auditPath, "utf8").slice(offsetBytes);
   return content
     .trim()
     .split("\n")
@@ -77,6 +83,8 @@ beforeEach(async () => {
   _resetMcpBridge();
   _resetHttpGateway();
   _resetMcpProxy();
+  auditPath = join(tmpDir, "plugin-audit.jsonl");
+  _setMcpBridge(new PluginMcpBridge(auditPath));
 
   const configPath = join(tmpDir, "mcp-proxy.json");
   const tokenPath = join(tmpDir, "mcp-proxy.token");
@@ -114,7 +122,7 @@ describe("mcp-proxy audit forensics", () => {
   // ── Test 1 — request_id propagated end-to-end ────────────────────────────
 
   it("request_id appears in ≥2 audit events and the HTTP response body", async () => {
-    const preOffset = existsSync(DEFAULT_AUDIT_PATH) ? statSync(DEFAULT_AUDIT_PATH).size : 0;
+    const preOffset = existsSync(auditPath) ? statSync(auditPath).size : 0;
     const customRequestId = "deadbeef12345678";
 
     const resp = await invokeViaTool(
@@ -135,6 +143,32 @@ describe("mcp-proxy audit forensics", () => {
     expect(withId.length).toBeGreaterThanOrEqual(2);
   });
 
+  // ── Test 1b — the call lands on the mcp.tool_call chain ─────────────────
+
+  it("a gateway invoke of a proxied tool records the upstream server and tool", async () => {
+    const sink = new ToolCallSink({ path: null, autoFlush: false });
+    __setToolCallSinkForTest(sink);
+    try {
+      const resp = await invokeViaTool(
+        gateway,
+        "mcp-proxy",
+        "test-server__echo",
+        { arguments: { message: "chain" }, mode: "direct" },
+        proxyToken,
+      );
+      expect(resp?.status).toBe(200);
+      expect(sink.pending()).toHaveLength(1);
+      expect(sink.pending()[0]).toMatchObject({
+        plugin: "test-server",
+        tool: "echo",
+        agent_id: "plugin-bridge",
+        status: "ok",
+      });
+    } finally {
+      __setToolCallSinkForTest(null);
+    }
+  });
+
   // ── Test 2 — all event types captured ────────────────────────────────────
 
   it("full register→invoke→error→unregister cycle captures all required event types", async () => {
@@ -144,6 +178,10 @@ describe("mcp-proxy audit forensics", () => {
     _resetMcpProxy();
 
     const localTmpDir = mkdtempSync(join(tmpdir(), "mcp-proxy-all-events-"));
+    // The reset above dropped the tmp-path bridge; without this the next
+    // `getMcpBridge()` would write to the operator's live journal again.
+    auditPath = join(localTmpDir, "plugin-audit.jsonl");
+    _setMcpBridge(new PluginMcpBridge(auditPath));
     const configPath = join(localTmpDir, "mcp-proxy.json");
     const tokenPath = join(localTmpDir, "mcp-proxy.token");
     writeFileSync(
@@ -160,7 +198,7 @@ describe("mcp-proxy audit forensics", () => {
       }),
     );
 
-    const preOffset = existsSync(DEFAULT_AUDIT_PATH) ? statSync(DEFAULT_AUDIT_PATH).size : 0;
+    const preOffset = existsSync(auditPath) ? statSync(auditPath).size : 0;
     const localPlugin = new McpProxyPlugin({ configPath, tokenPath });
     await localPlugin.start();
     const localGateway = getHttpGateway();
@@ -235,7 +273,7 @@ describe("mcp-proxy audit forensics", () => {
   // ── Test 4 — plugin token never leaks to audit log ───────────────────────
 
   it("plugin token hex string never appears in audit log entries", async () => {
-    const preOffset = existsSync(DEFAULT_AUDIT_PATH) ? statSync(DEFAULT_AUDIT_PATH).size : 0;
+    const preOffset = existsSync(auditPath) ? statSync(auditPath).size : 0;
     const tokenHex = proxyToken.toString("hex");
 
     // 5 invocations
@@ -249,8 +287,8 @@ describe("mcp-proxy audit forensics", () => {
       );
     }
 
-    const rawContent = existsSync(DEFAULT_AUDIT_PATH)
-      ? readFileSync(DEFAULT_AUDIT_PATH, "utf8").slice(preOffset)
+    const rawContent = existsSync(auditPath)
+      ? readFileSync(auditPath, "utf8").slice(preOffset)
       : "";
 
     expect(rawContent).not.toContain(tokenHex);

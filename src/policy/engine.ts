@@ -9,6 +9,19 @@
  * - Evaluation order: highest priority first, then specificity, then explicit deny > allow > require_approval
  * - Cache is configurable and bounded, invalidated on policy reload
  *
+ * TWO MECHANISMS, NOT ONE LADDER (#258):
+ * - The rules above are the ladder, and the order just described is the whole
+ *   of it — priority wins, deny first within a tier, and the allow-exception
+ *   pattern (a narrow high-priority allow above a broad deny) keeps working.
+ * - A SKILL OVERLAY is not a rule in that ladder. It is a ceiling on the tool
+ *   set, applied in `evaluate` BEFORE any rule is considered: a tool the
+ *   active skill refuses (`deniedTools` in its SKILL.md) never reaches the
+ *   ladder, so no allow of any priority can re-admit it. An overlay can only
+ *   remove. It has no way to add: `requiredTools` is actionable information,
+ *   never a grant, so an explicit user deny stays absolute over anything a
+ *   skill declares. Skills are increasingly third-party — an overlay that
+ *   could widen would be a privilege-escalation primitive.
+ *
  * CRASH CONSCIOUSNESS:
  * - All policy state is loaded from disk on init
  * - Invalid rules fail closed and are surfaced clearly
@@ -22,7 +35,7 @@ import { randomUUID } from "crypto";
 // Scoped per-channel/per-user policies. Imported for use at evaluate-time only
 // (not at module init), so the channel-policies↔engine cycle never hits a TDZ.
 import { getScopedRules, mergeScopedPolicies } from "./channel-policies";
-import { getCachedSkillOverlayRules, hasCachedSkillOverlay } from "./skill-overlays";
+import { hasCachedSkillOverlay, skillDeniesTool } from "./skill-overlays";
 
 const POLICY_DIR = join(process.cwd(), ".claude", "claudeclaw");
 const POLICY_FILE = join(POLICY_DIR, "policies.json");
@@ -149,6 +162,38 @@ export function evaluate(request: ToolRequestContext): PolicyDecision {
       requestId,
       action: "deny",
       reason: `Policy engine failed to initialize: ${loadError.message}`,
+      evaluatedAt,
+      cacheable: false,
+    };
+  }
+
+  // #258: the skill overlay first, as a ceiling on the tool set — not as a
+  // rule in the ladder. Terry's decision on the issue: skills are third-party
+  // and an overlay that could widen would let a skill grant itself what the
+  // user's policy denied, so an overlay only ever removes, and it removes
+  // before anything can allow. The engine's own semantics are untouched below:
+  // priority wins, deny first within a tier, allow-exceptions keep working.
+  //
+  // ABOVE the decision cache on purpose (adversarial pass): overlays are
+  // populated lazily, when a slash command resolves the SKILL.md, so a request
+  // evaluated before that arrives caches an ALLOW under this very key and it is
+  // served for the rest of its TTL — re-admitting a tool the skill now refuses.
+  // A ceiling that sits below the cache is not a ceiling. The lookup is a Map
+  // hit. The refusal itself is NOT cached either, so an edited SKILL.md that
+  // stops denying a tool takes effect when the overlay is refreshed rather than
+  // a decision-TTL later.
+  const ceiling = skillDeniesTool(request.skillName, request.toolName);
+  if (ceiling) {
+    return {
+      requestId,
+      action: "deny",
+      // Not a rule id: the ceiling is not a rule. It is still an EXPLICIT
+      // refusal, and callers tell explicit denies from the no-match
+      // default-deny by this field being set (the bus short-circuits an
+      // explicit deny instead of raising an approval card, #258 item 3), so it
+      // carries an identifier that names the mechanism and what it refused.
+      matchedRuleId: ceiling.id,
+      reason: ceiling.reason,
       evaluatedAt,
       cacheable: false,
     };
@@ -432,18 +477,12 @@ function getApplicableRules(request: ToolRequestContext): PolicyRule[] {
   } catch {
     candidates = loadedRules;
   }
-  // Fold in skill-overlay deny rules for this request's skill (#258 item 2).
-  // Overlays are deny-only and scoped by skillName, so they can only ADD a
-  // restriction for the matching skill — never widen access. Empty when the
-  // request carries no skillName or the skill declared no deniedTools.
-  const overlayRules = getCachedSkillOverlayRules(request.skillName);
-  if (overlayRules.length > 0) candidates = candidates.concat(overlayRules);
-  else if (request.skillName && !hasCachedSkillOverlay(request.skillName)) {
-    // #284 LOW: overlay enforcement is process-local — if this skill's SKILL.md
-    // was never resolved (or has expired) in THIS process, its deny overlay is
-    // silently absent on this evaluation path. Surface the gap once per skill so
-    // an operator can see a deny overlay may not be enforced here. No behaviour
-    // change: the request still falls through to the normal approval gate.
+  // #258: the skill overlay is NOT folded in here. It is a ceiling applied
+  // before evaluation (`evaluate`), so a tool the skill refuses never reaches
+  // this ladder and no allow can outrank it. What remains here is the
+  // observability gap: an overlay that was never resolved in this process
+  // cannot be enforced on this path, so say so once per skill.
+  if (request.skillName && !hasCachedSkillOverlay(request.skillName)) {
     warnUncachedSkillOverlay(request.skillName);
   }
   return candidates.filter((rule) => {

@@ -9,6 +9,7 @@
 import { randomUUID } from "crypto";
 import { evaluateBudget, type BudgetEvaluation, type BudgetState } from "./budget-engine";
 import { classifyTask, selectModel as legacySelectModel } from "../model-router";
+import { recordModeDispatch } from "./mode-dispatch-journal";
 import type { AgenticMode } from "../config";
 
 export type { BudgetState };
@@ -243,6 +244,12 @@ export async function selectModel(
       );
       selectedModel = legacyResult.model;
       reason = `Task classified as "${legacyResult.taskType}": ${legacyResult.reasoning}`;
+      // mode_dispatch telemetry: this keyword/phrase match IS the dispatch event.
+      // Inert no-op unless the daemon installed a sink (see mode-dispatch-journal).
+      recordModeDispatch({
+        mode: legacyResult.taskType,
+        matched_keyword: legacyResult.matchedKeyword,
+      });
     }
   } else if (requestContext.capability) {
     // Map capability to model

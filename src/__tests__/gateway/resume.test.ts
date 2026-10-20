@@ -3,8 +3,6 @@ import { rm } from "fs/promises";
 import { join } from "path";
 import {
   getOrCreateSessionMapping,
-  getResumeArgs,
-  getResumeArgsForEvent,
   recordClaudeSessionId,
   updateSessionAfterProcessing,
   getSessionStats,
@@ -100,90 +98,13 @@ describe("resume.ts", () => {
     });
   });
 
-  describe("getResumeArgs", () => {
-    test("new mapping returns empty args and canResume=false", async () => {
-      const result = await getResumeArgs("telegram:111", "default");
-
-      expect(result.args).toEqual([]);
-      expect(result.canResume).toBe(false);
-      expect(result.isNewMapping).toBe(true);
-      expect(result.claudeSessionId).toBeNull();
-    });
-
-    test("existing mapping with null claudeSessionId returns empty args", async () => {
-      const channelId = "telegram:222";
-      const threadId = "default";
-
-      // Create mapping but don't attach Claude session ID
-      await getOrCreateSessionMapping(channelId, threadId);
-
-      const result = await getResumeArgs(channelId, threadId);
-
-      expect(result.args).toEqual([]);
-      expect(result.canResume).toBe(false);
-      expect(result.isNewMapping).toBe(false);
-    });
-
-    test("mapping with real claudeSessionId returns --resume args", async () => {
-      const channelId = "telegram:333";
-      const threadId = "default";
-      const realSessionId = "abc-123-session-id";
-
-      // Create mapping and attach real Claude session ID
-      await getOrCreateSessionMapping(channelId, threadId);
-      await recordClaudeSessionId(channelId, threadId, realSessionId);
-
-      const result = await getResumeArgs(channelId, threadId);
-
-      expect(result.args).toEqual(["--resume", realSessionId]);
-      expect(result.canResume).toBe(true);
-      expect(result.isNewMapping).toBe(false);
-      expect(result.claudeSessionId).toBe(realSessionId);
-    });
-
+  // #376: `getResumeArgs` / `getResumeArgsForEvent` are retired — the runner
+  // resumes from its own store; the map records what the runner reports.
+  describe("recordClaudeSessionId mirrors the runner", () => {
     test("different channels/threads have independent mappings", async () => {
-      const channel1 = "telegram:100";
-      const channel2 = "telegram:200";
-      const thread1 = "default";
-      const thread2 = "thread-a";
-
-      await getOrCreateSessionMapping(channel1, thread1);
-      await getOrCreateSessionMapping(channel2, thread2);
-
-      const result1 = await getResumeArgs(channel1, thread1);
-      const result2 = await getResumeArgs(channel2, thread2);
-
-      expect(result1.mappingId).not.toBe(result2.mappingId);
-    });
-  });
-
-  describe("getResumeArgsForEvent", () => {
-    test("extracts channelId and threadId from event", async () => {
-      const event = createMockEvent({
-        channelId: "discord:guild:123:456",
-        threadId: "789",
-      });
-
-      const result = await getResumeArgsForEvent(event);
-
-      expect(result.canResume).toBe(false);
-      expect(result.isNewMapping).toBe(true);
-    });
-
-    test("returns resume args when event's session has real Claude session ID", async () => {
-      const event = createMockEvent({
-        channelId: "telegram:999",
-        threadId: "default",
-      });
-
-      // Create mapping first, then record the session ID
-      await getOrCreateSessionMapping(event.channelId, event.threadId);
-      await recordClaudeSessionId(event.channelId, event.threadId, "real-session-xyz");
-
-      const result = await getResumeArgsForEvent(event);
-
-      expect(result.args).toEqual(["--resume", "real-session-xyz"]);
-      expect(result.canResume).toBe(true);
+      const m1 = await getOrCreateSessionMapping("telegram:100", "default");
+      const m2 = await getOrCreateSessionMapping("telegram:200", "thread-a");
+      expect(m1.mappingId).not.toBe(m2.mappingId);
     });
   });
 
@@ -203,7 +124,10 @@ describe("resume.ts", () => {
       expect(entry?.status).toBe("active");
     });
 
-    test("does not overwrite existing real session ID without force", async () => {
+    // #376: the map mirrors the runner's store — a replaced session
+    // overwrites the recorded id (before #376 nothing ever produced an id,
+    // so the first-wins rule this test pinned never had a second id to keep).
+    test("follows the runner when it replaces the conversation's session", async () => {
       const channelId = "telegram:1001";
       const threadId = "default";
 
@@ -212,10 +136,10 @@ describe("resume.ts", () => {
       await recordClaudeSessionId(channelId, threadId, "second-session");
 
       const entry = await get(channelId, threadId);
-      expect(entry?.claudeSessionId).toBe("first-session");
+      expect(entry?.claudeSessionId).toBe("second-session");
     });
 
-    test("overwrites with force=true", async () => {
+    test("attachClaudeSessionId keeps its first-wins contract (force overwrites)", async () => {
       const channelId = "telegram:1002";
       const threadId = "default";
 
@@ -480,27 +404,23 @@ describe("resume.ts", () => {
       const channelId = "telegram:7000";
       const threadId = "default";
 
-      // Step 1: Create new mapping (should not be resumable)
-      const step1 = await getResumeArgs(channelId, threadId);
-      expect(step1.canResume).toBe(false);
-      expect(step1.args).toEqual([]);
-      expect(step1.isNewMapping).toBe(true);
+      // Step 1: Create new mapping (no id yet)
+      const step1 = await getOrCreateSessionMapping(channelId, threadId);
+      expect(step1.claudeSessionId).toBeNull();
 
-      // Step 2: First processing - should update stats but still not resumable
+      // Step 2: First processing - should update stats but still carry no id
       await updateSessionAfterProcessing(channelId, threadId, 1);
-      const step2 = await getResumeArgs(channelId, threadId);
-      expect(step2.canResume).toBe(false); // No real session ID yet
-      expect(step2.args).toEqual([]);
+      const step2 = await getSessionStats(channelId, threadId);
+      expect(step2!.canResume).toBe(false); // No real session ID yet
 
       // Step 3: Runner returns real Claude session ID - record it
       const realSessionId = "claude-runner-session-123";
       await recordClaudeSessionId(channelId, threadId, realSessionId);
 
-      // Step 4: Now resume should work
-      const step4 = await getResumeArgs(channelId, threadId);
-      expect(step4.canResume).toBe(true);
-      expect(step4.args).toEqual(["--resume", realSessionId]);
-      expect(step4.claudeSessionId).toBe(realSessionId);
+      // Step 4: the map now carries the runner's id
+      const step4 = await getSessionStats(channelId, threadId);
+      expect(step4!.canResume).toBe(true);
+      expect(step4!.claudeSessionId).toBe(realSessionId);
 
       // Step 5: More processing - turn count increases
       await updateSessionAfterProcessing(channelId, threadId, 2);

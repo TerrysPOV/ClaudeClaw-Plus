@@ -14,20 +14,58 @@ export const BUS_MCP_TOOLS = [
     name: "reply",
     description:
       "Send a reply to the originating surface (Discord/Telegram/Slack/Web UI). " +
-      "Use `intent: 'final'` for the turn-final message, `'progress'` for streaming " +
-      "updates, `'tool_status'` for tool-execution notes.",
+      "Call it as { message, intent } — `intent: 'final'` for the turn-final message, " +
+      "`'progress'` for streaming updates, `'tool_status'` for tool-execution notes; " +
+      "omitted, it is `'progress'`. " +
+      "When several chats talk to you, set `in_reply_to` to the `chat_id` " +
+      "(or `origin_id`) attribute of the <channel …> block you are answering, so the " +
+      "reply reaches that chat and not whichever one wrote last. One `final` per chat " +
+      "you answer; a second `final` to the same chat in one turn is dropped. " +
+      "The same two fields are also accepted under `metadata` (which wins if both are set); " +
+      "any other key is refused.",
     inputSchema: {
       type: "object" as const,
       properties: {
         message: { type: "string" },
+        // `null` on any optional reads as "not set" (the parser in mcp-server.ts
+        // agrees) — a model routinely writes null for a field it does not use.
+        intent: {
+          anyOf: [{ type: "string", enum: ["final", "progress", "tool_status"] }, { type: "null" }],
+          description: "'final' ends the turn and notifies the user; default 'progress'.",
+        },
+        in_reply_to: {
+          type: ["string", "integer", "null"],
+          minLength: 1,
+          // A number must be a safe integer (a snowflake as a JSON number has
+          // already lost precision) — pass ids as strings.
+          minimum: -9007199254740991,
+          maximum: 9007199254740991,
+          description:
+            "The chat_id (or origin_id) attribute of the <channel …> block this reply answers, " +
+            "as a string. Only chats that actually prompted you are honoured.",
+        },
         metadata: {
-          type: "object",
+          type: ["object", "null"],
+          description: "Alternative placement of the same `intent` / `in_reply_to` fields.",
           properties: {
-            intent: { type: "string", enum: ["final", "progress", "tool_status"] },
+            intent: {
+              anyOf: [
+                { type: "string", enum: ["final", "progress", "tool_status"] },
+                { type: "null" },
+              ],
+            },
+            in_reply_to: {
+              type: ["string", "integer", "null"],
+              minLength: 1,
+              minimum: -9007199254740991,
+              maximum: 9007199254740991,
+            },
           },
+          additionalProperties: false,
         },
       },
       required: ["message"],
+      additionalProperties: false,
     },
   },
   {
@@ -85,7 +123,8 @@ export const BUS_MCP_TOOLS = [
   {
     name: "dispatch_job",
     description:
-      "Dispatch a background job to another agent (e.g. run `reg`/`suzy` on a long " +
+      "Dispatch a background job to an agent — another one, or yourself when the channel " +
+      "instructions name you as a target (e.g. run a long " +
       "research/draft task). Fire-and-return: returns a `job_id` IMMEDIATELY and the " +
       "job runs headless in its own process — never blocks your turn. The result is " +
       "delivered back to you when it finishes, and is queryable via `job_status`. Use " +

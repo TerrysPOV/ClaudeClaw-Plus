@@ -25,6 +25,19 @@
  *            headers, so a query param is the de-facto standard).
  *   - If `token` is unset: dev mode, no auth, startup warning logged.
  *
+ * Origin check (both modes):
+ *   - A request carrying an `Origin` header (i.e. sent by a browser) is
+ *     refused with 403 unless the origin is same-origin with a loopback or
+ *     IP-literal host, or listed in `allowedOrigins`. Without it, any web
+ *     page the operator visits could POST a `text/plain` "simple request"
+ *     to `/prompt` (no CORS preflight) or open `/ws` and read agent events —
+ *     the browser's same-origin policy does not cover either.
+ *   - Same-origin is only trusted on loopback / IP-literal hosts: a DNS
+ *     rebinding page makes `Origin` and `Host` agree on the attacker's own
+ *     hostname, so agreement alone proves nothing.
+ *   - Requests with no `Origin` (curl, native and server-side clients) are
+ *     unaffected; they are still subject to the token when one is set.
+ *
  * Lifecycle:
  *   - `start()` binds the port and returns the resolved bind tuple.
  *     `bind: '127.0.0.1:0'` is supported for tests — the OS picks a port.
@@ -34,6 +47,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { isIP } from "node:net";
 import type { ServerWebSocket } from "bun";
 import type { BusCore, Subscription } from "../../bus/core";
 import type { BusEvent, BusEventTopic } from "../../bus/types";
@@ -54,10 +68,18 @@ export interface WebUiAdapterOptions {
    */
   bind?: string;
   /**
-   * Session token for auth (equivalent to `CCAW_WEBUI_TOKEN` env). If
-   * undefined, the adapter runs without auth and logs a startup warning.
+   * Session token for auth. The daemon wiring falls back to the
+   * `CCAW_WEBUI_TOKEN` env when `web.bus.token` is unset. If undefined, the
+   * adapter runs without auth and logs a startup warning.
    */
   token?: string;
+  /**
+   * Browser origins (`scheme://host[:port]`) allowed to call `/prompt` and
+   * open `/ws` cross-origin. Requests from any other origin get 403. Empty
+   * or unset = same-origin (loopback / IP-literal host) and non-browser
+   * clients only.
+   */
+  allowedOrigins?: string[];
   /**
    * If non-empty, only these `agent_id`s are accessible. An attempt to
    * subscribe or prompt any other agent returns 403 / WS close 4403.
@@ -90,6 +112,7 @@ export class WebUiAdapter {
   private readonly bus: BusCore;
   private readonly token: string | undefined;
   private readonly allowedAgentIds: ReadonlySet<string> | null;
+  private readonly allowedOrigins: ReadonlySet<string>;
   private readonly defaultTopics: BusEventTopic[] | undefined;
   private readonly logger: Pick<Console, "warn" | "info" | "error">;
   private readonly bindHost: string;
@@ -117,6 +140,9 @@ export class WebUiAdapter {
       opts.allowedAgentIds && opts.allowedAgentIds.length > 0
         ? new Set(opts.allowedAgentIds)
         : null;
+    this.allowedOrigins = new Set(
+      (opts.allowedOrigins ?? []).map(normalizeOrigin).filter((o): o is string => o !== null),
+    );
     this.defaultTopics = opts.defaultTopics;
     this.logger = opts.logger ?? console;
 
@@ -135,7 +161,8 @@ export class WebUiAdapter {
       this.logger.warn(
         "[webui-adapter] starting WITHOUT auth token — anyone reachable on " +
           `${this.bindHost}:${this.bindPort} can prompt and subscribe. ` +
-          "Set the `token` option (or CCAW_WEBUI_TOKEN env) before exposing.",
+          "Set `web.bus.token` (or the CCAW_WEBUI_TOKEN env) before exposing. " +
+          "Cross-origin browser requests are refused either way.",
       );
     }
     this.server = Bun.serve<WsContext, undefined>({
@@ -186,7 +213,13 @@ export class WebUiAdapter {
     const url = new URL(req.url);
 
     if (url.pathname === "/health" && req.method === "GET") {
-      return jsonOk({ ok: true, version: ADAPTER_VERSION });
+      return jsonOk({
+        ok: true,
+        version: ADAPTER_VERSION,
+        capabilities: ADAPTER_CAPABILITIES,
+        instance_id: INSTANCE_ID,
+        started_at: STARTED_AT,
+      });
     }
 
     if (url.pathname === "/prompt" && req.method === "POST") {
@@ -201,6 +234,8 @@ export class WebUiAdapter {
   }
 
   private async handlePromptRequest(req: Request): Promise<Response> {
+    const originError = this.checkOrigin(req);
+    if (originError) return originError;
     const authError = this.checkHttpAuth(req);
     if (authError) return authError;
 
@@ -242,6 +277,8 @@ export class WebUiAdapter {
     server: ReturnType<typeof Bun.serve>,
     url: URL,
   ): Response | undefined {
+    const originError = this.checkOrigin(req);
+    if (originError) return originError;
     const provided = url.searchParams.get("token") ?? extractBearer(req);
     if (this.token && provided !== this.token) {
       return jsonError(401, "unauthorized");
@@ -325,6 +362,23 @@ export class WebUiAdapter {
 
   /* ──────────────────────────── helpers ───────────────────────────── */
 
+  /**
+   * Refuse browser requests from a foreign origin — see "Origin check" in
+   * the file header. Runs before auth so a cross-site page learns nothing
+   * about whether a token is configured.
+   */
+  private checkOrigin(req: Request): Response | null {
+    const raw = req.headers.get("origin");
+    if (raw === null) return null;
+    const origin = normalizeOrigin(raw);
+    if (origin !== null && this.allowedOrigins.has(origin)) return null;
+    if (origin !== null && isTrustedSameOrigin(origin, req.headers.get("host"))) return null;
+    this.logger.warn(
+      `[webui-adapter] refused request from origin ${JSON.stringify(raw.slice(0, 200))}`,
+    );
+    return jsonError(403, "origin_not_allowed");
+  }
+
   private checkHttpAuth(req: Request): Response | null {
     if (!this.token) return null;
     const bearer = extractBearer(req);
@@ -357,6 +411,85 @@ export class WebUiAdapter {
  */
 const ADAPTER_VERSION = "0.1.0";
 
+/**
+ * What this daemon supports, for clients that must detect capabilities rather
+ * than sniff the version (a client branching on "0.1.0" is doing the brittle
+ * thing).
+ *
+ * Entries name OBSERVABLE BEHAVIOUR, never internal module names: a consumer
+ * vendoring this core sees behaviour that survives a refactor, where an
+ * internal name would drift.
+ *
+ * The array grows; it does not reorder or repurpose entries. A client that
+ * checks for membership keeps working as it fills.
+ */
+/**
+ * Identity of this daemon PROCESS, minted once at module load.
+ *
+ * The only property that matters is the one a version cannot give: it changes
+ * when the daemon restarts and does not change when it has not. A client that
+ * reconnects and sees a different value knows its cached state — subscriptions,
+ * in-flight operation ids, the sequence number it had reached — belongs to a
+ * process that no longer exists, and can resynchronise instead of resuming
+ * against a daemon that never heard of any of it.
+ *
+ * Version cannot answer that: a restart onto the same build reports the same
+ * version, which is precisely the case a desktop must not mistake for
+ * continuity.
+ *
+ * `started_at` rides along because it answers "how long has this been up"
+ * without a second round trip, and it makes a restart legible in a log where a
+ * random id is not.
+ */
+const INSTANCE_ID = randomUUID();
+const STARTED_AT = new Date().toISOString();
+
+const ADAPTER_CAPABILITIES = [
+  /**
+   * Events published for a turn carry `promise_id` — the value `POST /prompt`
+   * returned — while the operation owns the agent's slot.
+   *
+   * Deliberately NOT "every event": `response.turn_end` reaches the bus from
+   * the JSONL tailer with no identity of its own, so the slot is held by
+   * counting the terminators an agent still owes. Counting cannot see turns the
+   * bus did not start — an operator typing in the agent's own TUI, a cron tick
+   * — so such a turn ends a live operation early.
+   *
+   * The consequence is worse than a missing id, and the `correlation_ambiguity`
+   * note below spells it out: the freed slot is taken by the next submission
+   * without being flagged, and the earlier operation's remaining events publish
+   * under that later id. Read this capability as "ids are emitted and are
+   * correct in the common case", never as a guarantee of attribution.
+   */
+  "events.operation_id",
+  /**
+   * An event whose `promise_id` is known to be untrustworthy carries
+   * `correlation_ambiguous: true` — set when a submit lands while the slot is
+   * still occupied, and held for the whole life of that operation.
+   *
+   * KNOWN, and stronger than it may read: the flag covers overlapping submits,
+   * NOT the ambient-turn case above. There the slot is released early, so the
+   * next submission finds it free and is not flagged — and the first
+   * operation's remaining events, including its final answer, then publish
+   * under the SECOND operation's id with no flag at all. A client following the
+   * second operation receives the first one's answer as its own result, and the
+   * envelope asserts certainty.
+   *
+   * So a present id is ADVISORY, not authoritative: it is trustworthy only
+   * where the client has out-of-band evidence that no turn ran on that agent
+   * other than the ones it submitted.
+   *
+   * #239 narrowed the overlapping-submit case to one path: the bus admits one
+   * prompt per agent at a time, so a submit can only land on an occupied slot
+   * when the turn deadline freed it — and that admission is flagged. The
+   * ambient-turn case above is unchanged; session-per-conversation (#376) is
+   * where the remaining identity work goes.
+   */
+  "events.correlation_ambiguity",
+  /** `/health` reports `instance_id` and `started_at`, which change on restart. */
+  "health.instance_identity",
+] as const;
+
 function parseBind(bind: string | undefined): { host: string; port: number } {
   // Default per spec §5.5.4 sketch.
   const raw = bind && bind.length > 0 ? bind : "127.0.0.1:7878";
@@ -372,6 +505,39 @@ function parseBind(bind: string | undefined): { host: string; port: number } {
     throw new Error(`WebUiAdapter: invalid bind port "${portStr}"`);
   }
   return { host, port };
+}
+
+/**
+ * Canonical `scheme://host[:port]` for an origin string, or null when it is
+ * not an http(s) origin (`null`, `file://`, garbage). Default ports are
+ * dropped by `URL`, so `http://x:80` and `http://x` compare equal.
+ */
+function normalizeOrigin(raw: string): string | null {
+  try {
+    const u = new URL(raw.trim());
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    return u.origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Same-origin, and on a host DNS rebinding cannot take over: a loopback name
+ * or an IP literal. Anything else must be listed in `allowedOrigins`.
+ */
+function isTrustedSameOrigin(origin: string, hostHeader: string | null): boolean {
+  if (!hostHeader) return false;
+  const o = new URL(origin);
+  let h: URL;
+  try {
+    h = new URL(`${o.protocol}//${hostHeader}`);
+  } catch {
+    return false;
+  }
+  if (o.host !== h.host) return false;
+  const name = o.hostname.replace(/^\[|\]$/g, "");
+  return name === "localhost" || isIP(name) !== 0;
 }
 
 function extractBearer(req: Request): string | null {

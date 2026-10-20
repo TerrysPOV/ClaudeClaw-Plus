@@ -1,4 +1,5 @@
 import { writeFile, unlink, mkdir } from "fs/promises";
+import { allowlistStartupWarnings } from "../allowlist";
 import { existsSync } from "fs";
 import { randomBytes } from "crypto";
 import { homedir } from "os";
@@ -19,17 +20,35 @@ import {
   probeClaudeCliVersion,
 } from "../runner";
 import {
+  gatewaySessionThreadId,
   initGatewayProcessor,
   registerGatewayDelivery,
   unregisterGatewayDelivery,
 } from "../event-processor";
 import { writeState, type StateData } from "../statusline";
-import { cronMatches, nextCronMatch } from "../cron";
+import { ensureStatuslineSetting, removeStatuslineSetting } from "../statusline-settings";
+import { nextCronMatch } from "../cron";
+import { busSchedulerJobs, createJobLoop } from "../job-loop";
+import { busJobRelay } from "../job-relay";
+import { agentHasPersona } from "../agents";
 import { clearJobSchedule, loadJobs, resolveJobModel, snapshotJobFrontmatter } from "../jobs";
 import { migrateLegacyAgentJobs } from "../migrations";
 import { ensureUserSymlinks } from "../install";
-import { writePidFile, cleanupPidFile, checkExistingDaemon } from "../pid";
 import {
+  writePidFile,
+  cleanupPidFileIf,
+  checkExistingDaemon,
+  DaemonStateUnknownError,
+  acquirePidLock,
+  getPidLockPath,
+  releasePidLock,
+  waitForPidExit,
+  stopGraceMs,
+  readConfiguredDrainMs,
+  SHUTDOWN_MEMORY_SAVE_MS,
+} from "../pid";
+import {
+  getSettings,
   initConfig,
   loadSettings,
   reloadSettings,
@@ -37,6 +56,14 @@ import {
   type HeartbeatConfig,
   type Settings,
 } from "../config";
+import { DEFAULT_DRAIN_TURNS_MS, drainActiveTurns } from "../bus/shutdown-drain";
+import {
+  memoryPathForSessionKey,
+  saveGlobalMemoryOneShot,
+  saveMemoryAtShutdown,
+} from "../shutdown-memory-save";
+import { createShutdownController, runShutdownSequence } from "./shutdown-sequence";
+import { defaultCredentialsPath, enforceCredentialReadiness } from "../bus/credential-readiness";
 import { getDayAndMinuteAtOffset, buildClockPromptPrefix } from "../timezone";
 import { isHeartbeatExcludedAt, isHeartbeatExcludedNow } from "../heartbeat-windows";
 import { startWebUi, type WebServerHandle } from "../web";
@@ -49,7 +76,15 @@ import { PluginManager, setPluginManager } from "../plugins";
 import { indexSessionsBackground } from "../memory";
 import { getMcpProxyPlugin } from "../plugins/mcp-proxy/index.js";
 import { getMcpMultiplexerPlugin } from "../plugins/mcp-multiplexer/index.js";
-import { injectMcpIdentityIssuer } from "../runner/pty-supervisor";
+import { getMcpBridge } from "../plugins/mcp-bridge.js";
+import { getToolCallSink } from "../observability/tool-call-sink.js";
+import {
+  injectMcpIdentityIssuer,
+  liveSessionKeys,
+  sendToLiveSession,
+} from "../runner/pty-supervisor";
+import { defaultOutboxPath, getTelegramOutbox, type TelegramOutbox } from "../telegram-outbox";
+import { describeQuietHours, proactiveDeliver, quietHoursFrom } from "../quiet-hours";
 
 const CLAUDE_DIR = join(process.cwd(), ".claude");
 const HEARTBEAT_DIR = join(CLAUDE_DIR, "claudeclaw");
@@ -214,26 +249,14 @@ async function setupStatusline() {
   await mkdir(CLAUDE_DIR, { recursive: true });
   await writeFile(STATUSLINE_FILE, STATUSLINE_SCRIPT);
 
-  let settings: Record<string, unknown> = {};
-  try {
-    settings = await Bun.file(CLAUDE_SETTINGS_FILE).json();
-  } catch {
-    // file doesn't exist or isn't valid JSON
-  }
-  settings.statusLine = {
-    type: "command",
-    command: "node .claude/statusline.cjs",
-  };
-  await writeFile(CLAUDE_SETTINGS_FILE, JSON.stringify(settings, null, 2) + "\n");
+  await ensureStatuslineSetting(CLAUDE_SETTINGS_FILE);
 }
 
 async function teardownStatusline() {
   try {
-    const settings = await Bun.file(CLAUDE_SETTINGS_FILE).json();
-    delete settings.statusLine;
-    await writeFile(CLAUDE_SETTINGS_FILE, JSON.stringify(settings, null, 2) + "\n");
-  } catch {
-    // file doesn't exist, nothing to clean up
+    await removeStatuslineSetting(CLAUDE_SETTINGS_FILE);
+  } catch (err) {
+    console.warn("[statusline] teardown failed:", err);
   }
 
   try {
@@ -322,7 +345,17 @@ export async function start(args: string[] = []) {
 
   // One-shot mode: explicit prompt without trigger.
   if (hasPromptFlag && !hasTriggerFlag) {
-    const existingPid = await checkExistingDaemon();
+    let existingPid: number | null;
+    try {
+      existingPid = await checkExistingDaemon();
+    } catch (err) {
+      if (!(err instanceof DaemonStateUnknownError)) throw err;
+      // #435: unknown is not "none" — refuse rather than run beside a daemon.
+      console.error(
+        `\x1b[31mAborted: cannot tell whether a daemon is running: ${err.message}.\x1b[0m`,
+      );
+      process.exit(1);
+    }
     if (existingPid) {
       console.error(
         `\x1b[31mAborted: daemon already running in this directory (PID ${existingPid})\x1b[0m`,
@@ -342,7 +375,33 @@ export async function start(args: string[] = []) {
     return;
   }
 
-  const existingPid = await checkExistingDaemon();
+  // #435: hold the project's PID lock from the check below through
+  // `writePidFile()`, so no other `start` / `stop` reads, writes or removes
+  // `daemon.pid` in between. A second `start` arriving meanwhile stops here
+  // instead of passing the same check and launching a duplicate.
+  const pidLock = await acquirePidLock();
+  if (!pidLock.ok) {
+    console.error(
+      pidLock.holder !== null
+        ? `\x1b[31mAborted: another claudeclaw start/stop is in progress in this directory (PID ${pidLock.holder}).\x1b[0m`
+        : `\x1b[31mAborted: could not take the PID lock in this directory (${getPidLockPath()} cannot be created, is unreadable, or a stale one could not be removed).\x1b[0m`,
+    );
+    console.error(
+      `If no such process exists, remove ${getPidLockPath()} (and ${getPidLockPath()}.steal) and retry.`,
+    );
+    process.exit(1);
+  }
+
+  let existingPid: number | null;
+  try {
+    existingPid = await checkExistingDaemon();
+  } catch (err) {
+    if (!(err instanceof DaemonStateUnknownError)) throw err;
+    console.error(
+      `\x1b[31mAborted: cannot tell whether a daemon is running: ${err.message}.\x1b[0m`,
+    );
+    process.exit(1);
+  }
   if (existingPid) {
     if (!replaceExistingFlag) {
       console.error(
@@ -359,22 +418,49 @@ export async function start(args: string[] = []) {
       // ignore if process is already dead
     }
 
-    const deadline = Date.now() + 4000;
-    while (Date.now() < deadline) {
+    // #315: the old daemon drains its in-flight turns before it exits and
+    // owns the bus socket + agents until then. Starting the replacement
+    // after a fixed 4s would run two daemons on the same resources for the
+    // rest of the drain. Wait for its drain window (+ teardown margin), then
+    // force it, as a service manager would.
+    // Settings are loaded further down; the old daemon's drain window is
+    // read straight from this project's settings.json.
+    const graceMs = stopGraceMs(await readConfiguredDrainMs(process.cwd()));
+    console.log(
+      `Waiting up to ${Math.round(graceMs / 1000)}s for PID ${existingPid} to finish its in-flight turns...`,
+    );
+    if (!(await waitForPidExit(existingPid, graceMs))) {
+      console.log(
+        `PID ${existingPid} still alive after ${Math.round(graceMs / 1000)}s — sending SIGKILL.`,
+      );
       try {
-        process.kill(existingPid, 0);
-        await Bun.sleep(100);
+        process.kill(existingPid, "SIGKILL");
       } catch {
-        break;
+        // gone in between
+      }
+      if (!(await waitForPidExit(existingPid, 2000))) {
+        console.error(
+          `\x1b[31mAborted: PID ${existingPid} did not exit after SIGKILL — it may still own the bus socket and the agents.\x1b[0m`,
+        );
+        process.exit(1);
       }
     }
 
-    await cleanupPidFile();
+    // #420: remove the file only if it still names the daemon we replaced.
+    await cleanupPidFileIf(existingPid);
   }
 
   await initConfig();
   const settings = await loadSettings();
   await ensureProjectClaudeMd();
+
+  // #230: per-plugin kill switch on the plugin-tool bridge. Applied before any
+  // plugin registers or is called, and again on every hot-reload below.
+  getMcpBridge().setToolPolicy(settings.mcp.bridge);
+  // settings.mcp.audit: under "enforce" a tool call whose intent cannot be
+  // logged is refused, on both dispatch paths. The chain records the boot
+  // policy (enforce only) and every later change.
+  getToolCallSink().applyPolicy(settings.mcp.audit ?? "best-effort");
 
   // Wire operator-facing governance config into the in-memory watchdog state
   // (#268). Without this, `settings.governance.watchdog.{enabled,limits}` is
@@ -462,6 +548,7 @@ export async function start(args: string[] = []) {
 
   await setupStatusline();
   await writePidFile();
+  releasePidLock();
   let web: WebServerHandle | null = null;
   let discordStopGateway: (() => void) | null = null;
   let slackStopFn: (() => void) | null = null;
@@ -489,6 +576,24 @@ export async function start(args: string[] = []) {
   if (Object.keys(settings.plugins).length > 0) {
     await pluginManager.loadAll(settings.plugins);
     setPluginManager(pluginManager);
+  }
+
+  // #514: warn when a stored claude.ai login shadows a long-lived
+  // CLAUDE_CODE_OAUTH_TOKEN (interactive PTY agents use the stored login, not
+  // the env token), or when the store's refresh token is already dead. Runs for
+  // every runtime — legacy and bus both spawn the interactive `claude` REPL —
+  // and before any agent is spawned, so the warning is early in the log.
+  // Advisory only: it reads two timestamps, logs, and boot always continues.
+  // "ok" gets one line, because a check that leaves no trace at all is
+  // impossible to confirm from a log.
+  const credentialReadiness = enforceCredentialReadiness({
+    oauthTokenEnv: process.env.CLAUDE_CODE_OAUTH_TOKEN,
+    credentialsPath: defaultCredentialsPath(),
+  });
+  if (credentialReadiness.status === "ok") {
+    console.log(
+      `[${ts()}] Credential store: refresh token valid (access token expiry ${new Date(credentialReadiness.expiresAt).toISOString()})`,
+    );
   }
 
   // Bus runtime mount (Sprint 5.1 + 5.2a + 5.2b) — opt-in via `settings.runtime: "bus"`.
@@ -622,41 +727,115 @@ export async function start(args: string[] = []) {
 
   let mcpProxyStarted: Promise<void> = Promise.resolve();
 
+  const shutdownCtl = createShutdownController();
   async function shutdown() {
-    await mcpProxyStarted.catch(() => {}); // drain start() before stop() clears server map
-    await getMcpProxyPlugin().stop();
-    await pluginManager.stopServices();
-    setPluginManager(null);
-    if (discordStopGateway) discordStopGateway();
-    if (slackStopFn) slackStopFn();
-    if (web) web.stop();
-    // #294: unsubscribe the kanban tracker before the bus stops.
-    if (kanbanTracker) {
-      try {
-        kanbanTracker.stop();
-      } catch (err) {
-        console.error("[kanban-tracker] shutdown failed", err);
-      }
-      kanbanTracker = null;
+    // A second SIGTERM/SIGINT does not start a second teardown: it aborts the
+    // drain and the memory save below so the first one proceeds at once (Ctrl-C
+    // twice in a terminal, or an operator who does not want to wait).
+    if (shutdownCtl.request() === "abort") return;
+    // `getSettings()` follows the hot reload and is safe before
+    // `currentSettings` is initialised (a SIGTERM during boot).
+    let drainMs = DEFAULT_DRAIN_TURNS_MS;
+    try {
+      drainMs = getSettings().shutdown.drainTurnsMs;
+    } catch {
+      /* settings not loaded yet — keep the default */
     }
-    // #325: detach the operator-alert buffer before the bus stops.
-    if (operatorAlertBuffer) {
-      try {
-        operatorAlertBuffer.detach();
-      } catch (err) {
-        console.error("[operator-alert-buffer] shutdown failed", err);
-      }
-      operatorAlertBuffer = null;
-    }
-    if (busRuntimeHandle) {
-      try {
-        await busRuntimeHandle.stop();
-      } catch (err) {
-        console.error("[bus-runtime] shutdown failed", err);
-      }
-    }
-    await teardownStatusline();
-    await cleanupPidFile();
+    await runShutdownSequence({
+      // #315: let the bus finish what it owes the model (bounded) BEFORE any
+      // adapter or the bus goes away — a restart mid-turn used to drop the
+      // reply silently. Nothing here may prevent the teardown that follows.
+      drain: async () => {
+        if (!busCoreForWebUi) return;
+        const bus = busCoreForWebUi;
+        try {
+          await drainActiveTurns(drainMs, {
+            busyAgents: () => (bus.busyAgents ? bus.busyAgents() : bus.activeTurnAgents()),
+            onTurnEnd: (handler) => {
+              const sub = bus.subscribe({ topics: ["response.turn_end"] }, (event) =>
+                handler(event.agent_id),
+              );
+              return () => sub.close();
+            },
+            shouldAbort: () => shutdownCtl.aborted,
+            log: (line) => console.log(`[${ts()}] ${line}`),
+          });
+        } catch (err) {
+          console.error(`[${ts()}] [shutdown] drain failed (continuing with teardown):`, err);
+        }
+      },
+      // #549: ask each live session to save its memory — here, in the daemon, from
+      // the session it already has. The save has its own SHUTDOWN_MEMORY_SAVE_MS slot,
+      // independent of the drain: a turn that ate the whole drain window (#315), or
+      // `drainTurnsMs: 0`, must not cost the save. `stopGraceMs` waits for drain + save.
+      saveMemory: async () => {
+        await saveMemoryAtShutdown(SHUTDOWN_MEMORY_SAVE_MS, {
+          liveKeys: liveSessionKeys,
+          send: sendToLiveSession,
+          memoryPathFor: memoryPathForSessionKey,
+          // No live PTY (legacy `-p` runtime): resume the stored session instead, so
+          // that runtime keeps the save `claudeclaw stop` used to do. Not under the
+          // bus runtime, whose agents own their sessions.
+          fallbackSave: busRuntimeHandle ? undefined : saveGlobalMemoryOneShot,
+          signal: shutdownCtl.signal,
+          log: (line) => console.log(`[${ts()}] ${line}`),
+        });
+      },
+      teardown: async () => {
+        await mcpProxyStarted.catch(() => {}); // drain start() before stop() clears server map
+        await getMcpProxyPlugin().stop();
+        await pluginManager.stopServices();
+        setPluginManager(null);
+        if (discordStopGateway) discordStopGateway();
+        if (slackStopFn) slackStopFn();
+        if (web) web.stop();
+        // #294: unsubscribe the kanban tracker before the bus stops.
+        if (kanbanTracker) {
+          try {
+            kanbanTracker.stop();
+          } catch (err) {
+            console.error("[kanban-tracker] shutdown failed", err);
+          }
+          kanbanTracker = null;
+        }
+        // #325: detach the operator-alert buffer before the bus stops.
+        if (operatorAlertBuffer) {
+          try {
+            operatorAlertBuffer.detach();
+          } catch (err) {
+            console.error("[operator-alert-buffer] shutdown failed", err);
+          }
+          operatorAlertBuffer = null;
+        }
+      },
+      stopBus: async () => {
+        if (busRuntimeHandle) {
+          try {
+            await busRuntimeHandle.stop();
+          } catch (err) {
+            console.error("[bus-runtime] shutdown failed", err);
+          }
+        }
+      },
+      finalize: async () => {
+        // #436: a web-UI fire's frontmatter restore waits for its turn to end;
+        // the turns are drained by now, and a pending restore dies with us.
+        try {
+          const { restorePendingFrontmatter } = await import("./fire");
+          await restorePendingFrontmatter();
+        } catch (err) {
+          console.error("[fire] pending frontmatter restore failed at shutdown", err);
+        }
+        await teardownStatusline();
+        // #420: only our own file — a replacement that already wrote its PID keeps it.
+        // #435: a short lock wait: under `--replace-existing` the replacement holds
+        // the lock for our whole drain and removes the file itself, and a file left
+        // naming our dead PID is cleaned by the next check anyway.
+        await cleanupPidFileIf(process.pid, undefined, 250);
+      },
+      onStepError: (step, err) =>
+        console.error(`[${ts()}] [shutdown] ${step} failed (continuing with teardown):`, err),
+    });
     process.exit(0);
   }
   process.on("SIGTERM", shutdown);
@@ -692,12 +871,19 @@ export async function start(args: string[] = []) {
         ? "no adapters configured"
         : `adapters=[${configuredBusAdapters.join(", ")}] (wired after agents)`;
     console.log(`  Runtime: bus (Bus stack mounted, ${agentsLabel}, ${adaptersLabel})`);
+    // #508: an explicit `agents: []` mounts the bus with nothing behind it.
+    if (settings.agents.length === 0) {
+      console.warn(
+        `  WARNING: no agent — chat channels and heartbeat stay idle. Add "agents": [{ "id": "default" }] to settings.json, or set "runtime": "pty".`,
+      );
+    }
   } else if (settings.runtime === "bus") {
     console.log(`  Runtime: bus (Bus mount failed; legacy surfaces only)`);
   } else {
     console.log(`  Runtime: ${settings.runtime}`);
   }
   console.log(`  Security: ${settings.security.level}`);
+  for (const line of allowlistStartupWarnings(settings)) console.warn(`  WARNING: ${line}`);
   if (settings.security.allowedTools.length > 0)
     console.log(`    + allowed: ${settings.security.allowedTools.join(", ")}`);
   if (settings.security.disallowedTools.length > 0)
@@ -705,6 +891,7 @@ export async function start(args: string[] = []) {
   console.log(
     `  Heartbeat: ${settings.heartbeat.enabled ? `every ${settings.heartbeat.interval}m` : "disabled"}`,
   );
+  console.log(`  Quiet hours: ${describeQuietHours(quietHoursFrom(settings))}`);
   console.log(`  Web UI: ${webEnabled ? `http://${settings.web.host}:${webPort}` : "disabled"}`);
   if (debugFlag) console.log("  Debug: enabled");
   console.log(`  Jobs loaded: ${jobs.length}`);
@@ -721,14 +908,33 @@ export async function start(args: string[] = []) {
 
   // --- Telegram ---
   let telegramSend: ((chatId: number, text: string) => Promise<void>) | null = null;
+  // Proactive sends (heartbeat, job results, triggers) go through the durable
+  // outbox so a failed send is retried later instead of dropped.
+  let telegramOutbox: TelegramOutbox | null = null;
+  let telegramDeliver: ((chatId: number, text: string, label?: string) => Promise<boolean>) | null =
+    null;
   let telegramToken = "";
   let telegramReceiveEnabled = true;
 
   async function initTelegram(token: string, receiveEnabled = true) {
     if (token && token !== telegramToken) {
-      const { startPolling, sendMessage, deliverGatewayReply } = await import("./telegram");
+      const {
+        startPolling,
+        sendMessage,
+        buildTelegramChunks,
+        sendTelegramChunk,
+        deliverGatewayReply,
+      } = await import("./telegram");
       if (receiveEnabled) startPolling(debugFlag);
       telegramSend = (chatId, text) => sendMessage(token, chatId, text);
+      telegramOutbox = getTelegramOutbox(defaultOutboxPath(), (chatId, chunk, threadId) =>
+        sendTelegramChunk(token, chatId, chunk, threadId),
+      );
+      telegramOutbox.start();
+      // #512: held during quiet hours (all of it is proactive).
+      const deliver = proactiveDeliver(telegramOutbox, () => quietHoursFrom(currentSettings));
+      telegramDeliver = (chatId, text, label) =>
+        deliver({ chatId, chunks: buildTelegramChunks(text), label });
       telegramToken = token;
       telegramReceiveEnabled = receiveEnabled;
       // Register the outbound delivery hook so gateway-routed events get a reply.
@@ -748,6 +954,9 @@ export async function start(args: string[] = []) {
       telegramReceiveEnabled = receiveEnabled;
     } else if (!token && telegramToken) {
       telegramSend = null;
+      telegramOutbox?.stop();
+      telegramOutbox = null;
+      telegramDeliver = null;
       telegramToken = "";
       unregisterGatewayDelivery("telegram");
       console.log(`[${ts()}] Telegram: disabled`);
@@ -765,7 +974,14 @@ export async function start(args: string[] = []) {
 
   // --- Gateway event processor ---
   // Wire up the event processor for gateway v2 path (Discord/Telegram → event log → processor → runUserMessage)
-  await initGatewayProcessor(async (source, prompt) => runUserMessage(source, prompt));
+  // #376: with `session.gatewayScope: "conversation"` each conversation resumes
+  // its own runner session (`sessions.ts` is the single source of truth — the
+  // gateway's session map only records what the runner reports); by default
+  // every gateway turn resumes the one global session, as before. Read at each
+  // turn so a hot reload of settings takes effect without a restart.
+  await initGatewayProcessor(async (source, prompt, ctx) =>
+    runUserMessage(source, prompt, gatewaySessionThreadId(ctx, getSettings().session)),
+  );
 
   // --- Discord ---
   let discordSendToUser: ((userId: string, text: string) => Promise<void>) | null = null;
@@ -964,6 +1180,10 @@ export async function start(args: string[] = []) {
         // #197: lets the Telegram adapter mount on a token alone by routing to
         // the bus's default agent when `telegram.busRouting` is unset.
         defaultAgentId: busRuntimeHandle.spawnedAgentIds[0],
+        // #512: read on every proactive send, so a settings reload applies.
+        quietHours: () => quietHoursFrom(currentSettings),
+        // #520: allow-list gates read the reloaded settings on every event.
+        liveSettings: () => currentSettings,
       });
       for (const [name, msg] of Object.entries(errors)) {
         console.warn(`[${ts()}] Bus adapter "${name}" failed to mount: ${msg}`);
@@ -971,12 +1191,23 @@ export async function start(args: string[] = []) {
       busRuntimeHandle.attachAdapters(adapters);
       busRuntimeAdapterNames = busRuntimeHandle.mountedAdapterNames;
 
+      // The job loop runs every job under the bus too, but the legacy
+      // Telegram/Discord init was skipped above, so job results had nowhere to
+      // go. Send-only senders: the bus adapters keep polling and the gateway.
+      ({ telegramSend, telegramDeliver, discordSendToUser } = await busJobRelay({
+        telegramToken: currentSettings.telegram.token,
+        discordToken: currentSettings.discord.token,
+        quietHours: () => quietHoursFrom(currentSettings),
+        // #525: held job results are re-checked against the reloaded list.
+        telegramAllowlist: () => currentSettings.telegram,
+      }));
+
       const { wireBusScheduler } = await import("../bus/scheduler-wiring");
       const schedulerHandle = await wireBusScheduler({
         bus: busRuntimeHandle.bus,
         defaultAgentId: busRuntimeHandle.spawnedAgentIds[0] ?? null,
         heartbeat: currentSettings.heartbeat,
-        jobs: currentJobs,
+        jobs: busSchedulerJobs(currentJobs),
         timezoneOffsetMinutes: currentSettings.timezoneOffsetMinutes,
       });
       busRuntimeHandle.attachScheduler(schedulerHandle);
@@ -1213,8 +1444,8 @@ export async function start(args: string[] = []) {
             // Bus runtime: route the chat through the bus's default
             // agent so it lands in the same claude session every other
             // surface (Discord/Telegram/cron) drives. Pass the chunk
-            // callback so each `response.text` event from the agent
-            // gets streamed back to the dashboard SSE in real time.
+            // callback so each `reply` from the agent gets streamed back
+            // to the dashboard SSE in real time.
             const bus = busCoreForWebUi;
             const defaultAgent = busRuntimeSpawnedAgents[0];
             if (bus && defaultAgent) {
@@ -1263,6 +1494,7 @@ export async function start(args: string[] = []) {
                         origin: sendOpts?.origin as import("../bus/types").BusOrigin | undefined,
                         originId: sendOpts?.originId,
                         timeoutMs: sendOpts?.timeoutMs,
+                        onTurnSettled: sendOpts?.onTurnSettled,
                         // #227: rotate the live PTY when the threshold trips.
                         rotateAgent: busRuntimeHandle?.rotateAgent,
                       },
@@ -1337,15 +1569,14 @@ export async function start(args: string[] = []) {
     label: string,
     result: { exitCode: number; stdout: string; stderr: string },
   ) {
-    if (!telegramSend || currentSettings.telegram.allowedUserIds.length === 0) return;
+    if (!telegramDeliver || currentSettings.telegram.allowedUserIds.length === 0) return;
     const text =
       result.exitCode === 0
         ? `${label ? `[${label}]\n` : ""}${result.stdout || "(empty)"}`
         : `${label ? `[${label}] ` : ""}error (exit ${result.exitCode}): ${extractErrorDetail(result) || "Unknown"}`;
     for (const userId of currentSettings.telegram.allowedUserIds) {
-      telegramSend(userId, text).catch((err) =>
-        console.error(`[Telegram] Failed to forward to ${userId}: ${err}`),
-      );
+      // Never throws: a failed chunk and the ones after it are queued for retry.
+      void telegramDeliver(userId, text, label || undefined);
     }
   }
 
@@ -1496,6 +1727,14 @@ export async function start(args: string[] = []) {
   setInterval(async () => {
     try {
       const newSettings = await reloadSettings();
+      // Tool governance first: nothing later in this tick (jobs, adapters) may
+      // keep a policy change from taking effect.
+      getMcpBridge().setToolPolicy(newSettings.mcp.bridge);
+      const auditPolicy = newSettings.mcp.audit ?? "best-effort";
+      if (getToolCallSink().getPolicy() !== auditPolicy) {
+        console.log(`[${ts()}] MCP audit policy changed → ${auditPolicy}`);
+      }
+      getToolCallSink().applyPolicy(auditPolicy);
       const newJobs = await loadJobs();
 
       // Detect heartbeat config changes
@@ -1571,7 +1810,7 @@ export async function start(args: string[] = []) {
             bus: busRuntimeHandle.bus,
             defaultAgentId: busRuntimeHandle.spawnedAgentIds[0] ?? null,
             heartbeat: newSettings.heartbeat,
-            jobs: newJobs,
+            jobs: busSchedulerJobs(newJobs),
             timezoneOffsetMinutes: newSettings.timezoneOffsetMinutes,
           });
           // attachScheduler stops the previous scheduler before
@@ -1603,7 +1842,9 @@ export async function start(args: string[] = []) {
         const retryState = jobRetryState.get(job.name);
         return {
           name: job.name,
-          nextAt: nextCronMatch(job.schedule, now, currentSettings.timezoneOffsetMinutes).getTime(),
+          nextAt:
+            nextCronMatch(job.schedule, now, currentSettings.timezoneOffsetMinutes)?.getTime() ??
+            null,
           ...(last ? { lastResult: last.result, lastRanAt: last.ranAt } : {}),
           ...(retryState ? { failCount: retryState.failCount, retryAt: retryState.retryAt } : {}),
         };
@@ -1621,108 +1862,28 @@ export async function start(args: string[] = []) {
     writeState(state);
   }
 
-  // In-memory retry state: resets on daemon restart (no stale debt across restarts).
-  const jobRetryState = new Map<string, { failCount: number; retryAt: number }>();
-
-  // Track each job's most recent outcome so state.json can expose lastResult/lastRanAt
-  // for crash-recovery + status displays. Resets on daemon restart (in-memory only).
-  const jobLastResult = new Map<string, { result: "ok" | "error" | "skipped"; ranAt: number }>();
+  const jobLoop = createJobLoop({
+    run,
+    resolvePrompt,
+    resolveJobModel,
+    snapshotJobFrontmatter,
+    clearJobSchedule,
+    forward: (label, r) => {
+      forwardToTelegram(label, r);
+      forwardToDiscord(label, r);
+    },
+    busAgentIds: () => (busRuntimeHandle ? currentSettings.agents.map((a) => a.id) : []),
+    hasLegacyPersona: agentHasPersona,
+    isRateLimited,
+    timezoneOffsetMinutes: () => currentSettings.timezoneOffsetMinutes,
+  });
+  const jobRetryState = jobLoop.retryState;
+  const jobLastResult = jobLoop.lastResult;
 
   updateState();
 
-  function runJob(job: (typeof currentJobs)[0]) {
-    const timeoutMs = job.timeoutSeconds ? job.timeoutSeconds * 1000 : undefined;
-    snapshotJobFrontmatter(job.name).then((restoreFrontmatter) =>
-      resolvePrompt(job.prompt)
-        .then(async (prompt) => {
-          const modelOverride = await resolveJobModel(job);
-          const clock = buildClockPromptPrefix(new Date(), currentSettings.timezoneOffsetMinutes);
-          return run(
-            job.name,
-            `${clock}\n${prompt}`,
-            job.agent ? `agent:${job.agent}` : job.name,
-            modelOverride ?? job.model,
-            timeoutMs,
-            job.agent,
-            "job",
-          );
-        })
-        .then(async (r) => {
-          const restored = await restoreFrontmatter();
-          if (restored) console.log(`[${ts()}] Restored frontmatter for job: ${job.name}`);
-          jobLastResult.set(job.name, {
-            result: r.exitCode === 0 ? "ok" : "error",
-            ranAt: Date.now(),
-          });
-          if (r.exitCode === 0) {
-            jobRetryState.delete(job.name);
-          } else if (job.retry && job.retry > 0) {
-            // Preserve existing state so failCount accumulates correctly across retries.
-            const state = jobRetryState.get(job.name) ?? { failCount: 0, retryAt: 0 };
-            state.failCount += 1;
-            if (state.failCount <= job.retry) {
-              const delayMs = (job.retryDelay ?? 300) * 1000;
-              state.retryAt = Date.now() + delayMs;
-              jobRetryState.set(job.name, state);
-              console.log(
-                `[${ts()}] Job ${job.name} failed (attempt ${state.failCount}/${job.retry}), retrying in ${job.retryDelay ?? 300}s`,
-              );
-            } else {
-              jobRetryState.delete(job.name);
-              console.log(`[${ts()}] Job ${job.name} exhausted ${job.retry} retries`);
-            }
-          }
-          if (job.notify === false) return;
-          if (job.notify === "error" && r.exitCode === 0) return;
-          const forwardLabel = job.agent && job.label ? `${job.agent}: ${job.label}` : job.name;
-          forwardToTelegram(forwardLabel, r);
-          forwardToDiscord(forwardLabel, r);
-        })
-        .finally(async () => {
-          if (job.recurring) return;
-          // Only clear one-shot schedule when no retry is pending.
-          if (jobRetryState.has(job.name)) return;
-          try {
-            await clearJobSchedule(job.name);
-            console.log(`[${ts()}] Cleared schedule for one-time job: ${job.name}`);
-          } catch (err) {
-            console.error(`[${ts()}] Failed to clear schedule for ${job.name}:`, err);
-          }
-        }),
-    );
-  }
-
   setInterval(() => {
-    const now = new Date();
-    if (!isRateLimited()) {
-      for (const job of currentJobs) {
-        // Fire pending retries before checking the cron schedule.
-        const retryState = jobRetryState.get(job.name);
-        if (retryState && retryState.retryAt <= Date.now()) {
-          // Push retryAt to sentinel so subsequent cron ticks don't re-fire while in flight.
-          // runJob's .then() handler overwrites this with the real next-retry time (or deletes it).
-          retryState.retryAt = Number.MAX_SAFE_INTEGER;
-          console.log(
-            `[${ts()}] Retrying job: ${job.name} (attempt ${retryState.failCount + 1}/${job.retry})`,
-          );
-          runJob(job);
-          continue;
-        }
-        if (cronMatches(job.schedule, now, currentSettings.timezoneOffsetMinutes)) {
-          runJob(job);
-        }
-      }
-    } else {
-      const skippedAt = Date.now();
-      for (const job of currentJobs) {
-        const retryState = jobRetryState.get(job.name);
-        const retryDue = !!retryState && retryState.retryAt <= skippedAt;
-        const scheduleDue = cronMatches(job.schedule, now, currentSettings.timezoneOffsetMinutes);
-        if (retryDue || scheduleDue) {
-          jobLastResult.set(job.name, { result: "skipped", ranAt: skippedAt });
-        }
-      }
-    }
+    jobLoop.tick(currentJobs);
     updateState();
   }, 60_000);
 }

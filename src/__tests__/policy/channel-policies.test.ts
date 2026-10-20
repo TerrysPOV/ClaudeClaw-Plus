@@ -63,6 +63,10 @@ describe("Channel Policies - Scoped Rules", () => {
     } catch {
       // Ignore
     }
+    // #304: the scoped rules this test loaded stay in memory after the file
+    // is gone; a later file's `evaluate()` would still match them
+    // (policy/engine.test.ts saw `telegram-deny-bash` in a clean engine).
+    reloadScopedPolicy();
   });
 
   it("should return empty array when no scoped policy file exists", () => {

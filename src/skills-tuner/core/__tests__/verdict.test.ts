@@ -1,5 +1,5 @@
 import { describe, it, expect } from "bun:test";
-import { decideVerdict, type MetricDelta } from "../verdict.js";
+import { decideVerdict, decideVerdictDetailed, type MetricDelta } from "../verdict.js";
 
 /** Convenience builder for a target/guardrail delta. */
 function delta(p: Partial<MetricDelta> & Pick<MetricDelta, "baseline" | "post">): MetricDelta {
@@ -110,5 +110,64 @@ describe("decideVerdict — sample-size guard (fix 2)", () => {
       count: 1,
     });
     expect(decideVerdict(target, [guard], { minSamples: 2 })).toBe("improved");
+  });
+});
+
+describe("decideVerdict — guardrails veto an improvement, they do not judge a flat target", () => {
+  const g = delta({
+    metric: "g",
+    direction: "higher_is_better",
+    baseline: 147,
+    post: 138,
+    count: 5,
+  });
+
+  it("equal baseline and post on the target is neutral even when a guardrail fell", () => {
+    expect(
+      decideVerdict(delta({ baseline: 1.5, post: 1.5, count: 5 }), [g], { minSamples: 2 }),
+    ).toBe("neutral");
+  });
+
+  it("a target moving within noise is neutral even when a guardrail fell", () => {
+    expect(
+      decideVerdict(delta({ baseline: 100, post: 102, count: 5 }), [g], { minSamples: 2 }),
+    ).toBe("neutral");
+  });
+
+  it("an improved target paid for by a guardrail is still regressed", () => {
+    expect(
+      decideVerdict(delta({ baseline: 100, post: 50, count: 5 }), [g], { minSamples: 2 }),
+    ).toBe("regressed");
+  });
+
+  it("a regressed target stays regressed whatever the guardrails did", () => {
+    expect(
+      decideVerdict(delta({ baseline: 100, post: 150, count: 5 }), [g], { minSamples: 2 }),
+    ).toBe("regressed");
+  });
+
+  it("an underpowered target is neutral even when a guardrail fell", () => {
+    expect(
+      decideVerdict(delta({ baseline: 100, post: 150, count: 1 }), [g], { minSamples: 2 }),
+    ).toBe("neutral");
+  });
+
+  it("explains the decision and still reports the guardrails that moved", () => {
+    const flat = decideVerdictDetailed(delta({ baseline: 1, post: 1, count: 5 }), [g], {
+      minSamples: 2,
+    });
+    expect(flat).toEqual({ verdict: "neutral", reason: "target_flat", regressedGuardrails: ["g"] });
+    const vetoed = decideVerdictDetailed(delta({ baseline: 100, post: 50, count: 5 }), [g], {
+      minSamples: 2,
+    });
+    expect(vetoed).toEqual({
+      verdict: "regressed",
+      reason: "guardrail_regressed",
+      regressedGuardrails: ["g"],
+    });
+    const thin = decideVerdictDetailed(delta({ baseline: 100, post: 50, count: 1 }), [], {
+      minSamples: 2,
+    });
+    expect(thin.reason).toBe("target_underpowered");
   });
 });

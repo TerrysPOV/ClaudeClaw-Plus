@@ -141,7 +141,8 @@ async function showStatus(): Promise<boolean> {
       );
     }
     for (const job of state.jobs || []) {
-      console.log(`  → ${job.name}: ${formatCountdown(job.nextAt - now)}`);
+      const next = job.nextAt == null ? "no upcoming run" : formatCountdown(job.nextAt - now);
+      console.log(`  → ${job.name}: ${next}`);
     }
   } catch {}
 

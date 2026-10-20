@@ -8,7 +8,7 @@
  * Run with: bun test src/__tests__/integration/model-override.test.ts
  */
 
-import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, spyOn } from "bun:test";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll } from "bun:test";
 import { rm, mkdir, writeFile } from "fs/promises";
 import { join } from "path";
 import { createAgent } from "../../agents";
@@ -142,7 +142,7 @@ describe("Phase 18 end-to-end model override", () => {
     expect(await resolveJobModel(good as Job)).toBe("haiku");
   });
 
-  it("resolved model reaches runClaudeOnce via run() (end-to-end)", async () => {
+  it("resolved model reaches the primary exec via run() (end-to-end)", async () => {
     const name = uniq("e2e");
     await createAgent({
       name,
@@ -163,20 +163,40 @@ describe("Phase 18 end-to-end model override", () => {
 
     const captured: string[] = [];
     const SENTINEL = "P18_03_E2E_SENTINEL";
-    const spy = spyOn(runnerMod, "runClaudeOnce").mockImplementation((async (
-      _args: string[],
-      model: string,
-    ) => {
+    const usageDir = join(process.cwd(), ".claude", "claudeclaw", "usage");
+    const { readdir: readdirBefore, readFile: readFileBefore } = await import("node:fs/promises");
+    // Every file's content: the index and the daily usage log are appended in place.
+    const usageBefore = new Map<string, string>();
+    for (const f of await readdirBefore(usageDir).catch(() => [] as string[])) {
+      usageBefore.set(f, await readFileBefore(join(usageDir, f), "utf8"));
+    }
+    // #330: the primary-exec seam, not a module spy on `runClaudeOnce` — a
+    // function `execClaude` never calls for the primary run.
+    runnerMod._setPrimaryExecForTests(async ({ model }) => {
       captured.push(model);
       throw new Error(SENTINEL);
-    }) as any);
+    });
 
     try {
       await runnerMod.run("e2e-test", "prompt", undefined, { modelOverride: model });
     } catch (e: any) {
       if (!String(e?.message ?? e).includes(SENTINEL)) throw e;
     } finally {
-      spy.mockRestore();
+      runnerMod._setPrimaryExecForTests(null);
+      // #330: the run reached `recordInvocationStart`; drop only the phantom
+      // `started` record it left under <cwd>/.claude/claudeclaw/usage/ and put
+      // every file that was there back byte-for-byte (the index and the daily
+      // usage log are appended in place) — the directory is durable telemetry.
+      try {
+        const { readdir } = await import("node:fs/promises");
+        for (const f of await readdir(usageDir)) {
+          const before = usageBefore.get(f);
+          if (before === undefined) await rm(join(usageDir, f), { recursive: true, force: true });
+          else await writeFile(join(usageDir, f), before);
+        }
+      } catch {
+        /* directory may not exist */
+      }
     }
 
     expect(captured.length).toBeGreaterThanOrEqual(1);

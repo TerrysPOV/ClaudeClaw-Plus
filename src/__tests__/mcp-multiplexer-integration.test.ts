@@ -22,7 +22,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,17 +30,27 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { McpMultiplexerPlugin, _resetMcpMultiplexer } from "../plugins/mcp-multiplexer/index.js";
 import { _resetHttpGateway, getHttpGateway } from "../plugins/http-gateway.js";
-import { _resetMcpBridge, getMcpBridge } from "../plugins/mcp-bridge.js";
+import {
+  _resetMcpBridge,
+  _setMcpBridge,
+  getMcpBridge,
+  PluginMcpBridge,
+} from "../plugins/mcp-bridge.js";
 import { _resetIdentityStore, revokeIdentity } from "../plugins/mcp-multiplexer/pty-identity.js";
 import type { SessionPersistenceStore } from "../plugins/mcp-multiplexer/session-persistence.js";
 import { makeMuxSettingsView } from "./fixtures/mux-settings-view.js";
+import { __setToolCallSinkForTest, ToolCallSink } from "../observability/tool-call-sink.js";
+import {
+  __setMetricsRegistryForTest,
+  MetricsRegistry,
+} from "../plugins/mcp-multiplexer/metrics.js";
 
 const MOCK_SERVER = fileURLToPath(new URL("./fixtures/mock-mcp-server.ts", import.meta.url));
 const BUN_BIN = process.execPath;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function writeProxyConfig(dir: string, names: string[]): string {
+function writeProxyConfig(dir: string, names: string[], allowedTools = ["echo"]): string {
   const cfg = {
     servers: Object.fromEntries(
       names.map((name) => [
@@ -49,7 +59,7 @@ function writeProxyConfig(dir: string, names: string[]): string {
           command: BUN_BIN,
           args: ["run", MOCK_SERVER],
           enabled: true,
-          allowedTools: ["echo"],
+          allowedTools,
         },
       ]),
     ),
@@ -795,6 +805,7 @@ describe("mcp-multiplexer integration — the sweep and the replay path coexist"
       touch: async () => {},
       loadAll: async () => [],
       garbageCollect: async () => ({ scanned: 0, kept: 0, dropped: 0 }),
+      flush: async () => ({ settled: 0, failed: 0 }),
       drop: async () => {},
     };
     plugin = new McpMultiplexerPlugin({
@@ -965,12 +976,27 @@ describe("mcp-multiplexer integration — bridge callback path", () => {
     const fqns = bridge.listTools().map((t) => t.fqn);
     expect(fqns).toContain("mcp-multiplexer__alpha__echo");
 
-    const result = await bridge.invokeTool("mcp-multiplexer__alpha__echo", {
-      arguments: { message: "via-bridge" },
-    });
-    // Upstream returns `{ echo: "via-bridge" }` which is JSON-parsed
-    // by `McpServerProcess.call`, so the bridge result is the object.
-    expect(result).toEqual({ echo: "via-bridge" });
+    const sink = new ToolCallSink({ path: null, autoFlush: false });
+    __setToolCallSinkForTest(sink);
+    try {
+      const result = await bridge.invokeTool("mcp-multiplexer__alpha__echo", {
+        arguments: { message: "via-bridge" },
+      });
+      // Upstream returns `{ echo: "via-bridge" }` which is JSON-parsed
+      // by `McpServerProcess.call`, so the bridge result is the object.
+      expect(result).toEqual({ echo: "via-bridge" });
+      // Same keys as the HTTP path: the upstream server and tool, not the
+      // wrapper plugin and the namespaced name.
+      expect(sink.pending()).toHaveLength(1);
+      expect(sink.pending()[0]).toMatchObject({
+        plugin: "alpha",
+        tool: "echo",
+        agent_id: "plugin-bridge",
+        status: "ok",
+      });
+    } finally {
+      __setToolCallSinkForTest(null);
+    }
   });
 });
 
@@ -1086,6 +1112,7 @@ describe("mcp-multiplexer integration — onsessionclosed is throw-proof", () =>
       touch: async () => {},
       loadAll: async () => [],
       garbageCollect: async () => ({ scanned: 0, kept: 0, dropped: 0 }),
+      flush: async () => ({ settled: 0, failed: 0 }),
       // The one that matters: a SYNCHRONOUS throw, not a rejected promise.
       // `drop()` is `async` today, so the `.catch()` in the callback always
       // attaches and this shape is unreachable — that is the point. The
@@ -1134,4 +1161,337 @@ describe("mcp-multiplexer integration — onsessionclosed is throw-proof", () =>
 
     await conn.close();
   });
+});
+
+// ── 9) Every tools/call lands on the mcp.tool_call chain (#456) ─────────────
+
+describe("mcp-multiplexer integration — mcp.tool_call boundary capture", () => {
+  afterEach(() => {
+    __setToolCallSinkForTest(null);
+  });
+
+  it("records one mcp.tool_call per call — the dispatched one and the refused one", async () => {
+    const sink = new ToolCallSink({ path: null, autoFlush: false });
+    __setToolCallSinkForTest(sink);
+
+    const cfg = writeProxyConfig(tmpDir, ["alpha"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeMuxSettingsView({ webEnabled: true, shared: ["alpha"] }),
+    });
+    await plugin.start();
+    gateway = startTestGateway();
+    const ident = plugin.issueIdentity("pty-obs");
+    const { client, close } = await connectClient({
+      origin: gateway.origin,
+      server: "alpha",
+      ptyId: "pty-obs",
+      bearer: ident.headers.Authorization,
+    });
+
+    try {
+      await client.callTool({ name: "echo", arguments: { message: "hi" } });
+      // `secret_tool` is advertised by the child but not in `allowedTools`:
+      // the multiplexer refuses it. A refusal is a decision the chain must
+      // show, not only the plugin journal.
+      const refused = await client.callTool({ name: "secret_tool", arguments: {} });
+      expect(refused.isError).toBe(true);
+    } finally {
+      await close();
+    }
+
+    const events = sink.pending();
+    expect(events.length).toBe(2);
+    expect(events[0]).toMatchObject({
+      plugin: "alpha",
+      tool: "echo",
+      agent_id: "pty-obs",
+      status: "ok",
+    });
+    expect(typeof events[0]?.duration_ms).toBe("number");
+    expect(events[1]).toMatchObject({
+      plugin: "alpha",
+      tool: "secret_tool",
+      agent_id: "pty-obs",
+      status: "error",
+      error: "not_in_allowed_set",
+    });
+  }, 10000);
+});
+
+// ── 9b) settings.mcp.audit: "enforce" — no log, no action (#232) ────────────
+
+describe("mcp-multiplexer integration — mandatory audit (enforce)", () => {
+  afterEach(() => {
+    __setToolCallSinkForTest(null);
+  });
+
+  async function callEcho(message: string) {
+    const cfg = writeProxyConfig(tmpDir, ["alpha"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeMuxSettingsView({ webEnabled: true, shared: ["alpha"] }),
+    });
+    await plugin.start();
+    gateway = startTestGateway();
+    const ident = plugin.issueIdentity("pty-enf");
+    const { client, close } = await connectClient({
+      origin: gateway.origin,
+      server: "alpha",
+      ptyId: "pty-enf",
+      bearer: ident.headers.Authorization,
+    });
+    try {
+      return await client.callTool({ name: "echo", arguments: { message } });
+    } finally {
+      await close();
+    }
+  }
+  const textOf = (r: unknown) =>
+    ((r as { content?: Array<{ text: string }> }).content ?? [])[0]?.text ?? "";
+
+  it("refuses the call, without dispatching it, when the intent cannot be logged", async () => {
+    const auditPath = join(tmpDir, "plugin-audit.jsonl");
+    _setMcpBridge(new PluginMcpBridge(auditPath));
+    const sink = new ToolCallSink({
+      path: null,
+      policy: "enforce",
+      autoFlush: false,
+      logFactory: () => ({
+        append() {
+          throw new Error("chain unwritable");
+        },
+      }),
+    });
+    __setToolCallSinkForTest(sink);
+
+    const r = await callEcho("ran-anyway");
+    expect(r.isError).toBe(true);
+    expect(textOf(r)).not.toContain("ran-anyway");
+    expect(textOf(r)).toContain("audit log is unavailable");
+    const rejects = readFileSync(auditPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((l) => l.event === "multiplexer_audit_enforced_reject");
+    expect(rejects).toHaveLength(1);
+    expect(rejects[0]).toMatchObject({ server: "alpha", tool: "echo", error: "chain unwritable" });
+    expect(sink.pending()[0]).toMatchObject({ status: "error", error: "audit_unavailable" });
+  }, 10000);
+
+  it("appends the intent before dispatch when the chain is writable", async () => {
+    const appended: Array<{ event: string }> = [];
+    const sink = new ToolCallSink({
+      path: null,
+      policy: "enforce",
+      autoFlush: false,
+      logFactory: () => ({
+        append(e: { event: string }) {
+          appended.push(e);
+        },
+      }),
+    });
+    __setToolCallSinkForTest(sink);
+
+    const r = await callEcho("logged");
+    expect(r.isError).toBeFalsy();
+    expect(textOf(r)).toContain("logged");
+    // Intent written synchronously; the result is still only buffered.
+    expect(appended.map((e) => e.event)).toEqual(["mcp.tool_call_intent"]);
+    sink.flush();
+    expect(appended.map((e) => e.event)).toEqual(["mcp.tool_call_intent", "mcp.tool_call"]);
+  }, 10000);
+
+  it("refuses a cache hit too when the intent cannot be logged", async () => {
+    const cfg = writeProxyConfig(tmpDir, ["alpha"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeMuxSettingsView({
+        webEnabled: true,
+        shared: ["alpha"],
+        cache: {
+          enabled: true,
+          ttlMs: 60_000,
+          maxEntries: 100,
+          cacheable: { alpha: ["echo"] },
+          defensiveInvalidation: true,
+        },
+      }),
+    });
+    await plugin.start();
+    gateway = startTestGateway();
+    const ident = plugin.issueIdentity("pty-enf-cache");
+    const { client, close } = await connectClient({
+      origin: gateway.origin,
+      server: "alpha",
+      ptyId: "pty-enf-cache",
+      bearer: ident.headers.Authorization,
+    });
+    try {
+      // Warm the cache while the chain is writable.
+      __setToolCallSinkForTest(
+        new ToolCallSink({
+          path: null,
+          policy: "enforce",
+          autoFlush: false,
+          logFactory: () => ({ append() {} }),
+        }),
+      );
+      const warm = await client.callTool({ name: "echo", arguments: { message: "cached" } });
+      expect(textOf(warm)).toContain("cached");
+      // Same call, now a cache hit, with the chain down: still refused.
+      __setToolCallSinkForTest(
+        new ToolCallSink({
+          path: null,
+          policy: "enforce",
+          autoFlush: false,
+          logFactory: () => ({
+            append() {
+              throw new Error("chain unwritable");
+            },
+          }),
+        }),
+      );
+      const hit = await client.callTool({ name: "echo", arguments: { message: "cached" } });
+      expect(hit.isError).toBe(true);
+      expect(textOf(hit)).not.toContain("cached");
+    } finally {
+      await close();
+    }
+  }, 10000);
+
+  it("best-effort never blocks a call on an unwritable chain", async () => {
+    __setToolCallSinkForTest(
+      new ToolCallSink({
+        path: null,
+        policy: "best-effort",
+        autoFlush: false,
+        logFactory: () => ({
+          append() {
+            throw new Error("chain unwritable");
+          },
+        }),
+      }),
+    );
+    const r = await callEcho("still-runs");
+    expect(r.isError).toBeFalsy();
+    expect(textOf(r)).toContain("still-runs");
+  }, 10000);
+});
+
+// ── 10) A child result with `isError: true` is an error end to end ──────────
+//
+// Per the MCP spec a tool that runs and fails answers with a normal result
+// carrying `isError: true`. The proxy must not turn that into a success on
+// the chain, in the metrics, or in the result handed back to the caller.
+
+describe("mcp-multiplexer integration — child isError result", () => {
+  afterEach(() => {
+    __setToolCallSinkForTest(null);
+    __setMetricsRegistryForTest(null);
+  });
+
+  it("records status error and keeps isError: true for the caller", async () => {
+    const sink = new ToolCallSink({ path: null, autoFlush: false });
+    __setToolCallSinkForTest(sink);
+    const metrics = new MetricsRegistry();
+    __setMetricsRegistryForTest(metrics);
+
+    const cfg = writeProxyConfig(tmpDir, ["alpha"], ["echo", "fail_tool"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeMuxSettingsView({
+        webEnabled: true,
+        shared: ["alpha"],
+        metricsEnabled: true,
+      }),
+    });
+    await plugin.start();
+    gateway = startTestGateway();
+    const ident = plugin.issueIdentity("pty-fail");
+    const { client, close } = await connectClient({
+      origin: gateway.origin,
+      server: "alpha",
+      ptyId: "pty-fail",
+      bearer: ident.headers.Authorization,
+    });
+
+    let result: Awaited<ReturnType<Client["callTool"]>>;
+    try {
+      result = await client.callTool({ name: "fail_tool", arguments: {} });
+    } finally {
+      await close();
+    }
+
+    expect(result.isError).toBe(true);
+    const content = result.content as Array<{ type: string; text?: string }>;
+    expect(content[0]?.text).toContain("fail_tool: upstream refused");
+
+    const events = sink.pending();
+    expect(events.length).toBe(1);
+    expect(events[0]).toMatchObject({
+      plugin: "alpha",
+      tool: "fail_tool",
+      agent_id: "pty-fail",
+      status: "error",
+    });
+    expect(events[0]?.error).toContain("fail_tool: upstream refused");
+
+    const tuple = metrics.snapshot().tuples.find((t) => t.tool === "fail_tool");
+    expect(tuple).toMatchObject({ invocations: 1, successes: 0, errors: 1 });
+  }, 10000);
+
+  it("an error result from a cacheable tool is not cached and replayed as a hit", async () => {
+    const sink = new ToolCallSink({ path: null, autoFlush: false });
+    __setToolCallSinkForTest(sink);
+
+    const cfg = writeProxyConfig(tmpDir, ["alpha"], ["echo", "fail_tool"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeMuxSettingsView({
+        webEnabled: true,
+        shared: ["alpha"],
+        cache: {
+          enabled: true,
+          ttlMs: 60_000,
+          maxEntries: 100,
+          cacheable: { alpha: ["fail_tool"] },
+          defensiveInvalidation: true,
+        },
+      }),
+    });
+    await plugin.start();
+    gateway = startTestGateway();
+    const ident = plugin.issueIdentity("pty-cache");
+    const { client, close } = await connectClient({
+      origin: gateway.origin,
+      server: "alpha",
+      ptyId: "pty-cache",
+      bearer: ident.headers.Authorization,
+    });
+
+    try {
+      const first = await client.callTool({ name: "fail_tool", arguments: {} });
+      const second = await client.callTool({ name: "fail_tool", arguments: {} });
+      expect(first.isError).toBe(true);
+      expect(second.isError).toBe(true);
+    } finally {
+      await close();
+    }
+
+    expect(sink.pending().map((e) => e.status)).toEqual(["error", "error"]);
+  }, 10000);
+
+  it("the in-process bridge path rejects instead of returning the error text as a value", async () => {
+    const cfg = writeProxyConfig(tmpDir, ["alpha"], ["echo", "fail_tool"]);
+    plugin = new McpMultiplexerPlugin({
+      configPath: cfg,
+      settingsView: makeMuxSettingsView({ webEnabled: true, shared: ["alpha"] }),
+    });
+    await plugin.start();
+
+    await expect(
+      getMcpBridge().invokeTool("mcp-multiplexer__alpha__fail_tool", { arguments: {} }),
+    ).rejects.toThrow("fail_tool: upstream refused");
+  }, 10000);
 });

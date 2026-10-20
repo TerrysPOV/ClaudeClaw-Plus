@@ -5,7 +5,7 @@
  * Memory is injected into --append-system-prompt on every invocation.
  */
 
-import { join } from "path";
+import { join, posix, win32 } from "path";
 import { existsSync } from "fs";
 import { spawnSync, spawn } from "child_process";
 import { readFile, writeFile, mkdir } from "fs/promises";
@@ -42,6 +42,48 @@ export function getMemoryPath(agentName?: string): string {
     return join(AGENTS_MEMORY_DIR, agentName, "MEMORY.md");
   }
   return MEMORY_FILE;
+}
+
+/**
+ * The tool grant for a one-shot that must write ONE memory file and nothing else (#549):
+ * `tools` are the bare built-in tools to make available (`--tools`), `allowedTools` the
+ * permission rules to pre-approve (`--allowedTools`), pinned to `memPath`.
+ *
+ * Syntax (code.claude.com/docs/en/permissions): `//path` is an absolute path from the
+ * filesystem root, whereas `/path` anchors at the settings source. File rules are
+ * checked as `Edit(path)` / `Read(path)` only: "Edit rules apply to all built-in tools
+ * that edit files" (Write included), and a `Write(path)` rule is accepted but never
+ * consulted. `Read` is granted too because the Write tool refuses to overwrite an
+ * existing file the session has not read.
+ *
+ * On Windows, "paths are normalized to POSIX form before matching. `C:\Users\alice`
+ * becomes `/c/Users/alice`", so the rule for it is `//c/Users/alice`: lowercase drive
+ * letter, forward slashes. UNC (`\\server\share`) and device (`\\?\C:`) paths have no
+ * documented form and are refused.
+ *
+ * Throws when the path cannot be made absolute, or holds characters the rule syntax would
+ * read as a glob or separator: the rule could then match more than the one file, so no
+ * grant is better than a wider one.
+ */
+export function memoryFileGrant(
+  memPath: string,
+  flavour: PathFlavour = process.platform === "win32" ? "win32" : "posix",
+): { tools: string[]; allowedTools: string[] } {
+  const abs = (flavour === "win32" ? win32 : posix).resolve(memPath);
+  const posixAbs = flavour === "win32" ? winDriveToPosix(abs) : abs.startsWith("/") ? abs : null;
+  if (posixAbs === null || /[()*?[\]{},\r\n]/.test(posixAbs)) {
+    throw new Error(`memory path ${JSON.stringify(abs)} cannot be scoped in a permission rule`);
+  }
+  const rulePath = `/${posixAbs}`; // "/" + "/abs/path" = "//abs/path"
+  return { tools: ["Read", "Write"], allowedTools: [`Edit(${rulePath})`, `Read(${rulePath})`] };
+}
+
+export type PathFlavour = "posix" | "win32";
+
+/** `C:\a\b` -> `/c/a/b`; null for anything that is not a drive-letter absolute path. */
+function winDriveToPosix(abs: string): string | null {
+  const m = /^([A-Za-z]):\\(.*)$/.exec(abs);
+  return m ? `/${m[1].toLowerCase()}/${m[2].replace(/\\/g, "/")}` : null;
 }
 
 export async function ensureMemoryFile(agentName?: string): Promise<void> {

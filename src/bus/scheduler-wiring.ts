@@ -15,27 +15,16 @@
  *     single global session so "first agent" matches that behaviour.
  *     `excludeWindows` is honoured via the scheduler's `shouldFire`
  *     filter (Sprint 5.2d).
- *   - Each `Job` from `loadJobs()` → one `scheduleCron` call. Jobs with
+ *   - Each `Job` passed in → one `scheduleCron` call. Jobs with
  *     `enabled: false` are skipped (legacy parity). `job.agent`
  *     overrides the default agent_id when set; otherwise the default
  *     applies.
  *
- * Paradigm shift for per-job model / timeout overrides:
- *   Under the legacy runtime, `job.model` / `job.timeoutSeconds` would
- *   spin up a one-shot `claude -p` with the override. Under the Bus
- *   runtime, agents are LONG-LIVED PTY sessions with model + timeout
- *   baked in at spawn time, so per-job overrides don't fit the model.
- *
- *   To route a job to a different model under `runtime: "bus"`:
- *     1. Declare a second agent in `settings.agents` with the desired
- *        model (operators set the model via the agent's launch args /
- *        system-prompt-file rather than per-call).
- *     2. Set `job.agent` to that agent's id.
- *
- *   This is a cleaner architectural fit than the legacy per-job
- *   override (which was a workaround for there being only one global
- *   agent) and lets operators co-locate model + budget + auth
- *   decisions per-agent.
+ * The daemon passes no jobs (`busSchedulerJobs()` in `job-loop.ts`, #506):
+ * the 60 s job loop runs every job under every runtime, as a one-shot
+ * `claude -p` with its own model, timeout, retry and notify. Handing the
+ * jobs here as well ran each one twice. The cron path stays for callers
+ * that pass jobs explicitly.
  *
  * Sprint 5.2d follow-up gaps:
  *   - Bus-adapter hot-reload on settings change: still requires

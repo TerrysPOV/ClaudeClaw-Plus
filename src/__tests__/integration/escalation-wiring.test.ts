@@ -9,9 +9,9 @@
  * Run with: bun test src/__tests__/integration/escalation-wiring.test.ts
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, vi, afterAll } from "bun:test";
 import { randomUUID } from "crypto";
-import { rm, mkdir } from "node:fs/promises";
+import { rm, mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
@@ -20,9 +20,19 @@ import { join } from "node:path";
 // =============================================================================
 
 const ESCALATION_DIR = join(process.cwd(), ".claude", "claudeclaw");
+const POLICY_DIR = join(process.cwd(), ".claude", "claudeclaw");
 const PAUSE_STATE_FILE = join(ESCALATION_DIR, "paused.json");
 const PAUSE_ACTIONS_FILE = join(ESCALATION_DIR, "pause-actions.jsonl");
 const WORKFLOW_DIR = join(process.cwd(), ".claude", "claudeclaw", "workflows");
+const HANDOFFS_DIR = join(ESCALATION_DIR, "handoffs");
+
+// #304: the policy-denial and escalation triggers exercised here create real
+// handoff files under the checkout's `.claude/claudeclaw/handoffs/`; left
+// behind, escalation/handoff.test.ts ("initialize with empty handoff index")
+// counts them. This file cleans up what it created.
+afterAll(async () => {
+  await rm(HANDOFFS_DIR, { recursive: true, force: true }).catch(() => undefined);
+});
 
 // =============================================================================
 // Mock External Dependencies
@@ -179,6 +189,7 @@ import {
 } from "../../orchestrator/executor";
 
 import type { NormalizedEvent } from "../../gateway/normalizer";
+import { loadRules, clearCache } from "../../policy/engine";
 
 // Import pause controller for test setup
 import {
@@ -285,7 +296,6 @@ describe("Gateway Escalation Wiring", () => {
         processor: { processPersistedEvent: vi.fn() },
         resume: {
           getOrCreateSessionMapping: vi.fn(),
-          getResumeArgsForEvent: vi.fn(),
           updateSessionAfterProcessing: vi.fn(),
         },
       };
@@ -309,7 +319,6 @@ describe("Gateway Escalation Wiring", () => {
         processor: { processPersistedEvent: vi.fn() },
         resume: {
           getOrCreateSessionMapping: vi.fn(),
-          getResumeArgsForEvent: vi.fn(),
           updateSessionAfterProcessing: vi.fn(),
         },
       };
@@ -326,7 +335,44 @@ describe("Gateway Escalation Wiring", () => {
     it("should accept events when system is not paused", async () => {
       // Ensure system is not paused
       await resume({});
+      // #304: the gateway also evaluates the inbound event against the policy
+      // engine, whose in-memory rules are whatever the LAST `loadRules()` in
+      // this process saw — empty here, and empty means default deny. The test
+      // passed only when another file had left an allow rule loaded. Load
+      // one of our own, and put the file back afterwards.
+      const policyFile = join(POLICY_DIR, "policies.json");
+      const hadPolicyFile = existsSync(policyFile);
+      const previousPolicy = hadPolicyFile ? await readFile(policyFile, "utf8") : null;
+      await mkdir(POLICY_DIR, { recursive: true });
+      await writeFile(
+        policyFile,
+        JSON.stringify({
+          version: 1,
+          rules: [{ id: "test-allow-inbound", tool: "InboundMessage", action: "allow" }],
+          cache: { enabled: false, maxEntries: 1000, ttlMs: 60000 },
+          updatedAt: new Date().toISOString(),
+        }),
+        "utf8",
+      );
+      await loadRules();
+      try {
+        await acceptWhenNotPaused();
+      } finally {
+        clearCache();
+        if (previousPolicy !== null) {
+          await writeFile(policyFile, previousPolicy, "utf8");
+          await loadRules().catch(() => undefined);
+        } else {
+          // `loadRules()` recreates a default file; reload the empty rules
+          // through it, then leave the file as absent as it was found.
+          await rm(policyFile, { force: true });
+          await loadRules().catch(() => undefined);
+          await rm(policyFile, { force: true });
+        }
+      }
+    });
 
+    async function acceptWhenNotPaused(): Promise<void> {
       const mockDeps: GatewayDependencies = {
         eventLog: {
           append: vi.fn().mockResolvedValue({
@@ -364,13 +410,6 @@ describe("Gateway Escalation Wiring", () => {
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
           }),
-          getResumeArgsForEvent: vi.fn().mockResolvedValue({
-            mappingId: "mapping-1",
-            claudeSessionId: null,
-            args: [],
-            isNewMapping: true,
-            canResume: false,
-          }),
           updateSessionAfterProcessing: vi.fn(),
         },
       };
@@ -381,7 +420,7 @@ describe("Gateway Escalation Wiring", () => {
       const result = await gateway.processInboundEvent(event);
 
       expect(result.success).toBe(true);
-    });
+    }
 
     it("should check pause state in standalone processInboundEvent function", async () => {
       // Pause the system

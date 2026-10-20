@@ -1,21 +1,36 @@
 /**
- * Tests for runner.ts modelOverride wiring (Phase 18 Plan 01).
+ * Tests for runner.ts modelOverride wiring (Phase 18 Plan 01, made real in #330).
  *
- * Strategy: spy on runClaudeOnce to intercept model arg, throw sentinel
- * to short-circuit downstream side effects. Use isolated tmp cwd to
- * contain any session/log writes.
+ * Strategy: inject `execClaude`'s primary exec (`_setPrimaryExecForTests`) to
+ * capture the resolved model and throw a sentinel that short-circuits the
+ * downstream recovery paths. The runs still reach `recordInvocationStart`,
+ * so the usage records they leave under `<cwd>/.claude/claudeclaw/usage/` are
+ * removed in `afterAll` (same wipe the governance tests do in `beforeEach`).
  *
  * Run with: bun test src/__tests__/runner.test.ts
  */
 
-import { describe, it, expect, beforeAll, beforeEach, afterEach, spyOn, test } from "bun:test";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  spyOn,
+  test,
+} from "bun:test";
+import { readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import * as runnerMod from "../runner";
 import * as configMod from "../config";
 import { initConfig, loadSettings, getSettings } from "../config";
+import type { PrimaryExecCall, RunOptions } from "../runner";
+import { createThreadSession, removeThreadSession } from "../sessionManager";
 
 const SENTINEL = "RUNNER_TEST_SENTINEL";
 
-let runOnceSpy: ReturnType<typeof spyOn> | null = null;
 const capturedModels: string[] = [];
 
 beforeAll(async () => {
@@ -29,23 +44,63 @@ beforeAll(async () => {
   await loadSettings();
 });
 
+// #330: `execClaude` never calls `runClaudeOnce` for the primary run (that is
+// `runClaudeStream` / `runOnPty`), and a `spyOn(module, …)` cannot intercept
+// a local binding anyway — so these tests passed for months without asserting
+// anything (and passed an object into a string parameter). The primary-exec
+// seam is the only thing that sees the resolved model.
 beforeEach(() => {
   capturedModels.length = 0;
-  runOnceSpy = spyOn(runnerMod, "runClaudeOnce").mockImplementation((async (
-    _args: string[],
-    model: string,
-  ) => {
+  runnerMod._setPrimaryExecForTests(async ({ model }) => {
     capturedModels.push(model);
     throw new Error(SENTINEL);
-  }) as any);
+  });
 });
 
 afterEach(() => {
-  runOnceSpy?.mockRestore();
-  runOnceSpy = null;
+  runnerMod._setPrimaryExecForTests(null);
 });
 
-async function tryRun(opts?: { modelOverride?: string }): Promise<void> {
+// #330: with the exec seam the runs reach `recordInvocationStart`, which
+// writes a `status: "started"` record (never completed, since the seam throws)
+// plus an index entry per run. Leave none behind — and touch nothing that was
+// there before: the usage directory is durable operator telemetry, so only the
+// files this suite created are removed and the index is put back as found.
+const USAGE_DIR = join(process.cwd(), ".claude", "claudeclaw", "usage");
+// Every file's content before the suite: the per-invocation record is a new
+// file, but the index AND the daily `usage-YYYY-MM-DD.jsonl` log are appended
+// to in place, so both come back byte-for-byte.
+let usageBefore: Map<string, string> | null = null;
+beforeAll(async () => {
+  usageBefore = await snapshotUsageDir();
+});
+afterAll(async () => {
+  if (usageBefore) await restoreUsageDir(usageBefore);
+});
+async function snapshotUsageDir(): Promise<Map<string, string>> {
+  const snap = new Map<string, string>();
+  try {
+    for (const file of await readdir(USAGE_DIR)) {
+      snap.set(file, await readFile(join(USAGE_DIR, file), "utf8"));
+    }
+  } catch {
+    /* directory did not exist */
+  }
+  return snap;
+}
+async function restoreUsageDir(snap: Map<string, string>): Promise<void> {
+  try {
+    for (const file of await readdir(USAGE_DIR)) {
+      const before = snap.get(file);
+      if (before === undefined) await rm(join(USAGE_DIR, file), { recursive: true, force: true });
+      else await writeFile(join(USAGE_DIR, file), before);
+    }
+  } catch {
+    /* directory may not exist */
+  }
+}
+
+async function tryRun(opts?: string | { modelOverride?: string }): Promise<void> {
   try {
     await runnerMod.run("test-job", "hello world", undefined, opts);
   } catch (e) {
@@ -56,10 +111,26 @@ async function tryRun(opts?: { modelOverride?: string }): Promise<void> {
 }
 
 describe("Phase 18: runner modelOverride wiring", () => {
-  it("forwards modelOverride to runClaudeOnce as primaryConfig.model", async () => {
+  it("forwards modelOverride to the primary exec as primaryConfig.model", async () => {
     await tryRun({ modelOverride: "opus" });
     expect(capturedModels.length).toBeGreaterThanOrEqual(1);
     expect(capturedModels[0]).toBe("opus");
+  });
+
+  it("accepts the bare string form production passes (start.ts job tick)", async () => {
+    await tryRun("haiku");
+    expect(capturedModels[0]).toBe("haiku");
+  });
+
+  it("resolveModelOverride: string, object, blank and garbage", () => {
+    expect(runnerMod.resolveModelOverride("opus")).toBe("opus");
+    expect(runnerMod.resolveModelOverride({ modelOverride: "glm" })).toBe("glm");
+    expect(runnerMod.resolveModelOverride("  ")).toBeUndefined();
+    expect(runnerMod.resolveModelOverride({})).toBeUndefined();
+    expect(runnerMod.resolveModelOverride(undefined)).toBeUndefined();
+    expect(
+      runnerMod.resolveModelOverride({ modelOverride: 42 } as unknown as RunOptions),
+    ).toBeUndefined();
   });
 
   it("without options uses settings.model (back-compat)", async () => {
@@ -129,7 +200,7 @@ describe("Phase 18: runner modelOverride wiring", () => {
   // This is verified by inspection of src/runner.ts execClaude: fallbackConfig
   // is built from `fallback?.model` after the override branch, never from
   // options.modelOverride. Documented here rather than asserted because the
-  // runClaudeOnce spy only captures the primary model arg, not fallback.
+  // primary-exec seam only sees the primary model, not the fallback.
 });
 
 // ─── withCleanProcessEnv (issue: bun-pty env leak) ───────────────────────────
@@ -562,5 +633,94 @@ describe("buildSecurityArgs — native scheduling-tool block", () => {
     expect(args[toolsIdx + 1]).toBe("Read,Grep,Glob,Write");
     // The allow-list already excludes CronCreate; no --disallowedTools needed.
     for (const t of NATIVE) expect(args[toolsIdx + 1].split(",")).not.toContain(t);
+  });
+});
+
+describe("killActive reaches a PTY session that is still booting (#394)", () => {
+  it("gates the PTY kill on the entry count, not on the snapshot of live PTYs", async () => {
+    // `snapshotSupervisor().ptys` omits an entry whose spawn has not landed
+    // (no pid to show), so `/kill` against a session that was still booting
+    // was a no-op — and its late spawn then landed on an entry nothing had
+    // retired. The gate now reads the entry count.
+    const sup = await import("../runner/pty-supervisor");
+    const count = spyOn(sup, "supervisorEntryCount").mockReturnValue(1);
+    const snapshot = spyOn(sup, "snapshotSupervisor").mockReturnValue({ ptys: [] });
+    const kill = spyOn(sup, "killAllPtys").mockResolvedValue(0);
+    try {
+      expect(runnerMod.killActive()).toBe(true);
+      expect(kill).toHaveBeenCalledTimes(1);
+
+      count.mockReturnValue(0);
+      expect(runnerMod.killActive()).toBe(false);
+      expect(kill).toHaveBeenCalledTimes(1);
+    } finally {
+      count.mockRestore();
+      snapshot.mockRestore();
+      kill.mockRestore();
+    }
+  });
+});
+
+// #376: `--resume` restores the conversation, not the flags — `--mcp-config`,
+// `--settings`, `--plugin-dir`, `--add-dir`, `--append-system-prompt`, the
+// permission flags and `--model` must be passed again on every resumed turn.
+// The `claude -p` runner path passes the security flags, the appended system
+// prompt and the model (it uses none of the other four; the job path adds
+// `--mcp-config` in `buildAgentJobArgs`, pinned by its own test; the PTY runtime
+// re-passes its own `--mcp-config` on every spawn, a different path). This pins that a
+// resumed turn's argv is the fresh turn's argv plus `--resume <id>`, and that
+// the resolved model is the same — so a refactor that builds the resume argv
+// on a shorter path cannot drop a flag silently.
+describe("#376: a resumed turn re-passes what --resume does not restore", () => {
+  const calls: PrimaryExecCall[] = [];
+  const threads: string[] = [];
+
+  beforeEach(() => {
+    calls.length = 0;
+    runnerMod._setPrimaryExecForTests(async (call) => {
+      calls.push(call);
+      throw new Error(SENTINEL);
+    });
+  });
+
+  afterEach(async () => {
+    runnerMod._setPrimaryExecForTests(null);
+    for (const t of threads.splice(0)) await removeThreadSession(t);
+  });
+
+  async function runThread(threadId: string): Promise<PrimaryExecCall> {
+    threads.push(threadId);
+    const before = calls.length;
+    try {
+      await runnerMod.run("test-job", "hello world", threadId);
+    } catch (e) {
+      if (!(e as Error).message?.includes(SENTINEL)) throw e;
+    }
+    expect(calls.length).toBe(before + 1);
+    return calls[before];
+  }
+
+  it("resumed argv = fresh argv + `--resume <id>`; same model", async () => {
+    const stamp = `${Date.now()}-${process.pid}`;
+    const fresh = await runThread(`376-fresh-${stamp}`);
+    expect(fresh.args).not.toContain("--resume");
+
+    const resumedThread = `376-resumed-${stamp}`;
+    await createThreadSession(resumedThread, "sess-376-resume-me");
+    const resumed = await runThread(resumedThread);
+
+    const at = resumed.args.indexOf("--resume");
+    expect(at).toBeGreaterThan(-1);
+    expect(resumed.args[at + 1]).toBe("sess-376-resume-me");
+    const withoutResume = [...resumed.args.slice(0, at), ...resumed.args.slice(at + 2)];
+    expect(withoutResume).toEqual(fresh.args);
+    expect(resumed.model).toBe(fresh.model);
+
+    // The flags that do not survive `--resume` are present on the resumed turn.
+    expect(resumed.args).toContain("--append-system-prompt");
+    const permission = resumed.args.some(
+      (a) => a === "--dangerously-skip-permissions" || a === "--permission-mode",
+    );
+    expect(permission).toBe(true);
   });
 });

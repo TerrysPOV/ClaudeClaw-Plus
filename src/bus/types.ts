@@ -55,6 +55,18 @@ export function defaultSupervisionFor(origin: BusOrigin): SupervisionMode {
   return CHANNEL_DRIVEN_ORIGINS.has(origin) ? "pty-stdin" : "process-stream-json";
 }
 
+/**
+ * How a PTY-stdin delivery ended, as judged by the delivery-confirm loop
+ * (issue #361). Only `turn-started` means the CLI took the prompt. Every
+ * other value means the loop gave up and cleared the input box, so the
+ * prompt is no longer anywhere the CLI could still pick it up on its own.
+ */
+export type PromptDeliveryOutcome =
+  | "turn-started" // confirmed: transcript record, or the screen showed a turn
+  | "stuck-compaction" // an auto-compaction never finished within its budget
+  | "unconfirmed-idle" // the idle footer (or silence) survived every submit nudge
+  | "unconfirmed-live"; // the screen claimed a turn but a live transcript stayed silent
+
 /* ───────────────────────────────────────────────────────────────────── */
 /* BusEvent — single normalised event shape                              */
 /* ───────────────────────────────────────────────────────────────────── */
@@ -112,6 +124,45 @@ export interface BusEvent<P = unknown> {
   topic: BusEventTopic;
   /** Topic-specific payload. */
   payload: P;
+  /**
+   * Identifier of the operation (prompt submission) this event belongs to.
+   *
+   * `sendPrompt` mints it, returns it to the submitter, and stamps it on
+   * every event published for the turn it starts — so a client can follow a
+   * submission through to its results without inferring correlation from
+   * arrival order.
+   *
+   * Optional: events that belong to no operation (session lifecycle, tailer
+   * output observed outside a turn) carry none. Absent is a meaningful
+   * answer, not a gap.
+   *
+   * ADVISORY, not a guarantee. The slot is per AGENT, so two prompts in
+   * flight on the same agent share it — and, less obviously, sequential
+   * turns are not safe either: the JSONL tailer delivers `response.turn_end`
+   * asynchronously, so a lagged turn_end can land after the NEXT prompt has
+   * taken the slot. That race is documented at `core.ts` (#217 finding 3)
+   * and tracked as #239; it is not something a client can detect.
+   *
+   * So: treat a matching id as good evidence, never as proof. Exact
+   * correlation needs turn identity carried through the tailer (#239), which
+   * this does not provide.
+   */
+  promise_id?: string;
+
+  /**
+   * The operation id on this event is ADVISORY rather than exact.
+   *
+   * Set when a prompt arrived while the agent's previous operation had not
+   * reached its terminator, so events from that point cannot be attributed to
+   * one operation with confidence. A client should render the run as
+   * correlation-uncertain rather than drawing a confident parent — §3.3's
+   * degrade-visibly rather than fail-silently, applied to correlation.
+   *
+   * Absent means the slot was free when the operation began. It does not mean
+   * exactness: `promise_id` is advisory in general, and exact correlation needs
+   * turn identity carried through the tailer (#239).
+   */
+  correlation_ambiguous?: true;
   /** Original JSONL line or MCP message — kept for audit. */
   raw?: unknown;
 }
@@ -129,7 +180,8 @@ export interface BusEvent<P = unknown> {
  * echoes, however, ALSO match what the channel adapters subscribe to and
  * deliver — so without a marker every reply would be delivered twice
  * (once by the agent's real `reply` tool → `ingestReply`, once by this
- * observability echo). Adapters use {@link isTailerOriginEvent} to skip
+ * observability echo). Adapters, and the web UI bridge
+ * (`streamBusPrompt`), use {@link isTailerOriginEvent} to skip
  * tailer-origin `response.text` so only `ingestReply`-produced deliveries
  * reach the user. Synthesized recovery replies go through `ingestReply`
  * (not the tailer) and therefore carry NO marker → still delivered.
@@ -263,6 +315,9 @@ export interface IpcReply {
   agent_id: string;
   text: string;
   intent: "final" | "progress" | "tool_status";
+  /** #224: the `chat_id` of the `<channel>` block this reply answers (its
+   *  `origin_id`). The bus honours it only for a chat that prompted the agent. */
+  in_reply_to?: string;
 }
 
 /**

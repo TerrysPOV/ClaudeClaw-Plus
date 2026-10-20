@@ -63,6 +63,7 @@ import {
 } from "./helpers";
 import { createDiscordRestApi } from "./rest-api";
 import { resolveAgentId, uniqueAgentIds, type RoutingConfig } from "./router";
+import { type AllowlistState, isAllowedBy } from "../../allowlist";
 import type {
   DiscordAdapterOptions,
   DiscordGatewayLike,
@@ -84,7 +85,8 @@ const DISCORD_CDN_HOSTS = ["cdn.discordapp.com", "media.discordapp.net"];
 export class DiscordAdapter {
   private readonly bus: BusCore;
   private readonly token: string;
-  private readonly allowedUserIds: ReadonlySet<string>;
+  /** Read on every inbound event so a settings reload applies (#520). */
+  private readonly allowlist: () => AllowlistState<string>;
   private readonly routing: RoutingConfig;
   private readonly logger: Pick<Console, "warn" | "info" | "error">;
   private readonly rateLimitCheck: (userId: string) => boolean;
@@ -130,7 +132,8 @@ export class DiscordAdapter {
 
     this.bus = opts.bus;
     this.token = opts.token;
-    this.allowedUserIds = new Set(opts.allowedUserIds);
+    const mounted = { allowedUserIds: opts.allowedUserIds, allowAllUsers: opts.allowAllUsers };
+    this.allowlist = opts.allowlist ?? (() => mounted);
     this.routing = opts.routing;
     this.logger = opts.logger ?? console;
     this.rateLimitCheck = opts.rateLimitCheck ?? makeDefaultRateLimit();
@@ -238,17 +241,10 @@ export class DiscordAdapter {
     const channelId = message.channel_id;
     const isDM = !message.guild_id;
 
-    // 2. Allow-list — discord.ts:882 semantics:
-    //    * empty list = "allow all" (legacy `allowedUserIds.length > 0`
-    //      gate — preserved for default-config parity; operators with
-    //      `discord.allowedUserIds: []` should NOT see their bot stop
-    //      responding after the Bus runtime flip).
-    //    * non-empty list, member match = allow.
-    //    * non-empty list, no match = DM "Unauthorized." reply,
-    //      guild = silent skip.
-    //    Sprint 3 review (PR #113 agent #3): the earlier "empty = deny
-    //    all" behaviour was a silent regression. Restored here.
-    if (this.allowedUserIds.size > 0 && !this.allowedUserIds.has(userId)) {
+    // 2. Allow-list (src/allowlist.ts): empty list = nobody unless
+    //    `allowAllUsers`; no match = DM "Unauthorized." reply, guild =
+    //    silent skip.
+    if (!isAllowedBy(this.allowlist(), userId)) {
       if (isDM) {
         try {
           await this.restApi.sendMessage(channelId, "Unauthorized.");
@@ -415,11 +411,9 @@ export class DiscordAdapter {
     const parsed = parsePermissionCustomId(interaction.data.custom_id);
     if (!parsed) return;
 
-    // Allow-list — discord.ts:1358. Same semantics as the message path:
-    // empty = "allow all", non-empty = membership check. PR #113 review
-    // restored legacy parity.
+    // Allow-list — same rule as the message path (src/allowlist.ts).
     const actorId = interaction.member?.user?.id ?? interaction.user?.id;
-    if (!actorId || (this.allowedUserIds.size > 0 && !this.allowedUserIds.has(actorId))) {
+    if (!actorId || !isAllowedBy(this.allowlist(), actorId)) {
       try {
         await this.restApi.respondToInteraction(interaction.id, interaction.token, {
           content: "Unauthorized.",

@@ -12,6 +12,7 @@
  * cheaper). Keep this list curated as models ship.
  */
 import type { ModelBenchmark } from "./model-routing-benchmarks.js";
+import { parseSettingsForRewrite } from "../../settings-json";
 
 /** Operator model name (settings.json) → Artificial Analysis slug. Extend as models ship. */
 export const CLAUDE_SLUG_ALIASES: Record<string, string> = {
@@ -95,7 +96,8 @@ export function readAgenticModes(settingsContent: string): AgenticAssignment[] {
 export function setAgenticModel(settingsContent: string, mode: string, newModel: string): string {
   let parsed: { agentic?: { modes?: Array<{ name?: string; model?: string }> } };
   try {
-    parsed = JSON.parse(settingsContent);
+    // Integers past 2^53 (Discord ids) are written back as they were.
+    parsed = parseSettingsForRewrite(settingsContent);
   } catch {
     return settingsContent;
   }

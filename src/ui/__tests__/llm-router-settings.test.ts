@@ -1,32 +1,30 @@
 /**
  * Tests for `src/ui/services/llm-router-settings.ts` (#70 Phase C).
  *
- * Exercises the real settings.json read/write path with backup + restore around
- * the run, matching the harness used by runtime-config.test.ts.
+ * Exercises the settings.json read/write path on a temp file.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "bun:test";
 import { join } from "path";
-import { mkdir, copyFile, unlink, writeFile } from "fs/promises";
-import { existsSync } from "fs";
+import { tmpdir } from "os";
+import { mkdtemp, rm, writeFile } from "fs/promises";
 
 import { readLlmRouterSettings, updateLlmRouterSettings } from "../services/llm-router-settings";
+import { _setSettingsFileForTests } from "../../config";
 
-const SETTINGS_DIR = join(process.cwd(), ".claude", "claudeclaw");
-const SETTINGS_FILE = join(SETTINGS_DIR, "settings.json");
-const BACKUP_FILE = join(SETTINGS_DIR, "settings.json.llm-router-test-backup");
+// A temp settings.json, redirected through _setSettingsFileForTests: the
+// handlers never read or write the real <cwd>/.claude/claudeclaw/settings.json.
+let tempDir = "";
+let SETTINGS_FILE = "";
 
 beforeAll(async () => {
-  await mkdir(SETTINGS_DIR, { recursive: true });
-  if (existsSync(SETTINGS_FILE)) await copyFile(SETTINGS_FILE, BACKUP_FILE);
+  tempDir = await mkdtemp(join(tmpdir(), "llm-router-settings-"));
+  SETTINGS_FILE = join(tempDir, "settings.json");
+  _setSettingsFileForTests(SETTINGS_FILE);
 });
 
 afterAll(async () => {
-  if (existsSync(BACKUP_FILE)) {
-    await copyFile(BACKUP_FILE, SETTINGS_FILE);
-    await unlink(BACKUP_FILE);
-  } else if (existsSync(SETTINGS_FILE)) {
-    await unlink(SETTINGS_FILE);
-  }
+  _setSettingsFileForTests();
+  await rm(tempDir, { recursive: true, force: true });
 });
 
 async function seed(json: Record<string, unknown>): Promise<void> {

@@ -283,9 +283,10 @@ Defaults: `WEB_HOST=127.0.0.1`, `WEB_PORT=4632` unless changed via settings or `
 - `heartbeat.prompt` — the prompt sent to Claude on each heartbeat. Can be an inline string or a file path ending in `.md`, `.txt`, or `.prompt` (relative to project root). File contents are re-read on each tick, so edits take effect without restarting the daemon.
 - Heartbeat template override (optional) — create `.claude/claudeclaw/prompts/HEARTBEAT.md` to replace the built-in heartbeat template for this project.
 - `telegram.token` — Telegram bot token from @BotFather
-- `telegram.allowedUserIds` — array of numeric Telegram user IDs allowed to interact
+- `telegram.allowedUserIds` — array of numeric Telegram user IDs allowed to interact. **An empty list refuses everyone.**
 - `discord.token` — Discord bot token from the Developer Portal
-- `discord.allowedUserIds` — array of string Discord user IDs (snowflakes) allowed to interact
+- `discord.allowedUserIds` — array of string Discord user IDs (snowflakes) allowed to interact. **An empty list refuses everyone.**
+- `telegram.allowAllUsers` / `discord.allowAllUsers` / `slack.allowAllUsers` — `true` accepts every user of that platform regardless of `allowedUserIds`. Off by default; only for a deliberately public bot.
 - `discord.listenChannels` — array of string channel IDs where the bot responds to all messages without requiring an @mention
 - `security.level` — one of: `locked`, `strict`, `moderate`, `unrestricted`
 - `security.allowedTools` — extra tools to allow on top of the level (e.g. `["Bash(git:*)"]`)

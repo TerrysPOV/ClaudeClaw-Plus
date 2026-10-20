@@ -20,6 +20,12 @@ import { skillsHealth, accessedSkills } from "./skills-signal.js";
 import { ARTIFACT_SOURCE } from "../../skills-tuner/core/telemetry.js";
 import type { DateRange, Metric, TelemetryProvider } from "../../skills-tuner/core/telemetry.js";
 import { median } from "../../skills-tuner/core/aggregate.js";
+import {
+  describeError,
+  errorReason,
+  parseJudgeScores,
+  type QualityFailureReason,
+} from "./judge-failure.js";
 
 const SKILLS_MIN = 4; // need a few skills before "dead ratio" means anything
 const SKILLS_MAX_DEAD_RATIO = 0.5;
@@ -118,6 +124,48 @@ export interface SkillsSubjectConfig {
   projectsDir?: string;
 }
 
+/**
+ * Whether a transcript record of type "user" is a turn a human took. Claude Code
+ * also writes "user" records for tool results, loaded skill bodies
+ * (`sourceToolUseID`), hook feedback and other injections (`isMeta`), compaction
+ * summaries and subagent turns. A human turn may carry no text (an image alone).
+ * Bus channel messages are human turns unless the channel header names the
+ * daemon as sender: `/api/inject`, scheduled jobs, cron/heartbeat, the reply
+ * nudge. The id sits in `origin_id` (MCP delivery, flagged `isMeta`) or
+ * `chat_id` (PTY delivery).
+ */
+function isHumanTurn(msg: Record<string, unknown>, text: string | null): boolean {
+  if (msg["isCompactSummary"] || msg["isSidechain"]) return false;
+  if (msg["sourceToolUseID"] || msg["toolUseResult"]) return false;
+  const content = (msg["message"] as Record<string, unknown> | undefined)?.["content"];
+  if (
+    Array.isArray(content) &&
+    content.some((c) => (c as Record<string, unknown> | null)?.["type"] === "tool_result")
+  )
+    return false;
+  const head = (text ?? "").trimStart();
+  if (head.startsWith("<channel")) {
+    const header = head.slice(0, head.indexOf(">") + 1);
+    return header !== "" && !DAEMON_CHANNEL_RE.test(header);
+  }
+  if (msg["isMeta"]) return false;
+  return !head.startsWith("<local-command-") && !head.startsWith("<task-notification");
+}
+
+const DAEMON_CHANNEL_RE =
+  /\b(?:(?:origin_id|chat_id)="(?:inject|(?:agent-)?job:[^"]*|bus-scheduler:[^"]*)"|user_id="system"|source="cron"|origin="(?:cron|heartbeat)"|nudge="[^"]*")/;
+
+/**
+ * Override triggers come from user YAML. Non-string entries (e.g. maps) would make
+ * matchSkill throw, and collectObservations drops a session on any error, so they
+ * are ignored. An override with no usable string falls back to the skill's own.
+ */
+function stringTriggers(override: unknown): string[] | null {
+  if (!Array.isArray(override)) return null;
+  const strings = override.filter((t): t is string => typeof t === "string" && t.trim() !== "");
+  return strings.length > 0 || override.length === 0 ? strings : null;
+}
+
 function combineRegex(patterns: RegExp[]): RegExp {
   return new RegExp(patterns.map((p) => p.source).join("|"), "i");
 }
@@ -130,6 +178,8 @@ function stripFences(text: string): string {
   }
   return text.trim();
 }
+
+export type { QualityFailureReason };
 
 export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject {
   readonly name = "skills";
@@ -579,7 +629,8 @@ export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject 
     try {
       const c = JSON.parse(readFileSync(this.qualityCachePath, "utf8"));
       return typeof c.median === "number" ? c.median : null;
-    } catch {
+    } catch (e) {
+      console.warn(`[tuner] skills quality cache unreadable: ${describeError(e)}`);
       return null;
     }
   }
@@ -604,8 +655,9 @@ export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject 
         if (ageMs < cooldownMs) return;
       }
       await this.measureDescriptionQuality();
-    } catch {
-      /* best-effort; never block observation collection */
+    } catch (e) {
+      // best-effort; never block observation collection — but say why
+      console.warn(`[tuner] skills quality refresh failed: ${describeError(e)}`);
     }
   }
 
@@ -639,10 +691,10 @@ export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject 
     const user = sample.map((s) => `- ${s.name}: ${s.desc}`).join("\n");
     try {
       const raw = await this.llm.call("judge", system, [{ role: "user", content: user }], 400);
-      const nums = JSON.parse((raw.match(/\[[\s\S]*\]/) ?? ["[]"])[0]) as unknown[];
-      const scores = nums.filter((n): n is number => typeof n === "number" && n >= 1 && n <= 5);
+      const scores = parseJudgeScores(raw);
       if (scores.length === 0) {
-        this.stampQualityFailure();
+        // The reply itself is not recorded: it may echo skill descriptions.
+        this.stampQualityFailure({ code: "UNPARSEABLE", message: "judge reply had no 1-5 scores" });
         return null;
       }
       const med = median(scores);
@@ -657,23 +709,27 @@ export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject 
         "utf8",
       );
       return med;
-    } catch {
-      this.stampQualityFailure();
+    } catch (e) {
+      this.stampQualityFailure(errorReason(e));
       return null;
     }
   }
 
   /** L8: short-TTL failure stamp so refreshQualityIfStale won't re-fire a blocking
-   * LLM call every cycle after an error/timeout/unparseable reply. */
-  private stampQualityFailure(): void {
+   * LLM call every cycle after an error/timeout/unparseable reply. The reason is
+   * logged and kept in the cache, so a `median: null` says why. */
+  private stampQualityFailure(reason: QualityFailureReason): void {
+    console.warn(
+      `[tuner] skills quality judge failed: ${reason.code ?? "ERROR"}: ${reason.message}`,
+    );
     try {
       writeFileSync(
         this.qualityCachePath,
-        JSON.stringify({ ts: new Date().toISOString(), median: null, failed: true }),
+        JSON.stringify({ ts: new Date().toISOString(), median: null, failed: true, reason }),
         "utf8",
       );
-    } catch {
-      /* best-effort */
+    } catch (e) {
+      console.warn(`[tuner] skills quality failure stamp not written: ${describeError(e)}`);
     }
   }
 
@@ -699,10 +755,8 @@ export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject 
         if (!existsSync(skillMdPath)) continue;
         const { frontmatter, body } = await this.loadFrontmatter(skillMdPath);
         const name = (frontmatter["name"] as string | undefined) ?? entry.name;
-        const configOverride = this.overrides[name]?.triggers;
-        const triggers = Array.isArray(configOverride)
-          ? configOverride
-          : this.parseTriggers(frontmatter, name);
+        const triggers =
+          stringTriggers(this.overrides[name]?.triggers) ?? this.parseTriggers(frontmatter, name);
         map.set(name, {
           path: skillMdPath,
           dirPath: join(expanded, entry.name),
@@ -721,10 +775,8 @@ export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject 
         const { frontmatter, body } = await this.loadFrontmatter(filePath);
         const name = (frontmatter["name"] as string | undefined) ?? entry.name.replace(/\.md$/, "");
         if (map.has(name)) continue; // directory format wins
-        const configOverride = this.overrides[name]?.triggers;
-        const triggers = Array.isArray(configOverride)
-          ? configOverride
-          : this.parseTriggers(frontmatter, name);
+        const triggers =
+          stringTriggers(this.overrides[name]?.triggers) ?? this.parseTriggers(frontmatter, name);
         map.set(name, {
           path: filePath,
           dirPath: null,
@@ -747,7 +799,11 @@ export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject 
         .split(",")
         .map((t) => t.trim())
         .filter(Boolean);
-    if (Array.isArray(raw)) return raw.map(String);
+    if (Array.isArray(raw))
+      return raw
+        .filter((t) => typeof t === "string" || typeof t === "number")
+        .map(String)
+        .filter((t) => t.trim() !== "");
     return [fallback];
   }
 
@@ -839,15 +895,21 @@ export class SkillsSubject extends BaseSubject implements EvidenceDrivenSubject 
       const msg = messages[i]!;
       if (msg["type"] !== "user") continue;
       const text = this.extractText(msg);
-      if (!text) continue;
+      if (!text || !isHumanTurn(msg, text)) continue;
 
       const matchedSkill = this.matchSkill(text, skills);
       if (!matchedSkill) continue;
 
+      // The reaction is the next human turn. An agentic turn spans many records
+      // (one per assistant content block, tool results, injected context), so a
+      // fixed look-ahead of a few records rarely reaches it.
       let nextUserText = "";
-      for (let j = i + 1; j < Math.min(i + 5, messages.length); j++) {
-        if (messages[j]!["type"] === "user") {
-          nextUserText = this.extractText(messages[j]!) ?? "";
+      for (let j = i + 1; j < messages.length; j++) {
+        const next = messages[j]!;
+        if (next["type"] !== "user") continue;
+        const t = this.extractText(next);
+        if (isHumanTurn(next, t)) {
+          nextUserText = t ?? "";
           break;
         }
       }

@@ -15,6 +15,8 @@ import {
 } from "./bus/agent-jobs";
 import { parsePlugins, type PluginEntry } from "./plugins";
 import { parseMemorySearchSettings, type MemorySearchSettings } from "./memory";
+import { parseOneShotSettings, type OneShotSettings } from "./oneshot/config.js";
+import type { AuditPolicy } from "./observability/tool-call";
 
 /** Re-exported under the name used in the Settings interface. */
 export type WatchdogSettings = WatchdogConfig;
@@ -82,6 +84,7 @@ export function getAgentsDir(): string {
 }
 
 const DEFAULT_SETTINGS: Settings = {
+  oneShot: parseOneShotSettings(undefined),
   model: "",
   api: "",
   fallback: {
@@ -213,6 +216,10 @@ const DEFAULT_SETTINGS: Settings = {
   },
   sessionTimeoutMs: DEFAULT_SESSION_TIMEOUT_MS,
   timeouts: { telegram: 5, discord: 5, heartbeat: 15, job: 30, default: 5 },
+  // #315: on SIGTERM, wait this long for active agent turns to finish before
+  // stopping (0 = stop at once, the pre-#315 behaviour). Keep it below your
+  // service manager's stop timeout (systemd TimeoutStopSec defaults to 90s).
+  shutdown: { drainTurnsMs: 30_000 },
   pty: {
     // Opt-in by default. Operators flip this to true ONLY after the MCP
     // multiplexer follow-up lands and they've validated OAuth refresh on a
@@ -263,8 +270,15 @@ const DEFAULT_SETTINGS: Settings = {
   // shared exported default.
   stallWatchdog: structuredClone(DEFAULT_STALL_CONFIG),
   agentJobs: structuredClone(DEFAULT_AGENT_JOB_CONFIG),
+  quietHours: { windows: [], urgentBypass: false },
   governance: { watchdog: {} },
-  session: { autoRotate: false, maxMessages: 50, maxAgeHours: 24, summaryPath: "" },
+  session: {
+    autoRotate: false,
+    maxMessages: 50,
+    maxAgeHours: 24,
+    summaryPath: "",
+    gatewayScope: "global",
+  },
   // Default runtime: `bus` (Sprint 5.4 flip after Hetzner staging soak ended
   // 2026-05-25). `runtime: "pty"` remains as a permanent first-class option
   // for operators who need the `claude -p` / API-billed path — particularly
@@ -274,10 +288,11 @@ const DEFAULT_SETTINGS: Settings = {
   // One default agent so a fresh install actually mounts something. The
   // runtime default is `bus`, which spawns one `claude` per `agents[]` entry;
   // an empty default would mount the bus with zero agents — daemon up,
-  // channels polling, but nothing behind them ("no agents declared"). This is
-  // the *fresh-install* default only: `parseBusAgents` builds from `raw.agents`
-  // and never reads this list, so existing installs that omit `agents` or set
-  // `agents: []` are unaffected (#196 / cause #1 of #193).
+  // channels polling, but nothing behind them ("no agents declared"). Written
+  // by `initConfig` for a fresh install (#196 / cause #1 of #193), and used by
+  // `parseSettings` when an existing file omits `agents` — the shape of every
+  // config carried over from the original claudeclaw (#508). An explicit
+  // `agents: []` is still honoured as "no agent".
   agents: [{ id: "default" }],
   plugins: {},
   memorySearch: {},
@@ -299,6 +314,19 @@ export interface HeartbeatExcludeWindow {
   days?: number[];
   start: string;
   end: string;
+}
+
+/**
+ * Quiet hours for proactive messages (#512): job results, heartbeat, trigger
+ * output, the usage-limit notice and operator alerts produced inside a window
+ * are held and delivered when it ends. Replies to a message the user sent are
+ * never held. Same window shape and semantics as `heartbeat.excludeWindows`.
+ * Empty `windows` (the default) = off.
+ */
+export interface QuietHoursConfig {
+  windows: HeartbeatExcludeWindow[];
+  /** A `critical` operator alert goes out anyway. Off: it waits like the rest. */
+  urgentBypass: boolean;
 }
 
 export interface HeartbeatConfig {
@@ -370,11 +398,15 @@ export interface WebBusConfig {
   bind?: string;
   token?: string;
   allowedAgentIds?: string[];
+  /** Browser origins allowed to call the Web UI adapter cross-origin. */
+  allowedOrigins?: string[];
 }
 
 export interface TelegramConfig {
   token: string;
   allowedUserIds: number[];
+  /** Accept every Telegram user. Without it an empty `allowedUserIds` refuses everyone. */
+  allowAllUsers?: boolean;
   listenChats: number[];
   /** When false, skip Telegram polling (incoming messages). Useful for send-only instances. Default: true */
   receiveEnabled: boolean;
@@ -395,6 +427,8 @@ export interface TelegramConfig {
 export interface DiscordConfig {
   token: string;
   allowedUserIds: string[]; // Discord snowflake IDs exceed Number.MAX_SAFE_INTEGER
+  /** Accept every Discord user. Without it an empty `allowedUserIds` refuses everyone. */
+  allowAllUsers?: boolean;
   listenChannels: string[]; // Channel IDs where bot responds to all messages (no mention needed)
   listenGuilds: string[]; // Guild IDs where bot responds to all messages in any channel/thread
   channelNames?: Record<string, string>; // channelId -> friendly name for system prompt context
@@ -410,6 +444,8 @@ export interface SlackConfig {
   /** Slack app signing secret for Events API HTTP verification. Required for Bus runtime HTTP mode. */
   signingSecret?: string;
   allowedUserIds: string[];
+  /** Accept every Slack user. Without it an empty `allowedUserIds` refuses everyone. */
+  allowAllUsers?: boolean;
   listenChannels: string[]; // Channel IDs where bot responds without @mention
   allowBots: string[]; // Channel IDs where bot-posted messages are passed through
   allowBotIds: string[]; // Optional: Slack app/bot IDs (B...) that may post; empty = any bot in allowBots channel
@@ -562,6 +598,68 @@ export interface McpConfig {
      *  thrashing the cache. 5-agent review on PR #69 Agent 3 finding. */
     defensiveInvalidation: boolean;
   };
+  /**
+   * Per-plugin kill switch on the plugin-tool bridge (#230), with the words
+   * the multiplexer uses for its servers in `mcp-proxy.json`. Absent or empty
+   * → every registered tool stays callable (the behaviour before this block).
+   * Re-read by the settings hot-reload, so a tool can be switched off without
+   * unregistering its plugin or restarting.
+   *
+   * Scope: calls that go through the daemon's bridge (`invokeTool`: plugin
+   * HTTP gateway, in-process callers); `listTools` hides what it refuses. A
+   * shared server's `/mcp/<server>` route is governed by its `mcp-proxy.json`
+   * entry.
+   */
+  bridge?: McpBridgeConfig;
+  /**
+   * Mandatory-audit policy for MCP tool calls, on both dispatch paths (the
+   * multiplexer and the plugin-tool bridge). `"enforce"`: a call whose intent
+   * cannot be appended to the `mcp.tool_call` chain is refused before it
+   * runs — no log, no action. `"best-effort"` (default): logging never blocks
+   * a call. Re-read by the settings hot-reload.
+   */
+  audit?: AuditPolicy;
+}
+
+/**
+ * One entry in `settings.mcp.bridge.plugins`, keyed by plugin id — or, for a
+ * tool the mcp-proxy plugin or the multiplexer proxies from another MCP
+ * server, by that server's name (plugin ids and server names share this one
+ * namespace). Tool names are matched exactly against the name under that
+ * key: `{ "github": { "deniedTools": ["delete_repo"] } }` fences the proxied
+ * tool whichever wrapper carries it; `{ "mcp-proxy": { "deniedTools":
+ * ["github__delete_repo"] } }` fences it only as registered by mcp-proxy
+ * (the multiplexer registers as `mcp-multiplexer`). When both keys have an
+ * entry, either can refuse.
+ */
+export interface McpBridgePluginConfig {
+  /** `false` → every tool under this key is refused and hidden. Default true. */
+  enabled?: boolean;
+  /** When set, only these tools are callable. `[]` allows none. */
+  allowedTools?: string[];
+  /** Never callable, even when also listed in `allowedTools`. */
+  deniedTools?: string[];
+}
+
+export interface McpBridgeConfig {
+  plugins: Record<string, McpBridgePluginConfig>;
+  /**
+   * `true` → on the bridge, a tool is callable only if its plugin id or (for
+   * a proxied tool) its upstream server has an entry in `plugins`; anything
+   * else is refused and hidden, built-in plugins that register on the bridge
+   * included. An entry allows whatever carries that name: list servers rather
+   * than the `mcp-proxy` / `mcp-multiplexer` wrappers, whose entry counts for
+   * every server they proxy. Default false: unlisted plugins stay callable.
+   * Like the rest of this block it governs the bridge only, not a shared
+   * server's `/mcp/<server>` route (see `mcp-proxy.json`).
+   */
+  defaultDeny?: boolean;
+}
+
+/** #315: graceful drain on shutdown. */
+export interface ShutdownConfig {
+  /** Max time to wait for in-flight agent turns on SIGTERM/SIGINT; 0 disables. */
+  drainTurnsMs: number;
 }
 
 export interface PtyConfig {
@@ -680,6 +778,7 @@ export interface BusAgentSettings {
 }
 
 export interface Settings {
+  oneShot: OneShotSettings;
   model: string;
   api: string;
   fallback: ModelConfig;
@@ -697,6 +796,8 @@ export interface Settings {
   apiToken?: string;
   sessionTimeoutMs: number;
   timeouts: TimeoutsConfig;
+  /** #315: bounded wait for active turns before the daemon stops. */
+  shutdown: ShutdownConfig;
   /**
    * Daemon runtime selector. Defaults to `"bus"` (event-bus + per-agent
    * processes, multi-channel routing, MCP multiplexer) — subscription-billed
@@ -712,8 +813,9 @@ export interface Settings {
    * `runtime: "pty"` ignores this field entirely. Empty list = the daemon
    * mounts the Bus stack but spawns no agents (operator wires them via
    * REST/CLI later). A fresh install ships one `{ id: "default" }` entry
-   * (see `DEFAULT_SETTINGS`) so the bus mounts a working agent out of the box;
-   * clearing the list back to `[]` is a deliberate "wire later" opt-out.
+   * (see `DEFAULT_SETTINGS`), and a file with no `agents` key parses to the
+   * same entry (#508), so the bus mounts a working agent out of the box;
+   * setting the list to `[]` is a deliberate "wire later" opt-out.
    * See `BusAgentSettings` for the per-agent shape.
    */
   agents: BusAgentSettings[];
@@ -723,6 +825,8 @@ export interface Settings {
   stallWatchdog: StallWatchdogConfig;
   /** Agent-job primitive config (#296 PR 3): concurrency cap + per-job timeouts. */
   agentJobs: AgentJobConfig;
+  /** Quiet hours for proactive Telegram messages (#512). Off (no windows) by default. */
+  quietHours: QuietHoursConfig;
   governance: GovernanceConfig;
   plugins: Record<string, PluginEntry>;
   session: SessionConfig;
@@ -858,6 +962,19 @@ export interface SessionConfig {
   maxAgeHours: number;
   /** Directory to write markdown summaries before rotation. Empty string disables summaries. */
   summaryPath: string;
+  /**
+   * #376: which Claude session a gateway turn (Discord / Telegram through the
+   * event log) resumes. `"global"` (default, the behaviour so far): every
+   * gateway conversation shares the one global session, so what was said in
+   * one channel is context for the answer in another. `"conversation"`: each
+   * channel / thread / chat / topic gets its own session (keyed
+   * `channelId:threadId`, the gateway's own conversation identity), handled
+   * like a Discord thread session: its own queue (conversations run in
+   * parallel), no auto-rotation — `/reset` and `/compact` act on it. Splitting
+   * one context into many costs more tokens and the assistant stops
+   * remembering across channels — hence opt-in.
+   */
+  gatewayScope: "global" | "conversation";
 }
 
 let cached: Settings | null = null;
@@ -940,6 +1057,7 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
 
   return {
     model: typeof raw.model === "string" ? raw.model.trim() : "",
+    oneShot: parseOneShotSettings(raw.oneShot),
     api: typeof raw.api === "string" ? raw.api.trim() : "",
     fallback: {
       model: typeof raw.fallback?.model === "string" ? raw.fallback.model.trim() : "",
@@ -960,7 +1078,8 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
       token:
         process.env.TELEGRAM_TOKEN?.trim() ||
         (typeof raw.telegram?.token === "string" ? raw.telegram.token.trim() : ""),
-      allowedUserIds: raw.telegram?.allowedUserIds ?? [],
+      allowedUserIds: parseTelegramUserIds(raw.telegram?.allowedUserIds),
+      ...(raw.telegram?.allowAllUsers === true ? { allowAllUsers: true } : {}),
       listenChats: Array.isArray(raw.telegram?.listenChats)
         ? raw.telegram.listenChats.map(Number)
         : [],
@@ -977,12 +1096,8 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
       token:
         process.env.DISCORD_TOKEN?.trim() ||
         (typeof raw.discord?.token === "string" ? raw.discord.token.trim() : ""),
-      allowedUserIds:
-        Array.isArray(discordUserIds) && discordUserIds.length > 0
-          ? discordUserIds
-          : Array.isArray(raw.discord?.allowedUserIds)
-            ? raw.discord.allowedUserIds.map(String)
-            : [],
+      allowedUserIds: parseChatUserIds("discord", raw.discord?.allowedUserIds, discordUserIds),
+      ...(raw.discord?.allowAllUsers === true ? { allowAllUsers: true } : {}),
       listenChannels: Array.isArray(raw.discord?.listenChannels)
         ? raw.discord.listenChannels.map(String)
         : [],
@@ -1015,9 +1130,8 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
       appToken:
         process.env.SLACK_APP_TOKEN?.trim() ||
         (typeof raw.slack?.appToken === "string" ? raw.slack.appToken.trim() : ""),
-      allowedUserIds: Array.isArray(raw.slack?.allowedUserIds)
-        ? raw.slack.allowedUserIds.map(String)
-        : [],
+      allowedUserIds: parseChatUserIds("slack", raw.slack?.allowedUserIds),
+      ...(raw.slack?.allowAllUsers === true ? { allowAllUsers: true } : {}),
       listenChannels: Array.isArray(raw.slack?.listenChannels)
         ? raw.slack.listenChannels.map(String)
         : [],
@@ -1107,6 +1221,12 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
           ? Number(raw.timeouts.default)
           : 5,
     },
+    shutdown: {
+      drainTurnsMs:
+        Number.isFinite(raw.shutdown?.drainTurnsMs) && Number(raw.shutdown.drainTurnsMs) >= 0
+          ? Number(raw.shutdown.drainTurnsMs)
+          : 30_000,
+    },
     pty: {
       enabled: raw.pty?.enabled === true, // default false — opt-in (see DEFAULT_SETTINGS.pty)
       idleReapMinutes:
@@ -1154,11 +1274,16 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
           : 30_000,
     },
     runtime: parseRuntimeMode(raw.runtime),
-    agents: parseBusAgents(raw.agents),
+    // #508: absent key → the fresh-install default; `[]` stays empty.
+    agents:
+      raw.agents === undefined
+        ? structuredClone(DEFAULT_SETTINGS.agents)
+        : parseBusAgents(raw.agents),
     mcp: parseMcpConfig(raw.mcp, raw.web?.enabled),
     watchdog: parseWatchdogConfig(raw.watchdog),
     stallWatchdog: parseStallWatchdogConfig(raw.stallWatchdog),
     agentJobs: parseAgentJobConfig(raw.agentJobs),
+    quietHours: parseQuietHours(raw.quietHours),
     governance: parseGovernanceConfig(raw.governance),
     plugins: parsePlugins(raw.plugins),
     memorySearch: parseMemorySearchSettings(raw.memorySearch),
@@ -1169,6 +1294,8 @@ function parseSettings(raw: Record<string, any>, discordUserIds?: string[]): Set
       maxAgeHours: Number.isFinite(raw.session?.maxAgeHours) ? Number(raw.session.maxAgeHours) : 24,
       summaryPath:
         typeof raw.session?.summaryPath === "string" ? raw.session.summaryPath.trim() : "",
+      // Anything but the exact opt-in word keeps the shared session (#376).
+      gatewayScope: raw.session?.gatewayScope === "conversation" ? "conversation" : "global",
     },
     apiToken:
       typeof raw.apiToken === "string" && raw.apiToken.trim() ? raw.apiToken.trim() : undefined,
@@ -1501,12 +1628,109 @@ function parseWebBusConfig(raw: unknown): WebBusConfig | null {
   const allowedAgentIds = Array.isArray(r.allowedAgentIds)
     ? r.allowedAgentIds.filter((s): s is string => typeof s === "string" && s.length > 0)
     : [];
-  if (!bind && !token && allowedAgentIds.length === 0) return null;
+  const allowedOrigins = Array.isArray(r.allowedOrigins)
+    ? r.allowedOrigins
+        .filter((s): s is string => typeof s === "string" && s.trim().length > 0)
+        .map((s) => s.trim())
+    : [];
+  if (!bind && !token && allowedAgentIds.length === 0 && allowedOrigins.length === 0) return null;
   const out: WebBusConfig = {};
   if (bind) out.bind = bind;
   if (token) out.token = token;
   if (allowedAgentIds.length > 0) out.allowedAgentIds = allowedAgentIds;
+  if (allowedOrigins.length > 0) out.allowedOrigins = allowedOrigins;
   return out;
+}
+
+/** `settings.mcp` warnings already printed: the hot-reload re-parses the
+ *  settings every 30 s, and one bad value should not warn forever. */
+const mcpSettingWarned = new Set<string>();
+function warnMcpSettingOnce(message: string): void {
+  if (mcpSettingWarned.has(message)) return;
+  mcpSettingWarned.add(message);
+  console.warn(message);
+}
+
+const BRIDGE_ENTRY_KEYS = new Set(["enabled", "allowedTools", "deniedTools"]);
+
+/**
+ * Parse `settings.mcp.bridge` (#230). This block only ever restricts, so a
+ * typo must not leave open a tool the operator meant to fence: a malformed
+ * plugin entry (not an object, an unknown key such as a misspelt
+ * `deniedTools`, `enabled` not a boolean, a tool list that is not an array of
+ * strings) turns that key OFF, and a non-object block, an unknown key next to
+ * `plugins`, or a `defaultDeny` that is not a boolean turns deny-by-default
+ * ON. Each with one warning. `false` / `null` read as absent.
+ */
+function parseMcpBridgeConfig(raw: unknown): McpBridgeConfig {
+  const plugins: Record<string, McpBridgePluginConfig> = {};
+  if (raw === undefined || raw === null || raw === false) return { plugins };
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    warnMcpSettingOnce(
+      "[mcp] settings.mcp.bridge must be an object; refusing every bridge tool (defaultDeny, nothing listed)",
+    );
+    return { plugins, defaultDeny: true };
+  }
+  const obj = raw as Record<string, unknown>;
+  // Same fail-closed rule one level up: a misspelt `defaultDeny`, or a value
+  // that is not a boolean, turns deny-by-default ON rather than off.
+  let defaultDeny = false;
+  for (const key of Object.keys(obj)) {
+    if (key === "plugins" || key === "defaultDeny") continue;
+    warnMcpSettingOnce(
+      `[mcp] settings.mcp.bridge.${key} is not a known key (plugins, defaultDeny); unlisted plugins are refused`,
+    );
+    defaultDeny = true;
+  }
+  if (obj.defaultDeny === true) defaultDeny = true;
+  else if (obj.defaultDeny !== undefined && obj.defaultDeny !== null && obj.defaultDeny !== false) {
+    warnMcpSettingOnce(
+      "[mcp] settings.mcp.bridge.defaultDeny must be a boolean; unlisted plugins are refused",
+    );
+    defaultDeny = true;
+  }
+  const done = (): McpBridgeConfig => ({ plugins, ...(defaultDeny ? { defaultDeny } : {}) });
+  const rawPlugins = obj.plugins;
+  if (rawPlugins === undefined) return done();
+  if (!rawPlugins || typeof rawPlugins !== "object" || Array.isArray(rawPlugins)) {
+    warnMcpSettingOnce("[mcp] settings.mcp.bridge.plugins must be an object; ignoring it");
+    return done();
+  }
+  const toolList = (v: unknown): string[] | null =>
+    Array.isArray(v) && v.every((t) => typeof t === "string") ? (v as string[]) : null;
+  for (const [id, v] of Object.entries(rawPlugins as Record<string, unknown>)) {
+    // Cannot name a plugin or a server, and assigning it would set the
+    // object's prototype rather than add an entry.
+    if (id === "__proto__") {
+      warnMcpSettingOnce(
+        "[mcp] settings.mcp.bridge.plugins.__proto__ is not a valid key; ignoring it",
+      );
+      continue;
+    }
+    const entry = v as Record<string, unknown> | null;
+    const malformed =
+      !entry ||
+      typeof entry !== "object" ||
+      Array.isArray(entry) ||
+      Object.keys(entry).some((k) => !BRIDGE_ENTRY_KEYS.has(k)) ||
+      (entry.enabled !== undefined && typeof entry.enabled !== "boolean") ||
+      (entry.allowedTools !== undefined && toolList(entry.allowedTools) === null) ||
+      (entry.deniedTools !== undefined && toolList(entry.deniedTools) === null);
+    if (malformed) {
+      warnMcpSettingOnce(
+        `[mcp] settings.mcp.bridge.plugins.${id} is malformed (keys: enabled, allowedTools, deniedTools); all its tools are refused`,
+      );
+      plugins[id] = { enabled: false };
+      continue;
+    }
+    const parsed: McpBridgePluginConfig = {};
+    if (entry.enabled !== undefined) parsed.enabled = entry.enabled as boolean;
+    if (entry.allowedTools !== undefined)
+      parsed.allowedTools = [...(entry.allowedTools as string[])];
+    if (entry.deniedTools !== undefined) parsed.deniedTools = [...(entry.deniedTools as string[])];
+    plugins[id] = parsed;
+  }
+  return done();
 }
 
 function parseMcpConfig(raw: any, webEnabled: unknown): McpConfig {
@@ -1663,7 +1887,156 @@ function parseMcpConfig(raw: any, webEnabled: unknown): McpConfig {
       // setting false (e.g. cleanly-partitioned tools).
       defensiveInvalidation: rawCache?.defensiveInvalidation !== false,
     },
+    bridge: parseMcpBridgeConfig(raw?.bridge),
+    audit: parseMcpAuditPolicy(raw?.audit),
   };
+}
+
+/** The `telegram.allowedUserIds` warnings printed by the last parse: the
+ *  hot-reload re-parses the settings every 30 s, and one bad value should not
+ *  warn forever. A clean parse clears it, so a value that goes bad again warns
+ *  again. */
+let telegramIdsLastWarnings = "";
+
+/** TEST-ONLY: forget the last printed warnings, so each test sees its own. */
+export function _resetTelegramIdsWarningsForTests(): void {
+  telegramIdsLastWarnings = "";
+}
+
+/**
+ * `telegram.allowedUserIds`: a list of integer ids. A list keeps its non-zero
+ * integers, and integer strings as the number they spell; any other entry is
+ * dropped with a warning. Negative ids (group chats) never match a sender but
+ * are kept: the list also names where job output is forwarded. Taken as-is, a
+ * string reached `includes` in the allow check and matched any user whose id
+ * is a substring of it.
+ *
+ * A value that is present but holds no valid id (a lone string or number
+ * written by mistake, a list of junk) becomes `[0]`, not `[]`: no Telegram user
+ * has id 0, so both runtimes' allow checks refuse every sender, and the startup
+ * check (`allowlistStartupWarnings`) does not report the value as "empty" when
+ * the warning above already names the real problem. Outbound forwards that walk
+ * the list then target chat 0 and log a send error until the value is fixed.
+ */
+function parseTelegramUserIds(value: unknown): number[] {
+  const warnings: string[] = [];
+  const ids = telegramUserIdsOf(value, warnings);
+  const key = warnings.join("\n");
+  if (key !== telegramIdsLastWarnings) for (const w of warnings) console.warn(w);
+  telegramIdsLastWarnings = key;
+  return ids;
+}
+
+function telegramUserIdsOf(value: unknown, warnings: string[]): number[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    warnings.push(
+      `[config] telegram.allowedUserIds must be a list of integer user ids, got a ${typeof value}; no Telegram user is allowed until it is fixed`,
+    );
+    return [0];
+  }
+  const ids: number[] = [];
+  for (const entry of value) {
+    const id =
+      typeof entry === "string" && /^\s*-?\d+\s*$/.test(entry) ? Number(entry.trim()) : entry;
+    if (typeof id === "number" && Number.isSafeInteger(id) && id !== 0) ids.push(id);
+  }
+  if (ids.length < value.length) {
+    warnings.push(
+      `[config] telegram.allowedUserIds: ignored ${value.length - ids.length} entry(ies) that are not integer ids`,
+    );
+  }
+  if (value.length > 0 && ids.length === 0) {
+    warnings.push(
+      "[config] telegram.allowedUserIds has no valid user id; no Telegram user is allowed until it is fixed",
+    );
+    return [0];
+  }
+  return ids;
+}
+
+/** The `slack`/`discord` `allowedUserIds` warnings printed by the last parse,
+ *  per platform: same once-per-problem rule as `telegramIdsLastWarnings`. */
+const chatIdsLastWarnings = new Map<string, string>();
+
+/** TEST-ONLY: forget the last printed warnings, so each test sees its own. */
+export function _resetChatUserIdsWarningsForTests(): void {
+  chatIdsLastWarnings.clear();
+}
+
+/**
+ * `slack.allowedUserIds` / `discord.allowedUserIds`: a list of ids, kept as
+ * strings. Discord ids come from `preciseIds` (`parseSettingsText`: JSON
+ * numbers lose precision on snowflakes) only when they spell the parsed list
+ * entry for entry.
+ *
+ * A value that is present but is not a list (a single id written as a string
+ * or a number by mistake) becomes `["0"]`, not `[]`: no Slack or Discord user
+ * has id "0", so every allow check refuses every sender. Outbound DMs that walk the list
+ * then target "0" and log a send error until the value is fixed. Same rule as
+ * `telegram.allowedUserIds`.
+ */
+function parseChatUserIds(
+  platform: "slack" | "discord",
+  value: unknown,
+  preciseIds?: string[],
+): string[] {
+  const warnings: string[] = [];
+  let ids: string[];
+  if (value === undefined || value === null) {
+    ids = [];
+  } else if (!Array.isArray(value)) {
+    warnings.push(
+      `[config] ${platform}.allowedUserIds must be a list of user ids, got a ${typeof value}; no ${platform === "slack" ? "Slack" : "Discord"} user is allowed until it is fixed`,
+    );
+    ids = ["0"];
+  } else if (preciseIds && sameIds(preciseIds, value)) {
+    ids = preciseIds;
+  } else {
+    // A number past 2^53 was rounded by JSON.parse: its string is another id,
+    // not the one written (so is a nested list's: String([n])). Keep only
+    // strings and exact integers, drop the rest rather than allow whoever owns
+    // the rounded id; a list left empty that way allows nobody, not everyone.
+    const exact = (v: unknown) =>
+      typeof v === "string" || (typeof v === "number" && Number.isSafeInteger(v));
+    ids = value.filter(exact).map(String);
+    if (ids.length < value.length) {
+      warnings.push(
+        `[config] ${platform}.allowedUserIds holds an entry that is not an id, or an id written as a number too large to read exactly; write each id in quotes. It is ignored until then`,
+      );
+      if (ids.length === 0) ids = ["0"];
+    }
+  }
+  const key = warnings.join("\n");
+  if (key !== (chatIdsLastWarnings.get(platform) ?? "")) for (const w of warnings) console.warn(w);
+  chatIdsLastWarnings.set(platform, key);
+  return ids;
+}
+
+/** True when the raw-text ids are the parsed list, at full precision. */
+function sameIds(precise: string[], parsed: unknown[]): boolean {
+  return (
+    precise.length === parsed.length &&
+    precise.every((id, i) => {
+      const entry = parsed[i];
+      return typeof entry === "number" ? Number(id) === entry : entry === id;
+    })
+  );
+}
+
+/**
+ * `settings.mcp.audit`. Absent or null → `best-effort`. Any value other than the two
+ * known ones is read as `enforce`, with a warning: someone who set the key
+ * asked for something stricter than the default, and a typo must not
+ * silently turn the guarantee off.
+ */
+function parseMcpAuditPolicy(raw: unknown): AuditPolicy {
+  if (raw === undefined || raw === null || raw === "best-effort") return "best-effort";
+  if (raw === "enforce") return "enforce";
+  warnMcpSettingOnce(
+    `[mcp] settings.mcp.audit must be "enforce" or "best-effort" (got ${JSON.stringify(raw)}); using "enforce"`,
+  );
+  return "enforce";
 }
 
 function parseTimezone(value: unknown): string {
@@ -1696,43 +2069,79 @@ function parseExcludeWindows(value: unknown): HeartbeatExcludeWindow[] {
   return out;
 }
 
+function parseQuietHours(value: unknown): QuietHoursConfig {
+  const raw = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  return {
+    windows: parseExcludeWindows(raw.windows),
+    urgentBypass: raw.urgentBypass === true,
+  };
+}
+
 function parseTimezoneOffsetMinutes(value: unknown, timezoneFallback?: string): number {
   return resolveTimezoneOffsetMinutes(value, timezoneFallback);
 }
 
 /**
- * Extract discord.allowedUserIds as raw strings from the JSON text.
- * JSON.parse destroys precision on large numeric snowflakes (>2^53),
- * so we regex them out of the raw text first.
+ * Parse the settings text and read `discord.allowedUserIds` at full precision.
+ * JSON numbers lose precision past 2^53 (Discord snowflakes), so the parse
+ * keeps the source text of every number held in an array, keyed by the array
+ * JSON.parse built. The ids are then read from the very list the settings
+ * use: another "discord" or "allowedUserIds" anywhere in the file, a
+ * duplicated key or a key written with a \u escape cannot stand in for it.
+ * A runtime without the reviver's source text gives no ids, and the parsed
+ * list is used as is (a rounded id is dropped there, never allowed).
  */
-function extractDiscordUserIds(rawText: string): string[] {
-  // Match the "discord" object's "allowedUserIds" array values
-  const discordBlock = rawText.match(/"discord"\s*:\s*\{[\s\S]*?\}/);
-  if (!discordBlock) return [];
-  const arrayMatch = discordBlock[0].match(/"allowedUserIds"\s*:\s*\[([\s\S]*?)\]/);
-  if (!arrayMatch) return [];
-  const items: string[] = [];
-  // Match both quoted strings and bare numbers
-  for (const m of arrayMatch[1].matchAll(/("(\d+)"|(\d+))/g)) {
-    items.push(m[2] ?? m[3]);
+function parseSettingsText(rawText: string) {
+  const numberSources = new WeakMap<object, string[]>();
+  function keepNumberSource(
+    this: unknown,
+    key: string,
+    value: unknown,
+    context?: { source?: string },
+  ): unknown {
+    if (Array.isArray(this) && typeof value === "number" && typeof context?.source === "string") {
+      const sources = numberSources.get(this) ?? [];
+      sources[Number(key)] = context.source;
+      numberSources.set(this, sources);
+    }
+    return value;
   }
-  return items;
+  const raw = JSON.parse(rawText, keepNumberSource);
+  return { raw, discordUserIds: discordUserIdsOf(raw?.discord?.allowedUserIds, numberSources) };
+}
+
+/** The ids of `list` as written, or [] unless every entry is a plain integer. */
+function discordUserIdsOf(list: unknown, numberSources: WeakMap<object, string[]>): string[] {
+  if (!Array.isArray(list)) return [];
+  const sources = numberSources.get(list) ?? [];
+  const ids: string[] = [];
+  for (let i = 0; i < list.length; i++) {
+    const id = typeof list[i] === "number" ? sources[i] : list[i];
+    if (typeof id !== "string" || !/^\d+$/.test(id)) return [];
+    ids.push(id);
+  }
+  return ids;
 }
 
 export async function loadSettings(): Promise<Settings> {
   if (cached) return cached;
   const rawText = await Bun.file(SETTINGS_FILE).text();
-  const raw = JSON.parse(rawText);
-  cached = parseSettings(raw, extractDiscordUserIds(rawText));
+  const { raw, discordUserIds } = parseSettingsText(rawText);
+  cached = parseSettings(raw, discordUserIds);
   return cached;
 }
 
 /** Re-read settings from disk, bypassing cache. */
 export async function reloadSettings(): Promise<Settings> {
   const rawText = await Bun.file(SETTINGS_FILE).text();
-  const raw = JSON.parse(rawText);
-  cached = parseSettings(raw, extractDiscordUserIds(rawText));
+  const { raw, discordUserIds } = parseSettingsText(rawText);
+  cached = parseSettings(raw, discordUserIds);
   return cached;
+}
+
+/** Path of the settings.json the loader and the web UI save handlers use. */
+export function getSettingsFile(): string {
+  return SETTINGS_FILE;
 }
 
 export function getSettings(): Settings {
@@ -1744,7 +2153,8 @@ export function getSettings(): Settings {
  * TEST-ONLY: redirect the settings file path so tests never read or write the
  * developer's real `<cwd>/.claude/claudeclaw/settings.json` (which is frozen at
  * module load to the start-up cwd). Pass a temp path to point there; call with
- * no argument to restore the default. Clears the settings cache so the next
+ * no argument to restore the default. The web UI save handlers follow it too.
+ * Clears the settings cache so the next
  * `loadSettings()` / `reloadSettings()` reads from the (new) path. Pair with a
  * call in the test's `afterEach` to avoid leaking the override or cached
  * settings across tests.

@@ -53,7 +53,7 @@ import { createMcpReconciler } from "./mcp-reconciler";
 import type { MountedAdapter } from "./adapter-wiring";
 import { stopBusAdapters } from "./adapter-wiring";
 import { detectOrphanAgents, formatOrphanWarnings } from "./orphan-agent-detect";
-import { createPromptStreamHandler } from "./receipt-wiring";
+import { canStreamToAgent, createPromptStreamHandler } from "./receipt-wiring";
 import { peekSession } from "../sessions";
 import { generateSummary } from "../rotation";
 import { getSettings, type BusAgentSettings } from "../config";
@@ -414,6 +414,10 @@ export async function mountBusRuntime(
     bus.setStreamPromptHandler(
       createPromptStreamHandler((agentId) => sessionManager.getAgent(agentId)),
     );
+    // #428: deliver each prompt once. An agent the PTY reaches gets no IPC
+    // `prompt` frame; a `process` / `tmux` agent (its PTY write only rejects)
+    // keeps the frame as its delivery.
+    bus.setPtyReachableHandler?.(canStreamToAgent((agentId) => sessionManager.getAgent(agentId)));
 
     // #222 reconciliation: when an IPC send fails because the agent's MCP
     // registration is gone but its process is still alive (the recurring
@@ -734,6 +738,7 @@ export async function mountBusRuntime(
         try {
           bus.setSlashCommandHandler(null);
           bus.setStreamPromptHandler(null);
+          bus.setPtyReachableHandler?.(null);
           bus.setMcpSendFailedHandler(null);
         } catch (err) {
           logger.error("[bus-runtime] setSlashCommandHandler(null) failed", err);
@@ -765,6 +770,7 @@ export async function mountBusRuntime(
       try {
         bus.setSlashCommandHandler(null);
         bus.setStreamPromptHandler(null);
+        bus.setPtyReachableHandler?.(null);
         bus.setMcpSendFailedHandler(null);
       } catch {
         /* ignore — surfacing the original error matters more. */

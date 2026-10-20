@@ -5,6 +5,8 @@
  * the session_cost telemetry stream uses (date, cost_usd per session). Local only.
  */
 import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { Database } from "bun:sqlite";
 
 export interface DayCost {
@@ -99,6 +101,6 @@ export function costSignal(dbPath: string, maxRecentUsd = Infinity): CostSignal 
 }
 
 if (import.meta.main) {
-  const dbPath = process.argv[2] ?? `${process.env.HOME}/agent/data/costs.db`;
+  const dbPath = process.argv[2] ?? join(homedir(), "agent", "data", "costs.db");
   console.log(`[model-routing-signal] ${JSON.stringify(costSignal(dbPath))}`);
 }

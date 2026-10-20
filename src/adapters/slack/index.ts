@@ -9,12 +9,13 @@
  * `src/commands/slack.ts` (1950 LOC) for the subset the Bus runtime needs.
  *
  * PR #113 review carryovers (don't repeat):
- *   1. Allow-list: empty = allow all (legacy `slack.ts:976`).
+ *   1. Allow-list: empty = nobody unless `allowAllUsers` (src/allowlist.ts).
  *   2. Composite keying for pendingPermissions / pendingHumanAsks.
  *
  * Sprint 4.5+ TODOs at end of file.
  */
 
+import { type AllowlistState, isAllowedBy } from "../../allowlist";
 import type { BusCore, Subscription } from "../../bus/core";
 import {
   CHANNEL_DRIVEN_ORIGINS,
@@ -135,7 +136,8 @@ export class SlackAdapter {
   private readonly signingSecret: string;
   private readonly api: SlackApi;
   private readonly socket: SlackSocketLike | null;
-  private readonly allowedUserIds: ReadonlySet<string>;
+  /** Read on every inbound event so a settings reload applies (#520). */
+  private readonly allowlist: () => AllowlistState<string>;
   /** Issue #121 port of upstream PR #210: per-channel bot pass-through. */
   private readonly allowBots: ReadonlySet<string>;
   private readonly allowBotIds: ReadonlySet<string>;
@@ -205,7 +207,8 @@ export class SlackAdapter {
     this.signingSecret = opts.signingSecret;
     this.api = opts.api ?? createSlackApi(opts.token);
     this.socket = opts.socket ?? null;
-    this.allowedUserIds = new Set(opts.allowedUserIds);
+    const mounted = { allowedUserIds: opts.allowedUserIds, allowAllUsers: opts.allowAllUsers };
+    this.allowlist = opts.allowlist ?? (() => mounted);
     this.allowBots = new Set(opts.allowBots ?? []);
     this.allowBotIds = new Set(opts.allowBotIds ?? []);
     this.selfBotId = opts.selfBotId ?? null;
@@ -473,10 +476,10 @@ export class SlackAdapter {
     // Used for the `sendPrompt.user_id` tag.
     const userId = event.user ?? event.bot_profile?.name ?? event.username ?? event.bot_id ?? "";
 
-    // Allow-list — empty = allow all (legacy `slack.ts:976` semantics).
-    // Bot-allowed traffic bypasses this gate per upstream PR #210 — bots
-    // don't have a human userId to check.
-    if (!isBotAllowed && this.allowedUserIds.size > 0 && !this.allowedUserIds.has(userId)) {
+    // Allow-list (src/allowlist.ts): empty list = nobody unless
+    // `allowAllUsers`. Bot-allowed traffic bypasses this gate per upstream
+    // PR #210 — bots don't have a human userId to check.
+    if (!isBotAllowed && !isAllowedBy(this.allowlist(), userId)) {
       return;
     }
 
@@ -575,8 +578,8 @@ export class SlackAdapter {
     const userId = payload.user?.id;
     if (!userId) return;
 
-    // Allow-list — empty = allow all (legacy parity, `src/commands/slack.ts:1453`).
-    if (this.allowedUserIds.size > 0 && !this.allowedUserIds.has(userId)) {
+    // Allow-list — same rule as the message path (src/allowlist.ts).
+    if (!isAllowedBy(this.allowlist(), userId)) {
       return;
     }
 

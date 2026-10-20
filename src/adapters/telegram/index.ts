@@ -8,6 +8,7 @@
  */
 
 import type { BusCore, Subscription } from "../../bus/core";
+import { type AllowlistState, isAllowedBy } from "../../allowlist";
 import { openInboundReceipt } from "../../bus/receipt-wiring";
 import { getDefaultReceiptStore, type OpenReceipt, type ReceiptStore } from "../../bus/receipt";
 import {
@@ -18,10 +19,25 @@ import {
   isTailerOriginEvent,
   withSynthesizedNotice,
 } from "../../bus/types";
+import {
+  defaultOutboxPath,
+  getTelegramOutbox,
+  type OutboxChunk,
+  type TelegramOutbox,
+} from "../../telegram-outbox";
+import { quietHoldUntil, type QuietHoursState } from "../../quiet-hours";
 import { createTelegramApi } from "./api";
 import { extractReactionDirectives } from "./directives";
 import { markdownToTelegramHtml, isTelegramHtmlParseError } from "./format";
 import { buildPromptMetadata } from "./metadata";
+import {
+  ackForResolution,
+  decisionStripsKeyboard,
+  describeResolverFailure,
+  parseResolverVerdict,
+  redactResolverDiagnostics,
+  runPendingResolver,
+} from "./pending-resolver";
 import type {
   TelegramApi,
   TelegramCallbackQuery,
@@ -35,10 +51,18 @@ export interface TelegramAdapterOptions {
   /** Bot token (`123:abc…`). Used for the default HTTP API client. */
   token: string;
   /**
-   * Numeric user IDs allowed to talk to the bot. Empty list rejects all —
-   * explicit allow-listing is a precondition under the Bus runtime.
+   * Numeric user IDs allowed to talk to the bot. Empty list rejects all
+   * unless `allowAllUsers` is set — see `src/allowlist.ts`.
    */
   allowedUserIds: number[];
+  /** Accept every user regardless of `allowedUserIds`. Default false. */
+  allowAllUsers?: boolean;
+  /**
+   * Current allow-list, read on every inbound event so a settings reload
+   * applies without a restart (#520). Absent = `allowedUserIds` /
+   * `allowAllUsers` above, fixed at construction.
+   */
+  allowlist?: () => AllowlistState<number>;
   /** chat-id → agent_id routing. `defaultAgentId` covers fall-through. */
   routing: {
     chats: Record<string, string>;
@@ -63,6 +87,18 @@ export interface TelegramAdapterOptions {
   receiptStore?: ReceiptStore;
   /** Override the API client (tests inject a fake). */
   api?: TelegramApi;
+  /**
+   * Durable retry for lost proactive sends (final replies, operator alerts).
+   * Defaults to the process-wide outbox in the daemon's state dir when the
+   * real API client is used, and to none when `api` is injected, so tests
+   * never write to the working directory unless they pass one.
+   */
+  outbox?: TelegramOutbox | null;
+  /**
+   * Quiet hours (#512), read on every proactive send so a settings reload
+   * applies without a restart. Absent, or no windows = nothing is held.
+   */
+  quietHours?: () => QuietHoursState | undefined;
   /** Optional structured logger; defaults to `console`. */
   logger?: Pick<Console, "warn" | "info" | "error">;
 }
@@ -78,12 +114,26 @@ interface PendingPrompt {
   source_message_id: number;
   /** Optional forum-topic thread id, propagated to outbound sends. */
   message_thread_id?: number;
+  /**
+   * Sender of the inbound that set this entry. Re-checked against the live
+   * allow-list before chat-less output reuses the entry (#521).
+   */
+  user_id?: number;
 }
 
 /** In-flight `system.request_human` correlation; next chat reply answers it. */
 interface PendingHumanAsk {
   ask_id: string;
   agent_id: string;
+}
+
+/**
+ * #512: a reply to a scheduled turn (cron / heartbeat) is unprompted, so quiet
+ * hours hold it. Every other origin may be answering the user and is never held.
+ */
+function isProactiveReply(event: BusEvent): boolean {
+  const origin = (event.payload as { origin?: string } | undefined)?.origin;
+  return origin === "cron" || origin === "heartbeat";
 }
 
 /**
@@ -109,7 +159,9 @@ function eventBelongsToTelegram(event: BusEvent): boolean {
 export class TelegramAdapter {
   private readonly bus: BusCore;
   private readonly api: TelegramApi;
-  private readonly allowedUserIds: ReadonlySet<number>;
+  private readonly outbox: TelegramOutbox | null;
+  /** Read on every inbound event so a settings reload applies (#520). */
+  private readonly allowlist: () => AllowlistState<number>;
   private readonly routingChats: Record<string, string>;
   private readonly defaultAgentId: string | undefined;
   private readonly pollIntervalMs: number;
@@ -119,6 +171,7 @@ export class TelegramAdapter {
   private readonly receiptMaxBudgetMultiplier: number;
   private readonly receiptStore: ReceiptStore;
   private readonly logger: Pick<Console, "warn" | "info" | "error">;
+  private readonly quietHours: (() => QuietHoursState | undefined) | undefined;
 
   /** getUpdates offset cursor — bumped past the highest processed update_id. */
   private nextOffset = 0;
@@ -162,6 +215,10 @@ export class TelegramAdapter {
   >();
   /** Agents with a live turn message (placeholder/progress) the next reply edits in place. */
   private readonly turnActive = new Set<string>();
+  /** Text the agent put in the live turn message (progress / edit_message).
+   *  Absent while it is still the bare placeholder. A silent final keeps a
+   *  message that carries text and only deletes the bare placeholder. */
+  private readonly liveText = new Map<string, string>();
 
   /** Open per-message receipts (#211) keyed by convKey. Closed on the
    *  first final reply (`turn_observed`) or by timeout (`timeout`), so an
@@ -209,7 +266,19 @@ export class TelegramAdapter {
 
     this.bus = opts.bus;
     this.api = opts.api ?? createTelegramApi(opts.token);
-    this.allowedUserIds = new Set(opts.allowedUserIds);
+    const outboxSender = (chatId: number, chunk: OutboxChunk, threadId?: number) =>
+      this.sendOutboxChunk(chatId, chunk, threadId);
+    if (opts.outbox !== undefined) {
+      this.outbox = opts.outbox;
+      this.outbox?.setSender(outboxSender);
+    } else {
+      this.outbox = opts.api ? null : getTelegramOutbox(defaultOutboxPath(), outboxSender);
+    }
+    const mounted = { allowedUserIds: opts.allowedUserIds, allowAllUsers: opts.allowAllUsers };
+    this.allowlist = opts.allowlist ?? (() => mounted);
+    // #525: output held or queued for retry is re-checked when it drains, with
+    // the same live list as targetForAgent (#521) and the inbound gates (#520).
+    this.outbox?.setRecipientCheck((userId) => isAllowedBy(this.allowlist(), userId));
     this.routingChats = { ...opts.routing.chats };
     this.defaultAgentId = opts.routing.defaultAgentId;
     this.pollIntervalMs = opts.pollIntervalMs ?? 1000;
@@ -219,12 +288,16 @@ export class TelegramAdapter {
       opts.receiptMaxBudgetMultiplier ?? TelegramAdapter.DEFAULT_MAX_TURN_BUDGET_MULTIPLIER;
     this.receiptStore = opts.receiptStore ?? getDefaultReceiptStore();
     this.logger = opts.logger ?? console;
+    this.quietHours = opts.quietHours;
+    const quietHours = opts.quietHours;
+    if (quietHours) this.outbox?.setQuietHours((now) => quietHoldUntil(quietHours(), now));
   }
 
   async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
     this.generation += 1;
+    this.outbox?.start();
 
     // Subscribe for every routed agent + the default, so fallback-only
     // agents still receive `response.text`.
@@ -254,6 +327,7 @@ export class TelegramAdapter {
     if (!this.running) return;
     this.running = false;
     this.generation += 1; // signal the loop to exit on next iteration
+    this.outbox?.stop();
 
     // Abort the long-poll so stop() returns promptly (legacy waits 30s).
     if (this.inflightAbort) {
@@ -283,6 +357,7 @@ export class TelegramAdapter {
     this.pendingHumanAsks.clear();
     this.lastChatPerAgent.clear();
     this.lastBotMessage.clear();
+    this.liveText.clear();
     for (const id of Array.from(this.spinnerState.keys())) this.stopSpinner(id);
     this.turnActive.clear();
     // Receipt (#211): close any still-open receipts so their watchdog
@@ -355,16 +430,11 @@ export class TelegramAdapter {
     // Drop bot-to-bot echoes (legacy gating + spec allow-list semantics).
     if (message.from?.is_bot) return;
 
-    // Allow-list — telegram.ts:1131 semantics: empty list = "allow all"
-    // (preserved for default-config parity per PR #113 review); non-empty
-    // list with no match = named rejection in private chats / silent skip
-    // in group chats. The earlier "empty = deny all" behaviour was a
-    // silent regression for operators running default configs.
+    // Allow-list (src/allowlist.ts): empty list = nobody unless
+    // `allowAllUsers`; no match = named rejection in private chats / silent
+    // skip in group chats.
     const isPrivate = message.chat.type === "private";
-    if (
-      userId === undefined ||
-      (this.allowedUserIds.size > 0 && !this.allowedUserIds.has(userId))
-    ) {
+    if (!isAllowedBy(this.allowlist(), userId)) {
       if (isPrivate) {
         await this.safeSendMessage({
           chat_id: chatId,
@@ -433,6 +503,7 @@ export class TelegramAdapter {
       chat_id: chatId,
       source_message_id: message.message_id,
       message_thread_id: message.message_thread_id,
+      user_id: userId,
     };
     this.lastChatPerAgent.set(agentId, pending);
     this.lastTopicPerChat.set(chatId, message.message_thread_id);
@@ -460,6 +531,7 @@ export class TelegramAdapter {
           message_thread_id: message.message_thread_id,
         });
         this.turnActive.add(key);
+        this.liveText.delete(key);
         this.startSpinner(key, "...", chatId, id);
       }
     } catch (err) {
@@ -541,16 +613,31 @@ export class TelegramAdapter {
     // degrade to unformatted text, not vanish. Dropping it here would
     // contradict the no-silent-drop rule enforced just above.
     const send = { chat_id: target.chat_id, text, message_thread_id: target.message_thread_id };
-    await this.safe("sendMessage", async () => {
+    // #512: an alert is never a reply; quiet hours hold it, unless it is
+    // `critical` and the operator let critical alerts through, or the user is
+    // waiting on an answer in that chat (a stall alert about their own turn).
+    const urgent =
+      ((payload as { level?: string }).level === "critical" &&
+        this.quietHours?.()?.urgentBypass === true) ||
+      this.openReceipts.has(this.convKey(agentId, target.chat_id));
+    if (!urgent) {
+      if (this.holdForQuietHours(send, this.recipientOf(target))) return;
+      await this.outbox?.releaseHeld(send.chat_id);
+    }
+    try {
       try {
-        return await this.sendHtml(send);
+        await this.sendHtml(send);
       } catch (err) {
         // Only a malformed-HTML 400 warrants raw text; anything else (429,
-        // network, benign 400) rethrows to `safe`, which logs it.
+        // network, benign 400) rethrows to the outer catch.
         if (!isTelegramHtmlParseError(err)) throw err;
-        return await this.api.sendMessage(send);
+        await this.api.sendMessage(send);
       }
-    });
+    } catch (err) {
+      // Logged, then handed to the durable outbox instead of dropped.
+      this.logger.error("[telegram-adapter] sendMessage failed", err);
+      this.queueForRetry(send, err, !urgent, this.recipientOf(target));
+    }
   }
 
   private async handleResponseText(agentId: string, event: BusEvent): Promise<void> {
@@ -559,7 +646,11 @@ export class TelegramAdapter {
     // real delivery comes from the agent's `reply` tool (ingestReply),
     // which carries no tailer source marker. Delivering both double-posts.
     if (isTailerOriginEvent(event)) return;
-    const payload = event.payload as { text?: string };
+    const payload = event.payload as { text?: string; silent?: boolean };
+    if (payload?.silent === true) {
+      await this.closeSilentTurn(agentId, event);
+      return;
+    }
     const rawText = typeof payload?.text === "string" ? payload.text : "";
     if (rawText.length === 0) return;
 
@@ -575,13 +666,17 @@ export class TelegramAdapter {
 
     const intent = (event.payload as { intent?: string })?.intent;
     const isProgress = intent === "progress";
+    const key = this.convKey(agentId, target.chat_id);
+    // #512: a user waiting on an answer in this chat (open receipt) is awake;
+    // nothing for it is held. Also covers a late user reply whose origin slot a
+    // queued cron prompt already took over.
+    const proactive = isProactiveReply(event) && !this.openReceipts.has(key);
     const FRAMES = TelegramAdapter.SPINNER_FRAMES;
     // #240: a synthesized (silent-drop safety-net) final carries raw, uncurated
     // turn output — prefix the shared notice so it is not mistaken for a curated
     // reply. No-op for curated replies and empty text; only the non-progress
     // arms below use displayText, so progress frames are untouched.
     const displayText = withSynthesizedNotice(cleanedText, event.payload);
-    const key = this.convKey(agentId, target.chat_id);
     // Receipt timeout is INACTIVITY-based, not a wall-clock budget: any assistant
     // output for this turn — progress OR final — proves the turn is alive, so
     // rearm the timeout. A long, actively-working turn (subagents, tool calls)
@@ -601,11 +696,16 @@ export class TelegramAdapter {
     }
     if (cleanedText.length === 0) {
       // nothing textual; fall through to reactions.
+    } else if (!isProgress) {
+      await this.deliverFinal(key, target, displayText, proactive);
     } else if (this.turnActive.has(key)) {
-      // Live turn message exists (placeholder or earlier progress) — edit in place.
+      // Progress with a live turn message (placeholder or earlier progress) —
+      // edit in place. Edits never notify, which is what a progress update
+      // wants; the final goes out as a new message (see deliverFinal).
       const live = this.lastBotMessage.get(key);
       if (live) {
-        const editText = isProgress ? `${FRAMES[0]} ${cleanedText}` : displayText;
+        this.liveText.set(key, cleanedText);
+        const editText = `${FRAMES[0]} ${cleanedText}`;
         try {
           await this.editHtml({
             chat_id: live.chat_id,
@@ -625,23 +725,30 @@ export class TelegramAdapter {
             } catch (err2) {
               this.logger.error(`[telegram-adapter] turn edit failed`, err2);
             }
+          } else {
+            // A benign/non-format error (e.g. "message is not modified",
+            // "message to edit not found", 429) — leave the formatted message
+            // as is; do NOT resend raw markdown (that would downgrade it). Log
+            // it so a lost update is visible.
+            this.logger.warn(`[telegram-adapter] progress edit failed; message left as is`, err);
           }
-          // else: a benign/non-format error (e.g. "message is not modified",
-          // "message to edit not found", 429) — leave the formatted message as
-          // is; do NOT resend raw markdown (that would downgrade it).
         }
-        if (isProgress) {
+        // Restart the spinner only if this is still the live turn message. A
+        // final that landed while the edit above was in flight has already
+        // evicted it; restarting here would animate stale progress text.
+        if (
+          this.turnActive.has(key) &&
+          this.lastBotMessage.get(key)?.message_id === live.message_id
+        ) {
           this.startSpinner(key, cleanedText, live.chat_id, live.message_id);
-        } else {
-          // Final — turn done. Evict so a later unprompted reply (cron /
-          // heartbeat) doesn't edit this now-stale message id.
-          this.turnActive.delete(key);
-          this.lastBotMessage.delete(key);
         }
       }
+    } else if (proactive && this.outbox?.quietEndsAt() != null) {
+      // #512: progress of a scheduled turn inside quiet hours would notify;
+      // nothing is shown, and the turn's final is held for the window's end.
     } else {
-      // No live turn (unprompted reply / second final) — send fresh.
-      const sendText = isProgress ? `${FRAMES[0]} ${cleanedText}` : displayText;
+      // Progress with no live turn — send fresh and keep it for later edits.
+      const sendText = `${FRAMES[0]} ${cleanedText}`;
       try {
         let res: { ok: boolean; result?: { message_id: number } };
         try {
@@ -662,16 +769,14 @@ export class TelegramAdapter {
           });
         }
         const id = res?.ok && res.result ? res.result.message_id : null;
-        // Only retain the message for follow-up edits while a turn is live
-        // (progress). A fresh final reply needs no future edit, so leaving no
-        // entry avoids the stale-message_id edit bug.
-        if (id != null && isProgress) {
+        if (id != null) {
           this.lastBotMessage.set(key, {
             chat_id: target.chat_id,
             message_id: id,
             message_thread_id: target.message_thread_id,
           });
           this.turnActive.add(key);
+          this.liveText.set(key, cleanedText);
           this.startSpinner(key, cleanedText, target.chat_id, id);
         }
       } catch (err) {
@@ -689,6 +794,165 @@ export class TelegramAdapter {
           emoji,
         });
       }
+    }
+  }
+
+  /**
+   * Close a turn the bus ended with a silent final (the prompt was a bare
+   * acknowledgement or an answered repeat, so silence is the answer): stop the
+   * spinner, close the receipt as observed, and delete the placeholder. Nothing
+   * is sent to the chat. A live message the agent already wrote into
+   * (progress / edit_message) is its answer: it stays, without the spinner.
+   */
+  private async closeSilentTurn(agentId: string, event: BusEvent): Promise<void> {
+    const target = this.targetForOriginOrAgent(agentId, event);
+    if (!target) return;
+    const key = this.convKey(agentId, target.chat_id);
+    const spinning = this.spinnerState.has(key);
+    this.stopSpinner(key);
+    this.closeTelegramReceipt(key, "turn_observed", { silent: true });
+    const live = this.turnActive.has(key) ? this.lastBotMessage.get(key) : undefined;
+    const text = this.liveText.get(key);
+    this.turnActive.delete(key);
+    this.lastBotMessage.delete(key);
+    this.liveText.delete(key);
+    if (!live) return;
+    if (text !== undefined) {
+      if (!spinning) return;
+      try {
+        await this.editHtml({ chat_id: live.chat_id, message_id: live.message_id, text });
+      } catch (err) {
+        this.logger.warn(
+          `[telegram-adapter] could not clear the spinner from the turn message after a silent final; leaving it`,
+          err,
+        );
+      }
+      return;
+    }
+    try {
+      await this.api.deleteMessage({ chat_id: live.chat_id, message_id: live.message_id });
+    } catch (err) {
+      this.logger.warn(
+        `[telegram-adapter] could not delete the turn placeholder after a silent final; leaving it`,
+        err,
+      );
+    }
+  }
+
+  /**
+   * Deliver a turn-final reply as a NEW message, then clean up the turn's live
+   * placeholder/progress message.
+   *
+   * Editing the live message in place (the previous behaviour) never notifies:
+   * Telegram only pushes a notification for a new message, so a final that
+   * replaced a "working on it…" progress line reached the chat silently and the
+   * user never saw the answer. A non-format edit error was also swallowed, which
+   * lost the final with no log line.
+   *
+   * Order matters:
+   *   1. The live entry is evicted synchronously, before any await, so a
+   *      progress or edit_message handler whose edit is still in flight does
+   *      not restart the spinner on the old message once it settles (see the
+   *      guards in handleResponseText and handleResponseEditText). The spinner
+   *      itself is already stopped at the top of handleResponseText.
+   *   2. Send the final (HTML, plain-text fallback on a malformed-HTML 400 —
+   *      same contract as the fresh-send path).
+   *   3. Only once the final is out, delete the live message. A failed delete
+   *      is logged and the message left in place: cleanup must never cost the
+   *      final.
+   *   4. If the send itself fails, log it and fall back to editing the live
+   *      message (silent, but visible in the chat — better than nothing).
+   * Every failure branch on this path logs.
+   */
+  private async deliverFinal(
+    key: string,
+    target: PendingPrompt,
+    text: string,
+    proactive = false,
+  ): Promise<void> {
+    const live = this.turnActive.has(key) ? this.lastBotMessage.get(key) : undefined;
+    // Turn done — evict so a later unprompted reply (cron / heartbeat) or
+    // edit_message doesn't target this now-stale message id. A fresh final is
+    // never retained for follow-up edits (avoids the stale-message_id edit bug).
+    this.turnActive.delete(key);
+    this.lastBotMessage.delete(key);
+    this.liveText.delete(key);
+
+    const send = {
+      chat_id: target.chat_id,
+      text,
+      message_thread_id: target.message_thread_id,
+    };
+    // #512: a scheduled turn's final inside quiet hours waits for the window's
+    // end. A progress message left from before the window is removed, as after
+    // a delivered final (a delete never notifies).
+    if (proactive) {
+      if (this.holdForQuietHours(send, this.recipientOf(target))) {
+        if (live) await this.deleteLiveMessage(live);
+        return;
+      }
+      await this.outbox?.releaseHeld(send.chat_id);
+    }
+    let delivered = false;
+    let sendError: unknown;
+    try {
+      try {
+        await this.sendHtml(send);
+      } catch (err) {
+        // Only a malformed-HTML 400 warrants sending raw text; anything else
+        // (429 flood, network, benign 400) goes to the outer catch.
+        if (!isTelegramHtmlParseError(err)) throw err;
+        await this.api.sendMessage(send);
+      }
+      delivered = true;
+    } catch (err) {
+      sendError = err;
+      this.logger.error(
+        live
+          ? `[telegram-adapter] final sendMessage failed; falling back to editing the live turn message`
+          : `[telegram-adapter] sendMessage failed`,
+        err,
+      );
+    }
+
+    if (!live) {
+      // No live turn message to fall back on (cron / heartbeat reply, or a
+      // turn whose placeholder is gone): queue it for a later retry.
+      if (!delivered) this.queueForRetry(send, sendError, proactive, this.recipientOf(target));
+      return;
+    }
+    if (delivered) {
+      await this.deleteLiveMessage(live);
+      return;
+    }
+    try {
+      try {
+        await this.editHtml({ chat_id: live.chat_id, message_id: live.message_id, text });
+      } catch (err) {
+        if (!isTelegramHtmlParseError(err)) throw err;
+        await this.api.editMessageText({
+          chat_id: live.chat_id,
+          message_id: live.message_id,
+          text,
+        });
+      }
+    } catch (err) {
+      this.logger.error(
+        `[telegram-adapter] final reply lost: send and edit fallback both failed`,
+        err,
+      );
+      this.queueForRetry(send, sendError ?? err, proactive, this.recipientOf(target));
+    }
+  }
+
+  private async deleteLiveMessage(live: { chat_id: number; message_id: number }): Promise<void> {
+    try {
+      await this.api.deleteMessage({ chat_id: live.chat_id, message_id: live.message_id });
+    } catch (err) {
+      this.logger.warn(
+        `[telegram-adapter] could not delete the turn placeholder after the final reply; leaving it`,
+        err,
+      );
     }
   }
 
@@ -746,6 +1010,7 @@ export class TelegramAdapter {
     // Edit the live message; keep animating if a spinner was running.
     const wasSpinning = this.spinnerState.has(key);
     this.stopSpinner(key);
+    this.liveText.set(key, newText);
     const sendText = wasSpinning ? `${FRAMES[0]} ${newText}` : newText;
     try {
       try {
@@ -764,9 +1029,15 @@ export class TelegramAdapter {
             message_id: last.message_id,
             text: sendText,
           });
+        } else {
+          // Same contract as the progress path: leave the formatted message
+          // as is, but log it so a lost update is visible.
+          this.logger.warn(`[telegram-adapter] edit_message edit failed; message left as is`, err);
         }
       }
-      if (wasSpinning) {
+      // Same guard as the progress path: a final that landed while this edit
+      // was in flight has evicted (and deleted) the message; do not animate it.
+      if (wasSpinning && this.lastBotMessage.get(key)?.message_id === last.message_id) {
         this.startSpinner(key, newText, last.chat_id, last.message_id);
       }
     } catch (err) {
@@ -851,7 +1122,7 @@ export class TelegramAdapter {
     // A new prompt arrived before the previous turn replied — close the
     // stale receipt as `timeout` (note `superseded`) so it doesn't leak,
     // distinct from a genuine no-reply timeout.
-    this.closeTelegramReceipt(key, "timeout", { superseded: true });
+    this.closeTelegramReceipt(key, "timeout", { superseded: true, reason: "superseded" });
     const receipt = openInboundReceipt({
       store: this.receiptStore,
       messageId: `tg-${updateId}`,
@@ -998,20 +1269,32 @@ export class TelegramAdapter {
   }
 
   /**
-   * Handle `perm:<allow|deny>:<id>` (the only pattern this adapter emits).
-   * Legacy file's `btn:`, `pending:`, `sec_yes_` patterns are out of scope.
+   * Handle the two button shapes that reach a Bus deployment:
+   * `perm:<allow|deny>:<id>` (emitted by this adapter) and
+   * `pending:<id>:<value>` (emitted by the operator's `pending.py`, the same
+   * contract the legacy path honours). Any other shape is acked and dropped.
    */
   private async handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> {
     const data = query.data ?? "";
     const userId = query.from?.id;
-    // Allow-list — empty = "allow all" (legacy parity, PR #113 review).
-    if (
-      userId === undefined ||
-      (this.allowedUserIds.size > 0 && !this.allowedUserIds.has(userId))
-    ) {
+    // Allow-list — same rule as the message path (src/allowlist.ts).
+    if (!isAllowedBy(this.allowlist(), userId)) {
       await this.safeAnswerCallback({
         callback_query_id: query.id,
         text: "Unauthorized.",
+      });
+      return;
+    }
+
+    const pendingMatch = data.match(/^pending:(\d+):(.+)$/);
+    if (pendingMatch) {
+      const [, pendingId = "", pendingValue = ""] = pendingMatch;
+      // Not awaited: the resolver is a subprocess with a 5 s budget that may
+      // itself call the Bot API. Awaiting it here would pin the poll loop —
+      // every other update in the batch, and every later tap, would queue
+      // behind it. The legacy path fires and forgets too.
+      void this.handlePendingCallback(query, pendingId, pendingValue).catch((err) => {
+        this.logger.error("[telegram-adapter] pending callback failed", err);
       });
       return;
     }
@@ -1049,6 +1332,69 @@ export class TelegramAdapter {
       callback_query_id: query.id,
       text: behavior === "allow" ? "✅ Allowed" : "❌ Denied",
     });
+  }
+
+  /**
+   * A `pending:<id>:<value>` tap. The verdict comes from the operator's
+   * resolver; the ack and the message edit follow it. Mirrors the legacy path
+   * (`commands/telegram.ts`) so a deployment that moved to the Bus keeps its
+   * pending-action buttons working — before this, every tap was acked and
+   * silently dropped, and the operator's queue never saw a decision.
+   */
+  private async handlePendingCallback(
+    query: TelegramCallbackQuery,
+    actionId: string,
+    decision: string,
+  ): Promise<void> {
+    const pendingLibPath = process.env.CLAUDECLAW_PENDING_LIB_PATH;
+    if (!pendingLibPath) {
+      this.logger.warn(
+        "[Telegram] CLAUDECLAW_PENDING_LIB_PATH not set; cannot resolve pending action. " +
+          "Set it to the directory containing pending.py (e.g. export CLAUDECLAW_PENDING_LIB_PATH=/path/to/agent/lib).",
+      );
+      await this.safeAnswerCallback({
+        callback_query_id: query.id,
+        text: "⚠️ Pending action handler not configured",
+      });
+      return;
+    }
+
+    const result = await runPendingResolver(pendingLibPath, actionId, decision);
+    const { verdict } = parseResolverVerdict(result.stdout);
+    const ackText = ackForResolution(result.stdout, decision);
+    if (verdict === "no_answer") {
+      // No verdict: the ack cannot say whether the decision was applied, so
+      // the operator needs the reason it failed.
+      const how = describeResolverFailure(result);
+      const why = redactResolverDiagnostics(result.stderr).trim().slice(0, 200) || "no stderr";
+      this.logger.warn(
+        `[Telegram] pending resolver reported no verdict for action ${actionId} (${how}): ${why}`,
+      );
+    }
+
+    // Record the decision on the message — but only once the action is no
+    // longer waiting on the operator (#375). Editing strips the keyboard: an
+    // ack that asks the user to retry must not delete the buttons it points
+    // them at, and neither must `details` (the action stays pending) or `skip`
+    // (the resolver re-sent its own keyboard).
+    // Acknowledge first: the tap shows a spinner in the client until the
+    // callback query is answered, and the edit below is an unbounded fetch —
+    // a slow one would hold the spinner until Telegram times the query out.
+    // The edit is a best-effort follow-up (CodeRabbit on the PR).
+    await this.safeAnswerCallback({ callback_query_id: query.id, text: ackText });
+
+    const message = query.message;
+    if (message && decisionStripsKeyboard(verdict, decision)) {
+      const originalText = message.text ?? "";
+      await this.safe("editMessageText", () =>
+        this.api.editMessageText({
+          chat_id: message.chat.id,
+          message_id: message.message_id,
+          text: `${originalText}\n\n› ${ackText}`,
+          reply_markup: { inline_keyboard: [] },
+        }),
+      );
+    }
   }
 
   private resolveAgent(chatId: number): string | undefined {
@@ -1119,10 +1465,26 @@ export class TelegramAdapter {
    * which prefers `origin_id` over this fan-out cache, so two chats
    * routed to the same agent no longer cross-wire on interleaved
    * prompts.
+   *
+   * #521: the cached last chat is only reused while the user who set it is
+   * still allowed by the live allow-list. A user removed from
+   * `telegram.allowedUserIds` (or an `allowAllUsers` switched off) would
+   * otherwise keep reading cron / heartbeat / alert output until someone
+   * else wrote. The entry is dropped and routing falls back to the
+   * configured chats. In a group the entry is dropped the same way: the
+   * group was only targeted because that user wrote there, while a group
+   * the operator maps in `routing.chats` is still reached below.
    */
   private targetForAgent(agentId: string): PendingPrompt | null {
     const last = this.lastChatPerAgent.get(agentId);
-    if (last) return last;
+    if (last) {
+      if (isAllowedBy(this.allowlist(), last.user_id)) return last;
+      this.lastChatPerAgent.delete(agentId);
+      this.logger.warn(
+        `[telegram-adapter] dropped last chat ${last.chat_id} of agent ${agentId}: ` +
+          `user ${last.user_id} is no longer in telegram.allowedUserIds`,
+      );
+    }
     for (const [chatIdStr, mappedAgent] of Object.entries(this.routingChats)) {
       if (mappedAgent === agentId) {
         const chatId = Number(chatIdStr);
@@ -1132,6 +1494,79 @@ export class TelegramAdapter {
       }
     }
     return null;
+  }
+
+  /**
+   * #525: the user a queued message to `target` is re-checked against when it
+   * drains: the sender of the cached last chat, unless that chat is listed in
+   * `routing.chats` — configuration, which keeps receiving after its last
+   * writer is removed, as in {@link targetForAgent} (#542). Origin-bound
+   * targets carry no `user_id`.
+   */
+  private recipientOf(target: PendingPrompt): number | undefined {
+    return Object.hasOwn(this.routingChats, String(target.chat_id)) ? undefined : target.user_id;
+  }
+
+  /**
+   * Hand a message whose send failed to the durable outbox (if any), so it is
+   * retried with backoff instead of dropped. The first attempt already ran.
+   *
+   * `userId` comes from {@link recipientOf}; the drain re-checks it (#525).
+   * Configured chats and origin-bound replies carry none and drain as before.
+   */
+  private queueForRetry(
+    send: { chat_id: number; text: string; message_thread_id?: number },
+    err: unknown,
+    proactive = false,
+    userId?: number,
+  ): void {
+    if (!this.outbox) return;
+    this.outbox.enqueueFailed(this.outboxMessage(send, userId), err, { proactive });
+  }
+
+  /**
+   * #512: hold an unprompted message in the outbox while a quiet window is
+   * open. True when held; false when not quiet (or no outbox), send it now.
+   * `userId` as in {@link queueForRetry}.
+   */
+  private holdForQuietHours(
+    send: { chat_id: number; text: string; message_thread_id?: number },
+    userId?: number,
+  ): boolean {
+    return this.outbox?.hold(this.outboxMessage(send, userId)) ?? false;
+  }
+
+  private outboxMessage(
+    send: { chat_id: number; text: string; message_thread_id?: number },
+    userId?: number,
+  ) {
+    return {
+      chatId: send.chat_id,
+      threadId: send.message_thread_id,
+      ...(userId !== undefined ? { userId } : {}),
+      chunks: [
+        { text: markdownToTelegramHtml(send.text), parseMode: "HTML" as const, plain: send.text },
+      ],
+    };
+  }
+
+  /** Outbox sender: one chunk as HTML, raw text on a malformed-HTML 400. */
+  private async sendOutboxChunk(
+    chatId: number,
+    chunk: OutboxChunk,
+    threadId?: number,
+  ): Promise<void> {
+    const base = { chat_id: chatId, message_thread_id: threadId };
+    if (chunk.parseMode !== "HTML") {
+      await this.api.sendMessage({ ...base, text: chunk.text });
+      return;
+    }
+    try {
+      await this.api.sendMessage({ ...base, text: chunk.text, parse_mode: "HTML" });
+    } catch (err) {
+      if (!isTelegramHtmlParseError(err) || chunk.plain === undefined) throw err;
+      await this.api.sendMessage({ ...base, text: chunk.plain });
+    }
   }
 
   /** Best-effort API call — any throw is logged, never propagated. */
@@ -1153,8 +1588,9 @@ export class TelegramAdapter {
    * underlying API promise unwrapped, so `await this.sendHtml(x)` settles in
    * exactly one microtask hop — identical to `await this.api.sendMessage(x)`.
    * An extra hop would defer the caller's post-send bookkeeping (`turnActive` /
-   * `lastBotMessage`) past a back-to-back follow-up event, making a final reply
-   * fresh-send instead of editing the live message in place (regresses #141).
+   * `lastBotMessage`) past a back-to-back follow-up event, making a follow-up
+   * progress reply fresh-send instead of editing the live message in place, and
+   * a final miss the live message it should clean up (regresses #141).
    * The plain-text fallback for malformed-markup 400s lives in each caller's
    * `catch` (error path only, so it never affects success-path timing).
    */

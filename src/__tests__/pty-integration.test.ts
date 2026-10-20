@@ -61,11 +61,13 @@ import {
 import { createThreadSession, removeThreadSession } from "../sessionManager";
 import { readdir } from "fs/promises";
 import { homedir } from "os";
+import { encodeCwdForProjectsDir } from "../bus/jsonl-line-types";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Environment & guards.
 
-const REAL_CLAUDE = process.env.CLAUDECLAW_PTY_INTEGRATION_TESTS === "1";
+// #304: the real-`claude` tests that used to be gated here on
+// CLAUDECLAW_PTY_INTEGRATION_TESTS now live in tests/integration/ (nightly job).
 // Per-turn timeout passed to runTurn. Real Claude can take 30-60s for a cold
 // turn (model warmup, MCP attach, tool resolution); 120s is the operator
 // default in settings.timeouts.* too.
@@ -245,11 +247,11 @@ afterAll(async () => {
   }
 });
 
-// Slugify the cwd the same way Claude Code does for its JSONL directory.
-// Claude Code replaces both '/' and '.' with '-' to build the project dir
-// name under ~/.claude/projects/.
+// Slugify the cwd the same way Claude Code does for its JSONL directory —
+// through the one encoder production uses (#368), so this helper cannot pass
+// while production resolves to a directory that does not exist.
 function cwdSlug(cwd: string): string {
-  return cwd.replace(/[/.]/g, "-");
+  return encodeCwdForProjectsDir(cwd);
 }
 
 // Discover the session UUID Claude allocated for the current cwd. Returns the
@@ -282,41 +284,6 @@ async function discoverLatestClaudeSession(cwd: string): Promise<string | null> 
 // therefore the empty string (which the supervisor surfaces as `undefined`).
 // We assert the shape without requiring a non-empty sessionId.
 // (Resume-after-kill is tested below by discovering the sessionId from disk.)
-
-describe("PTY integration — real Claude happy path", () => {
-  test.skipIf(!REAL_CLAUDE)(
-    "single prompt against a fresh thread returns valid result shape",
-    async () => {
-      const threadId = `it-happy-${Date.now()}`;
-      try {
-        const result = await runOnPty(
-          `thread:${threadId}`,
-          "Reply with exactly the word ACK and nothing else.",
-          {
-            timeoutMs: TURN_TIMEOUT_MS,
-            threadId,
-          },
-        );
-
-        // Shape assertions match RunOnPtyResult in SPEC §3.2.
-        expect(typeof result.rawStdout).toBe("string");
-        expect(typeof result.stderr).toBe("string");
-        expect(typeof result.exitCode).toBe("number");
-        // Real-PTY runs return exitCode 0 on success.
-        expect(result.exitCode).toBe(0);
-        expect(result.stderr).toBe("");
-        // rawStdout is the parsed assistant response.
-        expect(result.rawStdout.length).toBeGreaterThan(0);
-        // sessionId field exists (may be string or undefined).
-        const sid = result.sessionId;
-        expect(sid === undefined || typeof sid === "string").toBe(true);
-      } finally {
-        await removeThreadSession(threadId).catch(() => {});
-      }
-    },
-    TEST_TIMEOUT_MS,
-  );
-});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test case 2 — Resume after kill (synthetic + real-claude smoke).
@@ -407,97 +374,8 @@ describe("PTY integration — resume after kill (synthetic)", () => {
 // which is the same shape the supervisor would produce after the
 // scrape-session-id fix lands per OR-6).
 
-describe("PTY integration — real Claude resume smoke", () => {
-  test.skipIf(!REAL_CLAUDE)(
-    "real claude PTY survives shutdown and respawns with a stored sessionId",
-    async () => {
-      const threadId = `real-resume-${Date.now()}`;
-      const cwd = process.cwd();
-      try {
-        // Turn 1 — let Claude allocate its own session.
-        const r1 = await runOnPty(`thread:${threadId}`, "say hello", {
-          timeoutMs: TURN_TIMEOUT_MS,
-          threadId,
-        });
-        expect(r1.exitCode).toBe(0);
-
-        // Discover whichever session UUID Claude allocated for this cwd.
-        // In a shared worktree the latest JSONL may not be ours, but it's
-        // guaranteed to exist (claude wrote one) and to be valid for --resume.
-        const someSessionId = await discoverLatestClaudeSession(cwd);
-        if (!someSessionId) {
-          throw new Error(`No JSONL session found under ~/.claude/projects/${cwdSlug(cwd)}/`);
-        }
-        await createThreadSession(threadId, someSessionId);
-
-        await shutdownSupervisor();
-        __resetSupervisorForTests();
-        injectEnsureAgentDir(async (name: string) => join(TEST_PROJECT_DIR, "agents", name));
-
-        // Turn 2 — supervisor must spawn with --resume <someSessionId>. We
-        // can't assert on Claude's actual response (the session content is
-        // shared/uncontrolled), but the supervisor's contract holds if the
-        // spawn succeeds and returns a non-error result.
-        const r2 = await runOnPty(`thread:${threadId}`, "echo READY", {
-          timeoutMs: TURN_TIMEOUT_MS,
-          threadId,
-        });
-        expect(r2.exitCode).toBe(0);
-        expect(r2.sessionId).toBe(someSessionId);
-      } finally {
-        await removeThreadSession(threadId).catch(() => {});
-      }
-    },
-    TEST_TIMEOUT_MS,
-  );
-});
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Test case 3 — Concurrency: three independent PTYs, no interleaving.
-
-describe("PTY integration — concurrent isolation", () => {
-  test.skipIf(!REAL_CLAUDE)(
-    "three concurrent runOnPty calls produce isolated, non-interleaved responses",
-    async () => {
-      const threads = [
-        { id: `it-conc-A-${Date.now()}`, secret: "ALPHA-111" },
-        { id: `it-conc-B-${Date.now()}`, secret: "BRAVO-222" },
-        { id: `it-conc-C-${Date.now()}`, secret: "CHARLIE-333" },
-      ];
-      try {
-        const promises = threads.map(({ id, secret }) =>
-          runOnPty(`thread:${id}`, `Reply with exactly this token and nothing else: ${secret}`, {
-            timeoutMs: TURN_TIMEOUT_MS,
-            threadId: id,
-          }),
-        );
-        const results = await Promise.all(promises);
-
-        // Each result must contain its own secret and not any other thread's.
-        for (let i = 0; i < threads.length; i++) {
-          const { secret } = threads[i]!;
-          const others = threads.filter((_, j) => j !== i).map((t) => t.secret);
-          expect(results[i]!.exitCode).toBe(0);
-          expect(results[i]!.rawStdout).toContain(secret);
-          for (const other of others) {
-            expect(results[i]!.rawStdout).not.toContain(other);
-          }
-        }
-        // Each thread got its own PTY entry.
-        const snapshot = snapshotSupervisor();
-        const adhocKeys = snapshot.ptys
-          .filter((p) => p.sessionKey.startsWith("thread:it-conc-"))
-          .map((p) => p.sessionKey);
-        expect(adhocKeys.length).toBe(3);
-      } finally {
-        for (const { id } of threads) {
-          await removeThreadSession(id).catch(() => {});
-        }
-      }
-    },
-    TEST_TIMEOUT_MS,
-  );
-});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test case 4 — Synthetic crash + retry.
@@ -768,59 +646,6 @@ describe("PTY integration — idle reap and respawn", () => {
 // We assert: (1) the response text contains the model's reply and NOT the
 // sentinel string itself, (2) a second turn in the same PTY also completes
 // — proving cleanup left the prompt buffer in a usable state.
-
-describe("PTY integration — sentinel-echo turn detection (real claude)", () => {
-  test.skipIf(!REAL_CLAUDE)(
-    "first turn parses cleanly and the sentinel does not leak into the response",
-    async () => {
-      const threadId = `it-sentinel-${Date.now()}`;
-      try {
-        const r = await runOnPty(`thread:${threadId}`, "Reply with exactly the single word: pong", {
-          timeoutMs: TURN_TIMEOUT_MS,
-          threadId,
-        });
-        expect(r.exitCode).toBe(0);
-        expect(r.rawStdout.length).toBeGreaterThan(0);
-        // The sentinel string is an implementation detail; the operator must
-        // NEVER see it in the response.
-        expect(r.rawStdout).not.toContain("<<<CCAW_TURN_END_");
-        // The model's response should appear.
-        expect(r.rawStdout.toLowerCase()).toContain("pong");
-      } finally {
-        await removeThreadSession(threadId).catch(() => {});
-      }
-    },
-    TEST_TIMEOUT_MS,
-  );
-
-  test.skipIf(!REAL_CLAUDE)(
-    "two sequential turns on the same PTY both succeed (sentinel cleanup works)",
-    async () => {
-      const threadId = `it-sentinel-multi-${Date.now()}`;
-      try {
-        const r1 = await runOnPty(`thread:${threadId}`, "Reply with the single word: alpha", {
-          timeoutMs: TURN_TIMEOUT_MS,
-          threadId,
-        });
-        expect(r1.exitCode).toBe(0);
-        expect(r1.rawStdout.toLowerCase()).toContain("alpha");
-
-        const r2 = await runOnPty(`thread:${threadId}`, "Reply with the single word: bravo", {
-          timeoutMs: TURN_TIMEOUT_MS,
-          threadId,
-        });
-        expect(r2.exitCode).toBe(0);
-        expect(r2.rawStdout.toLowerCase()).toContain("bravo");
-        // Each response must not contain the other prompt's keyword echoed
-        // back, proving cleanup cleared the input buffer between turns.
-        expect(r2.rawStdout.toLowerCase()).not.toContain("alpha");
-      } finally {
-        await removeThreadSession(threadId).catch(() => {});
-      }
-    },
-    TEST_TIMEOUT_MS,
-  );
-});
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test case 6 — Backward compat: runOnPty contract under enabled=false.

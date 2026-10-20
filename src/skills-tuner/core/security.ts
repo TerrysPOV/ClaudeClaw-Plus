@@ -8,11 +8,19 @@ import {
   appendFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import type { Proposal, UnsignedProposal } from "./types.js";
 
 export const SECRET_PATH = join(homedir(), ".config", "tuner", ".secret");
 export const AUDIT_PATH = join(homedir(), ".config", "tuner", "audit.jsonl");
+
+/** Audit file `auditLog()` appends to. `TUNER_AUDIT_PATH` overrides `AUDIT_PATH`
+ *  — read on each call, so the test preload (#474) keeps every `bun test` run
+ *  off the operator's live file. */
+export function auditPath(): string {
+  const override = process.env.TUNER_AUDIT_PATH;
+  return override ? resolve(override) : AUDIT_PATH;
+}
 
 export function initSecret(): void {
   mkdirSync(dirname(SECRET_PATH), { recursive: true });
@@ -78,7 +86,8 @@ export function sanitizeObservationContent(text: string, maxLength = 10_000): st
 }
 
 export function auditLog(event: string, payload: Record<string, unknown>): void {
-  mkdirSync(dirname(AUDIT_PATH), { recursive: true });
+  const path = auditPath();
+  mkdirSync(dirname(path), { recursive: true });
   const entry = { ts: new Date().toISOString(), event, ...payload };
-  appendFileSync(AUDIT_PATH, JSON.stringify(entry) + "\n");
+  appendFileSync(path, JSON.stringify(entry) + "\n");
 }

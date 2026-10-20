@@ -162,7 +162,16 @@ export function createMcpReconciler(
     deps.log("reconcile-restart", { agent: agentId, attempt: attemptNo, reason });
     Promise.resolve(deps.restart(agentId))
       .then(() => {
-        deps.log("reconcile-restart-ok", { agent: agentId, attempt: attemptNo });
+        // Issue #393: `restart()` resolving means the process was respawned,
+        // not that its plus-bus MCP server reconnected — that is only known
+        // when the next `sendPrompt` succeeds, or the next one fails and
+        // re-arms this reconciler. Say which state this is (#390 read six of
+        // these as six successful reconnects).
+        deps.log("reconcile-restart-ok", {
+          agent: agentId,
+          attempt: attemptNo,
+          mcp: "pending — restarted, connection not yet confirmed",
+        });
       })
       .catch((err) => {
         deps.log("reconcile-restart-failed", { agent: agentId, err: String(err) });

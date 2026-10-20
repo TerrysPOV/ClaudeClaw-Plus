@@ -23,7 +23,7 @@ import type { RiskTier, TunableSubject } from "../../skills-tuner/core/interface
 import type { DateRange, Metric, TelemetryProvider } from "../../skills-tuner/core/telemetry.js";
 import { isMetricActive } from "../../skills-tuner/core/fitness.js";
 import {
-  decideVerdict,
+  decideVerdictDetailed,
   guardrailMetricsFor,
   type MetricDelta,
   type Verdict,
@@ -211,32 +211,64 @@ export class OutcomeRecorder {
           }
           continue;
         }
-        const delta = post - (row.baseline ?? 0);
         postByMetric.set(row.metric, post);
-        // delta finalized below alongside verdict, but persist post/delta now
-        // so a crash mid-pass still leaves the measured post recorded.
-        this.db.finalizeOutcome({
-          proposal_id: proposalId,
-          metric: row.metric,
-          post,
-          delta,
-          verdict: "neutral",
-        });
       }
+      // Persist post/delta before the verdict so a crash mid-pass still leaves
+      // the measured posts recorded. Called only once the pass is going to
+      // decide (or give up on) a target: a row finalized here leaves the
+      // pending set.
+      const persistPosts = (): void => {
+        for (const row of rows) {
+          const post = postByMetric.get(row.metric);
+          if (post === undefined) continue;
+          this.db.finalizeOutcome({
+            proposal_id: proposalId,
+            metric: row.metric,
+            post,
+            delta: post - (row.baseline ?? 0),
+            verdict: "neutral",
+          });
+        }
+      };
 
       // Pick the TARGET metric explicitly (by role/guardrail relationship), not
       // by declaration order — a subject that declares a guardrail first must
       // not have it treated as the target.
       const target = this.selectTarget(declared, postByMetric);
-      if (!target) continue;
+      if (!target) {
+        // Only non-target rows matured. While the target's own row is still
+        // pending (longer window, or unmeasurable inside its grace period), keep
+        // them pending too, so the target is judged WITH its guardrails later.
+        const intended = this.selectTarget(declared, new Map(declared.map((m) => [m.name, 0])));
+        const targetPending =
+          intended !== undefined &&
+          this.db
+            .getOutcomes(proposalId)
+            .some((r) => r.metric === intended.name && r.verdict === null);
+        if (targetPending) continue;
+        // No target will ever mature for this proposal: record what was
+        // measured and say so once, instead of dropping it silently.
+        persistPosts();
+        if (postByMetric.size > 0) {
+          this.audit.append({
+            event: "verdict",
+            subject: subjectName,
+            proposal_id: proposalId,
+            detail: { verdict: "neutral", reason: "no_target", metrics: [...postByMetric.keys()] },
+          });
+        }
+        continue;
+      }
+      persistPosts();
       const guardrailDeltas = guardrailMetricsFor(target, declared)
         .filter((g) => postByMetric.has(g.name))
         .map((g) => this.toDelta(g, rows, postByMetric, counts));
-      const verdict = decideVerdict(
+      const decision = decideVerdictDetailed(
         this.toDelta(target, rows, postByMetric, counts),
         guardrailDeltas,
         { minSamples: this.minSamples },
       );
+      const verdict = decision.verdict;
 
       // Persist final verdict on the target row.
       const targetRow = rows.find((r) => r.metric === target.name)!;
@@ -260,9 +292,11 @@ export class OutcomeRecorder {
         ...(targetRow.commit_sha ? { commit_sha: targetRow.commit_sha } : {}),
         detail: {
           verdict,
+          reason: decision.reason,
           baseline: targetRow.baseline,
           post: postByMetric.get(target.name),
           guardrails: target.guardrails ?? [],
+          regressed_guardrails: decision.regressedGuardrails,
           risk_tier: subject.risk_tier,
         },
       });
@@ -308,20 +342,21 @@ export class OutcomeRecorder {
    *  1. a metric flagged `isTarget` (the fitness declaration's explicit target)
    *  2. else a metric that declares guardrails (the target-with-companions shape)
    *  3. else a matured metric that is nobody's guardrail (a bare target)
-   *  4. else the first matured metric (last-resort fallback)
    * Only metrics that actually matured (present in `postByMetric`) are eligible.
+   * A guardrail is never the target: when only guardrails matured this pass (the
+   * target has a longer window, or could not be measured), there is no verdict.
+   * Likewise when the declared `isTarget` metric has not matured yet.
    */
   private selectTarget(declared: Metric[], postByMetric: Map<string, number>): Metric | undefined {
+    const flaggedDeclared = declared.find((m) => (m as FitnessMetric).isTarget === true);
+    if (flaggedDeclared)
+      return postByMetric.has(flaggedDeclared.name) ? flaggedDeclared : undefined;
     const matured = declared.filter((m) => postByMetric.has(m.name));
     if (matured.length === 0) return undefined;
-    const flagged = matured.find((m) => (m as FitnessMetric).isTarget === true);
-    if (flagged) return flagged;
     const declaresGuardrails = matured.find((m) => (m.guardrails?.length ?? 0) > 0);
     if (declaresGuardrails) return declaresGuardrails;
     const guardNames = new Set(declared.flatMap((m) => m.guardrails ?? []));
-    const nonGuard = matured.find((m) => !guardNames.has(m.name));
-    if (nonGuard) return nonGuard;
-    return matured[0];
+    return matured.find((m) => !guardNames.has(m.name));
   }
 
   /**

@@ -14,7 +14,12 @@
  */
 
 import { describe, it, expect } from "bun:test";
-import { wireBusAdapters, stopBusAdapters, configuredBusAdapterNames } from "../adapter-wiring";
+import {
+  wireBusAdapters,
+  stopBusAdapters,
+  configuredBusAdapterNames,
+  resolveWebUiToken,
+} from "../adapter-wiring";
 import type { BusCore } from "../core";
 import type { Settings } from "../../config";
 
@@ -278,6 +283,80 @@ describe("wireBusAdapters — Telegram explicit-busRouting send-only pass-throug
   });
 });
 
+describe("wireBusAdapters — allow-list follows liveSettings (#520)", () => {
+  it("a user removed from telegram.allowedUserIds after mount is refused on the next event", async () => {
+    // Real TelegramAdapter behind the wiring; fetch answers the Bot API. One
+    // permission tap from user 42 is served once the list has been edited.
+    // Removed => "Unauthorized."; still on the mount-time list => the adapter
+    // looks the request up and answers "expired" instead.
+    let serve = false;
+    const answers: string[] = [];
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : String((input as { url?: string }).url);
+      const method = url.split("/").pop() ?? "";
+      const ok = (result: unknown) =>
+        new Response(JSON.stringify({ ok: true, result }), {
+          headers: { "content-type": "application/json" },
+        });
+      if (method === "getUpdates") {
+        if (!serve) {
+          await new Promise((r) => setTimeout(r, 5));
+          return ok([]);
+        }
+        serve = false;
+        return ok([
+          { update_id: 1, callback_query: { id: "cb", from: { id: 42 }, data: "perm:allow:x" } },
+        ]);
+      }
+      if (method === "answerCallbackQuery") {
+        answers.push(String(JSON.parse(String(init?.body ?? "{}")).text ?? ""));
+      }
+      return ok(true);
+    }) as unknown as typeof fetch;
+    const mounted = baseSettings({
+      telegram: {
+        token: "123:abc",
+        allowedUserIds: [42],
+        listenChats: [],
+        receiveEnabled: true,
+        dmIsolation: "shared",
+        busRouting: { chats: { "100": "triage" } },
+      } as Settings["telegram"],
+    });
+    let current = mounted;
+    const bus = {
+      subscribe: () => ({
+        id: "sub",
+        close() {},
+        overflowCount: 0,
+        depth: 0,
+      }),
+    } as unknown as BusCore;
+    try {
+      const result = await wireBusAdapters({
+        bus,
+        settings: mounted,
+        liveSettings: () => current,
+        logger: SILENT_LOGGER,
+      });
+      const tg = result.adapters.find((a) => a.name === "telegram");
+      expect(tg).toBeDefined();
+      // What the 30 s hot-reload does: a new settings object replaces the old.
+      current = { ...mounted, telegram: { ...mounted.telegram, allowedUserIds: [] } };
+      serve = true;
+      const deadline = Date.now() + 2000;
+      while (answers.length === 0 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      await tg?.stop();
+      expect(answers).toEqual(["Unauthorized."]);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});
+
 describe("configuredBusAdapterNames — Telegram token-only mount (#197)", () => {
   const tgSettings = (token: string, busRouting?: { chats: Record<string, string> }) =>
     baseSettings({
@@ -374,5 +453,22 @@ describe("stopBusAdapters", () => {
 
   it("empty list is a no-op", async () => {
     await stopBusAdapters([], SILENT_LOGGER);
+  });
+});
+
+describe("resolveWebUiToken", () => {
+  it("falls back to CCAW_WEBUI_TOKEN when web.bus.token is unset", () => {
+    expect(resolveWebUiToken({}, { CCAW_WEBUI_TOKEN: " from-env " })).toBe("from-env");
+  });
+
+  it("prefers web.bus.token over the env", () => {
+    expect(resolveWebUiToken({ token: "from-settings" }, { CCAW_WEBUI_TOKEN: "from-env" })).toBe(
+      "from-settings",
+    );
+  });
+
+  it("stays undefined when neither is set", () => {
+    expect(resolveWebUiToken({}, {})).toBeUndefined();
+    expect(resolveWebUiToken({}, { CCAW_WEBUI_TOKEN: "  " })).toBeUndefined();
   });
 });

@@ -303,6 +303,158 @@ describe("BusMcpServer — outbound tools", () => {
     expect(reply.intent).toBe("progress");
   });
 
+  it("`reply` tool honours a top-level `intent` (the form its description shows)", async () => {
+    const result = await h.client.callTool({
+      name: "reply",
+      arguments: { message: "done", intent: "final" },
+    });
+    expect(result.isError).toBeFalsy();
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.intent).toBe("final");
+  });
+
+  it("`reply` tool honours a top-level `in_reply_to` like metadata.in_reply_to", async () => {
+    await h.client.callTool({
+      name: "reply",
+      arguments: { message: "for chat A", intent: "final", in_reply_to: 100 },
+    });
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.in_reply_to).toBe("100");
+  });
+
+  it("`reply` tool lets metadata.in_reply_to win when both forms are given", async () => {
+    await h.client.callTool({
+      name: "reply",
+      arguments: { message: "x", in_reply_to: 1, metadata: { in_reply_to: 2 } },
+    });
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.in_reply_to).toBe("2");
+  });
+
+  it("`reply` tool refuses an empty or blank `in_reply_to` instead of routing it as unnamed", async () => {
+    for (const bad of ["", "   "]) {
+      const result = await h.client.callTool({
+        name: "reply",
+        arguments: { message: "x", intent: "final", in_reply_to: bad },
+      });
+      expect(result.isError).toBe(true);
+    }
+    expect(h.ipc.sent).toHaveLength(0);
+  });
+
+  it("`reply` tool refuses a fractional or unsafe numeric `in_reply_to` instead of routing a mangled id", async () => {
+    for (const bad of [1.5, 2 ** 53, -(2 ** 53) - 2, 2 ** 60]) {
+      const result = await h.client.callTool({
+        name: "reply",
+        arguments: { message: "x", intent: "final", in_reply_to: bad },
+      });
+      expect(result.isError).toBe(true);
+    }
+    expect(h.ipc.sent).toHaveLength(0);
+    // a safe integer still passes, as a string
+    await h.client.callTool({
+      name: "reply",
+      arguments: { message: "x", intent: "final", in_reply_to: 4200000001 },
+    });
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.in_reply_to).toBe("4200000001");
+  });
+
+  it("`reply` tool trims a padded `in_reply_to` so it names the chat it meant", async () => {
+    await h.client.callTool({
+      name: "reply",
+      arguments: { message: "x", intent: "final", in_reply_to: " 12345 " },
+    });
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.in_reply_to).toBe("12345");
+  });
+
+  it("`reply` tool lets metadata.intent win when both forms are given", async () => {
+    await h.client.callTool({
+      name: "reply",
+      arguments: { message: "x", intent: "progress", metadata: { intent: "final" } },
+    });
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.intent).toBe("final");
+  });
+
+  it("`reply` tool treats null optionals as unset (models write null for 'not applicable')", async () => {
+    const result = await h.client.callTool({
+      name: "reply",
+      arguments: { message: "done", intent: "final", in_reply_to: null, metadata: null },
+    });
+    expect(result.isError).toBeFalsy();
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.intent).toBe("final");
+    expect("in_reply_to" in reply).toBe(false);
+  });
+
+  it("`reply` tool: a null metadata.intent does not shadow a top-level intent", async () => {
+    const result = await h.client.callTool({
+      name: "reply",
+      arguments: { message: "done", intent: "final", metadata: { intent: null } },
+    });
+    expect(result.isError).toBeFalsy();
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.intent).toBe("final");
+  });
+
+  it("`reply` tool rejects an unknown key inside metadata too", async () => {
+    const result = await h.client.callTool({
+      name: "reply",
+      arguments: { message: "x", metadata: { intent: "final", chat_id: "100" } },
+    });
+    expect(result.isError).toBe(true);
+    expect(String((result.content as Array<{ text?: string }>)[0]?.text)).toContain("chat_id");
+    expect(h.ipc.sent.length).toBe(0);
+  });
+
+  it("`reply` tool rejects an unknown argument instead of delivering it as progress", async () => {
+    const result = await h.client.callTool({
+      name: "reply",
+      arguments: { message: "x", intnet: "final" },
+    });
+    expect(result.isError).toBe(true);
+    expect(String((result.content as Array<{ text?: string }>)[0]?.text)).toContain("intnet");
+    expect(h.ipc.sent.length).toBe(0);
+  });
+
+  it("`reply` tool forwards metadata.in_reply_to on the IpcReply (#224)", async () => {
+    await h.client.callTool({
+      name: "reply",
+      arguments: { message: "for chat A", metadata: { intent: "final", in_reply_to: "100" } },
+    });
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.in_reply_to).toBe("100");
+  });
+
+  it("`reply` tool omits in_reply_to when the agent did not set it", async () => {
+    await h.client.callTool({ name: "reply", arguments: { message: "x" } });
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect("in_reply_to" in reply).toBe(false);
+  });
+
+  it("`reply` tool accepts a numeric in_reply_to and forwards it as a string (#224)", async () => {
+    const result = await h.client.callTool({
+      name: "reply",
+      arguments: { message: "x", metadata: { in_reply_to: -1001234567890 } },
+    });
+    expect(result.isError).toBeFalsy();
+    const reply = take(h.ipc.sent[0], "reply");
+    if (reply.type !== "reply") throw new Error("type narrowing");
+    expect(reply.in_reply_to).toBe("-1001234567890");
+  });
+
   it("`edit_message` tool emits IpcEditMessage", async () => {
     const result = await h.client.callTool({
       name: "edit_message",
@@ -634,5 +786,44 @@ describe("BusMcpServer — permission flow", () => {
     expect(REQUEST_ID_PATTERN.test("abcd")).toBe(false); // 4 chars
     expect(REQUEST_ID_PATTERN.test("abcdef")).toBe(false); // 6 chars
     expect(REQUEST_ID_PATTERN.test("ab cd")).toBe(false); // whitespace
+  });
+});
+
+describe("BusMcpServer — channel instructions", () => {
+  async function instructionsSeenByClaude(agentId: string): Promise<string> {
+    // The production path: no injected server, so the constructor builds it.
+    const bus = new BusMcpServer({ agentId, ipc: makeFakeIpc() });
+    const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "test-client", version: "0.0.0" }, { capabilities: {} });
+    await Promise.all([bus.mcp.connect(serverTransport), client.connect(clientTransport)]);
+    const text = client.getInstructions() ?? "";
+    await client.close();
+    await bus.mcp.close();
+    return text;
+  }
+
+  it("tells the agent to hand long work to dispatch_job and still answer", async () => {
+    const text = await instructionsSeenByClaude("default");
+    expect(text).toContain("Long work");
+    expect(text).toContain("`dispatch_job` with a self-contained prompt");
+    expect(text).toContain("`reply` intent:'progress' with a one-line ack");
+    expect(text).toContain("End the turn with `reply` intent:'final'");
+    expect(text).toContain("Never end a turn");
+    expect(text).toContain("'Agent job … finished'");
+    expect(text).toContain("A job cannot use `reply`");
+  });
+
+  it("names the dispatcher's own agent id as a dispatch_job target", async () => {
+    expect(await instructionsSeenByClaude("default")).toContain('agent:"default"');
+    expect(await instructionsSeenByClaude("helper-2")).toContain('agent:"helper-2"');
+  });
+
+  it("names no self target for a bus id dispatch_job would refuse", async () => {
+    // Valid bus ids (`_`, leading digit) that `agentExists` rejects.
+    for (const id of ["helper_2", "2nd"]) {
+      const text = await instructionsSeenByClaude(id);
+      expect(text).toContain("`dispatch_job` with a self-contained prompt");
+      expect(text).not.toContain("as yourself");
+    }
   });
 });

@@ -235,6 +235,60 @@ describe("WebUiAdapter — /health", () => {
     expect(body.ok).toBe(true);
     expect(body.version.length).toBeGreaterThan(0);
   });
+
+  it("advertises a capability set, so a client detects instead of sniffing the version", async () => {
+    adapter = await startAdapter({ token: "sekret" });
+    const r = await fetch(`${baseUrl}/health`);
+    const body = (await r.json()) as { capabilities?: string[] };
+
+    expect(Array.isArray(body.capabilities)).toBe(true);
+    // Membership, never index or ordering: the array grows, and a client that
+    // depended on a position would break the first time an entry is added.
+    expect(body.capabilities).toContain("events.operation_id");
+  });
+
+  it("serves capabilities without auth, like the rest of /health", async () => {
+    // A client has to be able to ask what the daemon supports BEFORE it can
+    // present a credential — otherwise capability detection is unreachable
+    // for exactly the clients that need it.
+    adapter = await startAdapter({ token: "sekret" });
+    const r = await fetch(`${baseUrl}/health`);
+    expect(r.status).toBe(200);
+    const body = (await r.json()) as { capabilities?: string[] };
+    expect(body.capabilities?.length).toBeGreaterThan(0);
+  });
+  it("reports an instance identity that changes when the daemon restarts", async () => {
+    adapter = await startAdapter({ token: "sekret" });
+    // A version cannot answer this: a restart onto the same build reports the
+    // same version, which is exactly the case a desktop must not mistake for
+    // continuity. A client that reconnects and sees a different instance knows
+    // its cached subscriptions, in-flight operation ids and sequence position
+    // belong to a process that no longer exists.
+    const r = await fetch(`${baseUrl}/health`);
+    const body = (await r.json()) as { instance_id?: string; started_at?: string };
+    expect(typeof body.instance_id).toBe("string");
+    expect(body.instance_id?.length).toBeGreaterThan(0);
+    expect(typeof body.started_at).toBe("string");
+    expect(Number.isNaN(Date.parse(body.started_at ?? ""))).toBe(false);
+  });
+
+  it("reports the SAME instance across calls while the process lives", async () => {
+    adapter = await startAdapter({ token: "sekret" });
+    // The other half of the property, and the one a naive implementation
+    // breaks: an id minted per request changes on every call, which reads as a
+    // restart on every poll.
+    const a = (await (await fetch(`${baseUrl}/health`)).json()) as { instance_id?: string };
+    const b = (await (await fetch(`${baseUrl}/health`)).json()) as { instance_id?: string };
+    expect(a.instance_id).toBe(b.instance_id);
+  });
+
+  it("advertises the instance-identity and ambiguity capabilities", async () => {
+    adapter = await startAdapter({ token: "sekret" });
+    const r = await fetch(`${baseUrl}/health`);
+    const body = (await r.json()) as { capabilities?: string[] };
+    expect(body.capabilities).toContain("health.instance_identity");
+    expect(body.capabilities).toContain("events.correlation_ambiguity");
+  });
 });
 
 describe("WebUiAdapter — POST /prompt", () => {
@@ -509,5 +563,116 @@ describe("WebUiAdapter — multi-connection", () => {
       await waitFor(() => bus.state().subscriberCount === 1);
     });
     await waitFor(() => bus.state().subscriberCount === 0);
+  });
+});
+
+describe("WebUiAdapter — Origin check", () => {
+  const promptBody = JSON.stringify({ agent_id: "triage", text: "hi" });
+
+  /** Resolves "open" if the upgrade succeeded, "error" if it was refused. */
+  async function wsOutcome(url: string, headers: Record<string, string>) {
+    // Bun's WebSocket client accepts a `headers` option; the DOM type does not know it.
+    const ws = new WebSocket(url, { headers } as unknown as string[]);
+    const outcome = await new Promise<"open" | "error">((resolve) => {
+      ws.addEventListener("open", () => resolve("open"), { once: true });
+      ws.addEventListener("error", () => resolve("error"), { once: true });
+      ws.addEventListener("close", () => resolve("error"), { once: true });
+    });
+    try {
+      ws.close();
+    } catch {}
+    return outcome;
+  }
+
+  it("refuses a cross-origin text/plain POST /prompt when no token is set", async () => {
+    adapter = await startAdapter();
+    const r = await fetch(`${baseUrl}/prompt`, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain", Origin: "https://attacker.example" },
+      body: promptBody,
+    });
+    expect(r.status).toBe(403);
+    expect(((await r.json()) as { error: string }).error).toBe("origin_not_allowed");
+    expect(bus.prompts).toHaveLength(0);
+  });
+
+  it("refuses a cross-origin POST /prompt even with a valid token", async () => {
+    adapter = await startAdapter({ token: "sekret" });
+    const r = await fetch(`${baseUrl}/prompt`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer sekret",
+        Origin: "https://attacker.example",
+      },
+      body: promptBody,
+    });
+    expect(r.status).toBe(403);
+    expect(bus.prompts).toHaveLength(0);
+  });
+
+  it("refuses a cross-origin WS upgrade when no token is set", async () => {
+    adapter = await startAdapter();
+    expect(await wsOutcome(wsUrl, { Origin: "https://attacker.example" })).toBe("error");
+    expect(bus.subscriptions.size).toBe(0);
+  });
+
+  it("refuses an opaque `null` origin (sandboxed iframe, file://)", async () => {
+    adapter = await startAdapter();
+    const r = await fetch(`${baseUrl}/prompt`, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain", Origin: "null" },
+      body: promptBody,
+    });
+    expect(r.status).toBe(403);
+    expect(bus.prompts).toHaveLength(0);
+  });
+
+  it("refuses a DNS-rebound page whose Origin and Host agree on a foreign name", async () => {
+    adapter = await startAdapter();
+    const port = new URL(baseUrl).port;
+    const r = await fetch(`${baseUrl}/prompt`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "text/plain",
+        Origin: `http://rebind.attacker.example:${port}`,
+        Host: `rebind.attacker.example:${port}`,
+      },
+      body: promptBody,
+    });
+    expect(r.status).toBe(403);
+    expect(bus.prompts).toHaveLength(0);
+  });
+
+  it("accepts a same-origin loopback request", async () => {
+    adapter = await startAdapter();
+    const r = await fetch(`${baseUrl}/prompt`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: baseUrl },
+      body: promptBody,
+    });
+    expect(r.status).toBe(200);
+    expect(bus.prompts).toHaveLength(1);
+  });
+
+  it("accepts an origin listed in allowedOrigins, on POST and on WS", async () => {
+    adapter = await startAdapter({ allowedOrigins: ["https://console.example/"] });
+    const r = await fetch(`${baseUrl}/prompt`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: "https://console.example" },
+      body: promptBody,
+    });
+    expect(r.status).toBe(200);
+    expect(await wsOutcome(wsUrl, { Origin: "https://console.example" })).toBe("open");
+  });
+
+  it("leaves non-browser clients (no Origin header) unaffected", async () => {
+    adapter = await startAdapter();
+    const r = await fetch(`${baseUrl}/prompt`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: promptBody,
+    });
+    expect(r.status).toBe(200);
   });
 });

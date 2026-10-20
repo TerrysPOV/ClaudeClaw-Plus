@@ -8,7 +8,7 @@
       "name": "claudeclaw-plus",
       "source": "./",
       "description": "ClaudeClaw+ — governance, orchestration, persistent memory, and hardened web UI for Claude Code daemons. Sister project to moazbuilds/claudeclaw.",
-      "version": "2.2.232",
+      "version": "2.2.347",
       "keywords": [
         "cron",
         "heartbeat",
@@ -21,5 +21,6 @@
       ],
       "category": "productivity"
     }
-  ]
+  ],
+  "version": "2.2.347"
 }

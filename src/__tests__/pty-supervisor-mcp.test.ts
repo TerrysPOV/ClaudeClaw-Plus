@@ -207,6 +207,9 @@ beforeEach(async () => {
   });
 });
 
+/** Agent names this file spawns; see the cleanup in `afterEach`. */
+const AGENT_NAMES_USED = ["suzy"];
+
 afterEach(async () => {
   resetClock();
   resetSleep();
@@ -216,6 +219,15 @@ afterEach(async () => {
   try {
     rmSync(TEST_ROOT, { recursive: true, force: true });
   } catch {}
+  // `ensureAgentDir` is stubbed to TEST_ROOT above, but the supervisor's
+  // `persistSessionId` writes through `createSession()`, which always resolves
+  // against `process.cwd()` — so a run leaves `<repo>/agents/suzy` behind. It
+  // then makes `validateAgentName("suzy")` answer "already exists" in
+  // `agents.test.ts`, which is why the full-tree CI job has been red on main
+  // (the same cleanup the sibling `pty-integration.test.ts` already does).
+  for (const name of AGENT_NAMES_USED) {
+    rmSync(join(process.cwd(), "agents", name), { recursive: true, force: true });
+  }
 });
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

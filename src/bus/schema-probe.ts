@@ -26,7 +26,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { SCHEMA_VERSION } from "./jsonl-tailer";
+import { isTerminalStopReason, SCHEMA_VERSION } from "./jsonl-tailer";
 import {
   ASSERTION_DEFS,
   type AssertionResult,
@@ -59,8 +59,10 @@ export interface SchemaProbeOptions {
    */
   homeOverride?: string;
   /**
-   * Overall probe timeout in ms. Spec §11.1 budget is <5 s; we default
-   * to 15 s to give CI a safety margin without unbounded hangs.
+   * Overall probe budget in ms — an upper bound, not a pace: every step
+   * returns as soon as its event is observed (#441). Spec §11.1 said <5 s;
+   * a real run is two model turns plus boot (~20-40 s measured on 2.1.286),
+   * so the default leaves headroom for a slow API without hanging forever.
    */
   timeoutMs?: number;
 }
@@ -80,16 +82,20 @@ interface CacheEntry {
 }
 
 /* ───────────────────────────────────────────────────────────────────── */
-/* Helpers — path encoding (matches claude's own scheme; Spike 0.5)      */
+/* Helpers — path encoding (matches claude's own scheme)                 */
 /* ───────────────────────────────────────────────────────────────────── */
 
 /**
  * Encode a realpath cwd into the directory name claude uses under
- * `~/.claude/projects/`. claude replaces `/` with `-` only — other
- * characters (dots, underscores) are preserved. Empirically confirmed
- * against fixture: cwd `/private/tmp/spike-0.2` encodes as
- * `-private-tmp-spike-0.2` (dot kept). Re-exported from
- * `jsonl-line-types.ts` so the Tailer and the probe stay in lock-step.
+ * `~/.claude/projects/`. Re-exported from `jsonl-line-types.ts` so the Tailer
+ * and the probe stay in lock-step; see that file for the rule and how it was
+ * derived.
+ *
+ * The previous note here claimed dots and underscores are preserved, citing a
+ * Spike 0.5 fixture. They are not: the CLI replaces every non-alphanumeric
+ * character, and truncates past 200 characters with a hash of the original
+ * cwd. Kept as a warning because a stale comment on a re-export is worse than
+ * none — it is read as documentation of the shared contract.
  */
 export { encodeCwdForProjectsDir as encodeCwd } from "./jsonl-line-types";
 import { encodeCwdForProjectsDir as _encodeCwdImpl } from "./jsonl-line-types";
@@ -195,45 +201,21 @@ async function captureClaudeVersion(
   });
 }
 
+/* JSONL observation — read the file, wait on its contents             */
 /* ───────────────────────────────────────────────────────────────────── */
-/* JSONL collector — polls a file path until budget exhausted            */
-/* ───────────────────────────────────────────────────────────────────── */
-
-interface CollectorBudget {
-  totalMs: number;
-  pollMs?: number;
-}
 
 /**
- * Wait for `path` to exist + grow, polling at `pollMs` (default 50 ms)
- * for up to `totalMs`. Returns every newline-delimited JSON object
- * observed, plus the latest raw text (for debugging).
- *
- * Uses polling rather than `fs.watch` because:
- *  - Polling is cross-platform identical (no inotify/FSEvents quirks)
- *  - The probe is short-lived; missed-event hazards aren't material
- *  - The Tailer (Agent A) handles long-lived watching; we don't.
+ * Read every newline-delimited JSON object in `path` (missing file → none).
+ * A partial trailing line is skipped; the next read picks it up whole.
  */
-async function collectJsonl(path: string, budget: CollectorBudget): Promise<CollectedJsonl> {
-  const start = Date.now();
-  const pollMs = budget.pollMs ?? 50;
-  const lines: Record<string, unknown>[] = [];
+function readJsonl(path: string): { lines: Record<string, unknown>[]; raw: string } {
   let raw = "";
-  let lastSize = 0;
-  while (Date.now() - start < budget.totalMs) {
-    if (existsSync(path)) {
-      try {
-        const next = readFileSync(path, "utf8");
-        if (next.length !== lastSize) {
-          raw = next;
-          lastSize = next.length;
-        }
-      } catch {
-        /* race: file briefly missing */
-      }
-    }
-    await sleep(pollMs);
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return { lines: [], raw: "" };
   }
+  const lines: Record<string, unknown>[] = [];
   for (const line of raw.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -243,7 +225,52 @@ async function collectJsonl(path: string, budget: CollectorBudget): Promise<Coll
       /* tolerate partial/malformed line — assertions will surface gaps */
     }
   }
-  return { path, lines, raw };
+  return { lines, raw };
+}
+
+/**
+ * Poll `done` until it holds or `timeoutMs` runs out. Polling rather than
+ * `fs.watch`: cross-platform identical, and the probe is short-lived — the
+ * Tailer handles long-lived watching.
+ */
+async function waitFor(done: () => boolean, timeoutMs: number, pollMs = 50): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (done()) return true;
+    if (Date.now() >= deadline) return false;
+    await sleep(Math.min(pollMs, Math.max(1, deadline - Date.now())));
+  }
+}
+
+function waitForJsonl(
+  path: string,
+  done: (lines: Record<string, unknown>[]) => boolean,
+  timeoutMs: number,
+): Promise<boolean> {
+  return waitFor(() => done(readJsonl(path).lines), timeoutMs);
+}
+
+function isTurnEnd(line: Record<string, unknown>): boolean {
+  const msg = line.message as { stop_reason?: unknown } | undefined;
+  return line.type === "assistant" && isTerminalStopReason(msg?.stop_reason);
+}
+
+/** Assistant lines that end a turn — the Tailer's own `turn_end` rule. */
+function countTurnEnds(lines: Record<string, unknown>[]): number {
+  return lines.filter(isTurnEnd).length;
+}
+
+/** A tool turn is over once a terminal assistant line follows a tool_result. */
+function toolTurnEnded(lines: Record<string, unknown>[]): boolean {
+  const iResult = lines.findIndex((l) => {
+    const c = (l.message as { content?: unknown } | undefined)?.content;
+    return (
+      l.type === "user" &&
+      Array.isArray(c) &&
+      c.some((b) => (b as { type?: unknown } | null)?.type === "tool_result")
+    );
+  });
+  return iResult >= 0 && lines.slice(iResult + 1).some(isTurnEnd);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -273,7 +300,7 @@ export class SchemaProbe {
       force: opts.force ?? false,
       onWarning: opts.onWarning,
       homeOverride: opts.homeOverride,
-      timeoutMs: opts.timeoutMs ?? 15_000,
+      timeoutMs: opts.timeoutMs ?? 120_000,
     };
     this.runnerFactory = runnerFactory ?? defaultPtyRunnerFactory;
   }
@@ -324,45 +351,66 @@ export class SchemaProbe {
     const failures: Array<{ name: string; reason: string }> = [];
     let collected: CollectedJsonl = { path: expectedPath, lines: [], raw: "" };
 
-    // Pacing budget — split the configured timeout into the 6 steps that
-    // need wall-time. Default 15 s → ~750 ms steps + 3 s exit window.
-    // Tests inject a tiny timeoutMs to keep the suite fast (mock writes
-    // JSONL up front, so even sub-50 ms steps work).
-    const stepMs = Math.max(5, Math.floor(this.opts.timeoutMs / 20));
-    const exitMs = Math.max(20, Math.floor(this.opts.timeoutMs / 5));
+    // #441: pace on observed events, not fixed sleeps. Each step waits for
+    // its own evidence (REPL footer, a finished turn in the JSONL, the /clear
+    // rotation, process exit) with whatever is left of `timeoutMs` as the
+    // bound. A step that times out is recorded and the run tears down — the
+    // assertions below then say which shapes were never seen.
+    const deadline = Date.now() + this.opts.timeoutMs;
+    const remaining = () => Math.max(0, deadline - Date.now());
+    const stepTimedOut = (name: string, what: string) => {
+      const tail = runner?.screenTail?.() ?? "";
+      failures.push({
+        name: `step_timeout_${name}`,
+        reason: `${what} not observed within the ${this.opts.timeoutMs} ms budget${tail ? `; screen:\n${tail}` : ""}`,
+      });
+    };
 
     try {
-      runner = await this.runnerFactory({ cwd: realCwd, sessionId, claudeBin });
-
-      // Step 1 — wait for JSONL to materialise at the predicted path.
-      await sleep(stepMs);
-
-      // Step 6 prompt — canonical text prompt.
-      await runner.sendPrompt("Reply with exactly the text TEST_OK and call no tools.");
-      await sleep(stepMs);
-
-      // Step 7 prompt — tool-eliciting (probe accepts that the stub may
-      // synthesise a tool_use/tool_result pair; real claude will pick a
-      // safe tool given a benign nudge).
-      await runner.sendPrompt("List the cwd files using a tool, then say DONE.");
-      await sleep(stepMs);
-
-      // Step 8 — slash relay /clear: spec §11.1 + Spike 0.5 (rotation).
-      await runner.sendSlash("clear");
-      await sleep(stepMs);
-
-      // Step 9 — /quit. Validate exit + exit envelope in JSONL.
-      await runner.sendSlash("quit");
-      const exited = await runner.waitForExit(exitMs);
-      if (!exited) {
-        failures.push({ name: "process_exit", reason: "claude did not exit within budget" });
-      }
-
-      // Final tail of the original JSONL.
-      collected = await collectJsonl(expectedPath, {
-        totalMs: stepMs,
-        pollMs: Math.max(2, Math.floor(stepMs / 5)),
+      runner = await this.runnerFactory({
+        cwd: realCwd,
+        sessionId,
+        claudeBin,
+        homeDir: this.opts.homeOverride,
       });
+
+      const steps = async (r: ProbeRunner): Promise<void> => {
+        // Step 1 — REPL up (trust + dev-channels dialogs behind us).
+        if (r.waitForReady && !(await r.waitForReady(remaining()))) {
+          return stepTimedOut("repl_ready", "REPL idle footer");
+        }
+
+        // Step 6 prompt — canonical text prompt. Wait for its turn to end.
+        await r.sendPrompt("Reply with exactly the text TEST_OK and call no tools.");
+        if (!(await waitForJsonl(expectedPath, (l) => countTurnEnds(l) >= 1, remaining()))) {
+          return stepTimedOut("text_turn", "end of the text turn (terminal assistant line)");
+        }
+
+        // Step 7 prompt — tool-eliciting. Its turn ends on an assistant line
+        // AFTER the tool_result, so /clear is never typed mid-turn.
+        await r.sendPrompt("List the cwd files using a tool, then say DONE.");
+        if (!(await waitForJsonl(expectedPath, toolTurnEnded, remaining()))) {
+          return stepTimedOut(
+            "tool_turn",
+            "end of the tool turn (tool_result, then a terminal assistant line)",
+          );
+        }
+
+        // Step 8 — slash relay /clear: spec §11.1 + Spike 0.5 (rotation).
+        await r.sendSlash("clear");
+        if (!(await waitFor(() => collectSiblings(expectedPath).length > 0, remaining()))) {
+          return stepTimedOut("clear_rotation", "a rotated JSONL after /clear");
+        }
+
+        // Step 9 — /quit. Process exit is the authoritative end signal.
+        await r.sendSlash("quit");
+        if (!(await r.waitForExit(remaining()))) {
+          failures.push({ name: "process_exit", reason: "claude did not exit within budget" });
+        }
+      };
+      await steps(runner);
+
+      collected = { path: expectedPath, ...readJsonl(expectedPath) };
 
       // Also collect any sibling JSONLs (the /clear rotation).
       const siblings = collectSiblings(expectedPath);

@@ -9,7 +9,8 @@ import {
   appendFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, resolve, sep } from "node:path";
+import { dirname, resolve, sep } from "node:path";
+import { encodeCwdForProjectsDir } from "../../bus/jsonl-line-types.js";
 import { BaseSubject } from "../../skills-tuner/subjects/base.js";
 import { sanitizeObservationContent } from "../../skills-tuner/core/security.js";
 import type { LLMClient } from "../../skills-tuner/core/llm.js";
@@ -27,6 +28,12 @@ import type { DateRange, Metric, TelemetryProvider } from "../../skills-tuner/co
 import { ARTIFACT_SOURCE } from "../../skills-tuner/core/telemetry.js";
 import { median } from "../../skills-tuner/core/aggregate.js";
 import {
+  describeError,
+  errorReason,
+  parseJudgeScores,
+  type QualityFailureReason,
+} from "./judge-failure.js";
+import {
   type EvidenceDrivenSubject,
   type ResearchSpec,
   type LocalSignal,
@@ -43,13 +50,14 @@ const MEMORY_MAX_DEAD_RATIO = 0.05;
 /** Only treat index GROWTH as degradation once the index is genuinely sizable. */
 const MEMORY_SIZE_FLOOR = 18_000;
 
-/** Derive Claude Code's per-user memory index location.
- * Mirrors Claude Code's pattern: `~/.claude/projects/-home-<basename>/memory/MEMORY.md`.
+/** Derive Claude Code's per-user memory index location:
+ * `~/.claude/projects/<encoded $HOME>/memory/MEMORY.md`, through the one
+ * encoder the CLI's rule is implemented by (#368) — a hand-rolled
+ * `-home-<basename>` was wrong for any HOME outside `/home/<alnum>`.
  */
 function defaultMemoryIndex(): string {
   const home = homedir();
-  const slug = `-home-${basename(home)}`;
-  return `${home}/.claude/projects/${slug}/memory/MEMORY.md`;
+  return `${home}/.claude/projects/${encodeCwdForProjectsDir(home)}/memory/MEMORY.md`;
 }
 
 const MAX_INDEX_LINES = 200;
@@ -218,7 +226,10 @@ interface MemoryEntry {
  * MemorySubject — wisecron-managed MEMORY.md index tuner (LOW).
  *
  * What it tunes: MEMORY.md (auto-memory index) at
- * `~/.claude/projects/-home-<user>/memory/MEMORY.md`. Detects:
+ * `~/.claude/projects/<encoded home dir>/memory/MEMORY.md` — the directory
+ * name is the home directory run through the CLI's own rule
+ * (`encodeCwdForProjectsDir`, #368), e.g. `-home-simon` or `-Users-simon`.
+ * Detects:
  *  - duplicate entries (same slug or near-duplicate description)
  *  - dead entries (referenced .md file no longer exists)
  *  - stale ordering (most-referenced entries should be on top)
@@ -722,7 +733,8 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
     try {
       const c = JSON.parse(readFileSync(this.qualityCachePath, "utf8"));
       return typeof c.median === "number" ? c.median : null;
-    } catch {
+    } catch (e) {
+      console.warn(`[tuner] memory quality cache unreadable: ${describeError(e)}`);
       return null;
     }
   }
@@ -747,8 +759,9 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
         if (ageMs < cooldownMs) return;
       }
       await this.measureEntryQuality();
-    } catch {
-      /* best-effort; never block observation collection */
+    } catch (e) {
+      // best-effort; never block observation collection — but say why
+      console.warn(`[tuner] memory quality refresh failed: ${describeError(e)}`);
     }
   }
 
@@ -779,10 +792,10 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
         [{ role: "user", content: sample.join("\n") }],
         400,
       );
-      const nums = JSON.parse((raw.match(/\[[\s\S]*\]/) ?? ["[]"])[0]) as unknown[];
-      const scores = nums.filter((n): n is number => typeof n === "number" && n >= 1 && n <= 5);
+      const scores = parseJudgeScores(raw);
       if (scores.length === 0) {
-        this.stampQualityFailure();
+        // The reply itself is not recorded: it may echo memory entries.
+        this.stampQualityFailure({ code: "UNPARSEABLE", message: "judge reply had no 1-5 scores" });
         return null;
       }
       const med = median(scores);
@@ -797,23 +810,27 @@ export class MemorySubject extends BaseSubject implements RevertibleSubject, Evi
         "utf8",
       );
       return med;
-    } catch {
-      this.stampQualityFailure();
+    } catch (e) {
+      this.stampQualityFailure(errorReason(e));
       return null;
     }
   }
 
   /** L8: record a short-TTL failure stamp so refreshQualityIfStale won't re-fire a
-   * blocking LLM call every cycle after an error/timeout/unparseable reply. */
-  private stampQualityFailure(): void {
+   * blocking LLM call every cycle after an error/timeout/unparseable reply. The
+   * reason is logged and kept in the cache, so a `median: null` says why. */
+  private stampQualityFailure(reason: QualityFailureReason): void {
+    console.warn(
+      `[tuner] memory quality judge failed: ${reason.code ?? "ERROR"}: ${reason.message}`,
+    );
     try {
       writeFileSync(
         this.qualityCachePath,
-        JSON.stringify({ ts: new Date().toISOString(), median: null, failed: true }),
+        JSON.stringify({ ts: new Date().toISOString(), median: null, failed: true, reason }),
         "utf8",
       );
-    } catch {
-      /* best-effort */
+    } catch (e) {
+      console.warn(`[tuner] memory quality failure stamp not written: ${describeError(e)}`);
     }
   }
 

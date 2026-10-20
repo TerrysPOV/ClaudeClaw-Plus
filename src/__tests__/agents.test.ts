@@ -14,6 +14,7 @@ import {
   listAgents,
   validateAgentName,
   agentExists,
+  agentHasPersona,
   parseScheduleToCron,
   validateJobLabel,
   addJob,
@@ -114,6 +115,35 @@ describe("agentExists — path-traversal guard (#296 PR 3 security review)", () 
     const name = uniq("real");
     await mkdir(join(AGENTS_DIR, name), { recursive: true });
     expect(agentExists(name)).toBe(true);
+  });
+});
+
+describe("agentHasPersona", () => {
+  it("false for a missing agent and for the empty directory ensureAgentDir leaves", async () => {
+    const name = uniq("persona");
+    expect(await agentHasPersona(name)).toBe(false);
+    await mkdir(join(AGENTS_DIR, name), { recursive: true });
+    expect(await agentHasPersona(name)).toBe(false);
+    await writeFile(join(AGENTS_DIR, name, "SOUL.md"), "  \n");
+    expect(await agentHasPersona(name)).toBe(false);
+  });
+
+  it("accepts a bus agent id agentExists() refuses (underscore), as the runner does", async () => {
+    const name = `${uniq("persona")}_bus`;
+    created.push(name);
+    await mkdir(join(AGENTS_DIR, name), { recursive: true });
+    await writeFile(join(AGENTS_DIR, name, "IDENTITY.md"), "cron agent\n");
+    expect(agentExists(name)).toBe(false);
+    expect(await agentHasPersona(name)).toBe(true);
+  });
+
+  it("refuses names that leave the agents directory", async () => {
+    const name = uniq("persona");
+    await mkdir(join(AGENTS_DIR, name), { recursive: true });
+    await writeFile(join(AGENTS_DIR, name, "CLAUDE.md"), "persona\n");
+    expect(await agentHasPersona("..")).toBe(false);
+    expect(await agentHasPersona(`../agents/${name}`)).toBe(false);
+    expect(await agentHasPersona(name)).toBe(true);
   });
 });
 

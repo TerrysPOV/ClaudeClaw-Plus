@@ -1,0 +1,57 @@
+name: Integration (nightly)
+
+# #304: the tests that need a real `claude` and credentials. They are NOT in
+# the PR job — a test that skips when its infra is missing reports green and
+# proves nothing — so they run here, un-gated, every night and on demand, and
+# a failure is red and visible. A red nightly is information; a skipped PR
+# check is not.
+#
+# Needs the CLAUDE_CODE_OAUTH_TOKEN repository secret (a long-lived token from
+# `claude setup-token`). Without it the run fails at the auth check below,
+# which is the intended signal, not a skip.
+
+on:
+  schedule:
+    - cron: "17 6 * * *" # 06:17 UTC daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: Real-claude integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install Claude Code
+        run: bun install -g @anthropic-ai/claude-code
+
+      # The token reaches only the two steps that need it — not checkout,
+      # setup or the installs, where a compromised action or package script
+      # could read it.
+      - name: Check claude is usable
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          test -n "$CLAUDE_CODE_OAUTH_TOKEN" || { echo "CLAUDE_CODE_OAUTH_TOKEN secret is not set — the integration tests cannot run"; exit 1; }
+          claude --version
+
+      # Run from the directory: the repo's bunfig.toml scopes `bun test` to
+      # `src` (so a plain `bun test` never spawns a real claude); a bare path
+      # argument is only a filter within that root, and bun reads bunfig from
+      # the cwd, so this directory gets its own discovery and no preload.
+      - name: Run integration tests
+        working-directory: tests/integration
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: bun test

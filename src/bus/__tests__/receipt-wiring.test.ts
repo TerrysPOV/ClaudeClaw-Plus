@@ -10,10 +10,12 @@ import { join } from "node:path";
 import { createReceiptStore, hashPrompt, type ReceiptRecord, type ReceiptStore } from "../receipt";
 import {
   type AgentProcessLike,
+  confirmTurnReceipt,
   createPromptStreamHandler,
   openInboundReceipt,
   unwrapChannelText,
 } from "../receipt-wiring";
+import type { PromptDeliveryOutcome } from "../types";
 
 let tmpDir: string;
 let logPath: string;
@@ -37,7 +39,10 @@ function readReceipts(): ReceiptRecord[] {
     .map((l) => JSON.parse(l) as ReceiptRecord);
 }
 
-function fakeAgent(pid: number, sendImpl?: (line: string) => Promise<void>): AgentProcessLike {
+function fakeAgent(
+  pid: number,
+  sendImpl?: (line: string) => Promise<PromptDeliveryOutcome | void>,
+): AgentProcessLike {
   return {
     pid,
     send_prompt_stream: sendImpl ?? (() => Promise.resolve()),
@@ -91,6 +96,38 @@ describe("createPromptStreamHandler", () => {
     expect(r.record.process_generation).toBe(1);
     expect(r.record.notes?.route_resolved_at).toBeDefined();
     expect(r.record.notes?.stdin_written_at).toBeDefined();
+  });
+
+  test("stamps delivery_outcome and passes the verdict through when the process reports one (#361)", async () => {
+    const r = store.open("m-v", { agent_id: "alpha", prompt_hash: hashPrompt("hi") });
+    const handler = createPromptStreamHandler(
+      () => fakeAgent(3333, async () => "unconfirmed-live"),
+      { store },
+    );
+    await expect(handler("alpha", "hi")).resolves.toBe("unconfirmed-live");
+    expect(r.record.notes?.stdin_written_at).toBeDefined();
+    expect(r.record.notes?.delivery_outcome).toBe("unconfirmed-live");
+  });
+
+  test("a re-delivery keeps the first verdict and records its own as redelivery_outcome (#361)", async () => {
+    const r = store.open("m-rd", { agent_id: "alpha", prompt_hash: hashPrompt("hi") });
+    const verdicts = ["unconfirmed-live", "turn-started"] as const;
+    let n = 0;
+    const handler = createPromptStreamHandler(() => fakeAgent(3335, async () => verdicts[n++]), {
+      store,
+    });
+    await handler("alpha", "hi");
+    await expect(handler("alpha", "hi")).resolves.toBe("turn-started");
+    expect(r.record.notes?.delivery_outcome).toBe("unconfirmed-live");
+    expect(r.record.notes?.redelivery_outcome).toBe("turn-started");
+  });
+
+  test("no delivery_outcome note, and a void result, when the process reports nothing", async () => {
+    const r = store.open("m-void", { agent_id: "alpha", prompt_hash: hashPrompt("hi") });
+    const handler = createPromptStreamHandler(() => fakeAgent(3334), { store });
+    await expect(handler("alpha", "hi")).resolves.toBeUndefined();
+    expect(r.record.notes?.stdin_written_at).toBeDefined();
+    expect(r.record.notes).not.toHaveProperty("delivery_outcome");
   });
 
   test("generation bumps when the same agent_id is seen with a different pid", async () => {
@@ -212,5 +249,53 @@ describe("openInboundReceipt (#211 — adapter boundary open)", () => {
       originId: "1",
     });
     expect(store.findByPromptHash(hashPrompt(raw))?.record.message_id).toBe("tg-8");
+  });
+});
+
+describe("confirmTurnReceipt — tailer → receipt seam (#212)", () => {
+  test("hashes the unwrapped channel text, so the tailer's proof lands on the adapter's receipt", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ccplus-turn-seam-"));
+    try {
+      const store = createReceiptStore({ path: join(dir, "receipts.jsonl") });
+      const r = store.open("tg:1:abcd", { prompt_hash: hashPrompt("allô") });
+      const where = await confirmTurnReceipt(
+        {
+          promptText: '<channel source="telegram" chat_id="1" user_id="u" ts="t">allô</channel>',
+          jsonlPath: "/x/s.jsonl",
+          offset: 512,
+          messageId: "msg_1",
+          stopReason: "end_turn",
+          synthetic: false,
+        },
+        store,
+      );
+      expect(where).toBe("patched");
+      expect(r.record.turn_event_offset).toBe(512);
+      expect(r.record.claude_jsonl_path).toBe("/x/s.jsonl");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a synthetic boundary (CLI-written API error) is not a model turn and is skipped", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "ccplus-turn-seam-"));
+    try {
+      const store = createReceiptStore({ path: join(dir, "receipts.jsonl") });
+      const r = store.open("m", { prompt_hash: hashPrompt("x") });
+      const where = await confirmTurnReceipt(
+        {
+          promptText: "x",
+          jsonlPath: "/x",
+          offset: 1,
+          stopReason: "stop_sequence",
+          synthetic: true,
+        },
+        store,
+      );
+      expect(where).toBe("skipped");
+      expect(r.record.turn_event_offset).toBeUndefined();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

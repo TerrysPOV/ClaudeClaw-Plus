@@ -3,6 +3,7 @@ import { join, basename } from "node:path";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { getAgentsDir } from "../../config";
+import { encodeCwdForProjectsDir } from "../../bus/jsonl-line-types";
 
 export interface SessionInfo {
   id: string;
@@ -25,10 +26,9 @@ export interface ChatMessage {
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DISCORD_SNOWFLAKE_RE = /^\d{17,19}$/;
 
-// Must match Claude Code's JSONL directory sanitizer (slashes, backslashes, dots → dashes).
+// Must match Claude Code's JSONL directory name — the one encoder (#368).
 function getProjectDir(): string {
-  const sanitized = process.cwd().replace(/[/\\.]/g, "-");
-  return join(homedir(), ".claude", "projects", sanitized);
+  return join(homedir(), ".claude", "projects", encodeCwdForProjectsDir(process.cwd()));
 }
 
 function extractUserText(line: string): string {

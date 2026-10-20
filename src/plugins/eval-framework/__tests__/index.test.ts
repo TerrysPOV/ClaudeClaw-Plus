@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach, mock } from "bun:test";
+import { describe, it, expect, afterEach, mock, afterAll } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
@@ -8,6 +8,18 @@ import { dump as yamlStringify } from "js-yaml";
 
 const auditEvents: { event: string; payload: unknown }[] = [];
 const registeredTools: Map<string, { name: string; handler: Function }> = new Map();
+
+// #304: `mock.module` is process-global and outlives this file — every test
+// file bun loads after it would see these fakes in place of the real modules
+// (the mcp-multiplexer suites failed 10+ tests in the pack and 0 alone).
+// Keep the real exports so `afterAll` can put them back.
+const real0 = { ...(await import("../../mcp-bridge.js")) };
+const real1 = { ...(await import("../../http-gateway.js")) };
+
+afterAll(() => {
+  mock.module("../../mcp-bridge.js", () => real0);
+  mock.module("../../http-gateway.js", () => real1);
+});
 
 mock.module("../../mcp-bridge.js", () => ({
   getMcpBridge: () => ({

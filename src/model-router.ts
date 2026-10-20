@@ -10,6 +10,8 @@ interface TaskClassification {
   model: string;
   confidence: number;
   reasoning: string;
+  /** The phrase/keyword that selected this mode ("" when no keyword decided it: default fallback, a tie, or a win on the "?" boost alone). */
+  matchedKeyword: string;
 }
 
 /**
@@ -33,18 +35,23 @@ export function classifyTask(
           model: mode.model,
           confidence: 0.95,
           reasoning: `Matched phrase "${phrase}" → ${mode.name}`,
+          matchedKeyword: phrase,
         };
       }
     }
   }
 
-  // Phase 2: Score keywords per mode
-  const scores: { mode: AgenticMode; score: number }[] = modes.map((mode) => {
+  // Phase 2: Score keywords per mode (tracking the first keyword that matched).
+  const scores: { mode: AgenticMode; score: number; firstKeyword: string }[] = modes.map((mode) => {
     let score = 0;
+    let firstKeyword = "";
     for (const keyword of mode.keywords) {
-      if (normalized.includes(keyword)) score++;
+      if (normalized.includes(keyword)) {
+        score++;
+        if (!firstKeyword) firstKeyword = keyword;
+      }
     }
-    return { mode, score };
+    return { mode, score, firstKeyword };
   });
 
   // Question marks boost modes that have "planning"-style phrases
@@ -71,6 +78,7 @@ export function classifyTask(
         model: top.mode.model,
         confidence,
         reasoning: `${top.mode.name}: ${top.score}${second ? `, ${second.mode.name}: ${second.score}` : ""}`,
+        matchedKeyword: top.firstKeyword,
       };
     }
 
@@ -82,13 +90,21 @@ export function classifyTask(
       model: tiedFallback.mode.model,
       confidence: 0.6,
       reasoning: `Tie between ${tied.map((s) => s.mode.name).join(", ")} (score: ${top.score}), using ${tiedFallback.mode.name}`,
+      // The tie-break picked the mode, not a keyword: no provenance to report.
+      matchedKeyword: "",
     };
   }
 
   // Fallback to default mode
   const fallback = modes.find((m) => m.name === defaultMode) ?? modes[0];
   if (!fallback) {
-    return { mode: "unknown", model: "", confidence: 0, reasoning: "No modes configured" };
+    return {
+      mode: "unknown",
+      model: "",
+      confidence: 0,
+      reasoning: "No modes configured",
+      matchedKeyword: "",
+    };
   }
 
   return {
@@ -96,6 +112,7 @@ export function classifyTask(
     model: fallback.model,
     confidence: 0.5,
     reasoning: `Ambiguous prompt, defaulting to ${fallback.name}`,
+    matchedKeyword: "",
   };
 }
 
@@ -106,11 +123,12 @@ export function selectModel(
   prompt: string,
   modes: AgenticMode[],
   defaultMode: string,
-): { model: string; taskType: string; reasoning: string } {
+): { model: string; taskType: string; reasoning: string; matchedKeyword: string } {
   const classification = classifyTask(prompt, modes, defaultMode);
   return {
     model: classification.model,
     taskType: classification.mode,
     reasoning: classification.reasoning,
+    matchedKeyword: classification.matchedKeyword,
   };
 }

@@ -113,6 +113,6 @@ def summarizer_timeout_sec() -> int:
 
 
 def summarizer_cwd() -> Optional[Path]:
-    """Working dir for the summarizer subprocess (defaults to None = current cwd)."""
+    """Working dir for the summarizer subprocess (None = a fresh empty temp dir)."""
     env = os.environ.get("MEMORY_SEARCH_SUMMARY_CWD")
     return Path(env).expanduser() if env else None

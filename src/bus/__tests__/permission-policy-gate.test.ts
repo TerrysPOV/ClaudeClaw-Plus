@@ -11,7 +11,7 @@ function makeBus(evaluatePolicy: BusCoreOptions["evaluatePolicy"]): {
   events: Array<{ topic: string; payload: unknown }>;
 } {
   const events: Array<{ topic: string; payload: unknown }> = [];
-  const bus = createBusCore({ eventLogAppend: mockAppend, evaluatePolicy });
+  const bus = createBusCore({ eventLogAppend: mockAppend, evaluatePolicy, turnEndSettleMs: 0 });
   bus.subscribe({}, (e) => events.push(e as { topic: string; payload: unknown }));
   return { bus, events };
 }
@@ -87,15 +87,15 @@ describe("Bus permission policy gate (#258 item 3)", () => {
     expect(captured!.channelId).toBe("chat-1");
   });
 
-  it("ignores mis-attributable identity when same-agent prompts interleave (#284 MEDIUM)", async () => {
+  it("a prompt arriving mid-turn waits, so the gate sees the RUNNING turn's identity, not the newcomer's (#284, #239)", async () => {
     let captured: { userId?: string; skillName?: string; channelId?: string } | undefined;
     const { bus } = makeBus((ctx) => {
       captured = { userId: ctx.userId, skillName: ctx.skillName, channelId: ctx.channelId };
       return defaultDeny(); // don't auto-deny — only assert the threaded context
     });
-    // Two prompts on the SAME agent, the second arriving before the first
-    // completes: the origin slot is overwritten while P1 is still in flight, so
-    // the cached identity is ambiguous and must NOT reach the security gate.
+    // Before #239 the second prompt overwrote the origin slot while P1 was
+    // still in flight, so the cached identity was ambiguous and had to be
+    // withheld from the gate. It is now queued: P1's identity stays exact.
     await bus.sendPrompt({
       agent_id: "alpha",
       origin: "telegram",
@@ -103,6 +103,46 @@ describe("Bus permission policy gate (#258 item 3)", () => {
       user_id: "user-A",
       text: "/quant a",
       metadata: { command: "/quant" },
+    });
+    const second = await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "webui",
+      origin_id: "chat-B",
+      user_id: "user-B",
+      text: "/admin b",
+      metadata: { command: "/admin" },
+    });
+    expect(second.queued).toBe(true);
+    feed(bus, "Bash", "abcde");
+    expect(captured).toBeDefined();
+    expect(captured!.userId).toBe("user-A");
+    expect(captured!.skillName).toBe("quant");
+    expect(captured!.channelId).toBe("chat-A");
+  });
+
+  it("ignores mis-attributable identity when a turn ended without releasing its origin (#284 MEDIUM)", async () => {
+    let captured: { userId?: string; skillName?: string; channelId?: string } | undefined;
+    const { bus } = makeBus((ctx) => {
+      captured = { userId: ctx.userId, skillName: ctx.skillName, channelId: ctx.channelId };
+      return defaultDeny();
+    });
+    // P1's turn ends with no reply at all (no text, nothing to synthesize), so
+    // the origin slot still holds P1 when P2 is admitted: the overwrite makes
+    // the cached identity ambiguous and it must NOT reach the security gate.
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "chat-A",
+      user_id: "user-A",
+      text: "/quant a",
+      metadata: { command: "/quant" },
+    });
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "response.turn_end",
+      payload: { text: "" },
     });
     await bus.sendPrompt({
       agent_id: "alpha",

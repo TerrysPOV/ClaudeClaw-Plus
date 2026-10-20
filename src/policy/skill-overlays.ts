@@ -5,11 +5,21 @@
  * Skill overlays are translated into policy-relevant constraints.
  *
  * IMPORTANT: Skill overlays must not become a privilege-escalation path.
- * - "preferredTools" influences recommendation, not security overrides
- * - "requiredTools" surfaces actionable policy errors when unavailable
- * - "deniedTools" become deny rules at priority 150 (basePriority + 50): they
- *   restrict tools a broader rule allows, but the deny is NOT absolute — a
- *   higher-priority (or equal-priority, more-specific) allow still outranks it.
+ * Skills are increasingly third-party and the registries are large, so an
+ * overlay that could widen access would be an escalation primitive: a skill
+ * granting itself what the user's policy denied (#258).
+ *
+ * **An overlay is a ceiling filter applied BEFORE evaluation, not a set of
+ * rules merged into the priority ladder.** It narrows the tool set the engine
+ * is allowed to consider; the engine then evaluates that narrowed set with its
+ * documented semantics unchanged — priority wins, deny first within a tier,
+ * allow-exceptions keep working. Two mechanisms, no conflict:
+ *
+ * - "deniedTools" → the ceiling. A denied tool never reaches the ladder, so no
+ *   rule of any priority can re-allow it for that skill. It can only remove.
+ * - "requiredTools" surfaces actionable errors when a tool is unavailable; it
+ *   never grants anything (an explicit user deny stays absolute).
+ * - "preferredTools" influences recommendation, not security.
  */
 
 import type { PolicyRule, ToolRequestContext } from "./engine";
@@ -57,6 +67,17 @@ export function parseSkillMetadata(skillContent: string, skillName: string): Ski
   let preferredTools: string[] | undefined;
   let deniedTools: string[] | undefined;
 
+  // A deny that silently matches nothing is the worst kind of deny, and two
+  // ordinary YAML shapes produced one: a quoted entry (`- "Bash"`) parsed with
+  // its quotes, and a trailing comment (`- Bash # why`) parsed into the value.
+  // Tool names carry neither, so both are stripped (comment first — the `#` of
+  // a comment is never inside the quoted scalar we keep).
+  const stripQuotes = (v: string): string =>
+    v
+      .replace(/\s+#.*$/, "")
+      .replace(/^["']|["']$/g, "")
+      .trim();
+
   // Helper to parse array fields (handles both multiline and inline formats)
   function parseArrayField(fieldName: string): string[] | undefined {
     // Match multiline format:
@@ -67,7 +88,7 @@ export function parseSkillMetadata(skillContent: string, skillName: string): Ski
     if (multilineMatch) {
       return multilineMatch[1]
         .split("\n")
-        .map((line) => line.replace(/^\s*-\s*/, "").trim())
+        .map((line) => stripQuotes(line.replace(/^\s*-\s*/, "").trim()))
         .filter(Boolean);
     }
 
@@ -82,7 +103,7 @@ export function parseSkillMetadata(skillContent: string, skillName: string): Ski
     if (inlineMatch) {
       return inlineMatch[1]
         .split(",")
-        .map((item) => item.trim())
+        .map((item) => stripQuotes(item.trim()))
         .filter(Boolean);
     }
 
@@ -160,6 +181,13 @@ export function getSkillOverlayFromContent(
  * - requiredTools → no direct rules, tracked for validation
  * - preferredTools → informational only (not security-critical)
  */
+/**
+ * @deprecated #258: overlay denies are a ceiling applied before evaluation
+ * (`skillDeniesTool`), not rules in the priority ladder — as rules they could be
+ * outranked by a higher-priority allow, which is the escalation this must not
+ * permit. Kept for callers that render an overlay as policy-shaped data; the
+ * engine does not consult these.
+ */
 export function overlayToRules(overlay: SkillOverlay, basePriority: number = 100): PolicyRule[] {
   const rules: PolicyRule[] = [];
 
@@ -203,7 +231,10 @@ export function overlayToRules(overlay: SkillOverlay, basePriority: number = 100
  * (oldest evicted first) so it can't grow unbounded.
  */
 interface CachedOverlay {
-  rules: PolicyRule[];
+  /** The tools this skill refuses — the ceiling the engine applies (#258). */
+  deniedTools: string[];
+  /** The skill's own reason, shown when the ceiling refuses a tool. */
+  reason?: string;
   cachedAt: number;
 }
 const overlayRulesCache = new Map<string, CachedOverlay>();
@@ -235,13 +266,19 @@ export function cacheSkillOverlayFromContent(skillName: string, content: string)
   // slot, keeping the size-based eviction order meaningful.
   overlayRulesCache.delete(skillName);
   overlayRulesCache.set(skillName, {
-    rules: overlay ? overlayToRules(overlay) : [],
+    deniedTools: overlay?.deniedTools ?? [],
+    ...(overlay?.reason ? { reason: overlay.reason } : {}),
     cachedAt: now,
   });
   pruneOverlayCache(now);
 }
 
-/** Synchronously get cached overlay deny rules for a skill (empty if none/expired). */
+/**
+ * The cached overlay rendered as policy-shaped rules (empty if none/expired).
+ * The engine does NOT consult these — it applies `skillDeniesTool` as a ceiling
+ * (#258); this is for surfaces that display an overlay next to real rules.
+ * Derived on demand rather than precomputed, so nothing pays for it.
+ */
 export function getCachedSkillOverlayRules(skillName?: string): PolicyRule[] {
   if (!skillName) return [];
   const entry = overlayRulesCache.get(skillName);
@@ -250,7 +287,12 @@ export function getCachedSkillOverlayRules(skillName?: string): PolicyRule[] {
     overlayRulesCache.delete(skillName);
     return [];
   }
-  return entry.rules;
+  if (entry.deniedTools.length === 0) return [];
+  return overlayToRules({
+    skillName,
+    deniedTools: entry.deniedTools,
+    ...(entry.reason ? { reason: entry.reason } : {}),
+  });
 }
 
 /**
@@ -270,6 +312,41 @@ export function hasCachedSkillOverlay(skillName?: string): boolean {
   return true;
 }
 
+/**
+ * #258: the ceiling. `null` when this skill lets the request through — because
+ * it declared no overlay, or none that names this tool — and a reason when it
+ * refuses. The engine calls this BEFORE it evaluates any rule, so a refusal
+ * cannot be outranked by an allow of any priority: an overlay only ever
+ * removes from the set the engine considers. An overlay that was never
+ * resolved in this process caches nothing and is reported by
+ * `hasCachedSkillOverlay`, which the engine surfaces once per skill.
+ */
+export function skillDeniesTool(
+  skillName: string | undefined,
+  toolName: string,
+): { id: string; reason: string } | null {
+  if (!skillName) return null;
+  const entry = overlayRulesCache.get(skillName);
+  if (!entry) return null;
+  if (Date.now() - entry.cachedAt > OVERLAY_CACHE_TTL_MS) {
+    overlayRulesCache.delete(skillName);
+    return null;
+  }
+  // `*` denies every tool for this skill — the most restrictive thing a SKILL.md
+  // can say ("I am read-only, deny me everything"), and the shape the old rule
+  // form honoured through the engine's `matchesTool`. An exact-match-only
+  // ceiling would have turned it into a silent no-op (adversarial pass).
+  const denied = entry.deniedTools.includes("*") || entry.deniedTools.includes(toolName);
+  if (!denied) return null;
+  return {
+    // Reads as what it is — a ceiling, not a rule in the ladder.
+    id: `skill-overlay-ceiling:${skillName}:${toolName}`,
+    reason:
+      entry.reason ??
+      `Tool ${toolName} is denied by skill ${skillName} (skill overlay; skills can only narrow)`,
+  };
+}
+
 /** Clear the overlay rules cache (tests / skill reload). */
 export function clearSkillOverlayRulesCache(): void {
   overlayRulesCache.clear();
@@ -282,6 +359,11 @@ export function clearSkillOverlayRulesCache(): void {
 /**
  * Evaluate a tool request in the context of skill policy.
  * Checks if the requested tool is allowed given the skill's policy overlay.
+ *
+ * @deprecated #258: `allowed: true` here means "this skill's overlay does not
+ * refuse it", NOT "permitted" — the user policy still decides, and an explicit
+ * user deny is absolute. Do not treat this as a grant; the engine's `evaluate`
+ * is the only thing that decides. No production caller consults it.
  */
 export function evaluateSkillPolicy(overlay: SkillOverlay, toolName: string): SkillPolicyResult {
   // Check if tool is explicitly denied

@@ -10,6 +10,7 @@ jobs:
   typecheck:
     name: Typecheck ratchet
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -32,6 +33,7 @@ jobs:
   test:
     name: Bun test (module suites)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -42,38 +44,19 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      # Scoped to the suites that pass cleanly. `bun test` treats these as path
-      # patterns, so each must point at a dir that actually holds *.test.ts:
-      # the module dirs (src/bus, src/tuner, src/observability, src/skills-tuner)
-      # plus the governance tests — which live under src/__tests__/governance,
-      # NOT src/governance (that dir has no tests). The rest of the root
-      # `src/__tests__/` suite is intentionally excluded for now: ~41 pre-existing
-      # failures, a mix of cross-test pollution (pass in isolation, fail in the
-      # shared process) and infra-dependent tests (DB/queue CI doesn't provide).
-      # Folding those in would make CI permanently red. Tracked for cleanup — see
-      # the issue linked in the PR — after which these paths widen toward full.
-      # `src/__tests__/event-processor.test.ts` added #304 cluster 2: was
-      # 4 pass / 9 fail on a source-side ReferenceError; now 14 pass, stable
-      # 8/8 across repeat runs.
+      # #304: the whole `src` tree. The root `src/__tests__/` suite was excluded
+      # for months behind "~41 pre-existing failures"; re-baselined, those were
+      # (a) one module mock leaking process-wide out of gateway/index.test.ts —
+      # 38 escalation/gateway tests failed in the pack and 0 alone, (b) a
+      # fake-claude shell script whose `printf '\xHH'` dash does not support,
+      # (c) a test reading the OPERATOR's live plugin-audit journal, and (d) a
+      # test depending on whichever policy rules the previous file left
+      # loaded. All fixed in place; 0 failures across the tree, twice.
       #
-      # `src/__tests__/mcp-multiplexer-integration.test.ts` added #304: first
-      # file reclaimed from the excluded root suite (was 0 pass / 7 fail on a
-      # stale settings fixture; now 7 pass, verified 6/6 across repeat runs).
-      # Its sibling `session-persistence-integration.test.ts` is fixed too but
-      # deliberately NOT added yet — it carries a load-sensitive flake tracked
-      # in #326, and adding it would make CI randomly red.
-      #
-      # `src/adapters` added #301: the adapter suites are clean (252 pass) and
-      # they are where outbound routing and turn-semantics risk actually lives.
-      # Without them the adapter half of a delivery change never runs in CI —
-      # and there is no typecheck step to back it up.
-      #
-      # `src/__tests__/pty-boot-dialog.test.ts` added here: the boot-dialog
-      # watcher guards agents getting past claude's startup confirmation
-      # dialogs. Its exclusion is why a stale-fixture failure — and a real
-      # CHA-rendering drift bug in the watcher's ANSI stripper (the bus-path
-      # analogue of the #345 pty-supervisor footer hang) — slipped past CI.
-      # Fast (~0.5s), pure fake-PTY, no infra; verified 0 fail in the shared
-      # process (1443 pass across the clean suites) and stable across repeat runs.
-      - name: Run tests (clean suites)
-        run: bun test src/bus src/adapters src/tuner src/observability src/skills-tuner src/plugins/eval-framework src/__tests__/governance src/__tests__/mcp-multiplexer-integration.test.ts src/__tests__/event-processor.test.ts src/__tests__/pty-boot-dialog.test.ts
+      # Nothing in here may skip on an env var: a test that opts itself out
+      # reports green and proves nothing (the shape that let #290 through).
+      # Tests that need a real `claude` or credentials live in
+      # `tests/integration/` and run from integration.yml — nightly, un-gated,
+      # red when they fail.
+      - name: Run tests (all of src)
+        run: bun test src

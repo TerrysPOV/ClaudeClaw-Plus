@@ -1,8 +1,10 @@
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import { spawn } from "node:child_process";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SkillsSubject } from "../../../subjects/skills-subject.js";
+import { ClaudeCliBackend, type LLMClient } from "../../../../skills-tuner/core/llm.js";
 
 let dir: string;
 let logPath: string;
@@ -108,5 +110,144 @@ describe("SkillsSubject — description quality judge (no LLM → null)", () => 
   it("returns null when no LLM is configured", async () => {
     skill("alpha", "Alpha");
     expect(await subject().measureDescriptionQuality(12)).toBeNull();
+  });
+});
+
+describe("SkillsSubject — description quality judge failure reason", () => {
+  let warn: ReturnType<typeof spyOn>;
+  beforeEach(() => {
+    warn = spyOn(console, "warn").mockImplementation(() => {});
+  });
+  afterEach(() => warn.mockRestore());
+
+  /** A CLI backend whose `claude` cannot be found: spawn with an empty PATH → real ENOENT. */
+  function missingCli(): ClaudeCliBackend {
+    const emptyBin = join(dir, "empty-bin");
+    mkdirSync(emptyBin, { recursive: true });
+    const spawnNoPath = ((cmd: string, args: string[], opts: object) =>
+      spawn(cmd, args, { ...opts, env: { PATH: emptyBin } })) as unknown as typeof spawn;
+    return new ClaudeCliBackend({ models: {} } as never, spawnNoPath);
+  }
+  function judged(llm: LLMClient): SkillsSubject {
+    return new SkillsSubject({
+      scanDirs: [dir],
+      skillAccessLog: logPath,
+      qualityCachePath: qcPath,
+      llm,
+    });
+  }
+  function cache(): {
+    median: unknown;
+    failed?: boolean;
+    reason?: { code?: string; message: string };
+  } {
+    return JSON.parse(readFileSync(qcPath, "utf8"));
+  }
+  function warned(): string {
+    return warn.mock.calls.map((c: unknown[]) => String(c[0])).join("\n");
+  }
+
+  it("records and logs spawn ENOENT instead of a bare median null", async () => {
+    skill("alpha", "Alpha does alpha");
+    expect(await judged(missingCli()).measureDescriptionQuality(12)).toBeNull();
+    const c = cache();
+    expect(c.median).toBeNull();
+    expect(c.failed).toBe(true);
+    expect(c.reason?.code).toBe("ENOENT");
+    expect(c.reason?.message).toContain("claude");
+    expect(warned()).toContain("skills quality judge failed: ENOENT");
+  });
+
+  it("keeps the cycle going: collectObservations does not throw and leaves the reason", async () => {
+    skill("alpha", "Alpha does alpha");
+    const obs = await judged(missingCli()).collectObservations(new Date(0));
+    expect(Array.isArray(obs)).toBe(true);
+    expect(cache().reason?.code).toBe("ENOENT");
+  });
+
+  it("an unparseable reply gets a reason without the reply text", async () => {
+    skill("alpha", "Alpha does alpha");
+    const llm: LLMClient = {
+      call: async () => "secret-ish reply with no scores",
+      modelFor: () => "m",
+    };
+    expect(await judged(llm).measureDescriptionQuality(12)).toBeNull();
+    expect(cache().reason?.code).toBe("UNPARSEABLE");
+    expect(readFileSync(qcPath, "utf8")).not.toContain("secret-ish");
+    expect(warned()).toContain("UNPARSEABLE");
+  });
+
+  function throwing(message: string): LLMClient {
+    return {
+      call: async () => {
+        throw new Error(message);
+      },
+      modelFor: () => "m",
+    };
+  }
+
+  it("a malformed score array gets UNPARSEABLE, not the parser's message quoting the reply", async () => {
+    skill("alpha", "Alpha does alpha");
+    const llm: LLMClient = { call: async () => "[secretish token]", modelFor: () => "m" };
+    expect(await judged(llm).measureDescriptionQuality(12)).toBeNull();
+    expect(cache().reason?.code).toBe("UNPARSEABLE");
+    expect(readFileSync(qcPath, "utf8")).not.toContain("secretish");
+    expect(warned()).not.toContain("secretish");
+  });
+
+  it("keeps only the first line of an error", async () => {
+    skill("alpha", "Alpha does alpha");
+    await judged(throwing("spawn failed: boom\nsecond line")).measureDescriptionQuality(12);
+    const r = cache().reason;
+    expect(r?.code).toBeUndefined();
+    expect(r?.message).toBe("spawn failed: boom");
+  });
+
+  it("redacts token-shaped text from the reason", async () => {
+    skill("alpha", "Alpha does alpha");
+    // Built at runtime so the fixture never reads as a committed credential.
+    const key = ["sk", "ant", "api03", "AbCdEfGhIjKlMnOp_qrstuv"].join("-");
+    await judged(
+      throwing(`401 invalid x-api-key ${key} (Bearer abc.def)`),
+    ).measureDescriptionQuality(12);
+    const r = cache().reason;
+    expect(r?.message.startsWith("401 invalid x-api-key [redacted]")).toBe(true);
+    expect(readFileSync(qcPath, "utf8")).not.toContain("AbCdEf");
+    expect(readFileSync(qcPath, "utf8")).not.toContain("abc.def");
+    expect(warned()).not.toContain("AbCdEf");
+  });
+
+  it("caps a long error message", async () => {
+    skill("alpha", "Alpha does alpha");
+    await judged(throwing(`spawn failed: ${"word ".repeat(80)}`)).measureDescriptionQuality(12);
+    expect(cache().reason?.message.length).toBe(200);
+  });
+
+  it("survives an unprintable thrown value and still stamps the failure", async () => {
+    skill("alpha", "Alpha does alpha");
+    const llm: LLMClient = {
+      call: async () => {
+        throw Object.create(null);
+      },
+      modelFor: () => "m",
+    };
+    expect(await judged(llm).measureDescriptionQuality(12)).toBeNull();
+    expect(cache().reason?.message).toBe("unprintable error");
+  });
+
+  it("does not call the judge again within the failure cooldown", async () => {
+    skill("alpha", "Alpha does alpha");
+    let calls = 0;
+    const llm: LLMClient = {
+      call: async () => {
+        calls++;
+        throw Object.assign(new Error("timed out"), { code: "ETIMEDOUT" });
+      },
+      modelFor: () => "m",
+    };
+    await judged(llm).collectObservations(new Date(0));
+    await judged(llm).collectObservations(new Date(0));
+    expect(calls).toBe(1);
+    expect(cache().reason?.code).toBe("ETIMEDOUT");
   });
 });

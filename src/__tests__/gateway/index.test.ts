@@ -11,8 +11,23 @@
  * - Concurrent inbound events behave consistently
  */
 
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
 import { randomUUID } from "crypto";
+
+// #304: `vi.mock` is bun's `mock.module` — process-global, and it outlives
+// this file. Every test file bun loads after this one would see the fakes
+// below in place of `src/escalation`, `src/policy/engine` and
+// `src/governance/client` (the escalation suites failed 38 tests in the
+// pack and 0 alone). Keep the real exports so `afterAll` can put them back.
+const realEscalation = { ...(await import("../../escalation")) };
+const realPolicyEngine = { ...(await import("../../policy/engine")) };
+const realGovernanceClient = { ...(await import("../../governance/client")) };
+
+afterAll(() => {
+  vi.mock("../../escalation", () => realEscalation);
+  vi.mock("../../policy/engine", () => realPolicyEngine);
+  vi.mock("../../governance/client", () => realGovernanceClient);
+});
 
 // Mock modules before importing gateway
 vi.mock("../event-log", () => {
@@ -317,13 +332,6 @@ describe("Gateway", () => {
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
           }),
-          getResumeArgsForEvent: vi.fn().mockResolvedValue({
-            mappingId: "mapping-1",
-            claudeSessionId: null,
-            args: [],
-            isNewMapping: true,
-            canResume: false,
-          }),
           updateSessionAfterProcessing: vi.fn().mockResolvedValue(undefined),
         },
       };
@@ -390,13 +398,6 @@ describe("Gateway", () => {
             lastActiveAt: new Date().toISOString(),
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
-          }),
-          getResumeArgsForEvent: vi.fn().mockResolvedValue({
-            mappingId: "mapping-1",
-            claudeSessionId: null,
-            args: [],
-            isNewMapping: true,
-            canResume: false,
           }),
           updateSessionAfterProcessing: vi.fn(),
         },
@@ -485,6 +486,35 @@ describe("Gateway", () => {
       expect(legacyHandler).toHaveBeenCalled();
     });
 
+    it("trusts LegacyResult.success, not the optional exitCode (#377)", async () => {
+      clearGatewayEnabledCache();
+      setGatewayEnabled(false);
+      const event: NormalizedEvent = {
+        id: randomUUID(),
+        channel: "telegram",
+        channelId: "telegram:123",
+        threadId: "default",
+        userId: "456",
+        text: "Hello",
+        attachments: [],
+        timestamp: Date.now(),
+        metadata: {},
+      };
+
+      // A handler that does not wrap a process reports no exit code at all.
+      const noExitCode = await processEventWithFallback(event, {
+        legacyHandler: vi.fn().mockResolvedValue({ success: true }),
+      });
+      expect(noExitCode.success).toBe(true);
+
+      // And an exit code of 0 is not a verdict when the handler says it failed.
+      const zeroButFailed = await processEventWithFallback(event, {
+        legacyHandler: vi.fn().mockResolvedValue({ success: false, exitCode: 0, error: "nope" }),
+      });
+      expect(zeroButFailed.success).toBe(false);
+      expect(zeroButFailed.error).toBe("nope");
+    });
+
     it("should return error when gateway disabled and no legacy handler", async () => {
       clearGatewayEnabledCache();
       setGatewayEnabled(false);
@@ -556,17 +586,6 @@ describe("Gateway", () => {
               }
               return mappings.get(key);
             }),
-          getResumeArgsForEvent: vi.fn().mockImplementation(async (event: NormalizedEvent) => {
-            const key = `${event.channelId}:${event.threadId}`;
-            const entry = mappings.get(key);
-            return {
-              mappingId: entry?.mappingId ?? "unknown",
-              claudeSessionId: entry?.claudeSessionId ?? null,
-              args: entry?.claudeSessionId ? ["--resume", entry.claudeSessionId] : [],
-              isNewMapping: !entry,
-              canResume: entry?.claudeSessionId !== null,
-            };
-          }),
           updateSessionAfterProcessing: vi
             .fn()
             .mockImplementation(async (channelId: string, threadId: string, seq: number) => {
@@ -742,13 +761,6 @@ describe("Concurrent events", () => {
           lastActiveAt: new Date().toISOString(),
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
-        }),
-        getResumeArgsForEvent: vi.fn().mockResolvedValue({
-          mappingId: "mapping-1",
-          claudeSessionId: null,
-          args: [],
-          isNewMapping: false,
-          canResume: false,
         }),
         updateSessionAfterProcessing: vi.fn().mockImplementation(async () => {
           callOrder.push("update");

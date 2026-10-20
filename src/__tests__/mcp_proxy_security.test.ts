@@ -231,4 +231,67 @@ describe("mcp-proxy security", () => {
       _resetMcpProxy();
     }
   });
+
+  // ── Test 6b — oversized child error result → same cap, same 502 ──────────
+
+  it("an isError result over the cap is refused the same way, without its text", async () => {
+    // fail_tool answers isError: true; `size` pads its text past the 1MB cap.
+    _resetMcpBridge();
+    _resetHttpGateway();
+    _resetMcpProxy();
+
+    const capDir = mkdtempSync(join(tmpdir(), "mcp-proxy-large-err-test-"));
+    const capConfigPath = join(capDir, "mcp-proxy.json");
+    const capTokenPath = join(capDir, "mcp-proxy.token");
+    writeFileSync(
+      capConfigPath,
+      JSON.stringify({
+        servers: {
+          "test-server": {
+            command: BUN_BIN,
+            args: ["run", MOCK_SERVER],
+            enabled: true,
+            allowedTools: ["fail_tool"],
+          },
+        },
+      }),
+    );
+
+    let capPlugin: McpProxyPlugin | null = null;
+    try {
+      capPlugin = new McpProxyPlugin({ configPath: capConfigPath, tokenPath: capTokenPath });
+      await capPlugin.start();
+
+      const capGateway = getHttpGateway();
+      const capToken = Buffer.from(readFileSync(capTokenPath, "utf8").trim(), "hex");
+
+      const ts = new Date().toISOString();
+      const body = JSON.stringify({ arguments: { size: 2_000_000 }, mode: "direct" });
+      const sig = signRequest(capToken, body, ts);
+      const resp = await capGateway.handleRequest(
+        new Request("http://localhost/api/plugin/mcp-proxy/tools/test-server__fail_tool/invoke", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Plus-Ts": ts,
+            "X-Plus-Signature": sig,
+          },
+          body,
+        }),
+        new URL("http://localhost/api/plugin/mcp-proxy/tools/test-server__fail_tool/invoke"),
+      );
+      expect(resp?.status).toBe(502);
+      const text = (await resp?.text()) ?? "";
+      expect(text).toContain("Tool error exceeds");
+      expect(text.length).toBeLessThan(1_000);
+    } finally {
+      await capPlugin?.stop();
+      try {
+        rmSync(capDir, { recursive: true });
+      } catch {}
+      _resetMcpBridge();
+      _resetHttpGateway();
+      _resetMcpProxy();
+    }
+  });
 });

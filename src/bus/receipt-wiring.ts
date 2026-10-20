@@ -7,7 +7,8 @@
  * without booting the full bus runtime.
  */
 import { getDefaultReceiptStore, hashPrompt, type OpenReceipt, type ReceiptStore } from "./receipt";
-import type { BusOrigin } from "./types";
+import type { TurnObservation } from "./jsonl-line-types";
+import type { BusOrigin, PromptDeliveryOutcome, SupervisionMode } from "./types";
 
 /**
  * Recover the original prompt text from the `<channel source=... chat_id=...
@@ -63,12 +64,74 @@ export function openInboundReceipt(params: OpenInboundReceiptParams): OpenReceip
 
 /** Structural view of the bits an `AgentProcess` exposes that we touch.
  *  Declared here so the helper doesn't drag in `session-agent-process.ts`. */
-export interface AgentProcessLike {
-  readonly pid: number;
-  send_prompt_stream?(line: string): Promise<void>;
+/**
+ * #212: tailer → receipt seam. The tailer hands over the prompt text as the CLI
+ * recorded it — the `<channel …>` wrapper the bus added around the surface's
+ * text — so the hash is taken on the unwrapped inner text, the same key the
+ * adapter opened the receipt with and the PTY seam patches it by.
+ * Synthetic boundaries (a CLI-written API error) are not a model turn and are
+ * not recorded as one. Never throws: the tailer must keep going.
+ */
+export function confirmTurnReceipt(
+  observation: TurnObservation,
+  store: ReceiptStore = getDefaultReceiptStore(),
+): Promise<"patched" | "side-table" | "unknown" | "skipped"> {
+  if (observation.synthetic) return Promise.resolve("skipped");
+  return store
+    .confirmTurn(hashPrompt(unwrapChannelText(observation.promptText)), {
+      claude_jsonl_path: observation.jsonlPath,
+      turn_event_offset: observation.offset,
+      message_id: observation.messageId,
+    })
+    .catch(() => "unknown" as const);
 }
 
-export type StreamPromptHandler = (agent_id: string, text: string) => Promise<void>;
+export interface AgentProcessLike {
+  readonly pid: number;
+  /** Both real `AgentProcess` classes set it; fakes may omit it (treated as streamable). */
+  readonly supervision?: SupervisionMode;
+  send_prompt_stream?(line: string): Promise<PromptDeliveryOutcome | void>;
+}
+
+/**
+ * Supervision modes whose `send_prompt_stream` does not reject.
+ * `ChildAgentProcess` exposes the method in every mode but rejects it unless
+ * the mode is `process-stream-json` (`session-agent-process.ts`), so a
+ * `process` / `tmux` agent is NOT streamable: the IPC `prompt` frame is its
+ * only delivery (#428).
+ */
+const STREAMABLE_SUPERVISION: ReadonlySet<SupervisionMode> = new Set([
+  "pty-stdin",
+  "process-stream-json",
+]);
+
+/**
+ * Build the `PtyReachableCheck` (`core.ts`) the bus consults before it skips
+ * the IPC `prompt` frame (#428: deliver each prompt once). Reachable means
+ * registered, exposing `send_prompt_stream`, and in a supervision mode that
+ * method serves. The daemon wires it with
+ * `bus.setPtyReachableHandler(canStreamToAgent(getAgent))` alongside
+ * `setStreamPromptHandler`.
+ */
+export function canStreamToAgent(
+  getAgent: (agent_id: string) => AgentProcessLike | undefined,
+): (agent_id: string) => boolean {
+  return (agent_id) => {
+    const proc = getAgent(agent_id);
+    return (
+      !!proc &&
+      typeof proc.send_prompt_stream === "function" &&
+      (proc.supervision === undefined || STREAMABLE_SUPERVISION.has(proc.supervision))
+    );
+  };
+}
+
+/** Resolves with the process's delivery verdict when it reports one (issue
+ *  #361), so the bus can act on a give-up instead of assuming success. */
+export type StreamPromptHandler = (
+  agent_id: string,
+  text: string,
+) => Promise<PromptDeliveryOutcome | void>;
 
 export interface PromptStreamHandlerOptions {
   /** Receipt store to back-fill into. Defaults to the process-wide singleton. */
@@ -85,7 +148,12 @@ export interface PromptStreamHandlerOptions {
  *   2. Looks up an open receipt by `hashPrompt(text)`.
  *   3. If both present, stamps `process_pid`, `process_generation`,
  *      `route_resolved_at` BEFORE writing to the PTY.
- *   4. Writes the prompt; on success, stamps `stdin_written_at`. On failure,
+ *   4. Writes the prompt; on success, stamps `stdin_written_at` — and
+ *      `delivery_outcome` when the process reports one (issue #361), so a
+ *      receipt that later times out says the PTY layer gave up rather than
+ *      looking like a delivery that simply went unanswered (a bus
+ *      re-delivery's verdict lands in `redelivery_outcome`, the first one is
+ *      kept). On failure,
  *      closes the receipt as `stale_session` so the cause is visible in the
  *      receipts log (the caller can still close it later — `close` is
  *      idempotent).
@@ -103,7 +171,7 @@ export function createPromptStreamHandler(
   const now = opts.now ?? (() => new Date());
   const generationByAgent = new Map<string, { pid: number; gen: number }>();
 
-  return async (agent_id: string, text: string): Promise<void> => {
+  return async (agent_id: string, text: string): Promise<PromptDeliveryOutcome | void> => {
     const proc = getAgent(agent_id);
     // `BusCoreImpl.sendPrompt` wraps the prompt in a `<channel ...>...</channel>`
     // block before invoking us, so the receipt — keyed on the *raw* prompt at
@@ -128,12 +196,25 @@ export function createPromptStreamHandler(
         });
       }
       try {
-        await proc.send_prompt_stream(text);
+        const outcome = await proc.send_prompt_stream(text);
         if (receipt) {
+          // A bus re-delivery (#361) comes back through this same handler and
+          // finds the same open receipt: keep the first verdict, record the
+          // retry's under its own key, so a give-up followed by a clean retry
+          // still reads as "re-delivered", not as a first-try success.
+          const outcomeKey =
+            receipt.record.notes?.delivery_outcome === undefined
+              ? "delivery_outcome"
+              : "redelivery_outcome";
           receipt.patch({
-            notes: { ...receipt.record.notes, stdin_written_at: now().toISOString() },
+            notes: {
+              ...receipt.record.notes,
+              stdin_written_at: now().toISOString(),
+              ...(typeof outcome === "string" ? { [outcomeKey]: outcome } : {}),
+            },
           });
         }
+        return outcome;
       } catch (err) {
         // PTY write failed — `stale_session` reflects "the process was
         // there when we checked but rejected the write". The caller

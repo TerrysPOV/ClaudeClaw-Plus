@@ -1,5 +1,5 @@
 {
-  "total": 153,
+  "total": 149,
   "files": {
     "docs/spikes/probes/clear-with-history-probe.ts": 1,
     "docs/spikes/probes/lifecycle-markers-probe.ts": 1,
@@ -7,7 +7,6 @@
     "src/__tests__/gateway/adapter-wiring.test.ts": 1,
     "src/__tests__/gateway/index.test.ts": 1,
     "src/__tests__/gateway/resume.test.ts": 2,
-    "src/__tests__/integration/model-override.test.ts": 1,
     "src/__tests__/mcp-multiplexer-integration.test.ts": 7,
     "src/__tests__/mcp_proxy_basic.test.ts": 1,
     "src/__tests__/orchestrator/executor.test.ts": 1,
@@ -17,7 +16,6 @@
     "src/__tests__/pty-integration.test.ts": 1,
     "src/__tests__/pty-mcp-config-writer.test.ts": 1,
     "src/__tests__/pty-supervisor-mcp.test.ts": 1,
-    "src/__tests__/runner.test.ts": 1,
     "src/__tests__/runtime-config.test.ts": 1,
     "src/__tests__/session-persistence-integration.test.ts": 7,
     "src/__tests__/skills-tuner-config.test.ts": 2,
@@ -36,7 +34,7 @@
     "src/bus/__tests__/scheduler.test.ts": 1,
     "src/bus/__tests__/schema-probe.test.ts": 1,
     "src/bus/__tests__/wiring.test.ts": 2,
-    "src/gateway/index.ts": 3,
+    "src/gateway/index.ts": 1,
     "src/governance/client.ts": 1,
     "src/memory.ts": 3,
     "src/orchestrator/executor.ts": 3,

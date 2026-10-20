@@ -43,7 +43,7 @@ export function isHeartbeatExcludedNow(
  * window in the daemon's timezone.
  */
 export function isHeartbeatExcludedAt(
-  config: HeartbeatConfig,
+  config: Pick<HeartbeatConfig, "excludeWindows">,
   timezoneOffsetMinutes: number,
   at: Date,
 ): boolean {

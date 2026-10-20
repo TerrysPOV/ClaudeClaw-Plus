@@ -9,7 +9,21 @@
  * - Feature flag isolation between adapters
  */
 
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from "vitest";
+
+// #304: `vi.mock` is bun's `mock.module` — process-global, and it outlives
+// this file. `src/commands/discord` mocked here stayed mocked for the
+// commands suite loaded later (its mention-deny test failed in the pack and
+// passed alone). Keep the real exports so `afterAll` can put them back.
+const realGateway = { ...(await import("../../gateway")) };
+const realTelegram = { ...(await import("../../commands/telegram")) };
+const realDiscord = { ...(await import("../../commands/discord")) };
+
+afterAll(() => {
+  vi.mock("../../gateway", () => realGateway);
+  vi.mock("../../commands/telegram", () => realTelegram);
+  vi.mock("../../commands/discord", () => realDiscord);
+});
 
 // Mock the gateway module
 vi.mock("../../gateway", () => ({

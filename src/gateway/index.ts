@@ -20,10 +20,8 @@ import type { ProcessingResult } from "../event-processor";
 import type { NormalizedEvent } from "./normalizer";
 import {
   getOrCreateSessionMapping,
-  getResumeArgsForEvent,
   updateSessionAfterProcessing,
   recordClaudeSessionId,
-  type ResumeArgs,
 } from "./resume";
 import { shouldBlockAdmission, handlePolicyDenial } from "../escalation";
 import { evaluate, type ToolRequestContext, type PolicyDecision } from "../policy/engine";
@@ -53,7 +51,6 @@ export interface GatewayDependencies {
   /** Resume module functions */
   resume: {
     getOrCreateSessionMapping: typeof getOrCreateSessionMapping;
-    getResumeArgsForEvent: typeof getResumeArgsForEvent;
     updateSessionAfterProcessing: typeof updateSessionAfterProcessing;
     recordClaudeSessionId?: typeof recordClaudeSessionId;
   };
@@ -83,7 +80,6 @@ function createDefaultDependencies(): GatewayDependencies {
     },
     resume: {
       getOrCreateSessionMapping,
-      getResumeArgsForEvent,
       updateSessionAfterProcessing,
       recordClaudeSessionId,
     },
@@ -98,6 +94,8 @@ export class Gateway {
   private config: GatewayConfig;
   private deps: GatewayDependencies;
   private running = false;
+  /** #376: conversations already warned about a missing session id. */
+  private readonly warnedNoSessionId = new Set<string>();
 
   constructor(config: GatewayConfig = {}, deps?: GatewayDependencies) {
     this.config = config;
@@ -201,15 +199,14 @@ export class Gateway {
    * 3. Append event to event log (event log assigns sequence number)
    * 4. Trigger processor on persisted event record
    * 5. Update mapping metadata after success
-   * 6. Record real Claude session ID if available
+   * 6. Record the Claude session id the runner reported
    *
    * @param event - NormalizedEvent from adapter/normalizer
-   * @returns Processing result with event record and session info
+   * @returns Processing result with the event record
    */
   async processInboundEvent(event: NormalizedEvent): Promise<{
     success: boolean;
     eventRecord?: EventRecord;
-    resumeArgs?: ResumeArgs;
     error?: string;
   }> {
     if (!this.running) {
@@ -313,8 +310,15 @@ export class Gateway {
         );
       }
 
-      // Step 6: Record real Claude session ID if available in processor result
-      // This is transitional - the processor should expose a seam for session ID extraction
+      // Step 6: Record the real Claude session id the processor surfaced
+      // (#376: the runner reads it off the CLI's `system/init` / `result`
+      // events and it travels `RunResult` → `ProcessingResult`). Before #376
+      // nothing populated it, so every mapping stayed `claudeSessionId: null`.
+      // The map only records; which session a conversation resumes is the
+      // runner's own store (`sessions.ts`, keyed by the thread id the
+      // processor passes — per conversation under `session.gatewayScope:
+      // "conversation"`, the global session otherwise). Say so, once per
+      // conversation, when a successful turn brings no id.
       if (processorResult.success && processorResult.claudeSessionId) {
         if (this.deps.resume.recordClaudeSessionId) {
           await this.deps.resume.recordClaudeSessionId(
@@ -323,15 +327,20 @@ export class Gateway {
             processorResult.claudeSessionId,
           );
         }
+      } else if (processorResult.success) {
+        const key = `${event.channelId}\u0000${event.threadId}`;
+        if (!this.warnedNoSessionId.has(key)) {
+          this.warnedNoSessionId.add(key);
+          console.warn(
+            `[gateway] no Claude session id came back for channel=${event.channelId} thread=${event.threadId} — ` +
+              "the runner reported none for this turn; the mapping keeps no id until a turn reports one (logged once per conversation)",
+          );
+        }
       }
-
-      // Get resume args for response
-      const resumeArgs = await this.deps.resume.getResumeArgsForEvent(event);
 
       return {
         success: processorResult.success,
         eventRecord,
-        resumeArgs,
         error: processorResult.error,
       };
     } catch (err) {
@@ -387,7 +396,6 @@ export function setGateway(gateway: Gateway): void {
 export async function processInboundEvent(event: NormalizedEvent): Promise<{
   success: boolean;
   eventRecord?: EventRecord;
-  resumeArgs?: ResumeArgs;
   error?: string;
 }> {
   // Check if system is paused before creating gateway
@@ -451,7 +459,7 @@ export function setGatewayEnabled(enabled: boolean): void {
 // --- Extended Processor Result ---
 
 export interface ProcessorResult extends ProcessingResult {
-  /** Real Claude session ID if available (extracted from first successful run) */
+  /** Real Claude session ID if available (#376: populated by the event processor from `RunResult.sessionId`) */
   claudeSessionId?: string;
 }
 
@@ -493,7 +501,6 @@ export async function processEventWithFallback(
   success: boolean;
   source: "gateway" | "legacy";
   eventRecord?: EventRecord;
-  resumeArgs?: ResumeArgs;
   error?: string;
   legacyResult?: LegacyResult;
 }> {
@@ -522,7 +529,6 @@ export async function processEventWithFallback(
       success: result.success,
       source: "gateway",
       eventRecord: result.eventRecord,
-      resumeArgs: result.resumeArgs,
       error: result.error,
     };
   } else {
@@ -530,8 +536,12 @@ export async function processEventWithFallback(
     if (options.legacyHandler) {
       try {
         const legacyResult = await options.legacyHandler();
+        // `success` is the contract; `exitCode` is optional and informational
+        // (a handler that wraps a process reports it, one that does not has
+        // none). Deriving success from it turned `{ success: true }` into a
+        // failure and `{ success: false, exitCode: 0 }` into a success (#377).
         return {
-          success: legacyResult.exitCode === 0,
+          success: legacyResult.success,
           source: "legacy",
           error: legacyResult.error ?? legacyResult.stderr ?? undefined,
           legacyResult,

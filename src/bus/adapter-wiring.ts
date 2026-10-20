@@ -31,6 +31,8 @@
 
 import type { BusCore } from "./core";
 import type { Settings, DiscordConfig, TelegramConfig, SlackConfig, WebConfig } from "../config";
+import type { QuietHoursState } from "../quiet-hours";
+import type { AllowlistState } from "../allowlist";
 
 /**
  * Each adapter exposes a similar surface: a constructor with options,
@@ -71,6 +73,17 @@ export interface WireBusAdaptersOptions {
    * still skips, since there is nothing to route to.
    */
   defaultAgentId?: string;
+  /**
+   * Quiet hours for proactive Telegram messages (#512), read on every send so
+   * a settings reload applies without a restart. Omit = nothing is held.
+   */
+  quietHours?: () => QuietHoursState | undefined;
+  /**
+   * Current settings, read by the Telegram / Discord / Slack allow-list gates
+   * on every inbound event so a settings reload adds or revokes access without
+   * a restart (#520). Omit = the lists in `settings`, fixed at mount.
+   */
+  liveSettings?: () => Pick<Settings, "discord" | "telegram" | "slack">;
   /** Logger override. Defaults to `console`. */
   logger?: Pick<Console, "warn" | "info" | "error">;
 }
@@ -104,11 +117,23 @@ export async function wireBusAdapters(
     }
   };
 
-  await tryMount("discord", () => mountDiscord(opts.bus, opts.settings.discord, logger));
-  await tryMount("telegram", () =>
-    mountTelegram(opts.bus, opts.settings.telegram, logger, opts.defaultAgentId),
+  const live = opts.liveSettings;
+  await tryMount("discord", () =>
+    mountDiscord(opts.bus, opts.settings.discord, logger, live && (() => live().discord)),
   );
-  await tryMount("slack", () => mountSlack(opts.bus, opts.settings.slack, logger));
+  await tryMount("telegram", () =>
+    mountTelegram(
+      opts.bus,
+      opts.settings.telegram,
+      logger,
+      opts.defaultAgentId,
+      opts.quietHours,
+      live && (() => live().telegram),
+    ),
+  );
+  await tryMount("slack", () =>
+    mountSlack(opts.bus, opts.settings.slack, logger, live && (() => live().slack)),
+  );
   await tryMount("webui", () => mountWebUi(opts.bus, opts.settings.web, logger));
 
   return { adapters, errors };
@@ -167,6 +192,7 @@ async function mountDiscord(
   bus: BusCore,
   cfg: DiscordConfig,
   logger: Pick<Console, "warn" | "info" | "error">,
+  allowlist?: () => AllowlistState<string>,
 ): Promise<MountedAdapter | null> {
   if (!cfg.token || !cfg.busRouting) return null;
   const { DiscordAdapter } = await import("../adapters/discord");
@@ -174,6 +200,8 @@ async function mountDiscord(
     bus,
     token: cfg.token,
     allowedUserIds: cfg.allowedUserIds,
+    ...(cfg.allowAllUsers ? { allowAllUsers: true } : {}),
+    ...(allowlist ? { allowlist } : {}),
     routing: cfg.busRouting,
     logger,
   });
@@ -191,6 +219,8 @@ async function mountTelegram(
   cfg: TelegramConfig,
   logger: Pick<Console, "warn" | "info" | "error">,
   defaultAgentId?: string,
+  quietHours?: () => QuietHoursState | undefined,
+  allowlist?: () => AllowlistState<number>,
 ): Promise<MountedAdapter | null> {
   if (!cfg.token) return null;
   // #197: a fresh install sets `telegram.token` but never writes `busRouting`,
@@ -214,29 +244,25 @@ async function mountTelegram(
       return null;
     }
     routing = { chats: {}, defaultAgentId };
-    // Surface the derive. When allowedUserIds is empty the adapter accepts
-    // inbound from ANY Telegram user (empty allow-list = allow-all, a
-    // pre-existing policy — see adapters/telegram allow-list gate), so a
-    // token-only mount is open by default; warn so the operator can lock it down.
-    if (cfg.allowedUserIds.length === 0) {
-      logger.warn(
-        `[bus-adapters] telegram: no busRouting configured — routing all inbound chats to default agent "${defaultAgentId}". telegram.allowedUserIds is empty, so ANY Telegram user can reach it; set telegram.allowedUserIds to restrict access.`,
-      );
-    } else {
-      logger.info(
-        `[bus-adapters] telegram: no busRouting configured; routing all inbound chats to default agent "${defaultAgentId}"`,
-      );
-    }
+    // Surface the derive. Who may reach the agent is the allow-list's call
+    // (src/allowlist.ts) — an empty list refuses everyone, and the daemon
+    // warns about that once at startup.
+    logger.info(
+      `[bus-adapters] telegram: no busRouting configured; routing all inbound chats to default agent "${defaultAgentId}"`,
+    );
   }
   const { TelegramAdapter } = await import("../adapters/telegram");
   const adapter = new TelegramAdapter({
     bus,
     token: cfg.token,
     allowedUserIds: cfg.allowedUserIds,
+    ...(cfg.allowAllUsers ? { allowAllUsers: true } : {}),
+    ...(allowlist ? { allowlist } : {}),
     routing,
     // #201: honor send-only configs even with explicit busRouting — the
     // adapter wires outbound but skips the inbound long-poll. Default true.
     receiveEnabled: cfg.receiveEnabled,
+    ...(quietHours ? { quietHours } : {}),
     logger,
   });
   await adapter.start();
@@ -252,6 +278,7 @@ async function mountSlack(
   bus: BusCore,
   cfg: SlackConfig,
   logger: Pick<Console, "warn" | "info" | "error">,
+  allowlist?: () => AllowlistState<string>,
 ): Promise<MountedAdapter | null> {
   if (!cfg.botToken || !cfg.busRouting) return null;
   // Signing secret resolution: explicit override on busRouting wins, else
@@ -269,6 +296,8 @@ async function mountSlack(
     token: cfg.botToken,
     signingSecret,
     allowedUserIds: cfg.allowedUserIds,
+    ...(cfg.allowAllUsers ? { allowAllUsers: true } : {}),
+    ...(allowlist ? { allowlist } : {}),
     routing: {
       channels: cfg.busRouting.channels,
       ...(cfg.busRouting.threadAgentId ? { threadAgentId: cfg.busRouting.threadAgentId } : {}),
@@ -288,6 +317,17 @@ async function mountSlack(
   };
 }
 
+/**
+ * Web UI adapter token: `web.bus.token` wins; the `CCAW_WEBUI_TOKEN` env is
+ * the fallback, so the secret can stay out of settings.json.
+ */
+export function resolveWebUiToken(
+  bus: { token?: string },
+  env: Record<string, string | undefined> = process.env,
+): string | undefined {
+  return bus.token || env.CCAW_WEBUI_TOKEN?.trim() || undefined;
+}
+
 async function mountWebUi(
   bus: BusCore,
   cfg: WebConfig,
@@ -298,11 +338,13 @@ async function mountWebUi(
   // one (and vice versa) by setting `web.enabled: false` + `web.bus: {…}`.
   if (!cfg.bus) return null;
   const { WebUiAdapter } = await import("../adapters/webui");
+  const token = resolveWebUiToken(cfg.bus);
   const adapter = new WebUiAdapter({
     bus,
     ...(cfg.bus.bind ? { bind: cfg.bus.bind } : {}),
-    ...(cfg.bus.token ? { token: cfg.bus.token } : {}),
+    ...(token ? { token } : {}),
     ...(cfg.bus.allowedAgentIds ? { allowedAgentIds: cfg.bus.allowedAgentIds } : {}),
+    ...(cfg.bus.allowedOrigins ? { allowedOrigins: cfg.bus.allowedOrigins } : {}),
     logger,
   });
   await adapter.start();

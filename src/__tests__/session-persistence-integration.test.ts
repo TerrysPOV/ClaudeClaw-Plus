@@ -68,11 +68,14 @@ function writeProxyConfig(dir: string, names: string[]): string {
 }
 
 /** Real factory — constructs an actual `SessionPersistenceStore`. */
-function makePersistenceFactory(): (opts: {
-  storageRoot: string;
-  maxAgeMs: number;
-}) => SessionPersistenceStore {
-  return ({ storageRoot, maxAgeMs }) => new SessionPersistenceStore({ storageRoot, maxAgeMs });
+function makePersistenceFactory(
+  onCreate?: (store: SessionPersistenceStore) => void,
+): (opts: { storageRoot: string; maxAgeMs: number }) => SessionPersistenceStore {
+  return ({ storageRoot, maxAgeMs }) => {
+    const store = new SessionPersistenceStore({ storageRoot, maxAgeMs });
+    onCreate?.(store);
+    return store;
+  };
 }
 
 /** Ephemeral loopback gateway that routes `/mcp/*` and `/api/plugin/*`. */
@@ -570,6 +573,7 @@ describe("session-persistence integration — runtime GC", () => {
     const cfg = writeProxyConfig(tmpDir, ["alpha"]);
 
     // Daemon up, drive a live bucket, persist a fresh record.
+    let store: SessionPersistenceStore | undefined;
     plugin = new McpMultiplexerPlugin({
       configPath: cfg,
       settingsView: makeMuxSettingsView({
@@ -578,7 +582,9 @@ describe("session-persistence integration — runtime GC", () => {
         sessionPersistencePath: persistRoot,
         sessionMaxAgeSeconds: 3600,
       }),
-      persistenceFactory: makePersistenceFactory(),
+      persistenceFactory: makePersistenceFactory((s) => {
+        store = s;
+      }),
       gcTickMs: 0, // manual drive
     });
 
@@ -599,6 +605,13 @@ describe("session-persistence integration — runtime GC", () => {
         await conn.close();
       }
       await waitForAudit(events, "mcp_session_persisted");
+      // #326: the tool call above left a fire-and-forget `touch()` behind
+      // (read → modify → write of this very file). Editing the file while
+      // that write is in flight lets the touch put back the one-entry
+      // version, and the GC then scans 1 instead of 2 — the residual flake.
+      // Wait for the queue to drain before touching the file by hand.
+      expect(store).toBeDefined();
+      await store?.flush("alpha");
 
       // Manually append a second, EXPIRED entry to the same file.
       const file = readPersistenceFile(persistRoot, "alpha");

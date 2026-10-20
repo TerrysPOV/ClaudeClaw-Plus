@@ -6,15 +6,39 @@
  *   claudeclaw fire <agent> <label>
  *
  * Fires a single agent job immediately via the same `run()` code path as the
- * cron loop. Disabled jobs (enabled: false) CAN be fired manually — the
- * enabled flag only gates cron scheduling.
+ * cron loop (legacy and PTY runtimes). Disabled jobs (enabled: false) CAN be
+ * fired manually — the enabled flag only gates cron scheduling.
+ *
+ * Two things worth knowing (#344):
+ * - the fired turn runs AS the agent, on the agent's own session
+ *   (`agent:<name>`, the same one its scheduled runs use). A `claudeclaw fire`
+ *   from a second process therefore resumes the same session as the daemon's
+ *   cron tick — do not fire a job at the minute it is due.
+ * - under `runtime: "bus"` the scheduled turn still comes from the 60 s job
+ *   loop (`job-loop.ts`: a one-shot `claude -p` on the job's model, #506); a
+ *   fire through the web UI's bus runner sends the clock-prefixed prompt to the
+ *   bus agent and bounds its wait with the job's timeout — the model stays the
+ *   agent's.
  *
  * Closes GAP-17-05: no more waiting on cron to smoke-test a new job.
  */
 
-import { loadAgentJobsUnfiltered, agentDirExists, type Job } from "../jobs";
-import { run as defaultRun } from "../runner";
-import { resolvePrompt as defaultResolvePrompt, initConfig, loadSettings } from "../config";
+import {
+  loadAgentJobsUnfiltered,
+  agentDirExists,
+  resolveJobModel,
+  snapshotJobFrontmatter,
+  validateModelString,
+  type Job,
+} from "../jobs";
+import { run } from "../runner";
+import {
+  resolvePrompt as defaultResolvePrompt,
+  getSettings,
+  initConfig,
+  loadSettings,
+} from "../config";
+import { buildClockPromptPrefix } from "../timezone";
 
 export interface FireResult {
   success: boolean;
@@ -26,13 +50,114 @@ export interface FireResult {
   label?: string;
 }
 
+/**
+ * What the scheduled path (`runJob` in start.ts) derives from the job before it
+ * calls `run()`, so a manual fire is the same turn (#344): the job's own
+ * `timeout:` frontmatter (seconds → ms), its resolved model, and the `"job"`
+ * timeout category. Before #344 a fire passed none of these — it ran on the
+ * default 5-minute cap and on a different session key — which is how a job
+ * that legitimately runs 20 minutes "timed out" only when fired by hand.
+ */
+export interface FireRunExtras {
+  timeoutMs?: number;
+  modelOverride?: string;
+}
+
+export interface FireRunnerResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  /**
+   * #436: resolves when the agent's turn is over, when that is later than the
+   * runner's return — the bus runner returns when its WAIT ends (reply or
+   * timeout) and the turn can run on. The job's frontmatter is restored then,
+   * not before. Absent: the turn ended with the runner (the `run()` path
+   * kills the child at `timeout:`).
+   */
+  turnSettled?: Promise<unknown>;
+}
+
+/**
+ * #436: one frontmatter snapshot per job while any fired turn of it may still
+ * write. A second fire of the same job while the first turn runs on must not
+ * snapshot the file that turn may already have rewritten — it shares the
+ * first snapshot, and the restore runs when the last of them settles.
+ */
+const pendingRestores = new Map<
+  string,
+  { restore: () => Promise<boolean>; holders: number; restoring?: Promise<void> }
+>();
+
+async function holdFrontmatterSnapshot(jobName: string): Promise<() => Promise<void>> {
+  let entry = pendingRestores.get(jobName);
+  // A restore in flight: wait for it, so this fire snapshots the restored
+  // file rather than the one the previous turn rewrote.
+  while (entry?.restoring) {
+    await entry.restoring.catch(() => undefined);
+    entry = pendingRestores.get(jobName);
+  }
+  if (entry) {
+    entry.holders++;
+  } else {
+    // Two first fires can both reach this await: whichever publishes its
+    // snapshot first wins, the other joins it.
+    const restore = await snapshotJobFrontmatter(jobName);
+    entry = pendingRestores.get(jobName);
+    if (entry && !entry.restoring) entry.holders++;
+    else {
+      entry = { restore, holders: 1 };
+      pendingRestores.set(jobName, entry);
+    }
+  }
+  const held = entry;
+  let released = false;
+  return async () => {
+    if (released) return;
+    released = true;
+    if (pendingRestores.get(jobName) !== held) return; // already flushed at shutdown
+    if (--held.holders > 0) return;
+    // The entry stays until the restore lands (see the wait above).
+    held.restoring = (async () => {
+      try {
+        if (await held.restore()) console.log(`Restored frontmatter for job: ${jobName}`);
+      } finally {
+        if (pendingRestores.get(jobName) === held) pendingRestores.delete(jobName);
+      }
+    })();
+    await held.restoring;
+  };
+}
+
+/**
+ * #436: restore every snapshot still waiting on a turn. For daemon shutdown:
+ * the in-flight turns have been drained (or abandoned) by then, and a restore
+ * held in memory would otherwise be lost with the process.
+ */
+export async function restorePendingFrontmatter(): Promise<void> {
+  const entries = [...pendingRestores.entries()];
+  pendingRestores.clear();
+  for (const [jobName, entry] of entries) {
+    if (entry.restoring) {
+      await entry.restoring.catch(() => undefined); // already restoring
+      continue;
+    }
+    entry.holders = 0;
+    try {
+      if (await entry.restore()) console.log(`Restored frontmatter for job: ${jobName}`);
+    } catch (err) {
+      console.error(`[fire] frontmatter restore failed for ${jobName}:`, err);
+    }
+  }
+}
+
 export interface FireJobOptions {
-  /** Injectable runner for tests. Defaults to runner.run. */
+  /** Injectable runner for tests. Defaults to the scheduled path's `run()` call. */
   runner?: (
     name: string,
     prompt: string,
     agent?: string,
-  ) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
+    extras?: FireRunExtras,
+  ) => Promise<FireRunnerResult>;
   /** Injectable prompt resolver for tests. Defaults to config.resolvePrompt. */
   promptResolver?: (prompt: string) => Promise<string>;
   /** Injectable agent-job loader for tests. Defaults to loadAgentJobsUnfiltered. */
@@ -42,9 +167,32 @@ export interface FireJobOptions {
 }
 
 /**
+ * The scheduled path's `run()` call, exactly (`runJob` in start.ts): the
+ * session key `agent:<name>`, the job's model and timeout, the `"job"` timeout
+ * category, the agent name for its memory/identity.
+ */
+async function defaultRun(
+  name: string,
+  prompt: string,
+  agent?: string,
+  extras: FireRunExtras = {},
+): Promise<FireRunnerResult> {
+  return run(
+    name,
+    prompt,
+    agent ? `agent:${agent}` : name,
+    extras.modelOverride,
+    extras.timeoutMs,
+    agent,
+    "job",
+  );
+}
+
+/**
  * Fire a single agent job once, bypassing the cron loop and the enabled
- * filter. Uses the same `run()` signature as the scheduled path to guarantee
- * storage/exec format parity.
+ * filter. Derives the same arguments as the scheduled path (`runJob` in
+ * start.ts) — clock prefix, model, timeout, session key — so the fired turn is
+ * the scheduled turn, storage and exec included.
  */
 export async function fireJob(
   agent: string,
@@ -86,9 +234,47 @@ export async function fireJob(
     };
   }
 
-  // Mirror cron-loop pattern: resolvePrompt then run(name, prompt, agent)
-  const resolved = await promptResolver(job.prompt);
-  const result = await runner(job.name, resolved, job.agent);
+  // The cron loop's loader skips a job whose `model:` is invalid (#378); the
+  // unfiltered loader used here does not. Since a fire now honours `model:`,
+  // refuse the same way instead of handing claude a bad `--model`.
+  try {
+    validateModelString(job.model, `job '${agent}:${label}'`);
+  } catch (err) {
+    return {
+      success: false,
+      exitCode: 1,
+      error: err instanceof Error ? err.message : String(err),
+      agent,
+      label,
+    };
+  }
+
+  // Mirror the cron loop (`runJob`): clock prefix, resolved prompt, the job's
+  // own model and timeout, and the frontmatter snapshot — the agent's cwd is
+  // its own directory, and a turn that rewrites its job file must not drop
+  // `schedule:`. Settings may not be loaded (tests): the clock then carries
+  // no offset.
+  const releaseSnapshot = await holdFrontmatterSnapshot(job.name);
+  let result: FireRunnerResult;
+  try {
+    result = await runFired(job, promptResolver, runner);
+  } catch (err) {
+    // The runner's error is the one to surface, not a failed restore's.
+    await releaseSnapshot().catch((e) =>
+      console.error(`[fire] frontmatter restore failed for ${job.name}:`, e),
+    );
+    throw err;
+  }
+  if (result.turnSettled) {
+    // #436: the bus runner's wait is over; the turn may not be. Restore when
+    // it is — in the background, the caller has its result already.
+    void result.turnSettled
+      .catch(() => undefined)
+      .then(releaseSnapshot)
+      .catch((err) => console.error(`[fire] frontmatter restore failed for ${job.name}:`, err));
+  } else {
+    await releaseSnapshot();
+  }
   return {
     success: result.exitCode === 0,
     exitCode: result.exitCode,
@@ -97,6 +283,26 @@ export async function fireJob(
     agent,
     label,
   };
+}
+
+async function runFired(
+  job: Job,
+  promptResolver: (prompt: string) => Promise<string>,
+  runner: NonNullable<FireJobOptions["runner"]>,
+): Promise<FireRunnerResult> {
+  const resolved = await promptResolver(job.prompt);
+  let tzOffset = 0;
+  try {
+    tzOffset = getSettings().timezoneOffsetMinutes;
+  } catch {
+    /* settings not loaded */
+  }
+  const prompt = `${buildClockPromptPrefix(new Date(), tzOffset)}\n${resolved}`;
+  const extras: FireRunExtras = {
+    timeoutMs: job.timeoutSeconds ? job.timeoutSeconds * 1000 : undefined,
+    modelOverride: await resolveJobModel(job),
+  };
+  return runner(job.name, prompt, job.agent, extras);
 }
 
 /**

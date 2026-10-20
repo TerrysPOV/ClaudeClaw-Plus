@@ -25,6 +25,11 @@ const TOOLS = [
     description: "Returns a 2MB payload for size-cap testing",
     inputSchema: { type: "object" },
   },
+  {
+    name: "fail_tool",
+    description: "Returns a tool-level error result (isError: true)",
+    inputSchema: { type: "object" },
+  },
 ];
 
 function send(obj: unknown): void {
@@ -106,6 +111,20 @@ function handleMessage(msg: { id?: unknown; method?: string; params?: unknown })
         jsonrpc: "2.0",
         id,
         result: { content: [{ type: "text", text: JSON.stringify({ data: "x".repeat(2_000_000) }) }] },
+      });
+      return;
+    }
+
+    if (name === "fail_tool") {
+      // A tool that ran and failed: per the MCP spec this is a normal
+      // JSON-RPC result carrying `isError: true`, not a protocol error.
+      // `size` pads the text, for the error-length bound.
+      const args = params?.arguments as { size?: number };
+      const text = `fail_tool: upstream refused${"x".repeat(args?.size ?? 0)}`;
+      send({
+        jsonrpc: "2.0",
+        id,
+        result: { content: [{ type: "text", text }], isError: true },
       });
       return;
     }

@@ -2,6 +2,7 @@ import { describe, it, expect } from "bun:test";
 import {
   ackForAlready,
   ackForResolution,
+  decisionStripsKeyboard,
   parseResolverVerdict,
   redactResolverDiagnostics,
   describeResolverFailure,
@@ -33,12 +34,50 @@ describe("ackForAlready (#314)", () => {
     );
   });
 
-  it("omits the timestamp when absent or unparseable, defaults to approved", () => {
+  it("omits the timestamp when absent or unparseable", () => {
     expect(ackForAlready("already:approve")).toBe("✅ Déjà approuvé");
     expect(ackForAlready("already:approve:not-a-date")).toBe("✅ Déjà approuvé");
-    // Unknown decision string → treated as the approve default (informative, not alarming).
+  });
+
+  it("reports an unknown decision instead of calling it approved", () => {
+    // This assertion is the reverse of the one it replaces, deliberately. The
+    // old test asserted that an unrecognised decision defaults to "Déjà
+    // approuvé" — "informative, not alarming". That default is the defect: the
+    // decision vocabulary is not owned here, and the live database holds 39
+    // distinct values. Answering "approved" to a value this layer has never
+    // seen is not informative, it is a guess presented as a fact.
     expect(ackForAlready("already:done:2026-07-16T11:51:00")).toBe(
-      "✅ Déjà approuvé (16/07 11:51)",
+      "↩︎ Déjà traité — done (16/07 11:51)",
+    );
+  });
+
+  it("does not call a refusal an approval, in either ack path", () => {
+    // `refuse` runs `tuner refuse`, which blocks the pattern for 30 days, and
+    // its button reads "je le refuse pour 30 jours". It reached the default
+    // branch, so both paths answered approved. Telling someone their refusal
+    // was approved is the sharpest form of this bug.
+    expect(ackForResolution("ok", "refuse")).toBe("❌ Rejeté");
+    expect(ackForAlready("already:refuse:2026-07-16T11:51:00")).toBe(
+      "❌ Déjà rejeté (16/07 11:51)",
+    );
+  });
+
+  it("does not call a look at the details a decision", () => {
+    // `details` deliberately leaves the action pending — it shows something and
+    // decides nothing. Acking it as approved reported a decision that was never
+    // taken.
+    expect(ackForResolution("ok", "details")).toBe("👀 Consulté");
+    expect(ackForAlready("already:details:2026-07-16T11:51:00")).toBe(
+      "👀 Déjà consulté (16/07 11:51)",
+    );
+  });
+
+  it("answers `discuss` the same way in both paths — the rule lived in one and not the other", () => {
+    expect(ackForResolution("ok", "discuss")).toBe(
+      "💬 Envoyé en discussion — réponds pour continuer",
+    );
+    expect(ackForAlready("already:discuss:2026-07-16T11:51:00")).toBe(
+      "💬 Déjà envoyé en discussion (16/07 11:51)",
     );
   });
 });
@@ -79,6 +118,16 @@ describe("ackForResolution", () => {
     expect(ackForResolution("ok", "skip")).toBe("⏸ Plus tard");
     expect(ackForResolution("ok", "reject")).toBe("❌ Rejeté");
     expect(ackForResolution("ok", "cancel")).toBe("❌ Rejeté");
+    // `discuss` does not apply the proposal — it routes to the discussion
+    // handler, which opens a thread on it. Acking it as "Approuvé" would tell
+    // the operator something that did not happen. Case-insensitive, because the
+    // decision arrives from a callback payload that is not normalised.
+    expect(ackForResolution("ok", "discuss")).toBe(
+      "💬 Envoyé en discussion — réponds pour continuer",
+    );
+    expect(ackForResolution("ok", "DISCUSS")).toBe(
+      "💬 Envoyé en discussion — réponds pour continuer",
+    );
   });
 
   it("delegates an already-resolved tap to ackForAlready", () => {
@@ -102,6 +151,34 @@ describe("ackForResolution", () => {
     expect(ackForResolution("[pending] Telegram edit error: HTTP 429\nok", "approve")).toBe(
       "✅ Approuvé",
     );
+  });
+});
+
+describe("decisionStripsKeyboard (#375)", () => {
+  it("strips once a decision closed the action", () => {
+    expect(decisionStripsKeyboard("ok", "approve")).toBe(true);
+    expect(decisionStripsKeyboard("ok", "reject")).toBe(true);
+    expect(decisionStripsKeyboard("ok", "discuss")).toBe(true);
+    expect(decisionStripsKeyboard("ok", "something-the-resolver-accepted")).toBe(true);
+  });
+
+  it("strips when the buttons point at nothing (already resolved, unknown id)", () => {
+    expect(decisionStripsKeyboard("already", "approve")).toBe(true);
+    expect(decisionStripsKeyboard("not_found", "approve")).toBe(true);
+  });
+
+  it("keeps the keyboard for every value the classifier reads as informational or postponed", () => {
+    // `details` leaves the action pending on purpose and `skip` keeps its
+    // keyboard for a later tap; the other values share their ack class, and a
+    // resolver that treats them as terminal strips the keyboard itself.
+    expect(decisionStripsKeyboard("ok", "details")).toBe(false);
+    expect(decisionStripsKeyboard("ok", "DETAILS")).toBe(false);
+    expect(decisionStripsKeyboard("ok", "skip")).toBe(false);
+    expect(decisionStripsKeyboard("ok", "later")).toBe(false);
+  });
+
+  it("never edits when the resolver gave no verdict", () => {
+    expect(decisionStripsKeyboard("no_answer", "approve")).toBe(false);
   });
 });
 
@@ -148,5 +225,19 @@ describe("describeResolverFailure", () => {
     expect(describeResolverFailure({ timedOut: false, signal: "SIGKILL", code: null })).toBe(
       "killed by SIGKILL",
     );
+  });
+});
+
+describe("an unknown decision reads the same in both paths", () => {
+  it("echoes one normalised form, whatever case the caller passed", () => {
+    // The earlier tests all used a lowercase value, so they could not see this:
+    // `ackForAlready` lower-cases while parsing and `ackForResolution` does not,
+    // so the same decision printed two different ways depending only on which
+    // path resolved it. Classification was never wrong — the display was.
+    expect(ackForResolution("ok", "Done")).toBe("↩︎ Décision enregistrée — done");
+    expect(ackForAlready("already:Done:2026-07-16T11:51:00")).toBe(
+      "↩︎ Déjà traité — done (16/07 11:51)",
+    );
+    expect(ackForResolution("ok", "  DONE  ")).toBe("↩︎ Décision enregistrée — done");
   });
 });

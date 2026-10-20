@@ -141,14 +141,19 @@ describe("execClaude routing — flag and bootstrap (source-pinned)", () => {
   // We can't import execClaude (it's not exported), so we verify the
   // source-level routing rule by reading the runner.ts file and asserting
   // the bootstrap bypass + flag check exist exactly as the spec requires.
-  it("runner.ts contains the isInfraCall = name === 'bootstrap' check", async () => {
+  // #546: the decision lives in `resolveAgentTurnRoute`, shared by every
+  // agent-turn call site (behaviour pinned in pty-enabled-routing.test.ts).
+  it("resolveAgentTurnRoute keeps bootstrap on legacy and otherwise follows pty.enabled", async () => {
     const src = await Bun.file(join(process.cwd(), "src", "runner.ts")).text();
-    expect(src).toMatch(/isInfraCall\s*=\s*name\s*===\s*["']bootstrap["']/);
+    const fn = src.match(/export function resolveAgentTurnRoute\([\s\S]*?\n\}\n/);
+    expect(fn).not.toBeNull();
+    expect(fn![0]).toMatch(/name\s*===\s*["']bootstrap["']\)\s*return\s*["']legacy["']/);
+    expect(fn![0]).toMatch(/getSettings\(\)\.pty\.enabled\s*\?\s*["']pty["']\s*:\s*["']legacy["']/);
   });
 
-  it("runner.ts contains the useLegacyPath OR of !pty.enabled and isInfraCall", async () => {
+  it("execClaude takes its route from resolveAgentTurnRoute(name)", async () => {
     const src = await Bun.file(join(process.cwd(), "src", "runner.ts")).text();
-    expect(src).toMatch(/useLegacyPath\s*=\s*!\s*settings\.pty\.enabled\s*\|\|\s*isInfraCall/);
+    expect(src).toMatch(/useLegacyPath\s*=\s*resolveAgentTurnRoute\(name\)\s*===\s*["']legacy["']/);
   });
 
   it("runner.ts routes to runClaudeStream on the legacy branch", async () => {
@@ -163,16 +168,11 @@ describe("execClaude routing — flag and bootstrap (source-pinned)", () => {
     expect(src).toMatch(/runOnPty\(\s*sessionKey/);
   });
 
-  it("runner.ts streamClaude (OR-3 bypass) is unchanged: it still uses Bun.spawn directly", async () => {
+  it("runner.ts streamClaude (dashboard chat) goes through the same route decision (#546)", async () => {
     const src = await Bun.file(join(process.cwd(), "src", "runner.ts")).text();
-    // streamClaude must still spawn its own claude -p subprocess. Look for
-    // the streamClaude function signature and assert it still contains
-    // Bun.spawn (not runOnPty).
     const streamFn = src.match(/async function streamClaude\([\s\S]*?\n\}\n/);
     expect(streamFn).not.toBeNull();
-    // streamClaude should NOT invoke the supervisor.
-    expect(streamFn![0]).not.toMatch(/runOnPty/);
-    // streamClaude SHOULD still use the legacy spawn.
-    expect(streamFn![0]).toMatch(/Bun\.spawn/);
+    expect(streamFn![0]).toMatch(/resolveAgentTurnRoute\(name\)\s*===\s*["']pty["']/);
+    expect(streamFn![0]).toMatch(/execClaude\(/);
   });
 });

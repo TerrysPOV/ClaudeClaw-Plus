@@ -18,12 +18,12 @@
  * Write target mirrors the existing on-disk convention:
  *   - a named agent (a scaffolded `agents/<id>/` dir exists) → its own
  *     `agents/<id>/jobs/` dir, where `loadJobs()` tags `job.agent = <id>` from
- *     the directory (authoritative) and the scheduler routes the fire back to
- *     that same agent.
+ *     the directory (authoritative), so the job runs with that agent's persona.
  *   - the default/global session (no `agents/default/` scaffold) → the flat
- *     `getJobsDir()`, exactly where its `reminder-*.md` files already live. A
- *     flat job carries no `agent:` field, so the scheduler routes it to
- *     `defaultAgentId` — which is that same global session.
+ *     `getJobsDir()`, exactly where its `reminder-*.md` files already live.
+ * Either way the 60 s job loop runs the task as a one-shot `claude -p`, not in
+ * the calling agent's live session (#506); its output goes to the configured
+ * Telegram/Discord users.
  * This keeps the round-trip correct for either caller without a magic
  * "is this the default agent" string check.
  */

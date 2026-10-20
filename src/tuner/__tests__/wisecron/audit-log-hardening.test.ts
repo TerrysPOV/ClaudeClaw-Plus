@@ -106,6 +106,56 @@ describe("AuditLog — resyncFromDisk verifies the last link before adopting a t
   });
 });
 
+describe("AuditLog — resyncFromDisk reads the end of the file, not all of it", () => {
+  // The resync runs on every append and starts with a 64 KiB window; these
+  // fixtures sit past it so the window, not a full read, decides.
+  const pad = (n: number) => ({ pad: "p".repeat(n) });
+
+  it("adopts a cross-writer append at the end of a file larger than the window", () => {
+    const a = new AuditLog(logPath());
+    for (let i = 0; i < 300; i++) a.append({ event: "mcp.tool_call", detail: pad(500) });
+    expect(readFileSync(logPath()).length).toBeGreaterThan(128 * 1024);
+    const b = new AuditLog(logPath());
+    const r301 = b.append({ event: "verdict", subject: "p" });
+    const r302 = a.append({ event: "revert", subject: "p" });
+    expect(r302.seq).toBe(302);
+    expect(r302.prev_hash).toBe(r301.hash);
+  });
+
+  it("widens the window when the tail record alone is larger than it", () => {
+    const a = new AuditLog(logPath());
+    // 100 KiB predecessor: the 256 KiB window starts inside it, so the walk
+    // meets a cut line before it meets the predecessor and must widen again.
+    a.append({ event: "proposal", detail: pad(100 * 1024) });
+    const b = new AuditLog(logPath());
+    // 200 KiB tail: larger than the first window on its own.
+    const big = b.append({ event: "verdict", detail: pad(200 * 1024) });
+    const next = a.append({ event: "revert", subject: "p" });
+    expect(next.seq).toBe(3);
+    expect(next.prev_hash).toBe(big.hash);
+  });
+
+  it("still refuses a forged tail that is larger than the window", () => {
+    const a = new AuditLog(logPath());
+    const r1 = a.append({ event: "proposal", detail: pad(1_000) });
+    appendFileSync(
+      logPath(),
+      `${JSON.stringify({
+        seq: 2,
+        ts: "2020-01-01T00:00:00.000Z",
+        prev_hash: r1.hash,
+        hash: "f".repeat(64),
+        event: "verdict",
+        actor: "attacker",
+        detail: pad(100 * 1024),
+      })}\n`,
+    );
+    const r2 = a.append({ event: "verdict", subject: "p" });
+    expect(r2.seq).toBe(2);
+    expect(r2.prev_hash).toBe(r1.hash);
+  });
+});
+
 describe("AuditLog — maxRecords bounds memory without breaking the chain", () => {
   it("retains only the last N in memory but keeps seq/hash monotonic on disk", () => {
     const cap = 10;

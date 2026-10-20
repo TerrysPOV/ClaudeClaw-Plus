@@ -9,11 +9,15 @@ import {
 import { extractErrorDetail } from "../messaging";
 import { loadPendingResume } from "../pending-resume";
 import { getSettings, loadSettings, DEFAULT_IMAGE_OUTPUT_ROOT } from "../config";
+import { describeAllowlist, isUserAllowed } from "../allowlist";
 import { resetSession, resetFallbackSession, peekSession } from "../sessions";
 import { listThreadSessions, removeThreadSession, peekThreadSession } from "../sessionManager";
 import { readFile } from "node:fs/promises";
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
+import type { spawn } from "node:child_process";
+import { runOneShot } from "../oneshot/engine.js";
+import { withPrintRuntime } from "../oneshot/print.js";
 import { transcribeAudioToText } from "../whisper";
 import { resolveSkillPrompt } from "../skills";
 import { cacheSkillOverlayFromContent } from "../policy/skill-overlays";
@@ -21,10 +25,15 @@ import { fireJob, parseFireArgs } from "./fire";
 import { mkdir } from "node:fs/promises";
 import { extname, join, basename, sep } from "node:path";
 import { processEventWithFallback, setGatewayEnabled } from "../gateway";
-import { normalizeDiscordMessage, type NormalizedEvent } from "../gateway/normalizer";
+import {
+  discordConversation,
+  normalizeDiscordMessage,
+  type NormalizedEvent,
+} from "../gateway/normalizer";
 import type { EventRecord } from "../event-log";
-import type { GatewayRunResult } from "../event-processor";
+import { type GatewayRunResult, gatewayCommandSessionKey } from "../event-processor";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
+import { encodeCwdForProjectsDir } from "../bus/jsonl-line-types";
 
 // --- Discord API constants ---
 
@@ -115,6 +124,7 @@ interface DiscordGuild {
   name: string;
   system_channel_id?: string | null;
   joined_at?: string;
+  owner_id?: string;
 }
 
 interface GatewayPayload {
@@ -570,7 +580,64 @@ interface ThreadIntent {
   names: string[];
 }
 
-async function classifyThreadIntent(text: string): Promise<ThreadIntent | null> {
+/** Exact keys the classifier's `claude` keeps from the daemon env. */
+const CLASSIFIER_ENV_KEYS = new Set([
+  "PATH",
+  "USER",
+  "LOGNAME",
+  "LANG",
+  "TZ",
+  "TMPDIR",
+  "XDG_CONFIG_HOME",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "no_proxy",
+  "NODE_EXTRA_CA_CERTS",
+  "SSL_CERT_FILE",
+  "GOOGLE_APPLICATION_CREDENTIALS",
+  "CLOUD_ML_REGION",
+]);
+/** Key prefixes kept: model auth/routing (Anthropic, Bedrock, Vertex) and locale. */
+const CLASSIFIER_ENV_PREFIXES = ["ANTHROPIC_", "CLAUDE_", "AWS_", "LC_"];
+
+/**
+ * Allowlisted env for the classifier: what `claude` needs to reach the model,
+ * nothing else — the chat-platform tokens, SSH agent socket and other daemon
+ * secrets stay out. Model credentials pass as they did before, so the
+ * classifier authenticates the same way it always has.
+ */
+export function classifierSpawnEnv(
+  env: Record<string, string | undefined> = process.env,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value !== "string") continue;
+    if (CLASSIFIER_ENV_KEYS.has(key) || CLASSIFIER_ENV_PREFIXES.some((p) => key.startsWith(p))) {
+      out[key] = value;
+    }
+  }
+  out.HOME = homedir();
+  return out;
+}
+
+/**
+ * The classifier reads a message from any allowed guild member. It only has
+ * to answer with JSON, so `runOneShot` runs it as an untrusted call: no tools at
+ * all (`--tools ""`), no MCP server (`--strict-mcp-config` with no `--mcp-config`)
+ * and no saved session, with the prompt on stdin (the argv comes from
+ * `buildPrintArgs`, the single source of the isolation flags):
+ * an instruction hidden in the message has nothing to act with. It also loads
+ * no settings file (`--setting-sources ""`: no hooks, no user plugins) and no
+ * skills, and runs from an empty temp dir so no CLAUDE.md is in its context —
+ * otherwise a message can ask for that context back as "thread names".
+ */
+export async function classifyThreadIntent(
+  text: string,
+  deps: { spawn?: typeof spawn } = {},
+): Promise<ThreadIntent | null> {
   const systemPrompt = `You classify user messages into thread management intents.
 
 If the user wants to CREATE/SPAWN/DEPLOY threads (e.g. "hire X", "派出 X", "叫 X 出來", "派 X 去打", "開 X", "建立 X"):
@@ -587,17 +654,20 @@ Rules:
 - Return ONLY valid JSON or the word null. No explanation.`;
 
   try {
-    const { execSync } = await import("node:child_process");
     const input = `${systemPrompt}\n\n---\nUser message: ${text}`;
-    const result = execSync(
-      `claude --model claude-sonnet-4-20250514 --print --output-format text`,
-      {
-        input,
-        encoding: "utf-8",
-        timeout: 15000,
-        env: { ...process.env, HOME: homedir() },
-      },
-    ).trim();
+    const call = await withPrintRuntime(
+      { env: classifierSpawnEnv(), stdinPrompt: true, spawn: deps.spawn },
+      () =>
+        runOneShot({
+          route: "discord.classifier",
+          prompt: input,
+          model: "claude-sonnet-4-20250514",
+          isolation: "untrusted",
+          timeoutMs: 15000,
+        }),
+    );
+    if (call.exitCode !== 0) throw new Error(`classifier exited ${call.exitCode}`);
+    const result = call.text.trim();
 
     if (!result || result === "null") return null;
     // Extract JSON from response (in case there's extra text)
@@ -894,7 +964,7 @@ async function handleMessageCreate(
   }
 
   // Authorization check
-  if (config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(userId)) {
+  if (!isUserAllowed(config.allowedUserIds, userId, config.allowAllUsers)) {
     if (isDM) {
       await sendMessage(config.token, channelId, "Unauthorized.");
     } else {
@@ -1371,6 +1441,28 @@ async function handleMessageCreate(
 
 // --- Interaction handler (slash commands + secretary buttons) ---
 
+/**
+ * The runner session a slash command acts on. Direct path: a guild channel
+ * has its own session keyed by its channel id, a DM uses the global session.
+ * Gateway path (#376): the session the gateway gives the conversation — its
+ * own under `session.gatewayScope: "conversation"`, the global one otherwise
+ * — so /reset, /compact, /status and /context hit the session the next
+ * message will actually resume. `undefined` = the global session.
+ */
+export function interactionSessionKey(
+  interaction: Pick<DiscordInteraction, "guild_id" | "channel_id">,
+  gatewayOn = process.env.USE_GATEWAY_DISCORD === "true",
+): string | undefined {
+  if (!interaction.channel_id) return undefined;
+  if (gatewayOn) {
+    return gatewayCommandSessionKey(
+      discordConversation(interaction.guild_id, interaction.channel_id),
+      getSettings().session,
+    );
+  }
+  return interaction.guild_id ? interaction.channel_id : undefined;
+}
+
 async function handleInteractionCreate(
   token: string,
   interaction: DiscordInteraction,
@@ -1378,7 +1470,7 @@ async function handleInteractionCreate(
   const config = getSettings().discord;
   const actorId = interaction.member?.user?.id ?? interaction.user?.id;
 
-  if (config.allowedUserIds.length > 0 && (!actorId || !config.allowedUserIds.includes(actorId))) {
+  if (!isUserAllowed(config.allowedUserIds, actorId, config.allowAllUsers)) {
     await respondToInteraction(interaction, { content: "Unauthorized.", flags: 64 });
     return;
   }
@@ -1394,16 +1486,16 @@ async function handleInteractionCreate(
     }
 
     if (interaction.data.name === "reset") {
-      const isGuildCmd = !!interaction.guild_id && !!interaction.channel_id;
-      if (isGuildCmd) {
-        await removeThreadSession(interaction.channel_id!);
-        await resetFallbackSession(undefined, interaction.channel_id!);
+      const key = interactionSessionKey(interaction);
+      if (key) {
+        await removeThreadSession(key);
+        await resetFallbackSession(undefined, key);
       } else {
         await resetSession();
         await resetFallbackSession();
       }
       await respondToInteraction(interaction, {
-        content: isGuildCmd
+        content: key
           ? "Channel session reset. Next message starts fresh."
           : "Global session reset. Next message starts fresh.",
       });
@@ -1414,9 +1506,9 @@ async function handleInteractionCreate(
       await respondToInteraction(interaction, { content: "⏳ Compacting session..." });
       const compactChannelId = interaction.channel_id;
       const compactThreadInfo = compactChannelId ? knownThreads.get(compactChannelId) : undefined;
-      const isGuildCmd = !!interaction.guild_id && !!compactChannelId;
-      const result = isGuildCmd
-        ? await compactCurrentThreadSession(compactChannelId!, compactThreadInfo?.agentName)
+      const compactKey = interactionSessionKey(interaction);
+      const result = compactKey
+        ? await compactCurrentThreadSession(compactKey, compactThreadInfo?.agentName)
         : await compactCurrentSession();
       await fetch(
         `${DISCORD_API}/webhooks/${applicationId}/${interaction.token}/messages/@original`,
@@ -1430,10 +1522,8 @@ async function handleInteractionCreate(
     }
 
     if (interaction.data.name === "status") {
-      const isGuildCmd = !!interaction.guild_id && !!interaction.channel_id;
-      const session = isGuildCmd
-        ? await peekThreadSession(interaction.channel_id!)
-        : await peekSession();
+      const statusKey = interactionSessionKey(interaction);
+      const session = statusKey ? await peekThreadSession(statusKey) : await peekSession();
       const settings = getSettings();
       if (!session) {
         await respondToInteraction(interaction, { content: "📊 No active session." });
@@ -1466,16 +1556,14 @@ async function handleInteractionCreate(
     }
 
     if (interaction.data.name === "context") {
-      const isGuildCmd = !!interaction.guild_id && !!interaction.channel_id;
-      const session = isGuildCmd
-        ? await peekThreadSession(interaction.channel_id!)
-        : await peekSession();
+      const statusKey = interactionSessionKey(interaction);
+      const session = statusKey ? await peekThreadSession(statusKey) : await peekSession();
       if (!session) {
         await respondToInteraction(interaction, { content: "No active session." });
         return;
       }
       const home = homedir();
-      const projectSlug = process.cwd().replace(/\//g, "-");
+      const projectSlug = encodeCwdForProjectsDir(process.cwd()); // #368
       const jsonlPath = `${home}/.claude/projects/${projectSlug}/${session.sessionId}.jsonl`;
       if (!existsSync(jsonlPath)) {
         await respondToInteraction(interaction, { content: "Conversation file not found." });
@@ -1569,7 +1657,27 @@ async function handleInteractionCreate(
 
 // --- Guild join handler ---
 
-async function handleGuildCreate(token: string, guild: DiscordGuild): Promise<void> {
+/** Fixed greeting posted in the system channel of a newly joined server. */
+export const GUILD_ADDED_GREETING = "I was added to this server. Mention me to start.";
+
+interface GuildCreateDeps {
+  send: (token: string, channelId: string, text: string) => Promise<unknown>;
+  /** Injected so a test can assert the handler never starts a model turn. */
+  run: typeof run;
+}
+
+/**
+ * Bot added to a server. The greeting is a fixed string: the server name is
+ * chosen by whoever owns the server, so it must not reach a prompt — this used
+ * to run it through the GLOBAL session with the daemon's tools. GUILD_CREATE
+ * does not say who added the bot, so the allowlist is checked against the
+ * server owner.
+ */
+export async function handleGuildCreate(
+  _token: string,
+  guild: DiscordGuild,
+  deps: GuildCreateDeps = { send: sendMessage, run },
+): Promise<void> {
   const config = getSettings().discord;
 
   // Skip guilds we were already in at READY time
@@ -1578,27 +1686,21 @@ async function handleGuildCreate(token: string, guild: DiscordGuild): Promise<vo
   const channelId = guild.system_channel_id;
   if (!channelId) return;
 
-  console.log(`[Discord] Joined guild: ${guild.name} (${guild.id})`);
-
-  const eventPrompt =
-    `[Discord system event] I was added to a guild.\n` +
-    `Guild name: ${guild.name}\n` +
-    `Guild id: ${guild.id}\n` +
-    "Write a short first message for the server. Confirm I was added and explain how to trigger me (mention or reply).";
+  const guildName = JSON.stringify(String(guild.name ?? "").slice(0, 200));
+  if (!isUserAllowed(config.allowedUserIds, guild.owner_id, config.allowAllUsers)) {
+    console.log(
+      `[Discord] Joined guild ${guildName} (${guild.id}) owned by unauthorized user ${guild.owner_id ?? "unknown"} — not greeting`,
+    );
+    return;
+  }
+  console.log(`[Discord] Joined guild: ${guildName} (${guild.id})`);
 
   try {
-    const result = await run("discord", eventPrompt);
-    if (result.exitCode !== 0) {
-      await sendMessage(
-        config.token,
-        channelId,
-        "I was added to this server. Mention me to start.",
-      );
-      return;
-    }
-    await sendMessage(config.token, channelId, result.stdout || "I was added to this server.");
-  } catch {
-    await sendMessage(config.token, channelId, "I was added to this server. Mention me to start.");
+    await deps.send(config.token, channelId, GUILD_ADDED_GREETING);
+  } catch (err) {
+    console.error(
+      `[Discord] guild-added greeting error: ${err instanceof Error ? err.message : err}`,
+    );
   }
 }
 
@@ -2031,9 +2133,7 @@ export function startGateway(debug = false): void {
   if (ws) stopGateway();
   running = true;
   console.log("Discord bot started (gateway)");
-  console.log(
-    `  Allowed users: ${config.allowedUserIds.length === 0 ? "all" : config.allowedUserIds.join(", ")}`,
-  );
+  console.log(`  Allowed users: ${describeAllowlist(config.allowedUserIds, config.allowAllUsers)}`);
   if (config.listenChannels.length > 0) {
     console.log(`  Listen channels: ${config.listenChannels.join(", ")}`);
   }
@@ -2064,9 +2164,7 @@ export async function discord() {
   }
 
   console.log("Discord bot started (gateway, standalone)");
-  console.log(
-    `  Allowed users: ${config.allowedUserIds.length === 0 ? "all" : config.allowedUserIds.join(", ")}`,
-  );
+  console.log(`  Allowed users: ${describeAllowlist(config.allowedUserIds, config.allowAllUsers)}`);
   if (discordDebug) console.log("  Debug: enabled");
 
   connectGateway(config.token);

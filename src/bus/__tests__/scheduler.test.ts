@@ -523,6 +523,93 @@ describe("BusScheduler.scheduleCron (cronExpr)", () => {
     expect(calls).toHaveLength(1);
   });
 
+  // Issue #437: `nextCronMatch` used to give up after 48 hours and return
+  // the scan-end date, so a Tue/Thu schedule armed on a Thursday fired on
+  // Saturday (armed + 48h + 1min) instead of the next Tuesday.
+  it("arms the real next match when it is more than 48 hours away", () => {
+    const { bus, calls } = createFakeBus();
+    // Thursday 2026-09-17 07:00 (+2) == 05:00Z.
+    const start = Date.UTC(2026, 8, 17, 5, 0, 0);
+    const clock = makeFakeClock(start);
+    scheduler = createBusScheduler({ bus, clock, timezoneOffsetMinutes: 120 });
+
+    scheduler.scheduleCron({ agent_id: "alpha", cronExpr: "0 7 * * 2,4", prompt: "brief" });
+
+    // Nothing at the old bogus time (48h + 1min)…
+    clock.advance(48 * 60 * 60_000 + 60_000);
+    expect(calls).toHaveLength(0);
+    // …and the fire lands on Tuesday 2026-09-22 07:00 (+2), 5 days after arming.
+    const tuesday = Date.UTC(2026, 8, 22, 5, 0, 0);
+    clock.advance(tuesday - clock.now() - 1);
+    expect(calls).toHaveLength(0);
+    clock.advance(1);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].metadata?.fire_at).toBe(tuesday);
+
+    // Re-arm: Thursday 2026-09-24 07:00 (+2).
+    clock.advance(2 * 24 * 60 * 60_000);
+    expect(calls).toHaveLength(2);
+  });
+
+  // Blind adversarial review of the #437 fix: once far-away matches are
+  // reachable, `setTimeout` gets delays above 2^31−1 ms, which Node/Bun
+  // clamp to 1 ms — the job would fire immediately and re-arm in a loop.
+  it("hops long waits so no single timer exceeds 2^31−1 ms and fires only at the match", () => {
+    const { bus, calls } = createFakeBus();
+    // 2026-09-20 12:00Z, schedule Dec 25 09:00 at −240 (13:00Z), 96 days out.
+    const start = Date.UTC(2026, 8, 20, 12, 0, 0);
+    const inner = makeFakeClock(start);
+    const delays: number[] = [];
+    const clock: FakeClock = {
+      ...inner,
+      setTimeout: (fn, ms) => {
+        delays.push(ms);
+        return inner.setTimeout(fn, ms);
+      },
+    };
+    scheduler = createBusScheduler({ bus, clock, timezoneOffsetMinutes: -240 });
+    scheduler.scheduleCron({ agent_id: "alpha", cronExpr: "0 9 25 12 *", prompt: "noel" });
+
+    const fireAt = Date.UTC(2026, 11, 25, 13, 0, 0);
+    inner.advance(fireAt - start - 1);
+    expect(calls).toHaveLength(0);
+    inner.advance(1);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].metadata?.fire_at).toBe(fireAt);
+    expect(delays.length).toBeGreaterThan(1);
+    for (const ms of delays) expect(ms).toBeLessThanOrEqual(2_147_483_647);
+  });
+
+  it("hops a far-away one-shot `at` the same way", () => {
+    const { bus, calls } = createFakeBus();
+    const start = Date.UTC(2026, 8, 20, 12, 0, 0);
+    const inner = makeFakeClock(start);
+    const delays: number[] = [];
+    const clock: FakeClock = {
+      ...inner,
+      setTimeout: (fn, ms) => {
+        delays.push(ms);
+        return inner.setTimeout(fn, ms);
+      },
+    };
+    scheduler = createBusScheduler({ bus, clock });
+    const at = new Date(start + 40 * 24 * 60 * 60_000);
+    scheduler.scheduleCron({ agent_id: "alpha", at, prompt: "later" });
+    inner.advance(at.getTime() - start - 1);
+    expect(calls).toHaveLength(0);
+    inner.advance(1);
+    expect(calls).toHaveLength(1);
+    for (const ms of delays) expect(ms).toBeLessThanOrEqual(2_147_483_647);
+  });
+
+  it("rejects a well-formed cron expression that never matches", () => {
+    const { bus } = createFakeBus();
+    scheduler = createBusScheduler({ bus });
+    expect(() =>
+      scheduler.scheduleCron({ agent_id: "a", cronExpr: "0 0 31 2 *", prompt: "p" }),
+    ).toThrow(/no upcoming match/);
+  });
+
   // Codex P2 fix on PR #117: malformed cron expressions used to be
   // silently accepted (probe via nextCronMatch didn't throw on garbage).
   // Now eager validation rejects fast on operator typos.
@@ -706,5 +793,17 @@ describe("createBusScheduler factory", () => {
     const clock = makeFakeClock();
     scheduler = createBusScheduler({ bus, clock, timezoneOffsetMinutes: 60 });
     expect(scheduler).toBeDefined();
+  });
+});
+
+describe("BusScheduler — one-shot with an invalid date (CodeRabbit on #438)", () => {
+  it("rejects a NaN fire time instead of hopping forever", () => {
+    const { bus } = createFakeBus();
+    const clock = makeFakeClock();
+    scheduler = createBusScheduler({ bus, clock, onError: () => {} });
+    expect(() =>
+      scheduler?.scheduleCron({ agent_id: "a", at: new Date("invalid"), prompt: "p" }),
+    ).toThrow(/invalid one-shot time/);
+    expect(clock.pending().length).toBe(0);
   });
 });

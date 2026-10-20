@@ -5,17 +5,19 @@
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from "bun:test";
 import { join } from "path";
-import { mkdir, copyFile, unlink, writeFile } from "fs/promises";
-import { existsSync } from "fs";
+import { tmpdir } from "os";
+import { mkdtemp, rm, writeFile } from "fs/promises";
 
 import { startWebUi, __setLlmRouterCatalogueForTests } from "../server";
 import type { WebServerHandle, WebSnapshot } from "../types";
 import type { ModelCatalogue } from "../../plugins/llm-router/catalogue";
+import { _setSettingsFileForTests } from "../../config";
 
 const TOKEN = "test-web-token-abcdefghijklmnop";
-const SETTINGS_DIR = join(process.cwd(), ".claude", "claudeclaw");
-const SETTINGS_FILE = join(SETTINGS_DIR, "settings.json");
-const BACKUP_FILE = join(SETTINGS_DIR, "settings.json.llm-router-routes-test-backup");
+// A temp settings.json, redirected through _setSettingsFileForTests: the
+// handlers never read or write the real <cwd>/.claude/claudeclaw/settings.json.
+let tempDir = "";
+let SETTINGS_FILE = "";
 
 function snapshot(): WebSnapshot {
   return {
@@ -38,8 +40,9 @@ let handle: WebServerHandle;
 let base: string;
 
 beforeAll(async () => {
-  await mkdir(SETTINGS_DIR, { recursive: true });
-  if (existsSync(SETTINGS_FILE)) await copyFile(SETTINGS_FILE, BACKUP_FILE);
+  tempDir = await mkdtemp(join(tmpdir(), "llm-router-routes-"));
+  SETTINGS_FILE = join(tempDir, "settings.json");
+  _setSettingsFileForTests(SETTINGS_FILE);
   await writeFile(SETTINGS_FILE, `${JSON.stringify({}, null, 2)}\n`);
 
   handle = startWebUi({
@@ -54,12 +57,8 @@ beforeAll(async () => {
 afterAll(async () => {
   handle.stop();
   __setLlmRouterCatalogueForTests(null);
-  if (existsSync(BACKUP_FILE)) {
-    await copyFile(BACKUP_FILE, SETTINGS_FILE);
-    await unlink(BACKUP_FILE);
-  } else if (existsSync(SETTINGS_FILE)) {
-    await unlink(SETTINGS_FILE);
-  }
+  _setSettingsFileForTests();
+  await rm(tempDir, { recursive: true, force: true });
 });
 
 beforeEach(async () => {

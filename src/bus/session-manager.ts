@@ -43,8 +43,11 @@ import {
 import { createSession } from "../sessions";
 import type { BusCore } from "./core";
 import { JsonlTailer } from "./jsonl-tailer";
+import { BUS_MCP_TOOLS } from "./mcp-tools";
+import { confirmTurnReceipt } from "./receipt-wiring";
 import { capturePostMortem, type PostMortemOptions } from "./post-mortem";
 import type { ReceiptRecord } from "./receipt";
+import { ensureTrustAccepted } from "../runner/pty-trust-prompt";
 import {
   type AgentProcess,
   ChildAgentProcess,
@@ -437,19 +440,54 @@ export const CLAUDECLAW_PLUGIN_NAME = "claudeclaw-plus";
 const PLUGIN_MARKETPLACE_TAG = "inline";
 
 /**
- * MCP tools exposed by the plus-bus channel. Auto-allowed at spawn time
- * via `--allowedTools` so claude doesn't prompt the user before sending
- * an outbound message through the bus — these tools are safe by design
- * (they only call back through the IPC channel, no filesystem / network
- * effects outside the daemon).
+ * Bus tools pre-allowed for every bus agent via `--allowedTools`, so claude
+ * doesn't prompt the user before the agent sends an outbound message
+ * through the bus or reads schedule state. These only call back through the
+ * IPC channel.
  */
-const PLUS_BUS_TOOL_NAMES = [
-  "mcp__plugin_claudeclaw-plus_plus-bus__reply",
-  "mcp__plugin_claudeclaw-plus_plus-bus__edit_message",
-  "mcp__plugin_claudeclaw-plus_plus-bus__ask",
-  "mcp__plugin_claudeclaw-plus_plus-bus__cancel",
-  "mcp__plugin_claudeclaw-plus_plus-bus__request_human",
-];
+const PLUS_BUS_TOOLS_ALLOWED: ReadonlySet<string> = new Set([
+  "reply",
+  "edit_message",
+  "ask",
+  "cancel",
+  "request_human",
+  "list_scheduled_tasks",
+]);
+
+/**
+ * Bus tools pre-allowed only for an agent that runs without approvals
+ * (`bypassPermissions`, the default). `dispatch_job` and `schedule_task`
+ * start work that runs headless under the daemon-wide permission mode
+ * (`buildSecurityArgs`), not this agent's; `delete_scheduled_task` can remove
+ * a task from the shared jobs directory when the agent has no directory of
+ * its own; `job_status`, `list_jobs` and `cancel_job` reach every agent's
+ * jobs, not only the caller's. For an agent under approvals the permission
+ * flow is the only gate in front of that, so it stays.
+ */
+const PLUS_BUS_TOOLS_ALLOWED_WITHOUT_APPROVALS: ReadonlySet<string> = new Set([
+  "dispatch_job",
+  "schedule_task",
+  "delete_scheduled_task",
+  "job_status",
+  "list_jobs",
+  "cancel_job",
+]);
+
+/**
+ * The `--allowedTools` entries for the plus-bus tools, built from
+ * `BUS_MCP_TOOLS` (what the server answers `tools/list` with) so the names
+ * match what claude sees. A tool in neither set above is never pre-allowed:
+ * classify each new bus tool here. The hand-kept list this replaces had
+ * drifted, leaving the job and schedule tools out (#523).
+ */
+function plusBusAllowedTools(permissionMode: AgentConfig["permission_mode"]): string[] {
+  const approvals = (permissionMode ?? "bypassPermissions") !== "bypassPermissions";
+  return BUS_MCP_TOOLS.filter(
+    (tool) =>
+      PLUS_BUS_TOOLS_ALLOWED.has(tool.name) ||
+      (!approvals && PLUS_BUS_TOOLS_ALLOWED_WITHOUT_APPROVALS.has(tool.name)),
+  ).map((tool) => `mcp__plugin_${CLAUDECLAW_PLUGIN_NAME}_${PLUS_BUS_CHANNEL}__${tool.name}`);
+}
 
 /**
  * Resolve the absolute path to the ClaudeClaw+ plugin root — the
@@ -471,6 +509,23 @@ export function resolveClaudeclawPluginRoot(): string {
  * without delaying happy-path spawns by more than a second.
  */
 const DEFAULT_COLLISION_DETECT_MS = 2000;
+/**
+ * #326: how long the collision detector keeps listening after a NON-ZERO exit
+ * whose marker has not been seen yet. `onData` and `onExit` ride two
+ * independent PTY channels (a read loop and a wait loop), so under load the
+ * exit can be delivered ahead of the process's own last output; concluding
+ * "no collision" at that instant is what made the rotation tests flake. Only
+ * a boot crash without the marker pays this (a real collision resolves the
+ * moment its marker lands), and it is capped by the remaining window.
+ */
+const COLLISION_EXIT_DRAIN_MS = 250;
+/** Rolling window the collision marker is matched against — wide enough for
+ *  the marker line plus the escape codes the TUI wraps it in. */
+const COLLISION_MARKER_WINDOW_CHARS = 400;
+/** Issue #393: an exit this soon after spawn is a boot failure (claude never
+ *  reached the REPL — auth, a dialog it could not pass, a broken install), and
+ *  the exit log line names it as one instead of leaving it to be inferred. */
+const BOOT_FAILURE_WINDOW_MS = 20_000;
 
 /**
  * Restart rate-limit (Terry's required add on the respawn primitive). More
@@ -498,14 +553,38 @@ const SESSION_COLLISION_PATTERN = /Session ID [0-9a-fA-F-]{8,} is already in use
  * exit. Resolves false for: alive past the window, clean exit, exit
  * without the marker.
  */
-function detectSessionIdCollision(proc: AgentProcess, windowMs: number): Promise<boolean> {
+export function detectSessionIdCollision(
+  proc: Pick<AgentProcess, "onData" | "onExit" | "recentOutputTail">,
+  windowMs: number,
+  exitDrainMs: number = COLLISION_EXIT_DRAIN_MS,
+): Promise<boolean> {
   if (windowMs <= 0) return Promise.resolve(false);
   return new Promise((resolve) => {
+    const startedAt = Date.now();
     let resolved = false;
-    let markerSeen = false;
+    let exitedNonZero = false;
+    // Both timers are declared before any handler can run: `onExit` REPLAYS a
+    // past exit synchronously at registration (#393), so `finish` may execute
+    // inside the `proc.onExit(...)` call below.
+    let windowTimer: ReturnType<typeof setTimeout> | null = null;
+    let drainTimer: ReturnType<typeof setTimeout> | null = null;
+    // Output that landed before this detector attached is not replayed by
+    // `onData`; the process keeps its own tail. A marker already on screen at
+    // attach time (the child printed and exited before the spawn `await`
+    // resumed — the ordering a loaded host produces) counts as seen.
+    const tailHasMarker = () => {
+      const tail = proc.recentOutputTail?.();
+      return tail !== undefined && SESSION_COLLISION_PATTERN.test(tail);
+    };
+    let markerSeen = tailHasMarker();
+    // The marker can straddle two PTY chunks (Copilot on the PR): match on a
+    // rolling window of recent output, never on one chunk alone.
+    let recent = "";
     const finish = (value: boolean) => {
       if (resolved) return;
       resolved = true;
+      if (windowTimer) clearTimeout(windowTimer);
+      if (drainTimer) clearTimeout(drainTimer);
       resolve(value);
     };
     proc.onData((chunk) => {
@@ -516,14 +595,34 @@ function detectSessionIdCollision(proc: AgentProcess, windowMs: number): Promise
       // keeps the regex from running on every PTY chunk after the
       // detection window closes.
       if (resolved) return;
-      if (!markerSeen && SESSION_COLLISION_PATTERN.test(chunk)) {
+      recent = (recent + chunk).slice(-COLLISION_MARKER_WINDOW_CHARS);
+      if (!markerSeen && SESSION_COLLISION_PATTERN.test(recent)) {
         markerSeen = true;
+        // The exit already came in ahead of this chunk (#326): the verdict
+        // was only waiting for it.
+        if (exitedNonZero) finish(true);
       }
     });
     proc.onExit((code) => {
-      finish(markerSeen && code !== 0);
+      if (code === 0) {
+        finish(false);
+        return;
+      }
+      // The marker may have reached the process's tail without passing
+      // through our `onData` (delivered before we attached).
+      if (!markerSeen && tailHasMarker()) markerSeen = true;
+      if (markerSeen) {
+        finish(true);
+        return;
+      }
+      // Non-zero exit, marker not seen YET: its last output may still be in
+      // flight on the data channel. Hold the verdict for a short drain,
+      // bounded by the window that is left.
+      exitedNonZero = true;
+      const remaining = Math.max(0, windowMs - (Date.now() - startedAt));
+      drainTimer = setTimeout(() => finish(false), Math.min(exitDrainMs, remaining));
     });
-    setTimeout(() => finish(false), windowMs);
+    if (!resolved) windowTimer = setTimeout(() => finish(false), windowMs);
   });
 }
 
@@ -570,9 +669,9 @@ export function buildClaudeArgs(agent: AgentConfig, mode: SupervisionMode): stri
     args.push("-p", "--input-format=stream-json", "--output-format=stream-json", "--verbose");
   }
   args.push("--plugin-dir", resolveClaudeclawPluginRoot());
-  args.push("--allowedTools", PLUS_BUS_TOOL_NAMES.join(","));
+  args.push("--allowedTools", plusBusAllowedTools(agent.permission_mode).join(","));
   // Block Claude Code's native session-scoped scheduling tools so the agent
-  // is funnelled to the durable `schedule_job` bus tool instead. See the
+  // is funnelled to the durable `schedule_task` bus tool instead. See the
   // NATIVE_SCHEDULING_TOOLS_BLOCKLIST comment for why (the #342 lost-reminder
   // incident). Comma-joined to match `--allowedTools` above and the value
   // `claude` parses for `--disallowedTools`.
@@ -619,6 +718,13 @@ interface AgentRecord {
    * `agent.mcp_config`, or dormant multiplexer).
    */
   mcpConfigCwd?: string;
+  /** Epoch ms of the spawn (issue #393): the exit log line reports uptime,
+   *  and an exit within seconds of it is a boot failure and is named as one. */
+  spawnedAt: number;
+  /** Set by `stop()` before it asks the process to quit (issue #393), so the
+   *  spawn-time `onExit` cleanup can tell an exit the daemon asked for from
+   *  one it did not — only the latter is logged. */
+  stopping?: boolean;
   /**
    * Live session JSONL tailer (issue #215). Present when `options.bus`
    * is set; feeds `response.turn_end` events so the bus can synthesize a
@@ -639,6 +745,8 @@ export class SessionManager {
    * respawns have their own backpressure and bypass this budget entirely.
    */
   private readonly restartHistory = new Map<string, number[]>();
+  /** #402: tailers constructed per agent, in order — see JsonlTailerOptions.generation. */
+  private readonly tailerGeneration = new Map<string, number>();
   /**
    * Per-agent in-flight `restart()` promises. The three triggers
    * (control-plane wedge, data-plane model-hang, rotation) are independent
@@ -738,6 +846,19 @@ export class SessionManager {
     // revoked and its file never deleted. Clean up then re-throw.
     let proc: PtyAgentProcess | ChildAgentProcess;
     try {
+      // Issue #528: an interactive claude stalls on the trust dialog ("No,
+      // exit" preselected) the first time it runs in a cwd. The legacy PTY
+      // supervisor pre-accepts it; the bus spawn path must too, or a fresh
+      // ~/.claude.json (container recreate) leaves the agent never connecting.
+      // Best-effort: a failure is logged and the spawn proceeds.
+      if (mode === "pty-stdin" || mode === "tmux") {
+        const heal = await ensureTrustAccepted(realCwd);
+        if (!heal.ok) {
+          (this.options.logger ?? console).warn(
+            `[bus-session] agent=${agent.id} trust self-heal failed for ${realCwd}: ${heal.reason ?? "unknown"}`,
+          );
+        }
+      }
       if (mode === "pty-stdin") {
         proc = await this.spawnPty(agent, args, env, realCwd);
       } else if (mode === "process-stream-json" || mode === "process") {
@@ -757,16 +878,83 @@ export class SessionManager {
     // during the detection window for a non-collision reason (auth
     // error, missing config, claude crash) and we register after the
     // await, our `proc.onExit` handler is pushed onto a handler array
-    // whose owning proc has already exited — `PtyAgentProcess.onExit` /
-    // `ChildAgentProcess.onExit` are push-only and don't replay past
-    // exits. The cleanup never fires, leaving a dead entry in
-    // `this.agents` that breaks the next `already spawned` guard.
-    const record: AgentRecord = { agent, origin, mode, proc, mcpConfigCwd };
+    // whose owning proc has already exited. (Since #393 `onExit` replays a
+    // past exit synchronously at registration, so this ordering is also a
+    // correctness guard for the detector below, which may resolve inside
+    // its own `onExit` call.) Registering after the await used to leave a
+    // dead entry in `this.agents` that broke the next `already spawned` guard.
+    const record: AgentRecord = {
+      agent,
+      origin,
+      mode,
+      proc,
+      mcpConfigCwd,
+      spawnedAt: Date.now(),
+    };
+    // #402/#412: number this process's tailer generation and announce it to
+    // the bus BEFORE the record goes live — from `agents.set` on, the bus's
+    // PTY handler resolves this proc as the delivery target, and the
+    // collision wait below takes 2 s on a healthy spawn. A prompt typed into
+    // the replacement in that window must be tagged with its generation, not
+    // the one being replaced. The announce is monotonic, so a collided attempt
+    // that never builds its tailer leaves nothing behind; the retry announces
+    // the next number and its tailer carries that one.
+    const tailerGeneration = this.options.bus
+      ? (this.tailerGeneration.get(agent.id) ?? 0) + 1
+      : undefined;
+    if (this.options.bus && tailerGeneration !== undefined) {
+      this.tailerGeneration.set(agent.id, tailerGeneration);
+      this.options.bus.noteSpawnedGeneration?.(agent.id, tailerGeneration);
+    }
     this.agents.set(agent.id, record);
+    // The collision detector's verdict for this spawn, once it is armed below.
+    // The exit log reads it so that "collision" is said by ONE judge (#326):
+    // deciding from the screen tail at the instant of the exit mis-described a
+    // collision whose marker was still in flight as "nothing was printed".
+    let collisionVerdict: Promise<boolean> | null = null;
     // Auto-cleanup: drop registry entry on exit so restart() can reuse the id.
-    proc.onExit(() => {
+    proc.onExit((code) => {
       const current = this.agents.get(agent.id);
       if (current && current.proc === proc) {
+        // Issue #393: an exit the daemon did not ask for used to be silent —
+        // no agent id, no exit code, no output — so a claude that died at
+        // boot every restart (#390) left the operator with `spawned` and
+        // `reconcile-restart-ok` lines that all read as success. Say what
+        // happened and quote the last lines of the screen. `stop()` sets
+        // `stopping` first, so its exits stay quiet.
+        if (!current.stopping) {
+          const uptimeMs = Date.now() - current.spawnedAt;
+          const verdictPromise = collisionVerdict;
+          void (async () => {
+            // Wait for the detector (it drains a non-zero exit for its marker,
+            // #326) so the line quotes the screen the verdict was made on.
+            const tailFn = (proc as AgentProcess).recentOutputTail;
+            const tail = tailFn ? tailFn.call(proc) : undefined;
+            // One judge: when the detector ran, its verdict is the verdict —
+            // a marker-like line in the tail after a clean exit or an expired
+            // window must not make the log disagree with the spawn path
+            // (Copilot on the PR). The tail decides only when no detector was
+            // armed (the exit replayed before it, or the window is 0).
+            const collision = verdictPromise
+              ? await verdictPromise
+              : tail !== undefined && SESSION_COLLISION_PATTERN.test(tail);
+            const verdict = collision
+              ? retry === 0
+                ? " — session-id collision; the spawn is retried with a fresh id"
+                : " — session-id collision persisted after rotation"
+              : uptimeMs < BOOT_FAILURE_WINDOW_MS
+                ? " — exited during boot; treat as a startup failure"
+                : "";
+            const quoted =
+              tail === undefined
+                ? "    (no output captured in this supervision mode)"
+                : tail || "    (nothing was printed)";
+            (this.options.logger ?? console).warn(
+              `[bus-session] agent=${agent.id} pid=${proc.pid} exited outside stop(): ` +
+                `code=${code} uptime=${(uptimeMs / 1000).toFixed(1)}s${verdict}. Last output:\n${quoted}`,
+            );
+          })();
+        }
         // Issue #215: tear down the session tailer on natural exit too.
         void current.tailer?.stop();
         // Issue #165 (PR #184 re-review): a natural exit (crash, OOM,
@@ -796,7 +984,8 @@ export class SessionManager {
     const collisionWindow =
       this.options.sessionCollisionDetectMs ??
       (this.options.argsOverride !== undefined ? 0 : DEFAULT_COLLISION_DETECT_MS);
-    const collision = await detectSessionIdCollision(proc, collisionWindow);
+    collisionVerdict = detectSessionIdCollision(proc, collisionWindow);
+    const collision = await collisionVerdict;
     if (collision && retry === 0) {
       const fresh = randomUUID();
       (this.options.logger ?? console).warn(
@@ -848,6 +1037,15 @@ export class SessionManager {
     // fire-and-forget: it must not block returning the proc, and a tail
     // failure must never fail the spawn.
     if (this.options.bus) {
+      // Widen to the interface: `proc` is the concrete union
+      // `PtyAgentProcess | ChildAgentProcess`, and an optional member on the
+      // interface is not visible through a union of the classes implementing
+      // it. Both implement `AgentProcess`, so the transcript hooks are reached
+      // through it — and a runtime without them stays a no-op via `?.`.
+      const confirmable: AgentProcess = proc;
+      // #402: the generation numbered (and announced, #412) before the record
+      // went live above, so the bus can order this tailer's markers.
+      const generation = tailerGeneration as number;
       const tailer = new JsonlTailer({
         bus: this.options.bus,
         agent_id: agent.id,
@@ -855,7 +1053,26 @@ export class SessionManager {
         cwd: realCwd,
         startAt: "end",
         projectsDir: this.options.projectsDir,
+        generation,
+        // Issue #362: feed the transcript's prompt-ingestion fact back to the
+        // PTY delivery-confirm loop, which otherwise has only the rendered
+        // terminal to judge by and cannot distinguish a submitted prompt from
+        // a repaint. `startAt: "end"` above is what makes this safe on a
+        // resumed session: historical prompts are never replayed, so this can
+        // only ever fire for a prompt typed by this process.
+        onPromptIngested: (ingestion) => confirmable.notePromptIngested?.(ingestion),
+        // #212: the tailer saw the boundary — record its proof on the receipt.
+        onTurnObserved: (observation) => void confirmTurnReceipt(observation),
+        // #383: every line, so the process can tell a transcript that went
+        // quiet for good (rotated away by `/clear`) from one that is slow.
+        onTranscriptLine: () => confirmable.noteTranscriptActivity?.(),
+        // Only once a line has actually been read does the process stop
+        // trusting a post-compaction repaint. Enabling it at wiring time would
+        // strand any agent whose transcript path does not resolve: the strict
+        // branch would wait for a signal that can never arrive.
+        onTranscriptAlive: () => confirmable.enableTranscriptConfirmation?.(),
       });
+
       record.tailer = tailer;
       void tailer
         .start()
@@ -1019,6 +1236,8 @@ export class SessionManager {
   stop(agent_id: string): Promise<void> {
     const record = this.agents.get(agent_id);
     if (!record) return Promise.resolve();
+    // Issue #393: this exit is asked for — keep the spawn-time exit log quiet.
+    record.stopping = true;
     return new Promise<void>((resolve) => {
       const finalise = (): void => {
         // Issue #215: tear down the session tailer.

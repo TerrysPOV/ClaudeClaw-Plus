@@ -265,6 +265,8 @@ export class McpMultiplexerPlugin {
    *  leave exactly the handlers with no persistence unswept. Null only while
    *  the plugin is stopped or dormant. */
   private gcTimer: ReturnType<typeof setInterval> | null = null;
+  /** The GC pass currently running, if any — `stop()` waits for it (#326). */
+  private gcInFlight: Promise<void> | null = null;
   /** #72 item 7: file to check for shared-name collisions at startup.
    *  Defaults to `~/.claude/mcp.json`; tests can override. */
   private readonly userMcpJsonPath: string;
@@ -519,6 +521,11 @@ export class McpMultiplexerPlugin {
     this.active = false;
     this._stopHealthProbe();
     this._stopGCTick();
+    // #326: a GC pass the interval started may be mid-sweep. Let it finish
+    // BEFORE the handlers are stopped and cleared — otherwise it resumes
+    // over an empty handler map and its orphan sweep (and the drop() calls
+    // that sweep issues) silently never runs.
+    if (this.gcInFlight) await this.gcInFlight;
     try {
       getMcpBridge().unregisterPlugin(PLUGIN_ID);
     } catch {}
@@ -531,9 +538,21 @@ export class McpMultiplexerPlugin {
     await Promise.allSettled([...this.servers.values()].map((s) => s.stop()));
     this.servers.clear();
     // Drop the persistence reference last — handlers may have queued
-    // touch/drop calls that we don't await here (they're fire-and-
-    // forget). Letting GC reclaim the store object is fine; the next
-    // `start()` constructs a new one.
+    // touch/drop calls (fire-and-forget at their call sites). Let them land
+    // first (#326) so the next `start()` replays what this one actually
+    // decided, e.g. a `drop()` for a broken bucket. `flush` settles rather
+    // than rejects and reports how many tails failed; the store itself does
+    // not audit write failures, so say it here — a session update that did
+    // not reach disk before a restart is worth one warning line.
+    // Optional call: the production store always has `flush`, but the
+    // factory is injectable and older in-memory doubles predate it.
+    const flushed = await this.persistence?.flush?.();
+    if (flushed && flushed.failed > 0) {
+      console.warn(
+        `[mcp-multiplexer] ${flushed.failed} queued session-persistence write(s) failed before stop — ` +
+          "the on-disk records may lag the last session state",
+      );
+    }
     this.persistence = null;
     // Issue #69 / Agent 4 follow-up on PR #147: flush the response
     // cache on stop. Same precedent as PR #91 P2 (release per-PTY rate
@@ -706,7 +725,10 @@ export class McpMultiplexerPlugin {
   private _startGCTick(intervalMs: number): void {
     if (intervalMs <= 0) return;
     this.gcTimer = setInterval(() => {
-      void this._runGCTick();
+      if (this.gcInFlight) return; // a slow pass is not stacked on by the next tick
+      this.gcInFlight = this._runGCTick().finally(() => {
+        this.gcInFlight = null;
+      });
     }, intervalMs);
     if (typeof this.gcTimer.unref === "function") {
       this.gcTimer.unref();
@@ -954,6 +976,7 @@ export class McpMultiplexerPlugin {
         bridge.registerPluginTool(PLUGIN_ID, {
           name: fqn,
           description: tool.description,
+          upstream: { server: serverName, tool: tool.name },
           schema: z.object({
             arguments: z.record(z.string(), z.unknown()).optional().default({}),
           }),

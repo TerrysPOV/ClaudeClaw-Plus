@@ -87,3 +87,130 @@ describe("PtyAgentProcess boot-dialog watcher (issue #193)", () => {
     expect(writes.filter((w) => w === "\x1b[B").length).toBe(1);
   });
 });
+
+describe("PtyAgentProcess boot window expiry is loud (issue #393)", () => {
+  function makeExitablePty() {
+    const writes: string[] = [];
+    let dataCb: ((d: string) => void) | null = null;
+    let exitCb: ((e: { exitCode: number }) => void) | null = null;
+    const pty: PtyHandle = {
+      pid: 4343,
+      onData(cb) {
+        dataCb = cb;
+        return { dispose() {} };
+      },
+      onExit(cb) {
+        exitCb = cb;
+        return { dispose() {} };
+      },
+      write(d) {
+        writes.push(d);
+      },
+      kill() {},
+    };
+    return {
+      pty,
+      writes,
+      emit: (s: string) => dataCb?.(s),
+      exit: (code: number) => exitCb?.({ exitCode: code }),
+    };
+  }
+
+  function captureConsoleError(): { lines: string[]; restore: () => void } {
+    const lines: string[] = [];
+    const orig = console.error;
+    console.error = (...args: unknown[]) => {
+      lines.push(args.map(String).join(" "));
+    };
+    return { lines, restore: () => (console.error = orig) };
+  }
+
+  test("a startup screen the watcher does not recognise is logged with the agent id and the screen text, and no key is sent", async () => {
+    const { pty, writes, emit } = makeExitablePty();
+    const err = captureConsoleError();
+    try {
+      new PtyAgentProcess("default", pty, { bootDialogMaxMs: 40 });
+      // #390: claude's first-run login prompt. It has a "❯" row but no
+      // "Enter to confirm" affordance, so the confirm-dialog branch never
+      // matches; before #393 the window then closed silently.
+      emit(
+        "\x1b[2J\x1b[H Select login method:\n\n" +
+          "\x1b[36m❯\x1b[0m 1. Claude account with subscription\n" +
+          "  2. Anthropic Console account\n\n Enter to select · Esc to exit\n",
+      );
+      await new Promise((r) => setTimeout(r, 90));
+      const line = err.lines.find((l) => l.includes("[boot-dialog] agent=default"));
+      expect(line).toBeDefined();
+      expect(line).toContain("no REPL footer within 40ms");
+      expect(line).toContain("Select login method");
+      expect(line).toContain("Claude account with subscription");
+      // ANSI stripped, not echoed raw into the log.
+      expect(line).not.toContain("\x1b[");
+      expect(writes).toEqual([]);
+    } finally {
+      err.restore();
+    }
+  });
+
+  test("a boot that reaches the REPL inside the window logs nothing", async () => {
+    const { pty, emit } = makeExitablePty();
+    const err = captureConsoleError();
+    try {
+      new PtyAgentProcess("default", pty, { bootDialogMaxMs: 40 });
+      emit("\n⏵ accept edits on (shift+tab to cycle)\n");
+      await new Promise((r) => setTimeout(r, 90));
+      expect(err.lines.filter((l) => l.includes("[boot-dialog]"))).toEqual([]);
+    } finally {
+      err.restore();
+    }
+  });
+
+  test("a process that exits inside the window is not reported as stuck (the exit line speaks for it)", async () => {
+    const { pty, emit, exit } = makeExitablePty();
+    const err = captureConsoleError();
+    try {
+      new PtyAgentProcess("default", pty, { bootDialogMaxMs: 40 });
+      emit("Error: something went wrong at startup\n");
+      exit(1);
+      await new Promise((r) => setTimeout(r, 90));
+      expect(err.lines.filter((l) => l.includes("[boot-dialog]"))).toEqual([]);
+    } finally {
+      err.restore();
+    }
+  });
+
+  test("onExit replays an exit that already happened (bun-pty can deliver data and exit before the caller subscribes)", () => {
+    const { pty, exit } = makeExitablePty();
+    const proc = new PtyAgentProcess("default", pty, { bootDialogMaxMs: 10_000 });
+    exit(4);
+    const seen: number[] = [];
+    proc.onExit((code) => seen.push(code));
+    expect(seen).toEqual([4]);
+    expect(proc._isExited()).toBe(true);
+  });
+
+  test("the quoted tail cannot carry control characters that would forge a top-level log line", () => {
+    const { pty, emit } = makeExitablePty();
+    const proc = new PtyAgentProcess("default", pty, { bootDialogMaxMs: 10_000 });
+    emit("real line\n\x08\x08\x08\x08\x07[bus-session] forged\x9b31m\n");
+    const lines = proc.recentOutputTail().split("\n");
+    expect(lines).toEqual(["    real line", "    [bus-session] forged31m"]);
+  });
+
+  test("recentOutputTail keeps the last non-blank lines, trimmed and bounded", () => {
+    const { pty, emit } = makeExitablePty();
+    const proc = new PtyAgentProcess("default", pty, { bootDialogMaxMs: 10_000 });
+    emit("\x1b[1mfirst\x1b[0m   line\n\n\n   second line   \n");
+    emit(`${"x".repeat(400)}\n`);
+    const tail = proc.recentOutputTail();
+    const lines = tail.split("\n");
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toBe("    first line");
+    expect(lines[1]).toBe("    second line");
+    expect(lines[2].length).toBeLessThan(200);
+    expect(lines[2].endsWith("…")).toBe(true);
+    // Bounded to the last 8 lines.
+    for (let i = 0; i < 20; i++) emit(`line ${i}\n`);
+    expect(proc.recentOutputTail().split("\n")).toHaveLength(8);
+  });
+});

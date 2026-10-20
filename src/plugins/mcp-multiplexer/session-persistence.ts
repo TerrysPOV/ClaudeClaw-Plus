@@ -452,6 +452,28 @@ export class SessionPersistenceStore {
     return { scanned, kept, dropped };
   }
 
+  /**
+   * Resolve once every write queued so far has landed (or failed) — for one
+   * server, or for all of them. `touch()`/`drop()` are fire-and-forget at
+   * their call sites, so without this nothing can wait for the disk to
+   * reflect the in-memory state: the plugin's `stop()` used to let them
+   * race the next `start()`, and a test that edits a persistence file by
+   * hand raced the read-modify-write of a touch still in flight (#326 — the
+   * GC test's `scanned` came back one short).
+   */
+  async flush(serverName?: string): Promise<{ settled: number; failed: number }> {
+    const pending =
+      serverName === undefined
+        ? [...this.writeQueue.values()]
+        : [this.writeQueue.get(serverName) ?? Promise.resolve()];
+    const results = await Promise.allSettled(pending);
+    // A rejected tail means that server's LAST queued write failed (each
+    // caller already saw its own rejection); report it rather than swallow
+    // it, so a shutdown can say that a session update did not reach disk.
+    const failed = results.filter((r) => r.status === "rejected").length;
+    return { settled: results.length, failed };
+  }
+
   /** Test seam — clears all persisted state. */
   async _resetForTests(): Promise<void> {
     try {

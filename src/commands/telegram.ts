@@ -16,12 +16,12 @@ import {
 import { extractErrorDetail } from "../messaging";
 import { loadPendingResume } from "../pending-resume";
 import { getSettings, loadSettings } from "../config";
+import { describeAllowlist, isUserAllowed } from "../allowlist";
 import { transcribeAudioToText } from "../whisper";
 import { resetSession, resetFallbackSession, peekSession } from "../sessions";
 import { peekThreadSession, removeThreadSession } from "../sessionManager";
 import { readFile, mkdir } from "node:fs/promises";
 import { existsSync, realpathSync, statSync, mkdirSync } from "node:fs";
-import { execFile, type ExecFileException } from "node:child_process";
 import { homedir } from "node:os";
 import { resolve, sep } from "node:path";
 import { resolveSkillPrompt, listSkills } from "../skills";
@@ -30,9 +30,20 @@ import { fireJob, parseFireArgs } from "./fire";
 import { extname, join } from "node:path";
 import { submitTelegramToGateway } from "../gateway";
 import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wizard";
-import { markdownToTelegramHtml } from "../adapters/telegram/format";
+import { isTelegramHtmlParseError, markdownToTelegramHtml } from "../adapters/telegram/format";
+import {
+  ackForResolution,
+  decisionStripsKeyboard,
+  describeResolverFailure,
+  parseResolverVerdict,
+  redactResolverDiagnostics,
+  runPendingResolver,
+} from "../adapters/telegram/pending-resolver";
 import type { EventRecord } from "../event-log";
-import type { GatewayRunResult } from "../event-processor";
+import { type GatewayRunResult, gatewayCommandSessionKey } from "../event-processor";
+import { telegramConversation } from "../gateway/normalizer";
+import { encodeCwdForProjectsDir } from "../bus/jsonl-line-types";
+import type { OutboxChunk } from "../telegram-outbox";
 
 // --- Outbox sandbox for send-file / voice directives ---
 
@@ -371,9 +382,73 @@ async function callApi<T>(
     signal: AbortSignal.timeout(httpTimeout),
   });
   if (!res.ok) {
-    throw new Error(`Telegram API ${method}: ${res.status} ${res.statusText}`);
+    // Keep Telegram's reason and flood window in the message: the outbound
+    // retry (telegram-outbox.ts) records the first and honours the second.
+    let description = "";
+    let retryAfter = 0;
+    try {
+      const errBody = (await res.json()) as {
+        description?: string;
+        parameters?: { retry_after?: number };
+      };
+      description = errBody?.description ?? "";
+      retryAfter = errBody?.parameters?.retry_after ?? 0;
+    } catch {
+      /* error body was not JSON — ignore */
+    }
+    throw new Error(
+      `Telegram API ${method}: ${res.status} ${res.statusText}${
+        retryAfter ? ` (retry_after ${retryAfter}s)` : ""
+      }${description ? `: ${description}` : ""}`,
+    );
   }
   return (await res.json()) as T;
+}
+
+/** Split a reply into Telegram-sized chunks: HTML, with its plain-text fallback. */
+function buildTelegramChunks(text: string): OutboxChunk[] {
+  const normalized = normalizeTelegramText(text).replace(/\[react:[^\]\r\n]+\]/gi, "");
+  const html = markdownToTelegramHtml(normalized);
+  const MAX_LEN = 4096;
+  const chunks: OutboxChunk[] = [];
+  for (let i = 0; i < html.length; i += MAX_LEN) {
+    chunks.push({
+      text: html.slice(i, i + MAX_LEN),
+      parseMode: "HTML",
+      plain: normalized.slice(i, i + MAX_LEN),
+    });
+  }
+  return chunks;
+}
+
+async function sendTelegramChunk(
+  token: string,
+  chatId: number,
+  chunk: OutboxChunk,
+  threadId?: number,
+): Promise<void> {
+  const thread = threadId ? { message_thread_id: threadId } : {};
+  if (chunk.parseMode !== "HTML") {
+    await callApi(token, "sendMessage", { chat_id: chatId, text: chunk.text, ...thread });
+    return;
+  }
+  try {
+    await callApi(token, "sendMessage", {
+      chat_id: chatId,
+      text: chunk.text,
+      parse_mode: "HTML",
+      ...thread,
+    });
+  } catch (err) {
+    // Plain text only when Telegram rejected the HTML itself. A 429 or a
+    // network error rethrows: the outbox retries it on Telegram's schedule.
+    if (!isTelegramHtmlParseError(err)) throw err;
+    await callApi(token, "sendMessage", {
+      chat_id: chatId,
+      text: chunk.plain ?? chunk.text,
+      ...thread,
+    });
+  }
 }
 
 async function sendMessage(
@@ -382,25 +457,8 @@ async function sendMessage(
   text: string,
   threadId?: number,
 ): Promise<void> {
-  const normalized = normalizeTelegramText(text).replace(/\[react:[^\]\r\n]+\]/gi, "");
-  const html = markdownToTelegramHtml(normalized);
-  const MAX_LEN = 4096;
-  for (let i = 0; i < html.length; i += MAX_LEN) {
-    try {
-      await callApi(token, "sendMessage", {
-        chat_id: chatId,
-        text: html.slice(i, i + MAX_LEN),
-        parse_mode: "HTML",
-        ...(threadId ? { message_thread_id: threadId } : {}),
-      });
-    } catch {
-      // Fallback to plain text if HTML parsing fails
-      await callApi(token, "sendMessage", {
-        chat_id: chatId,
-        text: normalized.slice(i, i + MAX_LEN),
-        ...(threadId ? { message_thread_id: threadId } : {}),
-      });
-    }
+  for (const chunk of buildTelegramChunks(text)) {
+    await sendTelegramChunk(token, chatId, chunk, threadId);
   }
 }
 
@@ -965,7 +1023,26 @@ async function downloadDocumentFromMessage(
   return { localPath, originalName };
 }
 
-async function handleMyChatMember(update: TelegramMyChatMemberUpdate): Promise<void> {
+/** Fixed greeting posted when the bot is added to a group. */
+export const GROUP_ADDED_GREETING =
+  "I was added to this group. Mention me with a command to start.";
+
+interface MyChatMemberDeps {
+  send: (token: string, chatId: number, text: string) => Promise<unknown>;
+  /** Injected so a test can assert the handler never starts a model turn. */
+  run: typeof run;
+}
+
+/**
+ * Bot added to a group. The greeting is a fixed string: the group title and
+ * the adder's name are chosen by whoever adds the bot, so they must not reach
+ * a prompt — this used to run them through the GLOBAL session with the
+ * daemon's tools. And only an allowed user can make the bot speak.
+ */
+export async function handleMyChatMember(
+  update: TelegramMyChatMemberUpdate,
+  deps: MyChatMemberDeps = { send: sendMessage, run },
+): Promise<void> {
   const config = getSettings().telegram;
   const chat = update.chat;
   if (!botUsername && update.new_chat_member.user.username)
@@ -979,36 +1056,20 @@ async function handleMyChatMember(update: TelegramMyChatMemberUpdate): Promise<v
 
   if (!isGroup || !wasOut || !isIn) return;
 
-  const chatName = chat.title ?? String(chat.id);
+  const chatName = JSON.stringify((chat.title ?? String(chat.id)).slice(0, 200));
+  if (!isUserAllowed(config.allowedUserIds, update.from.id, config.allowAllUsers)) {
+    console.log(
+      `[Telegram] Added to ${chat.type} ${chatName} (${chat.id}) by unauthorized user ${update.from.id} — not greeting`,
+    );
+    return;
+  }
   console.log(`[Telegram] Added to ${chat.type}: ${chatName} (${chat.id}) by ${update.from.id}`);
 
-  const addedBy = update.from.username ?? `${update.from.first_name} (${update.from.id})`;
-  const eventPrompt =
-    `[Telegram system event] I was added to a ${chat.type}.\n` +
-    `Group title: ${chatName}\n` +
-    `Group id: ${chat.id}\n` +
-    `Added by: ${addedBy}\n` +
-    "Write a short first message for the group. It should confirm I was added and explain how to trigger me.";
-
   try {
-    const result = await run("telegram", eventPrompt);
-    if (result.exitCode !== 0) {
-      await sendMessage(
-        config.token,
-        chat.id,
-        "I was added to this group. Mention me with a command to start.",
-      );
-      return;
-    }
-    await sendMessage(config.token, chat.id, result.stdout || "I was added to this group.");
+    await deps.send(config.token, chat.id, GROUP_ADDED_GREETING);
   } catch (err) {
     console.error(
-      `[Telegram] group-added event error: ${err instanceof Error ? err.message : err}`,
-    );
-    await sendMessage(
-      config.token,
-      chat.id,
-      "I was added to this group. Mention me with a command to start.",
+      `[Telegram] group-added greeting error: ${err instanceof Error ? err.message : err}`,
     );
   }
 }
@@ -1028,6 +1089,28 @@ function getTelegramSessionKey(
   return `tg:${chatId}`;
 }
 
+/**
+ * The runner session a chat's messages and slash commands act on. Direct
+ * path: the legacy `tg:` keys above. Gateway path (#376): the session the
+ * gateway gives the conversation — its own under `session.gatewayScope:
+ * "conversation"`, the global one otherwise — so /reset, /compact, /status
+ * and /context hit the session the next message will actually resume.
+ * `undefined` = the global session.
+ */
+export function telegramSessionKey(
+  chatId: number,
+  threadId: number | undefined,
+  userId: number | undefined,
+  isPrivate: boolean,
+  dmIsolation: "shared" | "perUser",
+  gatewayOn = process.env.USE_GATEWAY_TELEGRAM === "true",
+): string | undefined {
+  if (gatewayOn) {
+    return gatewayCommandSessionKey(telegramConversation(chatId, threadId), getSettings().session);
+  }
+  return getTelegramSessionKey(chatId, threadId, userId, isPrivate, dmIsolation);
+}
+
 // --- Message handler ---
 
 async function handleMessage(message: TelegramMessage): Promise<void> {
@@ -1044,7 +1127,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
   );
   const hasVoice = Boolean(message.voice || message.audio || isAudioDocument(message.document));
   const hasDocument = Boolean(message.document && isDocumentAttachment(message.document));
-  const sessionKey = getTelegramSessionKey(chatId, threadId, userId, isPrivate, config.dmIsolation);
+  const sessionKey = telegramSessionKey(chatId, threadId, userId, isPrivate, config.dmIsolation);
 
   if (!isPrivate && !isGroup) return;
 
@@ -1065,14 +1148,17 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     return;
   }
 
-  if (userId && config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(userId)) {
+  // No `from` = no identity to check: refused like an unlisted user.
+  if (!isUserAllowed(config.allowedUserIds, userId, config.allowAllUsers)) {
     if (isPrivate) {
       await sendMessage(config.token, chatId, "Unauthorized.");
     } else {
       console.log(
-        `[Telegram] Ignored group message from unauthorized user ${userId} in chat ${chatId}`,
+        `[Telegram] Ignored group message from unauthorized user ${userId ?? "unknown"} in chat ${chatId}`,
       );
-      debugLog(`Skip group message chat=${chatId} from=${userId} reason=unauthorized_user`);
+      debugLog(
+        `Skip group message chat=${chatId} from=${userId ?? "unknown"} reason=unauthorized_user`,
+      );
     }
     return;
   }
@@ -1196,7 +1282,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       return;
     }
     const home = homedir();
-    const projectSlug = process.cwd().replace(/\//g, "-");
+    const projectSlug = encodeCwdForProjectsDir(process.cwd()); // #368
     const jsonlPath = `${home}/.claude/projects/${projectSlug}/${session.sessionId}.jsonl`;
     if (!existsSync(jsonlPath)) {
       await sendMessage(config.token, chatId, "Conversation file not found.", threadId);
@@ -1824,118 +1910,30 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
   }
 }
 
-/**
- * Ack for an `already:<decision>:<resolved_at>` resolution (#314) — the user
- * tapped a pending-action button whose action was resolved earlier (a
- * double-tap, a Telegram callback retry after a slow ack, or a duplicate
- * notification). Names the PRIOR decision and when it happened, so the ack is
- * informative instead of the alarming "not found" the boolean resolver forced.
- *
- * `resolved_at` is the ISO timestamp the resolver reports; it is rendered
- * `DD/MM HH:MM` when parseable, omitted otherwise.
- */
-export function ackForAlready(resolution: string): string {
-  const rest = resolution.slice("already:".length);
-  const sep = rest.indexOf(":");
-  const decision = (sep === -1 ? rest : rest.slice(0, sep)).toLowerCase();
-  const at = sep === -1 ? "" : rest.slice(sep + 1);
-  // "2026-07-16T11:51…" → " (16/07 11:51)"
-  const m = at.match(/^\d{4}-(\d{2})-(\d{2})T(\d{2}:\d{2})/);
-  const when = m ? ` (${m[2]}/${m[1]} ${m[3]})` : "";
-  if (decision === "reject" || decision === "cancel" || decision === "rejected")
-    return `❌ Déjà rejeté${when}`;
-  if (decision === "skip" || decision === "skipped") return `⏸ Déjà reporté${when}`;
-  return `✅ Déjà approuvé${when}`;
-}
-
-/** The four outcomes a pending resolver can report. `no_answer` is not a
- *  statement about the action — it means we never got a verdict. */
-export type ResolverVerdict = "ok" | "already" | "not_found" | "no_answer";
-
-/**
- * Read the resolver's verdict off its stdout.
- *
- * The verdict is the LAST non-empty line, not the whole buffer: the resolver is
- * operator-supplied, and a resolver that logs its own diagnostics (a failed
- * notification edit, a deprecation notice) prints them before the verdict it
- * was asked for. Comparing the whole buffer classifies "diagnostic\nok" as
- * garbage and misreports a decision that was in fact applied.
- */
-export function parseResolverVerdict(stdout: string): { verdict: ResolverVerdict; line: string } {
-  const line =
-    stdout
-      .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean)
-      .pop() ?? "";
-  if (line === "ok") return { verdict: "ok", line };
-  if (line.startsWith("already:")) return { verdict: "already", line };
-  if (line === "not_found") return { verdict: "not_found", line };
-  return { verdict: "no_answer", line };
-}
-
-/**
- * Ack for a pending-action resolution.
- *
- * `not_found` is a statement about the action: the id is unknown, the button is
- * stale. `no_answer` is a statement about the resolver: it never printed a
- * verdict, so the action's fate is unknown — the resolver commits its decision
- * before we read its exit status, so the tap may well have applied. Acking both
- * as "not found" claims the tap was rejected when it may have landed.
- */
-export function ackForResolution(stdout: string, decision: string): string {
-  const { verdict, line } = parseResolverVerdict(stdout);
-  if (verdict === "ok") {
-    const decLower = decision.toLowerCase();
-    if (decLower === "skip") return "⏸ Plus tard";
-    if (decLower === "reject" || decLower === "cancel") return "❌ Rejeté";
-    return "✅ Approuvé";
-  }
-  if (verdict === "already") return ackForAlready(line);
-  if (verdict === "not_found") return "⚠️ Action introuvable";
-  return "⚠️ Erreur — réessaie";
-}
-
-/**
- * Strip credentials from resolver diagnostics before they reach the log. A
- * resolver that fails while calling the Bot API can put the bot token — which
- * lives in the request URL — into its stderr. Mirrors the redaction the PTY
- * tail applies for the same reason.
- */
-/**
- * Describe how the pending resolver failed, in the shape an operator can act on.
- *
- * `code` is not always an exit status: a spawn failure (ENOENT, EACCES…) reports
- * a string there, so labelling it `exit ENOENT` would misreport the very failure
- * this diagnostic exists to explain. A signal kill reports `code: null`, which is
- * why the signal and timeout cases are tested first.
- */
-export function describeResolverFailure(result: {
-  timedOut: boolean;
-  signal: string | null;
-  code: number | string | null;
-}): string {
-  if (result.timedOut) return "timed out";
-  if (result.signal) return `killed by ${result.signal}`;
-  if (typeof result.code === "string") return `spawn error ${result.code}`;
-  return `exit ${result.code}`;
-}
-
-export function redactResolverDiagnostics(text: string): string {
-  return text
-    .replace(/\bbot\d+:[A-Za-z0-9_-]{20,}/g, "bot<redacted>")
-    .replace(/\bBearer\s+[A-Za-z0-9_.-]{16,}/g, "Bearer <redacted>");
-}
+// Pending-action ack helpers live with the Bus adapter now (shared by both
+// Telegram paths); re-exported so existing imports and tests keep working.
+export {
+  normalizeDecision,
+  classifyDecision,
+  ackForAlready,
+  decisionStripsKeyboard,
+  parseResolverVerdict,
+  ackForResolution,
+  describeResolverFailure,
+  redactResolverDiagnostics,
+  runPendingResolver,
+  type ResolverVerdict,
+} from "../adapters/telegram/pending-resolver";
 
 // --- Callback query handler ---
 
-async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> {
+export async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> {
   const config = getSettings().telegram;
   const data = query.data ?? "";
 
   // Enforce allowlist on callback queries (same policy as regular messages)
   const callbackUserId = query.from.id;
-  if (config.allowedUserIds.length > 0 && !config.allowedUserIds.includes(callbackUserId)) {
+  if (!isUserAllowed(config.allowedUserIds, callbackUserId, config.allowAllUsers)) {
     await callApi(config.token, "answerCallbackQuery", {
       callback_query_id: query.id,
       text: "Unauthorized.",
@@ -1993,42 +1991,7 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
       ackText = "⚠️ Pending action handler not configured";
     } else {
       try {
-        const result = await new Promise<{
-          code: number | string | null;
-          signal: string | null;
-          timedOut: boolean;
-          stdout: string;
-          stderr: string;
-        }>((resolve) => {
-          execFile(
-            "python3",
-            [
-              "-c",
-              // #314: prefer the richer `resolve_pending_ex`
-              // (ok|not_found|already:<decision>:<at>) when the operator's lib
-              // provides it, so an already-resolved tap is distinguishable from
-              // a genuinely unknown/expired one; fall back to the boolean
-              // `resolve_pending` otherwise (zero regression for older libs).
-              "import sys; sys.path.insert(0, sys.argv[1]); import pending; f = getattr(pending, 'resolve_pending_ex', None); print(f(int(sys.argv[2]), sys.argv[3]) if f else ('ok' if pending.resolve_pending(int(sys.argv[2]), sys.argv[3]) else 'not_found'))",
-              pendingLibPath,
-              actionId,
-              decision,
-            ],
-            { timeout: 5000 },
-            (err: ExecFileException | null, stdout: string, stderr: string) => {
-              // `err` carries the real exit code, or a signal when the 5s
-              // timeout killed the process — the three failure shapes this
-              // branch has to tell apart.
-              resolve({
-                code: err?.code ?? (err ? 1 : 0),
-                signal: err?.signal ?? null,
-                timedOut: err?.killed === true,
-                stdout: stdout.trim(),
-                stderr,
-              });
-            },
-          );
-        });
+        const result = await runPendingResolver(pendingLibPath, actionId, decision);
         const { verdict } = parseResolverVerdict(result.stdout);
         ackText = ackForResolution(result.stdout, decision);
         if (verdict === "no_answer") {
@@ -2040,10 +2003,12 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
             `[Telegram] pending resolver reported no verdict for action ${actionId} (${how}): ${why}`,
           );
         }
-        // Edit the original message to record the decision — but only once we
-        // know one was taken. Editing strips the keyboard, and an ack that asks
-        // the user to retry must not delete the buttons it is pointing them at.
-        if (query.message && verdict !== "no_answer") {
+        // Edit the original message to record the decision — but only once the
+        // action is no longer waiting on the operator (#375). Editing strips the
+        // keyboard: an ack that asks the user to retry must not delete the
+        // buttons it points them at, and neither must `details` (the action
+        // stays pending) or `skip` (the resolver re-sent its own keyboard).
+        if (query.message && decisionStripsKeyboard(verdict, decision)) {
           const originalText = query.message.text ?? "";
           await callApi(config.token, "editMessageText", {
             chat_id: query.message.chat.id,
@@ -2101,8 +2066,22 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
     // Inject button press as a new user message to the running Claude session
     const chatId = query.message?.chat.id ?? query.from.id;
     const threadId = query.message?.message_thread_id;
+    // The session the chat's own messages use (#376, CodeRabbit): a press
+    // used to go to the global session even when the chat had its own — on
+    // the direct path for a group, and under `session.gatewayScope:
+    // "conversation"` for every chat. Without the message (a stale button
+    // from a deleted message) there is no chat to key on: global, as before.
+    const sessionKey = query.message
+      ? telegramSessionKey(
+          chatId,
+          threadId,
+          query.from.id,
+          query.message.chat.type === "private",
+          config.dmIsolation,
+        )
+      : undefined;
     try {
-      const result = await runUserMessage("telegram", `[Button pressed: ${label}]`);
+      const result = await runUserMessage("telegram", `[Button pressed: ${label}]`, sessionKey);
       if (result.exitCode === 0 && result.stdout) {
         const { cleanedText: afterReact, reactionEmoji } = extractReactionDirective(result.stdout);
         const { cleanedText: afterVoice, voicePaths } = extractVoiceDirectives(afterReact);
@@ -2250,9 +2229,7 @@ async function poll(generation: number): Promise<void> {
   }
 
   console.log("Telegram bot started (long polling)");
-  console.log(
-    `  Allowed users: ${config.allowedUserIds.length === 0 ? "all" : config.allowedUserIds.join(", ")}`,
-  );
+  console.log(`  Allowed users: ${describeAllowlist(config.allowedUserIds, config.allowAllUsers)}`);
   if (telegramDebug) console.log("  Debug: enabled");
 
   // Register available skills as bot command menu (non-blocking)
@@ -2414,7 +2391,7 @@ export async function deliverGatewayReply(
 // --- Exports ---
 
 /** Send a message to a specific chat (used by heartbeat forwarding) */
-export { sendMessage };
+export { sendMessage, buildTelegramChunks, sendTelegramChunk };
 
 process.on("SIGTERM", () => {
   running = false;

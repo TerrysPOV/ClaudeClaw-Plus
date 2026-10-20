@@ -22,6 +22,7 @@ import {
   type ReceiptRecord,
   type ReceiptStore,
 } from "../receipt";
+import { TAILER_EVENT_SOURCE } from "../types";
 import { streamBusPrompt } from "../webui-bridge";
 import { createSession, peekSession, incrementMessageCount } from "../../sessions";
 import { reloadSettings, _setSettingsFileForTests } from "../../config";
@@ -72,7 +73,7 @@ function mockEventLog() {
 }
 
 function makeBus(): BusCore {
-  return createBusCore({ eventLogAppend: mockEventLog() });
+  return createBusCore({ eventLogAppend: mockEventLog(), turnEndSettleMs: 0 });
 }
 
 describe("streamBusPrompt", () => {
@@ -103,6 +104,77 @@ describe("streamBusPrompt", () => {
     expect(result.output).toBe("chunk-1 chunk-2 done");
   });
 
+  it("flags a final synthesized by the silent-drop net (#215) so the caller can tell it from a reply", async () => {
+    const bus = makeBus();
+    const pending = streamBusPrompt(bus, "alpha", "hi", { timeoutMs: 2000 });
+    await Promise.resolve();
+    await Promise.resolve();
+    // The safety net publishes through ingestReply with `synthetic: true`;
+    // that option is internal to BusCoreImpl, not on the BusCore interface.
+    (
+      bus as unknown as {
+        ingestReply(
+          r: { agent_id: string; text: string; intent: "final" },
+          o: { synthetic: boolean },
+        ): void;
+      }
+    ).ingestReply(
+      { agent_id: "alpha", text: "raw turn text", intent: "final" },
+      { synthetic: true },
+    );
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    expect(result.output).toBe("raw turn text");
+    expect(result.synthesized).toBe(true);
+  });
+
+  it("leaves `synthesized` unset on a real reply", async () => {
+    const bus = makeBus();
+    const pending = streamBusPrompt(bus, "alpha", "hi", { timeoutMs: 2000 });
+    await Promise.resolve();
+    await Promise.resolve();
+    bus.ingestReply({ agent_id: "alpha", text: "real answer", intent: "final" });
+    const result = await pending;
+    expect(result.synthesized).toBeUndefined();
+  });
+
+  it("a bare acknowledgement the agent leaves unanswered settles at turn end, not at the timeout", async () => {
+    const bus = makeBus();
+    const startedAt = Date.now();
+    const pending = streamBusPrompt(bus, "alpha", "ok 👍", { timeoutMs: 4000 });
+    await Promise.resolve();
+    await Promise.resolve();
+    // The turn ends with no `reply` and no text at all.
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "",
+      topic: "response.turn_end",
+      payload: { stop_reason: "end_turn", text: "" },
+    });
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    expect(result.output).toBe("");
+    expect(Date.now() - startedAt).toBeLessThan(1000);
+  });
+
+  it("a scheduled job's 'ok' prompt keeps the safety net: its caller still gets the turn text", async () => {
+    const bus = makeBus();
+    const pending = streamBusPrompt(bus, "alpha", "ok", { originId: "job:daily", timeoutMs: 4000 });
+    await Promise.resolve();
+    await Promise.resolve();
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "",
+      topic: "response.turn_end",
+      payload: { stop_reason: "end_turn", text: "job output" },
+    });
+    const result = await pending;
+    expect(result.output).toBe("job output");
+    expect(result.synthesized).toBe(true);
+  });
+
   it("invokes onChunk for every response.text event", async () => {
     const bus = makeBus();
     const chunks: string[] = [];
@@ -116,6 +188,53 @@ describe("streamBusPrompt", () => {
     bus.ingestReply({ agent_id: "alpha", text: "two", intent: "final" });
     await pending;
     expect(chunks).toEqual(["one", "two"]);
+  });
+
+  it("leaves out the transcript tailer's echo of the turn's text: output and chunks carry the reply only (#217)", async () => {
+    const bus = makeBus();
+    const chunks: string[] = [];
+    const pending = streamBusPrompt(bus, "alpha", "hi", {
+      timeoutMs: 2000,
+      onChunk: (t) => chunks.push(t),
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    // The agent writes a note between two tool calls; the tailer echoes it.
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "",
+      topic: "response.text",
+      payload: { text: "working note", _meta: { source: TAILER_EVENT_SOURCE } },
+    });
+    bus.ingestReply({ agent_id: "alpha", text: "the answer", intent: "final" });
+    const result = await pending;
+    expect(result.output).toBe("the answer");
+    expect(chunks).toEqual(["the answer"]);
+  });
+
+  it("a turn that ends without `reply` returns the safety net's text once, not echo + net (#215, #217)", async () => {
+    const bus = makeBus();
+    const pending = streamBusPrompt(bus, "alpha", "hi", { originId: "job:daily", timeoutMs: 4000 });
+    await Promise.resolve();
+    await Promise.resolve();
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "",
+      topic: "response.text",
+      payload: { text: "job output", _meta: { source: TAILER_EVENT_SOURCE } },
+    });
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "",
+      topic: "response.turn_end",
+      payload: { stop_reason: "end_turn", text: "job output" },
+    });
+    const result = await pending;
+    expect(result.output).toBe("job output");
+    expect(result.synthesized).toBe(true);
   });
 
   it("does NOT receive events for other agents", async () => {
@@ -204,6 +323,84 @@ describe("streamBusPrompt", () => {
     expect(bus.state().subscriberCount).toBe(0);
   });
 
+  it("ignores a final routed to ANOTHER chat while this prompt waits behind that chat's turn (#239)", async () => {
+    // The bus queues the webui prompt behind a telegram turn; that turn's
+    // final lands on this agent-wide subscription first. It is not ours.
+    const bus = makeBus();
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "chat-A",
+      user_id: "u",
+      text: "from A",
+    });
+    const pending = streamBusPrompt(bus, "alpha", "from webui", {
+      timeoutMs: 2000,
+      originId: "dash",
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    bus.ingestReply({ agent_id: "alpha", text: "answer for A", intent: "final" }); // routed to chat-A
+    let settled = false;
+    void pending.then(() => {
+      settled = true;
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(settled).toBe(false);
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "response.turn_end",
+      payload: { text: "" },
+    }); // A's turn ends → the webui prompt is admitted
+    bus.ingestReply({ agent_id: "alpha", text: "answer for webui", intent: "final" });
+    const result = await pending;
+    expect(result.output).toBe("answer for webui");
+  });
+
+  it("a final the agent names for ANOTHER chat inside our own turn still resolves, as on main (#224, #239)", async () => {
+    const bus = makeBus();
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "chat-A",
+      user_id: "u",
+      text: "earlier",
+    });
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "response.turn_end",
+      payload: { text: "" },
+    });
+    const pending = streamBusPrompt(bus, "alpha", "digest", { timeoutMs: 300, originId: "job:1" });
+    await Promise.resolve();
+    await Promise.resolve();
+    bus.ingestReply({ agent_id: "alpha", text: "for A", intent: "final", in_reply_to: "chat-A" });
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    expect(result.output).toBe("for A");
+  });
+
+  it("a caller that times out while still queued withdraws its prompt: no orphan turn later (#239)", async () => {
+    const bus = makeBus();
+    await bus.sendPrompt({
+      agent_id: "alpha",
+      origin: "telegram",
+      origin_id: "chat-A",
+      user_id: "u",
+      text: "long",
+    });
+    const result = await streamBusPrompt(bus, "alpha", "from dash", {
+      timeoutMs: 50,
+      originId: "dash",
+    });
+    expect(result.ok).toBe(false);
+    expect(bus.queuedPrompts("alpha")).toEqual([]);
+  });
+
   it("serializes concurrent prompts to the same agent (Codex P1 on #136)", async () => {
     // The bridge subscribes by agent_id only; without serialization a
     // second prompt's `final` could resolve the first caller. We assert
@@ -234,6 +431,16 @@ describe("streamBusPrompt", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(bus.state().subscriberCount).toBe(1);
+    // #239: the bus itself holds the second prompt until the first TURN ends
+    // (its final reply is not the terminator — `response.turn_end` is). The
+    // tailer supplies that in the daemon; here we do.
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: "alpha",
+      session_id: "s",
+      topic: "response.turn_end",
+      payload: { text: "" },
+    });
     bus.ingestReply({ agent_id: "alpha", text: "second-reply", intent: "final" });
     const secondResult = await secondPending;
     expect(secondResult.output).toBe("second-reply");
@@ -324,6 +531,7 @@ describe("streamBusPrompt — receipt chain", () => {
     expect(recs).toHaveLength(1);
     expect(recs[0].final_state).toBe("timeout");
     expect(recs[0].notes?.timeout_ms).toBe(100);
+    expect(recs[0].notes?.reason).toBe("no_final_reply_within_timeout");
   });
 
   it("indexes the open receipt by prompt_hash so the bus → PTY seam can patch", async () => {
@@ -457,5 +665,360 @@ describe("streamBusPrompt — per-agent bookkeeping (#213, split per #218)", () 
     // No createSession — incrementMessageCount no-ops; the prompt still resolves.
     await driveOneTurn("gamma");
     expect(await peekSession("gamma")).toBeNull();
+  });
+});
+
+describe("streamBusPrompt — dead IPC is surfaced after the reconnect grace (#390)", () => {
+  let sockDir: string;
+  beforeEach(() => {
+    sockDir = mkdtempSync(join(tmpdir(), "ccplus-bridge-ipc-"));
+  });
+  afterEach(() => {
+    if (existsSync(sockDir)) rmSync(sockDir, { recursive: true, force: true });
+  });
+  const readReceipts = (): ReceiptRecord[] =>
+    existsSync(join(sockDir, "receipts.jsonl"))
+      ? readFileSync(join(sockDir, "receipts.jsonl"), "utf8")
+          .split("\n")
+          .filter(Boolean)
+          .map((l) => JSON.parse(l) as ReceiptRecord)
+      : [];
+
+  it("warns the dashboard inline when the agent still has no MCP connection after the grace", async () => {
+    // A bus WITH an IPC server but no connected agent: `sendPrompt` falls
+    // through to the PTY leg and reports `ipc_sent: false`.
+    const bus = createBusCore({
+      eventLogAppend: mockEventLog(),
+      socketPath: join(sockDir, "b.sock"),
+    });
+    await bus.start();
+    try {
+      const chunks: Array<[number, string]> = [];
+      const t0 = Date.now();
+      const store = createReceiptStore({ path: join(sockDir, "receipts.jsonl") });
+      const result = await streamBusPrompt(bus, "alpha", "hi", {
+        timeoutMs: 400,
+        ipcWarningGraceMs: 50,
+        onChunk: (t) => chunks.push([Date.now() - t0, t]),
+        receiptStore: store,
+      });
+      expect(result.ok).toBe(false);
+      expect(chunks.length).toBe(1);
+      expect(chunks[0][1]).toContain("agent alpha still has no MCP connection");
+      expect(chunks[0][0]).toBeGreaterThanOrEqual(45);
+      // Wait for the receipt close fire-and-forget to flush to disk.
+      for (let i = 0; i < 50 && readReceipts().length === 0; i++) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      const rec = readReceipts().at(-1);
+      expect(rec?.notes?.ipc_sent).toBe(false);
+      expect(rec?.notes?.bus_send_ok).toBe(true);
+    } finally {
+      await bus.stop();
+    }
+  });
+
+  it("stays silent about IPC on a bus that runs without an IPC server", async () => {
+    const bus = createBusCore({ eventLogAppend: mockEventLog(), turnEndSettleMs: 0 });
+    const chunks: string[] = [];
+    const pending = streamBusPrompt(bus, "alpha", "hi", {
+      timeoutMs: 2000,
+      ipcWarningGraceMs: 10,
+      onChunk: (t) => chunks.push(t),
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    bus.ingestReply({ agent_id: "alpha", text: "ok", intent: "final" });
+    const result = await pending;
+    expect(result.ok).toBe(true);
+    expect(chunks).toEqual(["ok"]);
+  });
+
+  it("does not warn when the reply lands inside the grace (a normal restart window)", async () => {
+    const bus = createBusCore({
+      eventLogAppend: mockEventLog(),
+      socketPath: join(sockDir, "c.sock"),
+    });
+    await bus.start();
+    try {
+      const chunks: string[] = [];
+      const pending = streamBusPrompt(bus, "alpha", "hi", {
+        timeoutMs: 2000,
+        ipcWarningGraceMs: 200,
+        onChunk: (t) => chunks.push(t),
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      // The MCP server said hello in the meantime and the turn replied.
+      bus.ingestReply({ agent_id: "alpha", text: "late but here", intent: "final" });
+      const result = await pending;
+      await new Promise((r) => setTimeout(r, 250));
+      expect(result.ok).toBe(true);
+      expect(result.output).toBe("late but here");
+      expect(chunks).toEqual(["late but here"]);
+    } finally {
+      await bus.stop();
+    }
+  });
+
+  it("does not warn when the connection is back by the time the grace ends", async () => {
+    const bus = createBusCore({
+      eventLogAppend: mockEventLog(),
+      socketPath: join(sockDir, "d.sock"),
+    });
+    await bus.start();
+    try {
+      const chunks: string[] = [];
+      const busAny = bus as unknown as { hasIpcConnection: (a: string) => boolean };
+      const original = busAny.hasIpcConnection;
+      let connected = false;
+      busAny.hasIpcConnection = (a: string) => connected || original.call(bus, a);
+      const pending = streamBusPrompt(bus, "alpha", "hi", {
+        timeoutMs: 300,
+        ipcWarningGraceMs: 40,
+        onChunk: (t) => chunks.push(t),
+      });
+      await new Promise((r) => setTimeout(r, 10));
+      connected = true; // hello arrived inside the grace
+      const result = await pending;
+      expect(result.ok).toBe(false); // no reply in this test, only the timeout
+      expect(chunks).toEqual([]);
+    } finally {
+      await bus.stop();
+    }
+  });
+});
+
+/**
+ * #454: a caller's `timeoutMs` bounds the whole call, including the wait for
+ * the per-agent bridge lock held by another web-UI prompt — not only the wait
+ * for the reply once the lock is ours.
+ */
+describe("streamBusPrompt — the timeout covers the per-agent lock wait (#454)", () => {
+  let tmpDir: string;
+  let logPath: string;
+  let store: ReceiptStore;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "ccplus-bridge-lock-"));
+    logPath = join(tmpDir, "receipts.jsonl");
+    store = createReceiptStore({ path: logPath });
+  });
+
+  afterEach(() => {
+    if (existsSync(tmpDir)) rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  async function readReceiptsWhen(n: number): Promise<ReceiptRecord[]> {
+    const read = () =>
+      existsSync(logPath)
+        ? readFileSync(logPath, "utf-8")
+            .split("\n")
+            .filter((l) => l.trim().length > 0)
+            .map((l) => JSON.parse(l) as ReceiptRecord)
+        : [];
+    for (let i = 0; i < 50 && read().length < n; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    return read();
+  }
+
+  const endTurn = (bus: BusCore, agent: string) =>
+    bus.ingestSessionEvent({
+      ts: Date.now(),
+      agent_id: agent,
+      session_id: "s",
+      topic: "response.turn_end",
+      payload: { text: "" },
+    });
+
+  it("gives up after its own timeout while another prompt holds the lock, and never sends", async () => {
+    const bus = makeBus();
+    const sent: string[] = [];
+    const origSend = bus.sendPrompt.bind(bus);
+    bus.sendPrompt = (p) => {
+      sent.push(p.text);
+      return origSend(p);
+    };
+    const first = streamBusPrompt(bus, "alpha", "long inject", { timeoutMs: 5000 });
+    const t0 = Date.now();
+    const fire = await streamBusPrompt(bus, "alpha", "fired job", { timeoutMs: 100 });
+    const elapsed = Date.now() - t0;
+
+    expect(elapsed).toBeLessThan(1000);
+    expect(fire.ok).toBe(false);
+    expect(fire.exitCode).toBe(1);
+    expect(fire.error).toContain("timed out after 100ms");
+    expect(fire.error).toContain("another web-UI prompt");
+    expect(sent).toEqual(["long inject"]);
+
+    bus.ingestReply({ agent_id: "alpha", text: "first-reply", intent: "final" });
+    expect((await first).output).toBe("first-reply");
+  });
+
+  it("a caller that gave up keeps the queue in order: the next waiter still waits for the holder", async () => {
+    const bus = makeBus();
+    const first = streamBusPrompt(bus, "alpha", "first", { timeoutMs: 5000 });
+    const quitter = streamBusPrompt(bus, "alpha", "quitter", { timeoutMs: 50 });
+    const third = streamBusPrompt(bus, "alpha", "third", { timeoutMs: 5000 });
+    expect((await quitter).ok).toBe(false);
+    // The quitter is gone but the first still runs: the third must not start.
+    await new Promise((r) => setTimeout(r, 30));
+    expect(bus.state().subscriberCount).toBe(1);
+
+    bus.ingestReply({ agent_id: "alpha", text: "first-reply", intent: "final" });
+    expect((await first).output).toBe("first-reply");
+    await new Promise((r) => setTimeout(r, 10));
+    endTurn(bus, "alpha");
+    bus.ingestReply({ agent_id: "alpha", text: "third-reply", intent: "final" });
+    expect((await third).output).toBe("third-reply");
+  });
+
+  it("once the lock is acquired, only the remaining budget is spent waiting for the reply", async () => {
+    const bus = makeBus();
+    const first = streamBusPrompt(bus, "alpha", "first", { timeoutMs: 5000 });
+    const t0 = Date.now();
+    const second = streamBusPrompt(bus, "alpha", "second", { timeoutMs: 400 });
+    await new Promise((r) => setTimeout(r, 250));
+    bus.ingestReply({ agent_id: "alpha", text: "first-reply", intent: "final" });
+    await first;
+    endTurn(bus, "alpha");
+    // No reply for the second: it times out on its own budget, counted from entry.
+    const r = await second;
+    const elapsed = Date.now() - t0;
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain("timed out after 400ms");
+    expect(elapsed).toBeLessThan(600);
+  });
+
+  it("does not send when the lock comes with almost none of the budget left", async () => {
+    const bus = makeBus();
+    const sent: string[] = [];
+    const origSend = bus.sendPrompt.bind(bus);
+    bus.sendPrompt = (p) => {
+      sent.push(p.text);
+      return origSend(p);
+    };
+    const first = streamBusPrompt(bus, "alpha", "first", { timeoutMs: 5000 });
+    const reasons: string[] = [];
+    const late = streamBusPrompt(bus, "alpha", "late", {
+      timeoutMs: 1000,
+      onTurnSettled: (r) => reasons.push(r),
+    });
+    // The lock frees with ~5% of the late caller's budget left.
+    await new Promise((r) => setTimeout(r, 950));
+    bus.ingestReply({ agent_id: "alpha", text: "first-reply", intent: "final" });
+    await first;
+    const r = await late;
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain("another web-UI prompt");
+    expect(sent).toEqual(["first"]);
+    await new Promise((res) => setTimeout(res, 20));
+    expect(reasons).toEqual(["no_turn"]);
+  });
+
+  it("caps the minimum reply budget, so a long timeout is not refused with seconds left", async () => {
+    const bus = makeBus();
+    const sent: string[] = [];
+    const origSend = bus.sendPrompt.bind(bus);
+    bus.sendPrompt = (p) => {
+      sent.push(p.text);
+      return origSend(p);
+    };
+    const first = streamBusPrompt(bus, "alpha", "first", { timeoutMs: 5000 });
+    // 3000 ms budget, lock after ~2850 ms: ~150 ms left is under a tenth
+    // (300 ms) but over a 20 ms cap, so it is sent. Wide margins on both
+    // sides for slow runners. Scaled-down stand-in for a 5 min budget with
+    // 20 s left.
+    const late = streamBusPrompt(bus, "alpha", "late", {
+      timeoutMs: 3000,
+      minReplyBudgetCapMs: 20,
+    });
+    await new Promise((r) => setTimeout(r, 2850));
+    bus.ingestReply({ agent_id: "alpha", text: "first-reply", intent: "final" });
+    await first;
+    await new Promise((r) => setTimeout(r, 5));
+    expect(sent).toEqual(["first", "late"]);
+    await late;
+  });
+
+  it("an oversized timeout still waits for the lock instead of giving up at once", async () => {
+    const bus = makeBus();
+    const first = streamBusPrompt(bus, "alpha", "first", { timeoutMs: 5000 });
+    const huge = streamBusPrompt(bus, "alpha", "huge", { timeoutMs: 2 ** 32 });
+    await new Promise((r) => setTimeout(r, 50));
+    bus.ingestReply({ agent_id: "alpha", text: "first-reply", intent: "final" });
+    await first;
+    await new Promise((r) => setTimeout(r, 10));
+    endTurn(bus, "alpha");
+    bus.ingestReply({ agent_id: "alpha", text: "huge-reply", intent: "final" });
+    expect((await huge).output).toBe("huge-reply");
+  });
+
+  it("the receipt shows when the request arrived and how long it waited for the lock", async () => {
+    const bus = makeBus();
+    const first = streamBusPrompt(bus, "alpha", "first", { timeoutMs: 5000, receiptStore: store });
+    const arrived = Date.now();
+    const quitter = streamBusPrompt(bus, "alpha", "quitter", {
+      timeoutMs: 100,
+      receiptStore: store,
+      originId: "fire-1",
+    });
+    await quitter;
+    const [gaveUp] = await readReceiptsWhen(1);
+    expect(gaveUp.message_id).toMatch(/^webui:fire-1:/);
+    expect(gaveUp.final_state).toBe("timeout");
+    expect(Math.abs(Date.parse(gaveUp.received_at) - arrived)).toBeLessThan(50);
+    expect(gaveUp.duration_ms).toBeGreaterThanOrEqual(90);
+    expect(gaveUp.notes).toMatchObject({
+      reason: "bridge_lock_wait_exceeded",
+      stage: "bridge_lock",
+      timeout_ms: 100,
+    });
+    expect(gaveUp.notes?.lock_wait_ms as number).toBeGreaterThanOrEqual(90);
+    // The prompt that never went out is not indexed for the bus → PTY seam.
+    expect(store.findByPromptHash(hashPrompt("quitter"))).toBeUndefined();
+
+    const waited = streamBusPrompt(bus, "alpha", "waited", {
+      timeoutMs: 5000,
+      receiptStore: store,
+      originId: "fire-2",
+    });
+    await new Promise((r) => setTimeout(r, 120));
+    // Still waiting for the lock: not sent, so not findable by the seam yet.
+    expect(store.findByPromptHash(hashPrompt("waited"))).toBeUndefined();
+    bus.ingestReply({ agent_id: "alpha", text: "first-reply", intent: "final" });
+    await first;
+    await new Promise((r) => setTimeout(r, 10));
+    expect(store.findByPromptHash(hashPrompt("waited"))).toBeDefined();
+    endTurn(bus, "alpha");
+    bus.ingestReply({ agent_id: "alpha", text: "ok", intent: "final" });
+    await waited;
+    const recs = await readReceiptsWhen(3);
+    const w = recs.find((r) => r.message_id.startsWith("webui:fire-2:"));
+    expect(w?.final_state).toBe("turn_observed");
+    expect(w?.prompt_hash).toBe(hashPrompt("waited"));
+    expect(w?.notes?.lock_wait_ms as number).toBeGreaterThanOrEqual(100);
+    expect(w?.duration_ms as number).toBeGreaterThanOrEqual(w?.notes?.lock_wait_ms as number);
+  });
+
+  it("tells a turn-settled caller that no turn will run when it gave up on the lock", async () => {
+    const bus = makeBus();
+    const first = streamBusPrompt(bus, "alpha", "first", { timeoutMs: 5000 });
+    const reasons: string[] = [];
+    let resolvedFirst = false;
+    const quitter = streamBusPrompt(bus, "alpha", "quitter", {
+      timeoutMs: 50,
+      onTurnSettled: (r) => {
+        expect(resolvedFirst).toBe(true);
+        reasons.push(r);
+      },
+    }).then((r) => {
+      resolvedFirst = true;
+      return r;
+    });
+    expect((await quitter).ok).toBe(false);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(reasons).toEqual(["no_turn"]);
+    bus.ingestReply({ agent_id: "alpha", text: "first-reply", intent: "final" });
+    await first;
   });
 });

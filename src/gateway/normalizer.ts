@@ -290,8 +290,7 @@ export function normalizeTelegramMessage(message: TelegramMessage): NormalizedEv
     id: "", // assigned by event log
     channel: "telegram",
     sourceEventId: message.message_id ? String(message.message_id) : undefined,
-    channelId: `telegram:${message.chat.id}`,
-    threadId: message.message_thread_id ? String(message.message_thread_id) : "default",
+    ...telegramConversation(message.chat.id, message.message_thread_id),
     userId: message.from?.id ? String(message.from.id) : "unknown",
     text,
     attachments,
@@ -306,6 +305,37 @@ export function normalizeTelegramMessage(message: TelegramMessage): NormalizedEv
  * Normalize a Discord message into the unified schema.
  * Preserves source provenance (id, channel_id, author.id) for dedupe/replay.
  */
+/**
+ * The gateway identity of a Telegram conversation: the chat, and the forum
+ * topic when there is one (`"default"` otherwise). Spelled once here so the
+ * normalizer and the slash commands that act on a conversation's session
+ * (#376) cannot disagree.
+ */
+export function telegramConversation(
+  chatId: number | string,
+  messageThreadId?: number | string,
+): { channelId: string; threadId: string } {
+  return {
+    channelId: `telegram:${chatId}`,
+    threadId: messageThreadId ? String(messageThreadId) : "default",
+  };
+}
+
+/**
+ * The gateway identity of a Discord conversation. Discord exposes guild_id and
+ * channel_id separately; the full channel context keeps the guild, and the
+ * channel id (a thread is a channel) is repeated as the thread id.
+ */
+export function discordConversation(
+  guildId: string | undefined,
+  channelId: string,
+): { channelId: string; threadId: string } {
+  return {
+    channelId: guildId ? `discord:guild:${guildId}:${channelId}` : `discord:dm:${channelId}`,
+    threadId: channelId,
+  };
+}
+
 export function normalizeDiscordMessage(message: DiscordMessage): NormalizedEvent {
   // Trim content
   const text = message.content.trim();
@@ -343,9 +373,7 @@ export function normalizeDiscordMessage(message: DiscordMessage): NormalizedEven
   // Discord exposes guild_id and channel_id separately
   // threadId: Discord uses parent channel_id + optional thread id in message
   // We preserve the full channel context by including guild_id in channelId
-  const channelId = message.guild_id
-    ? `discord:guild:${message.guild_id}:${message.channel_id}`
-    : `discord:dm:${message.channel_id}`;
+  const { channelId, threadId } = discordConversation(message.guild_id, message.channel_id);
 
   // Discord message type (e.g., 0=DEFAULT, 19=REPLY, 20=CHANNEL_PINNED_MESSAGE)
   metadata.rawType = message.type;
@@ -367,7 +395,7 @@ export function normalizeDiscordMessage(message: DiscordMessage): NormalizedEven
     channel: "discord",
     sourceEventId: message.id,
     channelId,
-    threadId: message.channel_id, // Discord thread id embedded in channel_id if needed
+    threadId,
     userId: message.author.id,
     text,
     attachments,

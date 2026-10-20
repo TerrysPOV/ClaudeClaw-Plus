@@ -1,4 +1,28 @@
-export const pageStyles = String.raw`    :root {
+export const pageStyles = String.raw`    /* Served by the daemon (src/ui/assets.ts), not a CDN. Variable fonts:
+       one file covers every weight the page uses. */
+    @font-face {
+      font-family: "Fraunces";
+      font-style: normal;
+      font-weight: 100 900;
+      font-display: swap;
+      src: url(/assets/fonts/fraunces-latin.woff2) format("woff2");
+    }
+    @font-face {
+      font-family: "Space Grotesk";
+      font-style: normal;
+      font-weight: 300 700;
+      font-display: swap;
+      src: url(/assets/fonts/space-grotesk-latin.woff2) format("woff2");
+    }
+    @font-face {
+      font-family: "JetBrains Mono";
+      font-style: normal;
+      font-weight: 400 800;
+      font-display: swap;
+      src: url(/assets/fonts/jetbrains-mono-latin.woff2) format("woff2");
+    }
+
+    :root {
       --bg-top: #2a4262;
       --bg-bottom: #0d1828;
       --bg-spot-a: #7fb8ff3d;

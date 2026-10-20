@@ -17,6 +17,7 @@ import { join } from "path";
 import { homedir } from "os";
 import { mkdir, writeFile, rm } from "fs/promises";
 import { randomUUID } from "crypto";
+import { encodeCwdForProjectsDir } from "../../bus/jsonl-line-types";
 
 // The usage tracker uses .claude/claudeclaw/usage/ - clean this for test isolation
 const USAGE_DIR = join(process.cwd(), ".claude", "claudeclaw", "usage");
@@ -286,7 +287,7 @@ describe("extractTranscriptUsage (budget wiring)", () => {
   test("sums assistant usage from the session transcript, excluding turns before startedAt", async () => {
     const cwd = `/tmp/claudeclaw-test-${randomUUID()}`;
     const sessionId = randomUUID();
-    const dir = join(homedir(), ".claude", "projects", cwd.replace(/\//g, "-"));
+    const dir = join(homedir(), ".claude", "projects", encodeCwdForProjectsDir(cwd));
     const jsonl = join(dir, `${sessionId}.jsonl`);
     await mkdir(dir, { recursive: true });
     const lines = [

@@ -20,6 +20,7 @@ import { existsSync } from "fs";
 import { appendFile, readdir, readFile } from "fs/promises";
 import { randomUUID } from "crypto";
 import { homedir } from "os";
+import { encodeCwdForProjectsDir } from "../bus/jsonl-line-types";
 
 const USAGE_DIR = join(process.cwd(), ".claude", "claudeclaw", "usage");
 const USAGE_INDEX_FILE = join(USAGE_DIR, "usage-index.json");
@@ -60,7 +61,7 @@ export async function extractTranscriptUsage(
 ): Promise<UsageMetrics | null> {
   try {
     if (!sessionId || sessionId === "unknown") return null;
-    const mangled = cwd.replace(/\//g, "-");
+    const mangled = encodeCwdForProjectsDir(cwd); // #368
     const jsonlPath = join(homedir(), ".claude", "projects", mangled, `${sessionId}.jsonl`);
     if (!existsSync(jsonlPath)) return null;
     const since = Date.parse(sinceIso);

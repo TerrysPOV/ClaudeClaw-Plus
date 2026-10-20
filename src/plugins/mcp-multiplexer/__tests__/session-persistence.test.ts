@@ -523,3 +523,86 @@ describe("SessionPersistenceStore", () => {
     expect(entries.some((e) => e.ptyId === "reg" && e.sessionId === "sess-B")).toBe(true);
   });
 });
+
+// #326: flush() makes the fire-and-forget write queue awaitable. The scenario
+// is the GC integration test's residual flake, reproduced on purpose: a
+// touch() whose read already happened, an external edit of the file, then the
+// touch's write — which puts the pre-edit content back.
+describe("SessionPersistenceStore.flush (#326)", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "ccplus-persist-flush-"));
+  });
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /** Make every `_readFile` pause AFTER it read, and expose when it did — the
+   *  window between a touch's read and its write, opened on purpose. */
+  function holdWrites(store: SessionPersistenceStore) {
+    let readDone: () => void = () => undefined;
+    let release: () => void = () => undefined;
+    const read = new Promise<void>((r) => {
+      readDone = r;
+    });
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const s = store as unknown as { _readFile: (n: string) => Promise<unknown> };
+    const real = s._readFile.bind(store);
+    s._readFile = async (n: string) => {
+      const r = await real(n);
+      readDone();
+      await gate;
+      return r;
+    };
+    return { read, release };
+  }
+  const entriesOnDisk = () =>
+    (JSON.parse(readFileSync(join(root, "alpha.json"), "utf8")) as { entries: unknown[] }).entries
+      .length;
+
+  it("an in-flight touch puts the pre-edit file back — the race flush() exists for", async () => {
+    const store = new SessionPersistenceStore({ storageRoot: root, maxAgeMs: 3600_000 });
+    await store.record("alpha", "pty-live", "11111111-0000-0000-0000-000000000000");
+    const hold = holdWrites(store);
+    const inflight = store.touch("alpha", "pty-live");
+    await hold.read; // its read is done, its write is not
+    const file = JSON.parse(readFileSync(join(root, "alpha.json"), "utf8"));
+    file.entries.push({ ...file.entries[0], ptyId: "pty-stale" });
+    writeFileSync(join(root, "alpha.json"), JSON.stringify(file));
+    expect(entriesOnDisk()).toBe(2);
+    hold.release();
+    await inflight;
+    expect(entriesOnDisk()).toBe(1);
+  });
+
+  it("editing after flush() keeps the edit", async () => {
+    const store = new SessionPersistenceStore({ storageRoot: root, maxAgeMs: 3600_000 });
+    await store.record("alpha", "pty-live", "11111111-0000-0000-0000-000000000000");
+    const hold = holdWrites(store);
+    void store.touch("alpha", "pty-live");
+    await hold.read;
+    hold.release();
+    await store.flush("alpha");
+    const file = JSON.parse(readFileSync(join(root, "alpha.json"), "utf8"));
+    file.entries.push({ ...file.entries[0], ptyId: "pty-stale" });
+    writeFileSync(join(root, "alpha.json"), JSON.stringify(file));
+    await store.flush();
+    expect(entriesOnDisk()).toBe(2);
+  });
+
+  it("flush() resolves even when a queued write failed", async () => {
+    const store = new SessionPersistenceStore({ storageRoot: root, maxAgeMs: 3600_000 });
+    await store.record("alpha", "pty-live", "11111111-0000-0000-0000-000000000000");
+    const s = store as unknown as { _atomicWrite: () => Promise<void> };
+    s._atomicWrite = async () => {
+      throw new Error("disk full");
+    };
+    await expect(store.touch("alpha", "pty-live")).rejects.toThrow("disk full");
+    // must not reject — and must say that a write failed
+    expect(await store.flush()).toEqual({ settled: 1, failed: 1 });
+    expect(await store.flush("alpha")).toEqual({ settled: 1, failed: 1 });
+    expect(await store.flush("never-seen")).toEqual({ settled: 1, failed: 0 });
+  });
+});

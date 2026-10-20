@@ -12,27 +12,26 @@ function decodeUnicodeEscapes(text: string): string {
   });
 }
 
-export function htmlPage(): string {
+/**
+ * The dashboard shell. `nonce` must be the one in the response's
+ * Content-Security-Policy (see `security-headers.ts`): it is what lets the
+ * inline script and style run, so the markup carries no inline handler or
+ * style attribute — the policy would block them.
+ */
+export function htmlPage(nonce: string): string {
   const html = String.raw`
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <!-- Issue #164 PR B (Codex P1): the dashboard bootstraps with the web
-       token in ?token=. This MUST be the first head element so the
-       no-referrer policy is in force before the Google Fonts preconnect /
-       stylesheet below fire — otherwise a browser defaulting to
-       no-referrer-when-downgrade would leak the full URL (token included)
-       to fonts.googleapis.com via the Referer header. The /-route HTTP
-       response also sets Referrer-Policy: no-referrer as the authoritative
-       belt-and-suspenders. -->
+       token in ?token=. Kept as the first head element so no-referrer is in
+       force before anything else in the page can fire a request; the
+       response also sends Referrer-Policy: no-referrer. -->
   <meta name="referrer" content="no-referrer" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ClaudeClaw+</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,500&family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <style>
+  <style nonce="${nonce}">
 ${pageStyles}
   </style>
 </head>
@@ -277,7 +276,7 @@ ${pageStyles}
                 type="file"
                 id="chat-file-input"
                 multiple
-                style="display:none"
+                hidden
                 accept="text/plain,text/html,text/css,text/javascript,text/typescript,text/x-python,text/csv,text/xml,text/markdown,application/json,application/yaml,application/toml,image/jpeg,image/png,image/gif,image/webp,.js,.ts,.py,.json,.yaml,.yml,.md,.txt,.csv,.xml,.sh,.sql,.toml,.ini,.env,.log"
               />
               <textarea
@@ -325,7 +324,7 @@ ${pageStyles}
               <span class="kanban-col-title">Done</span>
               <span class="kanban-col-count" id="kanban-count-done">0</span>
             </div>
-            <button class="kanban-clear-btn" onclick="clearKanbanDone()" type="button">Clear</button>
+            <button class="kanban-clear-btn" id="kanban-clear-btn" type="button">Clear</button>
           </div>
           <div class="kanban-cards" id="kanban-cards-done"></div>
         </div>
@@ -371,7 +370,7 @@ ${pageStyles}
   <!-- #325: out-of-band operator alerts (stall watchdog, …), polled via /api/state. Hidden when empty. -->
   <section class="operator-alerts" id="operator-alerts" aria-live="polite" hidden></section>
 
-  <script>
+  <script nonce="${nonce}">
 ${pageScript}
   </script>
 </body>

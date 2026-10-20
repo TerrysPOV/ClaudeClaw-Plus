@@ -18,6 +18,12 @@ interface SessionsData {
 
 let sessionsCache: SessionsData | null = null;
 
+/** Drop the in-memory thread-session cache so the next read comes from disk
+ *  — for tests only (a test that removed the file must not keep seeing it). */
+export function _resetThreadSessionsForTests(): void {
+  sessionsCache = null;
+}
+
 async function loadSessions(): Promise<SessionsData> {
   if (sessionsCache) return sessionsCache;
   try {

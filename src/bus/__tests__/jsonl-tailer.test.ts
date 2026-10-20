@@ -22,6 +22,7 @@ import { join } from "node:path";
 import type { BusCore, SendPromptRequest } from "../core";
 import { encodeCwdForProjectsDir } from "../jsonl-line-types";
 import { JsonlTailer, SCHEMA_VERSION } from "../jsonl-tailer";
+import type { PromptIngestion } from "../jsonl-line-types";
 import type { BusEvent, BusEventTopic } from "../types";
 
 /* ───────────────────────────────────────────────────────────────────── */
@@ -354,6 +355,328 @@ describe("JsonlTailer — assistant lines", () => {
 
     const turnEnd = events.find((e) => e.topic === "response.turn_end");
     expect(turnEnd).toBeUndefined();
+  });
+
+  it("emits response.turn_end carrying the real stop_reason when the turn stops on max_tokens (#401)", async () => {
+    writeFileSync(
+      sessionPath,
+      jsonl({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          id: "msg_MT",
+          content: [{ type: "text", text: "A long answer that got cut" }],
+          stop_reason: "max_tokens",
+        },
+        timestamp: "2026-06-02T10:00:02.000Z",
+        sessionId: SESSION_ID,
+      }),
+    );
+    const { bus, events } = createMockBus();
+    tailer = makeTailer(bus);
+    await tailer.start();
+
+    const turnEnd = events.find((e) => e.topic === "response.turn_end");
+    expect(turnEnd).toBeDefined();
+    const payload = turnEnd?.payload as { stop_reason: string; text: string };
+    expect(payload.stop_reason).toBe("max_tokens");
+    expect(payload.text).toBe("A long answer that got cut");
+  });
+
+  it("emits response.turn_end when the turn stops on stop_sequence (#401)", async () => {
+    // Observed live: the CLI's synthetic error line ("Prompt is too long …")
+    // stops with `stop_sequence` and the next transcript line is the next
+    // prompt — the turn is over, and nothing else will terminate it.
+    writeFileSync(
+      sessionPath,
+      jsonl({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          id: "msg_SS",
+          content: [{ type: "text", text: "Prompt is too long" }],
+          stop_reason: "stop_sequence",
+        },
+        timestamp: "2026-06-02T10:00:03.000Z",
+        sessionId: SESSION_ID,
+      }),
+    );
+    const { bus, events } = createMockBus();
+    tailer = makeTailer(bus);
+    await tailer.start();
+
+    const turnEnd = events.find((e) => e.topic === "response.turn_end");
+    expect(turnEnd).toBeDefined();
+    expect((turnEnd?.payload as { stop_reason: string }).stop_reason).toBe("stop_sequence");
+  });
+
+  it("emits an empty-text response.turn_end for a synthetic API-error line, so the turn releases without a nudge (#401)", async () => {
+    // Live shape: the CLI writes `model: "<synthetic>"` + `isApiErrorMessage`
+    // for "Prompt is too long …" / "You've hit your session limit …", stopping
+    // with `stop_sequence`; the next transcript line is `last-prompt`.
+    writeFileSync(
+      sessionPath,
+      jsonl({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          id: "msg_ERR",
+          model: "<synthetic>",
+          content: [{ type: "text", text: "Prompt is too long · the request is ~3664273 tokens" }],
+          stop_reason: "stop_sequence",
+        },
+        isApiErrorMessage: true,
+        error: "invalid_request",
+        apiErrorStatus: "400",
+        timestamp: "2026-06-02T10:00:06.000Z",
+        sessionId: SESSION_ID,
+      }),
+    );
+    const { bus, events } = createMockBus();
+    tailer = makeTailer(bus);
+    await tailer.start();
+
+    const turnEnd = events.find((e) => e.topic === "response.turn_end");
+    expect(turnEnd).toBeDefined();
+    const payload = turnEnd?.payload as { stop_reason: string; text: string; synthetic?: boolean };
+    expect(payload.stop_reason).toBe("stop_sequence");
+    expect(payload.text).toBe(""); // never handed to the #215 synthesizer
+    expect(payload.synthetic).toBe(true);
+    // The error itself still reaches subscribers through its own topic — and
+    // BEFORE the boundary, so it is still stamped with the turn's promise_id
+    // when bus core releases the operation slot on turn_end.
+    const apiErrorAt = events.findIndex((e) => e.topic === "system.api_error");
+    const turnEndAt = events.findIndex((e) => e.topic === "response.turn_end");
+    expect(apiErrorAt).toBeGreaterThanOrEqual(0);
+    expect(apiErrorAt).toBeLessThan(turnEndAt);
+  });
+
+  it("does NOT emit response.turn_end for the synthetic 'No response requested.' placeholder (#401)", async () => {
+    // Live shape: an SDK-enqueued prompt produces a meta user line, then this
+    // placeholder, then the REAL user prompt ~90 ms later. It precedes the
+    // turn, so it must not terminate anything.
+    writeFileSync(
+      sessionPath,
+      jsonl(
+        {
+          type: "user",
+          isMeta: true,
+          message: {
+            role: "user",
+            content: [{ type: "text", text: "Continue from where you left off." }],
+          },
+          timestamp: "2026-06-02T10:00:07.000Z",
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "msg_NRR",
+            model: "<synthetic>",
+            content: [{ type: "text", text: "No response requested." }],
+            stop_reason: "stop_sequence",
+          },
+          isApiErrorMessage: false,
+          timestamp: "2026-06-02T10:00:07.050Z",
+          sessionId: SESSION_ID,
+        },
+      ),
+    );
+    const { bus, events } = createMockBus();
+    tailer = makeTailer(bus);
+    await tailer.start();
+
+    expect(events.find((e) => e.topic === "response.turn_end")).toBeUndefined();
+  });
+
+  it("tags each boundary line of a multi-line message with its message_id (#405)", async () => {
+    // Live shape on current CLIs: thinking line and text line, same message id,
+    // the terminal stop_reason repeated on both.
+    writeFileSync(
+      sessionPath,
+      jsonl(
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "msg_MULTI",
+            content: [{ type: "thinking", thinking: "…" }],
+            stop_reason: "end_turn",
+          },
+          timestamp: "2026-06-02T10:00:08.000Z",
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "msg_MULTI",
+            content: [{ type: "text", text: "the answer" }],
+            stop_reason: "end_turn",
+          },
+          timestamp: "2026-06-02T10:00:08.100Z",
+          sessionId: SESSION_ID,
+        },
+      ),
+    );
+    const { bus, events } = createMockBus();
+    tailer = makeTailer(bus);
+    await tailer.start();
+
+    const ends = events.filter((e) => e.topic === "response.turn_end");
+    expect(ends).toHaveLength(2);
+    const ids = ends.map((e) => (e.payload as { message_id?: string }).message_id);
+    expect(ids).toEqual(["msg_MULTI", "msg_MULTI"]);
+    // The text line still carries the text the #215 net needs.
+    expect((ends[1].payload as { text: string }).text).toBe("the answer");
+  });
+
+  it("does NOT emit response.turn_end when stop_reason is pause_turn (server-tool turn resumes, #401)", async () => {
+    writeFileSync(
+      sessionPath,
+      jsonl({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          id: "msg_PT",
+          content: [{ type: "text", text: "searching…" }],
+          stop_reason: "pause_turn",
+        },
+        timestamp: "2026-06-02T10:00:05.000Z",
+        sessionId: SESSION_ID,
+      }),
+    );
+    const { bus, events } = createMockBus();
+    tailer = makeTailer(bus);
+    await tailer.start();
+
+    expect(events.find((e) => e.topic === "response.turn_end")).toBeUndefined();
+  });
+
+  it("does NOT emit response.turn_end for a content-block line whose stop_reason is null (still streaming, #401)", async () => {
+    writeFileSync(
+      sessionPath,
+      jsonl({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          id: "msg_NULL",
+          content: [{ type: "text", text: "partial" }],
+          stop_reason: null,
+        },
+        timestamp: "2026-06-02T10:00:04.000Z",
+        sessionId: SESSION_ID,
+      }),
+    );
+    const { bus, events } = createMockBus();
+    tailer = makeTailer(bus);
+    await tailer.start();
+
+    expect(events.find((e) => e.topic === "response.turn_end")).toBeUndefined();
+    // The text block itself is still surfaced.
+    expect(events.find((e) => e.topic === "response.text")).toBeDefined();
+  });
+
+  it("carries the tailer generation on replay_done and session.compact when given one (#402)", async () => {
+    writeFileSync(
+      sessionPath,
+      jsonl({
+        type: "system",
+        subtype: "compact_boundary",
+        compactMetadata: { trigger: "auto", preTokens: 10, postTokens: 5, durationMs: 1 },
+        timestamp: "2026-06-02T10:00:09.000Z",
+        sessionId: SESSION_ID,
+      }),
+    );
+    const { bus, events } = createMockBus();
+    tailer = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      generation: 7,
+      onError: () => {},
+    });
+    await tailer.start();
+
+    const replay = events.find((e) => e.topic === "bus.events.replay_done");
+    expect((replay?.payload as { generation?: number }).generation).toBe(7);
+    const compact = events.find((e) => e.topic === "session.compact");
+    expect((compact?.payload as { generation?: number }).generation).toBe(7);
+  });
+
+  it("omits the generation when none was given (older wiring stays unchanged)", async () => {
+    writeFileSync(sessionPath, "");
+    const { bus, events } = createMockBus();
+    tailer = makeTailer(bus);
+    await tailer.start();
+    const replay = events.find((e) => e.topic === "bus.events.replay_done");
+    expect(replay).toBeDefined();
+    expect("generation" in (replay?.payload as object)).toBe(false);
+  });
+
+  it("fires onTranscriptLine for every line it reads — ingestion or not, replayed or live — and keeps dispatching when the callback throws (#383)", async () => {
+    // Two replayed lines: an assistant line (not an ingestion) and a user
+    // prompt (an ingestion); then one live-tailed line.
+    writeFileSync(
+      sessionPath,
+      jsonl(
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "msg_A",
+            content: [{ type: "text", text: "hi" }],
+            stop_reason: "end_turn",
+          },
+          timestamp: "2026-06-02T10:00:10.000Z",
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "user",
+          message: { role: "user", content: "a prompt" },
+          timestamp: "2026-06-02T10:00:11.000Z",
+          sessionId: SESSION_ID,
+        },
+      ),
+    );
+    const { bus, events } = createMockBus();
+    let lines = 0;
+    tailer = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      onError: () => {},
+      onTranscriptLine: () => {
+        lines++;
+        throw new Error("subscriber bug"); // must not stop the tailer
+      },
+    });
+    await tailer.start();
+    expect(lines).toBe(2); // both replayed lines, ingestion or not
+    expect(events.some((e) => e.topic === "response.turn_end")).toBe(true); // dispatch went on past the throw
+    expect(events.some((e) => e.topic === "prompt")).toBe(true);
+
+    await appendFile(
+      sessionPath,
+      `\n{"type":"assistant","truncated":\n${jsonl({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          id: "msg_B",
+          content: [{ type: "text", text: "later" }],
+          stop_reason: "end_turn",
+        },
+        timestamp: "2026-06-02T10:00:12.000Z",
+        sessionId: SESSION_ID,
+      })}`,
+    );
+    await waitFor(events, (e) => e.filter((x) => x.topic === "response.turn_end").length >= 2);
+    expect(lines).toBe(5); // a blank line and a malformed one counted as activity too, then the good one
   });
 
   it("surfaces api_error fields as system.api_error", async () => {
@@ -796,6 +1119,54 @@ describe("JsonlTailer — real fixtures", () => {
   });
 });
 
+describe("JsonlTailer — prompt absorbed mid-turn (issue #389)", () => {
+  /**
+   * Fixture 04 is the real record (CLI 2.1.270) of a prompt the CLI folded
+   * into the running turn instead of starting its own: `enqueue` → `remove`
+   * with `reason: "absorbed_mid_turn"` → a `queued_command` attachment carrying
+   * the same text, and NO `user` line ever. The core cancels that prompt's
+   * flush-verify on either of the last two; this pins that both reach it with
+   * the text intact, and that the tailer's own delivery-confirm channel (#363)
+   * still counts the enqueue only.
+   */
+  it("forwards the remove (with reason and content) and the attachment (with prompt) to the bus", async () => {
+    const fs = await import("node:fs/promises");
+    const fixture = await fs.readFile(
+      join(process.cwd(), "docs/spikes/fixtures/jsonl/04-absorbed-mid-turn.jsonl"),
+      "utf8",
+    );
+    writeFileSync(sessionPath, fixture);
+    const { bus, events } = createMockBus();
+    const ingested: PromptIngestion[] = [];
+    tailer = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      onError: () => undefined,
+      onPromptIngested: (i) => ingested.push(i),
+    });
+    await tailer.start();
+
+    const text = (JSON.parse(fixture.split("\n")[0] ?? "{}") as { content: string }).content;
+    expect(text).toContain('message_id="18786"');
+
+    const queue = events
+      .filter((e) => e.topic === "session.queue")
+      .map((e) => e.payload as { operation?: string; reason?: string; content?: string });
+    expect(queue.map((q) => q.operation)).toEqual(["enqueue", "remove"]);
+    expect(queue[1]).toMatchObject({ reason: "absorbed_mid_turn", content: text });
+
+    const attachment = events.find((e) => e.topic === "attachment.queued_command");
+    expect(attachment).toBeDefined();
+    expect((attachment?.payload as { prompt?: string }).prompt).toBe(text);
+
+    expect(events.some((e) => e.topic === "prompt")).toBe(false);
+    expect(ingested.map((i) => i.source)).toEqual(["enqueue"]);
+  });
+});
+
 describe("startAt: 'end' (issue #215 runtime wiring)", () => {
   function endTurn(text: string, ts = "2026-06-02T10:00:00.000Z"): object {
     return {
@@ -854,5 +1225,568 @@ describe("startAt: 'end' (issue #215 runtime wiring)", () => {
     await waitFor(events, (e) => e.some((x) => x.topic === "response.turn_end"));
     const te = events.find((e) => e.topic === "response.turn_end");
     expect((te?.payload as { text: string }).text).toBe("first turn of a brand new session");
+  });
+});
+
+/* ───────────────────────────────────────────────────────────────────── */
+/* Prompt-ingestion callbacks (issue #363)                               */
+/*                                                                       */
+/* Added after the adversarial pass found this half of the change        */
+/* covered by nothing: deleting the `operation === "enqueue"` filter AND  */
+/* the sidechain/isMeta exclusion left the whole suite green. The tests   */
+/* that existed called `notePromptIngested` directly, bypassing the code  */
+/* that decides which transcript records qualify in the first place.      */
+/* ───────────────────────────────────────────────────────────────────── */
+
+describe("prompt ingestion callbacks", () => {
+  /** A tailer wired to capture what it reports, rather than only bus events. */
+  function makeIngestTailer(bus: BusCore) {
+    const ingested: PromptIngestion[] = [];
+    let aliveCalls = 0;
+    const t = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      onError: () => undefined,
+      onPromptIngested: (i) => ingested.push(i),
+      onTranscriptAlive: () => {
+        aliveCalls += 1;
+      },
+    });
+    return { t, ingested, alive: () => aliveCalls };
+  }
+
+  it("reports an enqueue record as an ingestion", async () => {
+    const { bus, events } = createMockBus();
+    const h = makeIngestTailer(bus);
+    tailer = h.t;
+    await writeFile(
+      sessionPath,
+      jsonl({
+        type: "queue-operation",
+        operation: "enqueue",
+        content: "run the nightly sync",
+        timestamp: "2026-09-07T15:00:00.000Z",
+      }),
+    );
+    await h.t.start();
+    await waitFor(events, (e) => e.some((x) => x.topic === "session.queue"));
+
+    expect(h.ingested).toHaveLength(1);
+    expect(h.ingested[0]?.source).toBe("enqueue");
+    expect(h.ingested[0]?.text).toBe("run the nightly sync");
+    expect(h.ingested[0]?.ingestedAtMs).toBe(Date.parse("2026-09-07T15:00:00.000Z"));
+  });
+
+  /**
+   * A `dequeue` is the queue handing the prompt to the RUNNER, not handing it
+   * back. `docs/spikes/fixtures/jsonl/01-headless-text-only.jsonl` shows it
+   * 1 ms after the enqueue and 13 ms before the `user` line of a normal
+   * delivery, and it carries no `content`. Two rounds of review read it as a
+   * cancellation; a test asserted that reading, against a record shape the CLI
+   * does not write.
+   */
+  it("does not report a dequeue as an ingestion", async () => {
+    const { bus, events } = createMockBus();
+    const h = makeIngestTailer(bus);
+    tailer = h.t;
+    await writeFile(
+      sessionPath,
+      jsonl(
+        {
+          type: "queue-operation",
+          operation: "enqueue",
+          content: "the prompt",
+          timestamp: "2026-09-07T15:00:00.000Z",
+        },
+        // The fixture's own shape: 1 ms later, no `content`.
+        {
+          type: "queue-operation",
+          operation: "dequeue",
+          timestamp: "2026-09-07T15:00:00.001Z",
+        },
+        // And the shape that would actually reach the consumer if a future CLI
+        // started writing `content` on this line. Without the operation filter
+        // this one IS forwarded, and the delivery it names gets un-confirmed —
+        // so this is the assertion that holds the guard in place, not the one
+        // above (which the missing `content` would drop anyway).
+        {
+          type: "queue-operation",
+          operation: "dequeue",
+          content: "the prompt",
+          timestamp: "2026-09-07T15:00:00.002Z",
+        },
+      ),
+    );
+    await h.t.start();
+    await waitFor(events, (e) => e.filter((x) => x.topic === "session.queue").length >= 3);
+
+    expect(h.ingested).toHaveLength(1);
+    expect(h.ingested[0]?.source).toBe("enqueue");
+  });
+
+  it("ignores a queue operation that is not an acceptance", async () => {
+    const { bus, events } = createMockBus();
+    const h = makeIngestTailer(bus);
+    tailer = h.t;
+    await writeFile(
+      sessionPath,
+      jsonl({
+        type: "queue-operation",
+        operation: "reorder",
+        content: "still queued",
+        timestamp: "2026-09-07T15:00:00.000Z",
+      }),
+    );
+    await h.t.start();
+    await waitFor(events, (e) => e.some((x) => x.topic === "session.queue"));
+
+    expect(h.ingested).toHaveLength(0);
+  });
+
+  it("does not report a sub-agent prompt as this process's delivery", async () => {
+    const { bus, events } = createMockBus();
+    const h = makeIngestTailer(bus);
+    tailer = h.t;
+    await writeFile(
+      sessionPath,
+      jsonl(
+        {
+          type: "user",
+          isSidechain: true,
+          message: { content: "a sub-agent's prompt" },
+          timestamp: "2026-09-07T15:00:00.000Z",
+        },
+        {
+          type: "user",
+          isMeta: true,
+          message: { content: "<command-name>/compact</command-name>" },
+          timestamp: "2026-09-07T15:00:01.000Z",
+        },
+        {
+          type: "user",
+          message: { content: "the real prompt" },
+          promptId: "pid-real",
+          timestamp: "2026-09-07T15:00:02.000Z",
+        },
+      ),
+    );
+    await h.t.start();
+    await waitFor(events, (e) => e.filter((x) => x.topic === "prompt").length >= 3);
+
+    // All three publish `prompt`; only the last is OUR delivery.
+    expect(h.ingested).toHaveLength(1);
+    expect(h.ingested[0]?.text).toBe("the real prompt");
+    expect(h.ingested[0]?.promptId).toBe("pid-real");
+  });
+
+  it("signals the transcript is alive exactly once, on the first line", async () => {
+    const { bus, events } = createMockBus();
+    const h = makeIngestTailer(bus);
+    tailer = h.t;
+    await writeFile(
+      sessionPath,
+      jsonl(
+        { type: "ai-title", aiTitle: "first", timestamp: "2026-09-07T15:00:00.000Z" },
+        { type: "ai-title", aiTitle: "second", timestamp: "2026-09-07T15:00:01.000Z" },
+      ),
+    );
+    await h.t.start();
+    await waitFor(events, (e) => e.filter((x) => x.topic === "session.title").length >= 2);
+
+    expect(h.alive()).toBe(1);
+  });
+});
+
+describe("onTurnObserved — tailer-confirmed turn with transcript offset (#212)", () => {
+  it("reports the prompt the boundary belongs to, the file, and the byte offset of the boundary line", async () => {
+    const userLine = {
+      type: "user",
+      message: { role: "user", content: '<channel source="telegram" chat_id="1">allô</channel>' },
+      promptId: "p-1",
+      timestamp: "2026-06-02T10:00:10.000Z",
+      sessionId: SESSION_ID,
+    };
+    const thinkingLine = {
+      type: "assistant",
+      message: {
+        role: "assistant",
+        id: "msg_T",
+        content: [{ type: "thinking", thinking: "…" }],
+        stop_reason: "end_turn",
+      },
+      timestamp: "2026-06-02T10:00:11.000Z",
+      sessionId: SESSION_ID,
+    };
+    const textLine = {
+      type: "assistant",
+      message: {
+        role: "assistant",
+        id: "msg_T",
+        content: [{ type: "text", text: "salut — ça va très bien, merci à toi élève" }],
+        stop_reason: "end_turn",
+      },
+      timestamp: "2026-06-02T10:00:12.000Z",
+      sessionId: SESSION_ID,
+    };
+    writeFileSync(sessionPath, "");
+    const { bus } = createMockBus();
+    const seen: Array<{
+      promptText: string;
+      offset: number;
+      jsonlPath: string;
+      messageId?: string;
+      promptId?: string;
+    }> = [];
+    tailer = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      onError: () => {},
+      onTurnObserved: (o) =>
+        seen.push({
+          promptText: o.promptText,
+          offset: o.offset,
+          jsonlPath: o.jsonlPath,
+          messageId: o.messageId,
+          promptId: o.promptId,
+        }),
+    });
+    await tailer.start();
+    const first = jsonl(userLine);
+    await appendFile(sessionPath, first);
+    // append the two boundary lines in a second write, splitting the last one across syscalls
+    // Split the second write INSIDE a multi-byte code point of the THINKING
+    // line (its "…"): a string-based buffer decodes U+FFFD on both sides of
+    // the cut, the line's byte length is miscounted, and the offset of the
+    // text line that follows in the same chunk drifts.
+    const secondBytes = Buffer.from(jsonl(thinkingLine, textLine), "utf8");
+    const dots = secondBytes.indexOf(Buffer.from("…", "utf8"));
+    expect(dots).toBeGreaterThan(0);
+    const cut = dots + 1; // one byte into the three-byte "…"
+    await appendFile(sessionPath, secondBytes.subarray(0, cut));
+    await new Promise((r) => setTimeout(r, 60));
+    await appendFile(sessionPath, secondBytes.subarray(cut));
+    for (let i = 0; i < 100 && seen.length < 2; i++) await new Promise((r) => setTimeout(r, 20));
+    expect(seen).toHaveLength(2); // one per boundary line, same message
+    const userBytes = Buffer.byteLength(first, "utf8");
+    const thinkingBytes = Buffer.byteLength(JSON.stringify(thinkingLine), "utf8") + 1;
+    expect(seen[0]).toEqual({
+      promptText: userLine.message.content,
+      promptId: "p-1",
+      jsonlPath: sessionPath,
+      offset: userBytes,
+      messageId: "msg_T",
+    });
+    expect(seen[1].offset).toBe(userBytes + thinkingBytes);
+    expect(seen[1].messageId).toBe("msg_T");
+  });
+
+  it("a prompt delivered over the MCP channel is recorded isMeta:true by the CLI and still owns its turn", async () => {
+    // Observed live: every `<channel source="plugin:claudeclaw-plus:plus-bus">`
+    // prompt carries isMeta:true. Skipping it pinned its boundary on the
+    // previous prompt — a wrong proof.
+    writeFileSync(sessionPath, "");
+    const { bus } = createMockBus();
+    const seen: Array<{ promptText: string; messageId?: string }> = [];
+    tailer = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      onError: () => {},
+      onTurnObserved: (o) => seen.push({ promptText: o.promptText, messageId: o.messageId }),
+    });
+    await tailer.start();
+    const A = '<channel source="telegram" chat_id="1">A</channel>';
+    const B = '<channel source="plugin:claudeclaw-plus:plus-bus" chat_id="2">B</channel>';
+    await appendFile(
+      sessionPath,
+      jsonl(
+        { type: "user", message: { role: "user", content: A }, sessionId: SESSION_ID },
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "mA",
+            content: [{ type: "text", text: "a" }],
+            stop_reason: "end_turn",
+          },
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "user",
+          isMeta: true,
+          message: { role: "user", content: B },
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "mB",
+            content: [{ type: "text", text: "b" }],
+            stop_reason: "end_turn",
+          },
+          sessionId: SESSION_ID,
+        },
+      ),
+    );
+    for (let i = 0; i < 100 && seen.length < 2; i++) await new Promise((r) => setTimeout(r, 20));
+    expect(seen).toEqual([
+      { promptText: A, messageId: "mA" },
+      { promptText: B, messageId: "mB" },
+    ]);
+  });
+
+  it("a compaction summary does not displace the prompt it summarises", async () => {
+    // Observed live: prompt, then the `isCompactSummary` user line, then the
+    // boundary pair — the boundary belongs to the prompt.
+    writeFileSync(sessionPath, "");
+    const { bus } = createMockBus();
+    const seen: string[] = [];
+    tailer = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      onError: () => {},
+      onTurnObserved: (o) => seen.push(o.promptText),
+    });
+    await tailer.start();
+    await appendFile(
+      sessionPath,
+      jsonl(
+        { type: "user", message: { role: "user", content: "the prompt" }, sessionId: SESSION_ID },
+        {
+          type: "user",
+          isCompactSummary: true,
+          message: {
+            role: "user",
+            content: "This session is being continued from a previous conversation…",
+          },
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "m",
+            content: [{ type: "thinking", thinking: "…" }],
+            stop_reason: "end_turn",
+          },
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "m",
+            content: [{ type: "text", text: "ok" }],
+            stop_reason: "end_turn",
+          },
+          sessionId: SESSION_ID,
+        },
+      ),
+    );
+    for (let i = 0; i < 100 && seen.length < 2; i++) await new Promise((r) => setTimeout(r, 20));
+    expect(seen).toEqual(["the prompt", "the prompt"]);
+  });
+
+  it("a CLI continuation (isMeta, array text, no channel) starts a turn nobody's receipt owns", async () => {
+    writeFileSync(sessionPath, "");
+    const { bus } = createMockBus();
+    const seen: string[] = [];
+    tailer = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      onError: () => {},
+      onTurnObserved: (o) => seen.push(o.promptText),
+    });
+    await tailer.start();
+    await appendFile(
+      sessionPath,
+      jsonl(
+        { type: "user", message: { role: "user", content: "A" }, sessionId: SESSION_ID },
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "mA",
+            content: [{ type: "text", text: "a" }],
+            stop_reason: "end_turn",
+          },
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "user",
+          isMeta: true,
+          message: {
+            role: "user",
+            content: [{ type: "text", text: "Continue from where you left off." }],
+          },
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "mC",
+            content: [{ type: "text", text: "c" }],
+            stop_reason: "end_turn",
+          },
+          sessionId: SESSION_ID,
+        },
+        // and a second boundary of yet another message with no prompt at all in between
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "mD",
+            content: [{ type: "text", text: "d" }],
+            stop_reason: "end_turn",
+          },
+          sessionId: SESSION_ID,
+        },
+      ),
+    );
+    await new Promise((r) => setTimeout(r, 300));
+    expect(seen).toEqual(["A"]); // mC cleared the attribution; mD had no prompt either
+  });
+
+  it("a sub-agent's boundary (sidechain assistant line) owns no receipt and does not consume the parent's prompt", async () => {
+    writeFileSync(sessionPath, "");
+    const { bus } = createMockBus();
+    const seen: Array<{ promptText: string; messageId?: string }> = [];
+    tailer = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      onError: () => {},
+      onTurnObserved: (o) => seen.push({ promptText: o.promptText, messageId: o.messageId }),
+    });
+    await tailer.start();
+    await appendFile(
+      sessionPath,
+      jsonl(
+        {
+          type: "user",
+          message: { role: "user", content: "parent prompt" },
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "user",
+          isSidechain: true,
+          message: { role: "user", content: "sub-agent task" },
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "assistant",
+          isSidechain: true,
+          message: {
+            role: "assistant",
+            id: "mSub",
+            content: [{ type: "text", text: "sub done" }],
+            stop_reason: "end_turn",
+          },
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "mParent",
+            content: [{ type: "text", text: "parent done" }],
+            stop_reason: "end_turn",
+          },
+          sessionId: SESSION_ID,
+        },
+      ),
+    );
+    for (let i = 0; i < 100 && seen.length < 1; i++) await new Promise((r) => setTimeout(r, 20));
+    await new Promise((r) => setTimeout(r, 100));
+    expect(seen).toEqual([{ promptText: "parent prompt", messageId: "mParent" }]);
+  });
+
+  it("a sidechain prompt does not become the prompt the next boundary belongs to", async () => {
+    writeFileSync(sessionPath, "");
+    const { bus } = createMockBus();
+    const seen: string[] = [];
+    tailer = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      onError: () => {},
+      onTurnObserved: (o) => seen.push(o.promptText),
+    });
+    await tailer.start();
+    await appendFile(
+      sessionPath,
+      jsonl(
+        { type: "user", message: { role: "user", content: "the real one" }, sessionId: SESSION_ID },
+        {
+          type: "user",
+          isSidechain: true,
+          message: { role: "user", content: "sub-agent" },
+          sessionId: SESSION_ID,
+        },
+        {
+          type: "assistant",
+          message: {
+            role: "assistant",
+            id: "m",
+            content: [{ type: "text", text: "ok" }],
+            stop_reason: "end_turn",
+          },
+          sessionId: SESSION_ID,
+        },
+      ),
+    );
+    for (let i = 0; i < 100 && seen.length < 1; i++) await new Promise((r) => setTimeout(r, 20));
+    expect(seen).toEqual(["the real one"]);
+  });
+
+  it("a boundary with no ingested prompt yet (attached mid-turn) is not reported", async () => {
+    writeFileSync(sessionPath, "");
+    const { bus, events } = createMockBus();
+    const seen: string[] = [];
+    tailer = new JsonlTailer({
+      bus,
+      agent_id: AGENT_ID,
+      session_id: SESSION_ID,
+      cwd,
+      projectsDir,
+      onError: () => {},
+      onTurnObserved: (o) => seen.push(o.promptText),
+    });
+    await tailer.start();
+    await appendFile(
+      sessionPath,
+      jsonl({
+        type: "assistant",
+        message: {
+          role: "assistant",
+          id: "m",
+          content: [{ type: "text", text: "ok" }],
+          stop_reason: "end_turn",
+        },
+        sessionId: SESSION_ID,
+      }),
+    );
+    await waitFor(events, (e) => e.some((x) => x.topic === "response.turn_end"));
+    expect(seen).toEqual([]);
   });
 });

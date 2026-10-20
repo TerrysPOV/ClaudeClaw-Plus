@@ -23,6 +23,7 @@
  */
 
 import type { BusCore } from "../../bus/core";
+import type { AllowlistState } from "../../allowlist";
 
 /* ────────────────────────────────────────────────────────────────────── */
 /* Public adapter options                                                  */
@@ -39,12 +40,19 @@ export interface SlackAdapterOptions {
    */
   signingSecret: string;
   /**
-   * Slack user IDs (`U…`) allowed to talk to the bot. Empty list = allow
-   * all (legacy parity per `src/commands/slack.ts:976` — the existing
-   * `allowedUserIds.length > 0` gate). PR #113 review on Discord/Telegram
-   * caught the same regression; we preserve the documented semantics here.
+   * Slack user IDs (`U…`) allowed to talk to the bot. Empty list rejects all
+   * unless `allowAllUsers` is set — see `src/allowlist.ts`. Bot traffic
+   * admitted through `allowBots` is not subject to this list.
    */
   allowedUserIds: string[];
+  /** Accept every user regardless of `allowedUserIds`. Default false. */
+  allowAllUsers?: boolean;
+  /**
+   * Current allow-list, read on every inbound event so a settings reload
+   * applies without a restart (#520). Absent = `allowedUserIds` /
+   * `allowAllUsers` above, fixed at construction.
+   */
+  allowlist?: () => AllowlistState<string>;
   /**
    * Channel ids where messages from OTHER bots (event.bot_id set) are
    * passed through to claude instead of being silently dropped. Issue

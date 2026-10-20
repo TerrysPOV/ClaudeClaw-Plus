@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { encodeCwdForProjectsDir } from "../../bus/jsonl-line-types";
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -23,8 +24,9 @@ export interface SessionUsage {
 }
 
 function getProjectDir(): string {
-  const sanitized = process.cwd().replace(/[/\\.]/g, "-");
-  return join(homedir(), ".claude", "projects", sanitized);
+  // #368: the one rule the CLI uses (every non-alphanumeric → `-`, hashed past
+  // 200 chars), not a local approximation of it.
+  return join(homedir(), ".claude", "projects", encodeCwdForProjectsDir(process.cwd()));
 }
 
 function calcCost(

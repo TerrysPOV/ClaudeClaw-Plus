@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, vi } from "bun:test";
+import { describe, test, expect, beforeEach, vi, afterAll } from "bun:test";
 import type { GovernanceCheck } from "../../orchestrator/executor";
 
 // Mock the real GovernanceClient
@@ -9,6 +9,19 @@ const mockGetGovernanceClient = vi.fn(() => ({
 
 // Mock evaluateBudget
 const mockEvaluateBudget = vi.fn();
+
+// #304: `vi.mock` is bun's `mock.module` — process-global, and it outlives
+// this file. `src/governance` mocked here reached every file bun loaded
+// after it (governance/budget-engine, model-router, telemetry and
+// policy/wiring failed in the pack and passed alone). Keep the real exports
+// so `afterAll` can put them back.
+const realGovernanceClient = { ...(await import("../../governance/client")) };
+const realGovernance = { ...(await import("../../governance")) };
+
+afterAll(() => {
+  vi.mock("../../governance/client", () => realGovernanceClient);
+  vi.mock("../../governance", () => realGovernance);
+});
 
 vi.mock("../../governance/client", () => ({
   GovernanceClient: class MockRealGovernanceClient {

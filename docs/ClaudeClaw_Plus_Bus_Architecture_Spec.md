@@ -213,8 +213,8 @@ Both capabilities are mandatory (validated empirically in Spike 0.1 against aero
 - Claude Code receives the notification and treats it as a new turn in the conversation.
 
 **Outbound (from Claude → Plus Bus core):**
-- The MCP server exposes a `reply` tool with schema `{message: string, metadata?: { intent?: 'final' | 'progress' | 'tool_status' }}`.
-- When Claude calls `reply`, the MCP server forwards to the Bus core: `{type: 'reply', text, agent_id, intent}`.
+- The MCP server exposes a `reply` tool with schema `{message: string, intent?: 'final' | 'progress' | 'tool_status', in_reply_to?: string | number, metadata?: { intent?, in_reply_to? }}`. `intent` and `in_reply_to` are read at the top level or under `metadata` (`metadata` wins when both are set; `null` means unset); the parse is strict, so an unknown key is refused with an `isError` result naming it rather than delivered as `progress` (#433). `in_reply_to` is the `chat_id` / `origin_id` of the `<channel …>` block the reply answers (#224); a number is stringified by the MCP server. The core honours it only for a chat that has prompted the agent, and deduplicates finals per chat the reply is routed to (named, or the last-prompt slot when unnamed).
+- When Claude calls `reply`, the MCP server forwards to the Bus core: `{type: 'reply', text, agent_id, intent, in_reply_to?}`.
 - The MCP server exposes an `ask` tool with schema `{question: string}` → returns `{ask_id: string}` immediately. The agent loop continues running other tools / thinking while waiting; the answer arrives asynchronously as a Bus event referencing the same `ask_id`. This matches aerolalit's reference plugin and is required for parity with the official Telegram channel plugin (§9 GA migration).
 - `request_human` — synchronous clarifying-question tool (blocks the agent loop until a reply arrives). Use sparingly; prefer `ask` for non-blocking flows.
 - `cancel` — graceful turn termination.
@@ -380,7 +380,14 @@ interface BusCore {
     user_id: string;         // allow-list checked here
     text: string;
     metadata?: Record<string, any>;
-  }): Promise<{ promise_id: string }>;
+  }): Promise<{ promise_id: string; ipc_sent?: boolean; queued?: true }>;
+  // One active turn per agent: a prompt arriving while the agent still owes a
+  // terminator for an earlier one is queued (fair: FIFO per origin, round-robin
+  // across origins, capped per origin) and delivered — same promise_id — once
+  // that turn ends. The ack says `queued: true`; `PromptQueueFullError` rejects
+  // the newest prompt of an origin past the cap. An admitted turn that shows no
+  // sign of life for `turnDeadlineMs` (default 15 min) is released, loudly.
+  queuedPrompts(agent_id: string): ReadonlyArray<{ promise_id: string; origin: string; origin_id: string }>;
 
   // surface ← Bus  (pub/sub)
   subscribe(filter: {

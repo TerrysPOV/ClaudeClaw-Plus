@@ -31,6 +31,7 @@ import type { BusCore } from "./core";
 import {
   BUS_CRITICAL_ATTACHMENT_SUBTYPES,
   encodeCwdForProjectsDir,
+  type PromptIngestion,
   extractToolResults,
   type AssistantLine,
   type AttachmentLine,
@@ -38,6 +39,7 @@ import {
   type SystemLine,
   type ToolResultBlock,
   type UserLine,
+  type TurnObservation,
 } from "./jsonl-line-types";
 import { type BusEvent, type BusEventTopic, TAILER_EVENT_SOURCE } from "./types";
 
@@ -92,6 +94,8 @@ const SIMPLE_DISPATCH: Record<
   },
 };
 
+export type { PromptIngestion };
+
 export interface JsonlTailerOptions {
   bus: BusCore;
   agent_id: string;
@@ -106,6 +110,15 @@ export interface JsonlTailerOptions {
   /** Surfaced via schema-probe cache (Sprint 2 Agent B). */
   schemaVersion?: string;
   /**
+   * Which tailer this is for the agent, in order of construction (the session
+   * manager counts per agent). Carried on `bus.events.replay_done` and
+   * `session.compact` so bus core can tell a marker from a replaced tailer's
+   * last reads apart from the live one — the transcript's `session_id` cannot
+   * serve: it is the stable Claude UUID and survives a `--resume` restart
+   * (#402). Omitted (tests, other wiring) → the bus treats ordering as unknown.
+   */
+  generation?: number;
+  /**
    * Where to begin tailing when the session file already exists.
    * `"begin"` (default) replays from byte 0 — used by tests and any
    * consumer that wants historical events. `"end"` seeks to EOF and
@@ -116,16 +129,134 @@ export interface JsonlTailerOptions {
   startAt?: "begin" | "end";
   /** Error sink. Defaults to console.error. */
   onError?: (err: unknown, ctx?: Record<string, unknown>) => void;
+  /**
+   * Called when the transcript records that the CLI actually ingested a
+   * top-level user prompt (issue #362). This is the only delivery signal that
+   * originates outside the terminal rendering: on the PTY surface "the CLI
+   * submitted my text" and "the CLI repainted something" are the same bytes,
+   * so every screen heuristic can be fooled by a post-compaction repaint.
+   * The session manager wires this to the agent's `notePromptIngested`.
+   */
+  onPromptIngested?: (ingestion: PromptIngestion) => void;
+  /**
+   * #212: the tailer saw the turn boundary for the last top-level prompt it
+   * ingested. Carries the transcript path and the byte offset of the line so a
+   * receipt closed as `turn_observed` by the bridge can be confirmed by the
+   * tailer too — the last of the #207 ambiguities ("the tailer never saw the
+   * turn") becomes visible as a receipt with no offset. Called once per
+   * boundary line (a thinking+text message yields two, same `message_id`);
+   * an open receipt is patched twice with the same message (last offset wins,
+   * the text line), the side table dedupes on the message. Errors in the
+   * consumer never stop the tail.
+   */
+  onTurnObserved?: (observation: TurnObservation) => void;
+  /**
+   * Called once, on the first line this tailer actually reads (issue #362).
+   *
+   * Being constructed is NOT evidence that a transcript is readable: the path
+   * is derived from the cwd encoding, and a mismatch there leaves the tailer
+   * pointed at a file that never appears — silently, since a missing session
+   * file is a normal startup state. Anything that hardens behaviour on the
+   * assumption that the transcript will speak must key off this, not off the
+   * wiring, or it degrades every agent whose transcript is unreachable.
+   */
+  onTranscriptAlive?: () => void;
+  /**
+   * Called for EVERY newline-terminated line read, parseable or not (#383).
+   * Lets the process tell a transcript that is slow from one that is gone:
+   * after `/clear` the CLI writes to a NEW file, this tailer keeps watching
+   * the old one, and nothing ever arrives again — so a confirmation armed
+   * once by `onTranscriptAlive` would trust a transcript that no longer
+   * speaks for this process.
+   */
+  onTranscriptLine?: () => void;
+}
+
+/** `message.model` on assistant lines the CLI writes itself (errors, placeholders). */
+const SYNTHETIC_MODEL = "<synthetic>";
+
+/**
+ * Stop reasons after which the CLI continues the same turn: `tool_use` (the
+ * model resumes after the tool result) and `pause_turn` (a server-tool turn
+ * the client resumes by sending the response back). Neither is a boundary.
+ */
+const CONTINUING_STOP_REASONS: ReadonlySet<string> = new Set(["tool_use", "pause_turn"]);
+
+/**
+ * A `stop_reason` that ends the turn. A `null`/`undefined` reason is a
+ * content-block line still streaming, and {@link CONTINUING_STOP_REASONS}
+ * resume the turn. Everything else the API can return (`end_turn`,
+ * `max_tokens`, `stop_sequence`, `refusal`, …) is terminal for the transcript:
+ * the CLI writes no further assistant line for that turn (#401). Observed live
+ * so far: `tool_use`, `end_turn`, `stop_sequence`.
+ */
+export function isTerminalStopReason(stopReason: unknown): stopReason is string {
+  return (
+    typeof stopReason === "string" &&
+    stopReason.length > 0 &&
+    !CONTINUING_STOP_REASONS.has(stopReason)
+  );
+}
+
+/**
+ * A prompt the daemon sent through `/api/inject`, in either recorded form: the
+ * CLI's rendering of the MCP channel push (`origin="webui" origin_id="inject"`)
+ * or the bus's PTY wrapper (`source="webui" chat_id="inject"`), possibly inside
+ * a paste wrapper. Only the opening `<channel>` tag is read; the prompt body is
+ * XML-escaped, so user text cannot forge one.
+ */
+export function isDaemonInjectPrompt(text: string): boolean {
+  const m = text.match(/^\s*(?:<pasted_content\b[^>]*>\s*)?<channel\s([^>]*)>/);
+  if (!m) return false;
+  // Whole attribute names, first occurrence wins: the identity attributes are
+  // written before any metadata, so a metadata key (`data-origin`, a repeated
+  // `origin_id`) can neither forge nor override them. The second attribute
+  // tells the two forms apart (`origin` for the CLI's, `chat_id` for ours).
+  const names: string[] = [];
+  const attrs = new Map<string, string>();
+  for (const [, name, value] of m[1].matchAll(/(?:^|\s)([\w:.-]+)="([^"]*)"/g)) {
+    names.push(name);
+    if (!attrs.has(name)) attrs.set(name, value);
+  }
+  if (names[1] === "origin") {
+    return attrs.get("origin") === "webui" && attrs.get("origin_id") === "inject";
+  }
+  if (names[1] === "chat_id") {
+    return attrs.get("source") === "webui" && attrs.get("chat_id") === "inject";
+  }
+  return false;
 }
 
 export class JsonlTailer {
   private readonly bus: BusCore;
   private readonly agent_id: string;
   private readonly session_id: string;
+  private readonly generation: number | undefined;
   private readonly cwd: string;
   private readonly projectsDir: string;
   private readonly schemaVersion: string;
   private readonly onError: (err: unknown, ctx?: Record<string, unknown>) => void;
+  private readonly onPromptIngested?: (ingestion: PromptIngestion) => void;
+  private readonly onTurnObserved?: (observation: TurnObservation) => void;
+  /** #212: the last top-level prompt this tailer ingested (the `user` line),
+   *  which the next turn boundary belongs to. */
+  private lastIngestedPrompt: { text: string; promptId?: string } | null = null;
+  /** The turn in progress was opened by a daemon inject (`/api/inject`), read
+   *  from the transcript itself rather than from the bus's single origin slot:
+   *  a re-delivered copy of an inject can run while the bus already believes a
+   *  Telegram prompt owns the turn. Survives the CLI's own continuation lines
+   *  ("no visible output", a Stop-hook note), which carry on the same work. */
+  private turnPromptIsInject = false;
+  private lastBoundaryMessageId: string | undefined;
+  /** Set when a prompt is adopted; cleared when a boundary consumes it. */
+  private promptSinceLastBoundary = false;
+  /** #212: byte offset in the file where `this.buffer` begins, and of the line
+   *  currently being dispatched. */
+  private bufferStartOffset = 0;
+  private currentLineOffset = 0;
+  private readonly onTranscriptAlive?: () => void;
+  private readonly onTranscriptLine?: () => void;
+  private sawAnyLine = false;
   private readonly filePath: string;
   private readonly startAt: "begin" | "end";
 
@@ -139,7 +270,12 @@ export class JsonlTailer {
    * (#217 review).
    */
   private seekToEndPending = false;
-  private buffer = "";
+  /** Unconsumed bytes since the last newline. Kept as BYTES, not a string:
+   *  decoding a chunk that ends inside a multi-byte code point would yield
+   *  U+FFFD and change the byte length of the line, so every later offset
+   *  in that chunk would drift (#212 review). Lines are split on 0x0a and
+   *  decoded one at a time. */
+  private buffer: Buffer = Buffer.alloc(0);
   /** Set true once the first non-empty line emits `session.init`. */
   private initEmitted = false;
   private watcher: FSWatcher | null = null;
@@ -157,11 +293,16 @@ export class JsonlTailer {
     this.bus = opts.bus;
     this.agent_id = opts.agent_id;
     this.session_id = opts.session_id;
+    this.generation = opts.generation;
     this.cwd = opts.cwd;
     this.projectsDir = opts.projectsDir ?? join(homedir(), ".claude", "projects");
     this.schemaVersion = opts.schemaVersion ?? SCHEMA_VERSION;
     this.onError = opts.onError ?? ((err, ctx) => console.error("[jsonl-tailer]", err, ctx));
     this.startAt = opts.startAt ?? "begin";
+    this.onPromptIngested = opts.onPromptIngested;
+    this.onTurnObserved = opts.onTurnObserved;
+    this.onTranscriptAlive = opts.onTranscriptAlive;
+    this.onTranscriptLine = opts.onTranscriptLine;
     this.filePath = join(
       this.projectsDir,
       encodeCwdForProjectsDir(this.cwd),
@@ -325,8 +466,11 @@ export class JsonlTailer {
       const length = size - this.offset;
       const buf = Buffer.alloc(length);
       await fh.read(buf, 0, length, this.offset);
+      // #212: an empty buffer starts at the byte we are about to read; a
+      // buffer holding a partial line keeps the offset of that line's start.
+      if (this.buffer.length === 0) this.bufferStartOffset = this.offset;
       this.offset = size;
-      this.buffer += buf.toString("utf8");
+      this.buffer = this.buffer.length === 0 ? buf : Buffer.concat([this.buffer, buf]);
       this.flushBufferedLines();
     } catch (err) {
       this.onError(err, { ctx: "drain-read" });
@@ -340,9 +484,23 @@ export class JsonlTailer {
     // Note: we keep any trailing partial line in `this.buffer` for the
     // next drain — JSONL writers can append a line in multiple syscalls.
     // biome-ignore lint/suspicious/noAssignInExpressions: idiomatic newline scan
-    while ((nl = this.buffer.indexOf("\n")) >= 0) {
-      const raw = this.buffer.slice(0, nl);
-      this.buffer = this.buffer.slice(nl + 1);
+    while ((nl = this.buffer.indexOf(0x0a)) >= 0) {
+      const raw = this.buffer.subarray(0, nl).toString("utf8");
+      this.buffer = this.buffer.subarray(nl + 1);
+      // #212: where this line starts in the file — what a receipt records as
+      // `turn_event_offset` when the line turns out to be a turn boundary.
+      // `nl` is the line's exact on-disk byte length (bytes, not code units).
+      this.currentLineOffset = this.bufferStartOffset;
+      this.bufferStartOffset += nl + 1;
+      // #383: the transcript is being written to — that is the fact the
+      // process needs, and it holds for a blank line or one the parser rejects
+      // as much as for a record it accepts. Counted here, before any filtering
+      // or parsing, so neither can make a live transcript look rotated away.
+      try {
+        this.onTranscriptLine?.();
+      } catch (err) {
+        this.onError(err, { where: "onTranscriptLine", agent_id: this.agent_id });
+      }
       if (raw.length === 0) continue;
       this.handleRawLine(raw);
     }
@@ -376,7 +534,48 @@ export class JsonlTailer {
    * "simple" types (single field extraction) are handled via the
    * `SIMPLE_DISPATCH` table to keep this method small.
    */
+  /**
+   * Issue #363 — a queued prompt's acceptance, reported the moment the CLI
+   * takes the keystrokes rather than when it gets round to running them. The
+   * line is already dispatched to `session.queue` via SIMPLE_DISPATCH; this is
+   * an additional consumer of the same record, not new parsing.
+   *
+   * `operation` takes other values too (`"dequeue"` / `"remove"` depending on
+   * CLI version), so the test is positive rather than a blocklist.
+   */
+  private notifyEnqueue(line: Record<string, unknown>): void {
+    if (!this.onPromptIngested) return;
+    // Only `enqueue`. A `dequeue` is NOT the queue giving the prompt back — the
+    // fixtures in `docs/spikes/fixtures/jsonl/` show it firing 1 ms after the
+    // enqueue and 13 ms before the `user` line of a normal delivery, i.e. the
+    // queue handing the prompt to the runner. A round of review read it as a
+    // cancellation and this forwarded it as one; every delivery it touched
+    // would have been un-confirmed. Positive test, so any other operation a
+    // future CLI adds is ignored rather than guessed at.
+    if (line.operation !== "enqueue") return;
+    const content = line.content;
+    if (typeof content !== "string") return;
+    const ts = typeof line.timestamp === "string" ? Date.parse(line.timestamp) : Number.NaN;
+    try {
+      this.onPromptIngested({
+        text: content,
+        source: "enqueue",
+        ingestedAtMs: Number.isFinite(ts) ? ts : 0,
+      });
+    } catch (err) {
+      this.onError(err, { where: "onPromptIngested(enqueue)", agent_id: this.agent_id });
+    }
+  }
+
   private dispatch(line: JsonlLine, raw: string): void {
+    if (!this.sawAnyLine) {
+      this.sawAnyLine = true;
+      try {
+        this.onTranscriptAlive?.();
+      } catch (err) {
+        this.onError(err, { where: "onTranscriptAlive", agent_id: this.agent_id });
+      }
+    }
     switch (line.type) {
       case "user":
         this.dispatchUser(line as UserLine, raw);
@@ -391,6 +590,9 @@ export class JsonlTailer {
         this.dispatchSystem(line as SystemLine);
         return;
       default: {
+        if (line.type === "queue-operation") {
+          this.notifyEnqueue(line as unknown as Record<string, unknown>);
+        }
         const simple = SIMPLE_DISPATCH[line.type];
         if (simple) {
           this.publish(simple.topic, simple.extract(line as Record<string, unknown>), line);
@@ -418,6 +620,32 @@ export class JsonlTailer {
         },
         line,
       );
+      // Issue #362: the transcript writing this line IS the CLI acknowledging
+      // it ingested the prompt, which is what the PTY delivery-confirm loop
+      // has no way to observe. Notify out-of-band so a failure in a consumer
+      // cannot take down the tail — the publish above is the contract, this is
+      // a side-channel.
+      // Sub-agent prompts and harness meta lines are recorded the same way but
+      // are not this process's delivery. Excluded at the source so no consumer
+      // has to know the distinction.
+      this.adoptPromptForAttribution(line, content);
+      if (
+        this.onPromptIngested &&
+        line.isSidechain !== true &&
+        !(line as { isMeta?: boolean }).isMeta
+      ) {
+        const ts = line.timestamp ? Date.parse(line.timestamp) : Number.NaN;
+        try {
+          this.onPromptIngested({
+            text: content,
+            source: "user",
+            promptId: line.promptId,
+            ingestedAtMs: Number.isFinite(ts) ? ts : 0,
+          });
+        } catch (err) {
+          this.onError(err, { where: "onPromptIngested", agent_id: this.agent_id });
+        }
+      }
       return;
     }
     if (Array.isArray(content)) {
@@ -431,12 +659,49 @@ export class JsonlTailer {
         // when claude carries other block types here. Forward-compat:
         // emit unknown so we don't drop silently.
         this.publish("bus.event.unknown", { raw, type: "user.array-no-tool-result" }, line);
+        // #212: a text prompt in array form (observed live: the CLI's
+        // `isMeta` "Continue from where you left off" after a compaction)
+        // starts a turn of its own. Attribute it if it reads as a prompt;
+        // otherwise nothing owns the next boundary.
+        const text = content
+          .filter((b) => b.type === "text" && typeof (b as { text?: unknown }).text === "string")
+          .map((b) => (b as unknown as { text: string }).text)
+          .join("\n");
+        this.adoptPromptForAttribution(line, text);
         return;
       }
       for (const block of results) {
         this.publishToolResult(block, line);
       }
     }
+  }
+
+  /**
+   * #212: decide whether the next turn boundary belongs to this user line.
+   * Learned from the live transcripts, not from the flags' names:
+   *  - a prompt the bus delivered over the MCP channel is recorded `isMeta:true`
+   *    — it still owns its turn (the `<channel …>` wrapper says so);
+   *  - a compaction summary (`isCompactSummary`) follows the prompt it
+   *    summarises and precedes that prompt's boundary — it owns nothing and
+   *    must not displace the prompt;
+   *  - a sub-agent (sidechain) line is not this process's delivery;
+   *  - any other meta line (a CLI continuation, a harness note) starts a turn
+   *    nobody's receipt is waiting for: clear the attribution so the boundary
+   *    is not pinned on an earlier prompt.
+   */
+  private adoptPromptForAttribution(line: UserLine, text: string): void {
+    if (line.isSidechain === true) return;
+    if ((line as { isCompactSummary?: boolean }).isCompactSummary) return;
+    const meta = Boolean((line as { isMeta?: boolean }).isMeta);
+    const channel = /^\s*<channel[\s>]/.test(text);
+    if (meta && !channel) {
+      this.lastIngestedPrompt = null;
+      return;
+    }
+    if (text.length === 0) return;
+    this.turnPromptIsInject = isDaemonInjectPrompt(text);
+    this.lastIngestedPrompt = { text, promptId: line.promptId };
+    this.promptSinceLastBoundary = true;
   }
 
   private publishToolResult(block: ToolResultBlock, line: UserLine): void {
@@ -496,33 +761,103 @@ export class JsonlTailer {
     if (line.message?.usage) {
       this.publish("usage", line.message.usage, line);
     }
-    // Turn-boundary surfacing — when the API stops with `end_turn`, the
-    // agent has signalled "I'm done with this turn". Emit a single event
-    // carrying the concatenated text blocks of this turn so downstream
-    // subscribers (silent-drop safety net in bus core) can detect the
-    // pattern where the agent ended the turn with text but never called
-    // the `reply` tool to deliver it to the user. `tool_use` stop_reason
-    // means the agent intends to continue after a tool result, so we
-    // don't emit on those.
-    if (line.message?.stop_reason === "end_turn") {
-      const turnText = blocks
-        .filter((b) => b.type === "text")
-        .map((b) => (b as { text?: string }).text ?? "")
-        .join("\n")
-        .trim();
+    // Degraded-turn surfacing — §5.2 mentions `error` / `isApiErrorMessage` /
+    // `apiErrorStatus` on assistant lines. Forward as `system.api_error`.
+    // Published BEFORE the turn boundary below: bus core releases the
+    // operation slot on `response.turn_end`, and the error is the one event a
+    // client most needs stamped with the failed prompt's `promise_id` (#401).
+    if (line.error || line.isApiErrorMessage) {
+      this.publish("system.api_error", { error: line.error, status: line.apiErrorStatus }, line);
+    }
+    // Turn-boundary surfacing — when the API stops for any terminal reason
+    // (`end_turn`, but also `max_tokens`, `stop_sequence`, `refusal`, …) the
+    // turn is over: the CLI writes no further assistant line for it and the
+    // next line is the next prompt. Emit a single event carrying the real
+    // `stop_reason` and the concatenated text blocks of this turn so
+    // downstream subscribers (silent-drop safety net in bus core, the
+    // `agentTurnActive` flag, the operation slot, the reconciler) all see the
+    // terminator. `tool_use`/`pause_turn` mean the turn resumes after the
+    // tool result, and a missing/null stop_reason is a partial line still
+    // streaming, so none of those is a turn boundary (#401 — previously only
+    // `end_turn` was surfaced, and a turn stopping on any other reason left
+    // `agentTurnActive` set until the next clean turn).
+    //
+    // Synthetic lines (`model: "<synthetic>"`) are written by the CLI, not the
+    // API, and all stop with `stop_sequence`. Two kinds, both observed live:
+    //  - an API error ("Prompt is too long …", "You've hit your session limit …",
+    //    `isApiErrorMessage: true`): the turn IS over — surface the boundary so
+    //    the flag and the operation slot release, but with empty text, so the
+    //    #215 net neither nudges an agent that cannot answer nor ships the raw
+    //    error string as a reply (the error is already published as
+    //    `system.api_error` above);
+    //  - a placeholder ("No response requested.", no error) that the CLI writes
+    //    for an SDK-enqueued prompt BEFORE that prompt's real turn starts: not a
+    //    boundary at all — emitting one would nudge the agent and free the slot
+    //    while the real turn is about to begin, so it is skipped as before.
+    const stopReason = line.message?.stop_reason;
+    const synthetic = line.message?.model === SYNTHETIC_MODEL;
+    const apiError = Boolean(line.error || line.isApiErrorMessage);
+    if (isTerminalStopReason(stopReason) && (!synthetic || apiError)) {
+      const turnText = synthetic
+        ? ""
+        : blocks
+            .filter((b) => b.type === "text")
+            .map((b) => (b as { text?: string }).text ?? "")
+            .join("\n")
+            .trim();
+      // The CLI writes one line per content block and repeats the message's
+      // stop_reason on every line, so a thinking+text message yields TWO
+      // boundary lines for one turn. Each is still published (the text line is
+      // the one the #215 net needs), tagged with the message id so bus core
+      // releases the operation slot once per message, not once per line (#405).
       this.publish(
         "response.turn_end",
         {
-          stop_reason: "end_turn",
+          stop_reason: stopReason,
           text: turnText,
+          message_id: line.message?.id,
+          ...(synthetic ? { synthetic: true } : {}),
+          ...(this.turnPromptIsInject ? { inject_prompt: true } : {}),
         },
         line,
       );
-    }
-    // Degraded-turn surfacing — §5.2 mentions `error` / `isApiErrorMessage` /
-    // `apiErrorStatus` on assistant lines. Forward as `system.api_error`.
-    if (line.error || line.isApiErrorMessage) {
-      this.publish("system.api_error", { error: line.error, status: line.apiErrorStatus }, line);
+      // #212: tailer-confirmed turn — out-of-band, so a consumer failure cannot
+      // take down the tail (the publish above is the contract).
+      // A sub-agent's boundary (sidechain assistant line) is not this
+      // process's turn: publish as before, but it owns no receipt and must not
+      // consume the parent's prompt (Copilot on the PR).
+      const sidechain = (line as { isSidechain?: boolean }).isSidechain === true;
+      // A boundary of a new message with no new prompt in between (a
+      // continuation the CLI started on its own) belongs to nobody.
+      if (
+        !sidechain &&
+        this.lastIngestedPrompt &&
+        this.lastBoundaryMessageId !== undefined &&
+        line.message?.id !== undefined &&
+        line.message.id !== this.lastBoundaryMessageId &&
+        !this.promptSinceLastBoundary
+      ) {
+        this.lastIngestedPrompt = null;
+      }
+      if (this.onTurnObserved && this.lastIngestedPrompt && !sidechain) {
+        this.promptSinceLastBoundary = false;
+        try {
+          this.onTurnObserved({
+            promptText: this.lastIngestedPrompt.text,
+            promptId: this.lastIngestedPrompt.promptId,
+            jsonlPath: this.filePath,
+            offset: this.currentLineOffset,
+            messageId: line.message?.id,
+            stopReason: String(stopReason),
+            synthetic,
+          });
+        } catch (err) {
+          this.onError(err, { where: "onTurnObserved", agent_id: this.agent_id });
+        }
+        // The two boundary lines of one message (thinking, then text) share
+        // the prompt; a boundary of a DIFFERENT message ends a later turn.
+        this.lastBoundaryMessageId = line.message?.id;
+      }
     }
   }
 
@@ -536,6 +871,22 @@ export class JsonlTailer {
     // subtypes still go through (forward-compat). We don't gate on
     // `BUS_CRITICAL_ATTACHMENT_SUBTYPES` — that set is for downstream
     // filtering, not for dropping events here.
+    // A prompt the CLI folds into the running turn makes that turn answer it
+    // too: an inject turn that absorbed a user's message is no longer internal.
+    // A task notification folded in is the agent's own business, not a user's.
+    if (subtype === "queued_command" && line.isSidechain !== true) {
+      const { prompt, commandMode } = line.attachment as {
+        prompt?: unknown;
+        commandMode?: unknown;
+      };
+      if (
+        typeof prompt === "string" &&
+        commandMode !== "task-notification" &&
+        !isDaemonInjectPrompt(prompt)
+      ) {
+        this.turnPromptIsInject = false;
+      }
+    }
     const topic = `attachment.${subtype}` as BusEventTopic;
     this.publish(topic, line.attachment, line, {
       bus_critical: BUS_CRITICAL_ATTACHMENT_SUBTYPES.has(subtype),
@@ -563,6 +914,7 @@ export class JsonlTailer {
           preTokens: m.preTokens,
           postTokens: m.postTokens,
           durationMs: m.durationMs,
+          ...(this.generation !== undefined ? { generation: this.generation } : {}),
         },
         line,
       );
@@ -627,6 +979,7 @@ export class JsonlTailer {
         offset: this.offset,
         schema_version: this.schemaVersion,
         path: this.filePath,
+        ...(this.generation !== undefined ? { generation: this.generation } : {}),
       },
     };
     try {

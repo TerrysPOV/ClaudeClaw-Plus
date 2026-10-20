@@ -81,15 +81,29 @@ describe("parseSettings — runtime field (Sprint 5.4 flip — bus is default)",
 });
 
 describe("parseSettings — agents field (Sprint 5.2a)", () => {
-  // This is the PARSE-path default (an existing settings.json that omits
-  // `agents`), NOT the fresh-install default. `parseBusAgents` returns [] for
-  // a missing/empty field and never reads DEFAULT_SETTINGS.agents — whereas a
-  // brand-new install ships one `{ id: "default" }` via initConfig (#196). See
+  // #508: an existing settings.json that omits `agents` (every config carried
+  // over from the original claudeclaw) parses like a fresh install — one
+  // `{ id: "default" }` — so the bus has an agent behind Telegram and the
+  // heartbeat. An explicit `agents: []` stays the "wire later" opt-out. See
   // config-init-default-agent.test.ts for the fresh-install write path.
-  it("defaults to empty array when the field is absent", async () => {
+  it("defaults to one `default` agent when the field is absent", async () => {
     await writeRawSettings({});
     await reloadSettings();
+    expect(getSettings().agents).toEqual([{ id: "default" }]);
+  });
+
+  it("keeps an explicit empty list empty (deliberate opt-out)", async () => {
+    await writeRawSettings({ agents: [] });
+    await reloadSettings();
     expect(getSettings().agents).toEqual([]);
+  });
+
+  it("does not share the default entry between reloads", async () => {
+    await writeRawSettings({});
+    await reloadSettings();
+    getSettings().agents[0].cwd = "/mutated";
+    await reloadSettings();
+    expect(getSettings().agents).toEqual([{ id: "default" }]);
   });
 
   it("accepts a minimal entry (id only)", async () => {
@@ -262,6 +276,14 @@ describe("parseSettings — bus routing (Sprint 5.2b)", () => {
       token: "secret-token",
       allowedAgentIds: ["triage", "research"],
     });
+  });
+
+  it("web.bus parses allowedOrigins", async () => {
+    await writeRawSettings({
+      web: { bus: { allowedOrigins: [" https://console.example ", "", 7] } },
+    });
+    await reloadSettings();
+    expect(getSettings().web.bus).toEqual({ allowedOrigins: ["https://console.example"] });
   });
 
   it("web.bus drops empty config entirely", async () => {
