@@ -81,6 +81,8 @@ export class FakeProbe implements ProcessProbe {
   readonly reads: number[] = [];
   failure: Error | null = null;
   stall = false;
+  /** Reads of this one pid never answer (a record's process, while spawns of the test still work). */
+  stallPid: number | null = null;
   /** Called for every `read`, before the table; may return a replacement answer. */
   intercept: ((pid: number, nth: number) => ProcessInfo | null | undefined) | null = null;
   onKill: (pid: number, signal: string) => void = () => {};
@@ -91,7 +93,7 @@ export class FakeProbe implements ProcessProbe {
   async read(pid: number): Promise<ProcessInfo | null> {
     this.reads.push(pid);
     this.events.push(`read:${pid}`);
-    if (this.stall) return new Promise(() => {});
+    if (this.stall || pid === this.stallPid) return new Promise(() => {});
     if (this.failure) throw this.failure;
     const nth = this.reads.filter((p) => p === pid).length;
     const replaced = this.intercept?.(pid, nth);

@@ -55,6 +55,7 @@ import {
   createSystemProbe,
   decideResume,
   type OwnershipRecord,
+  OwnershipRecordError,
   type OwnershipStore,
   type ProcessProbe,
   recordOwnership,
@@ -586,6 +587,36 @@ const CLEAR_STOP_BOUND_MS = 8000;
 const sleepMs = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /**
+ * A spawn failed because the process it started could not be recorded (#595 r4). `retired` says
+ * whether the OS confirmed the unrecorded process gone; when it did not, its session is quarantined.
+ */
+export class SpawnUnrecordedError extends Error {
+  readonly code = "ownership-record-failed";
+  constructor(
+    agentId: string,
+    readonly stage: "identity-read" | "write",
+    readonly retired: boolean,
+  ) {
+    super(
+      `agent ${agentId}: the spawned claude could not be recorded (${stage}), so it was ended and the spawn failed` +
+        (retired ? "" : "; it is not confirmed gone, so its session is quarantined"),
+    );
+    this.name = "SpawnUnrecordedError";
+  }
+}
+
+/** The `/clear` replacement exited during startup: nothing is running, so the clear did not happen. */
+export class ClearReplacementExitedError extends Error {
+  readonly code = "clear-replacement-exited";
+  constructor(agentId: string, exitedWithin: string) {
+    super(
+      `clear failed for agent ${agentId}: the replacement claude exited during startup (${exitedWithin}); the agent is not running`,
+    );
+    this.name = "ClearReplacementExitedError";
+  }
+}
+
+/**
  * claude's refusal of `--resume <id>` when it cannot load a conversation for that id
  * ("No conversation found with session ID: <id>", exit 1). #595: the one genuine resume
  * failure that rotates the session; any other boot failure of a resumed spawn does not.
@@ -809,6 +840,11 @@ interface AgentRecord {
    */
   ownership?: Promise<OwnershipRecord | null>;
   /**
+   * False from registration until the ownership write has settled (#595 r4): `getAgent()` hides the
+   * process until then, so no prompt reaches a claude that is not yet recorded.
+   */
+  deliverable: boolean;
+  /**
    * Live session JSONL tailer (issue #215). Present when `options.bus`
    * is set; feeds `response.turn_end` events so the bus can synthesize a
    * reply the agent forgot to send. Stopped on agent exit / stop().
@@ -842,6 +878,25 @@ export class SessionManager {
   private readonly restartInFlight = new Map<string, Promise<AgentProcess>>();
   /** In-flight `clearSession()` per agent: a second `/clear` joins the first instead of racing it. */
   private readonly clearInFlight = new Map<string, Promise<void>>();
+  /**
+   * Tail of the per-agent LIFECYCLE queue (#595 r4): spawn, restart and `/clear` all retire and/or
+   * start the agent's claude, so they run one after another, never beside each other.
+   */
+  private readonly lifecycleTail = new Map<string, Promise<unknown>>();
+
+  private enqueueLifecycle<T>(agent_id: string, op: () => Promise<T>): Promise<T> {
+    const prev = this.lifecycleTail.get(agent_id) ?? Promise.resolve();
+    const run = prev.then(op, op);
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.lifecycleTail.set(agent_id, tail);
+    void tail.then(() => {
+      if (this.lifecycleTail.get(agent_id) === tail) this.lifecycleTail.delete(agent_id);
+    });
+    return run;
+  }
 
   constructor(options: SessionManagerOptions = {}) {
     this.options = options;
@@ -873,7 +928,9 @@ export class SessionManager {
   }
 
   async spawnAgent(agent: AgentConfig, origin: BusOrigin): Promise<AgentProcess> {
-    return this.spawnAgentInternal(agent, origin, /* retry */ 0);
+    return this.enqueueLifecycle(agent.id, () =>
+      this.spawnAgentInternal(agent, origin, /* retry */ 0),
+    );
   }
 
   /**
@@ -908,41 +965,53 @@ export class SessionManager {
   clearSession(agent_id: string): Promise<void> {
     const inflight = this.clearInFlight.get(agent_id);
     if (inflight) return inflight;
-    const p = this.clearSessionInternal(agent_id).finally(() => {
-      this.clearInFlight.delete(agent_id);
-    });
+    const p = this.enqueueLifecycle(agent_id, () => this.clearSessionInternal(agent_id)).finally(
+      () => {
+        this.clearInFlight.delete(agent_id);
+      },
+    );
     this.clearInFlight.set(agent_id, p);
     return p;
   }
 
-  private async clearSessionInternal(agent_id: string): Promise<void> {
-    const record = this.agents.get(agent_id);
-    if (!record) throw new Error(`clear: no active agent for id=${agent_id}`);
-    if (record.mode === "tmux") {
-      throw new Error(
-        `clear: agent ${agent_id} runs under tmux, where its claude is not owned by the daemon and cannot be retired`,
-      );
-    }
+  /**
+   * End the claude in `record` and return only once the OS confirms it gone (#562 semantics, shared by
+   * `/clear` and by a spawn that could not be recorded). The session is fenced from the first
+   * synchronous step; `owned` (the ownership record, if any) lets the confirmation SIGKILL exactly that
+   * process once; an exit that cannot be confirmed quarantines the session and throws. The registry
+   * slot is free when this returns.
+   */
+  private async retireLive(
+    agent_id: string,
+    record: AgentRecord,
+    owned: OwnershipRecord | null | undefined | Promise<OwnershipRecord | null>,
+    ctx: { quarantineReason: string; logReason: string; failure: string },
+  ): Promise<void> {
     const log = this.options.logger ?? console;
-    const { agent, origin } = record;
-    const oldId = agent.session_id;
+    const sessionId = record.agent.session_id;
     const key = `bus:${agent_id}`;
     const pid = record.proc.pid;
     const probe = this.options.processProbe ?? createSystemProbe();
     const stageMs = this.options.ownershipTermMs ?? 2000;
 
     // #562: fenced before the first await, so nothing is spawned on the old session while it retires.
-    fenceKey(key, record, () => oldId);
+    fenceKey(key, record, () => sessionId);
     try {
-      const owned = (await record.ownership) ?? null;
+      const proven = (await owned) ?? null;
       const stopped = this.stop(agent_id);
-      // A process that ignores /quit and SIGTERM must not hold the clear forever: OS confirmation
+      // A process that ignores /quit and SIGTERM must not hold the retirement forever: OS confirmation
       // (with a SIGKILL of the recorded process) decides, not the exit event.
       await Promise.race([stopped, sleepMs(CLEAR_STOP_BOUND_MS)]);
       const confirm = async (): Promise<boolean> => {
         const store = this.options.ownershipStore;
-        if (owned && store) {
-          return confirmRetired({ store, probe, record: owned, graceMs: stageMs, killMs: stageMs });
+        if (proven && store) {
+          return confirmRetired({
+            store,
+            probe,
+            record: proven,
+            graceMs: stageMs,
+            killMs: stageMs,
+          });
         }
         // No record to prove identity with: only a pid that no longer exists counts as gone.
         return (await probe.read(pid, 1500).catch(() => undefined)) === null;
@@ -956,20 +1025,20 @@ export class SessionManager {
           {
             label: key,
             pid,
-            sessionId: oldId,
-            cwd: agent.cwd,
+            sessionId,
+            cwd: record.agent.cwd,
             isAlive: () => true,
             dispose: unconfirmed,
             confirmExit: unconfirmed,
           } as unknown as PtyProcess,
-          "bus-clear-exit-unconfirmed",
+          ctx.quarantineReason,
           record,
         );
         log.error(
-          `[bus-session] agent=${agent_id} reason=clear-retire-unconfirmed session_id=${oldId} pid=${pid} — the clear failed: the old claude is not confirmed gone, so the session is quarantined and keeps its id`,
+          `[bus-session] agent=${agent_id} reason=${ctx.logReason} session_id=${sessionId} pid=${pid} — ${ctx.failure}: the claude is not confirmed gone, so the session is quarantined and keeps its id`,
         );
         throw new Error(
-          `clear failed for agent ${agent_id}: the old claude (pid ${pid}) is not confirmed gone; session ${oldId} stays quarantined and keeps its id`,
+          `${ctx.failure} for agent ${agent_id}: the old claude (pid ${pid}) is not confirmed gone; session ${sessionId} stays quarantined and keeps its id`,
         );
       }
       // Let stop()'s own bookkeeping land before a new process takes the registry slot.
@@ -978,6 +1047,25 @@ export class SessionManager {
     } finally {
       liftFence(record);
     }
+  }
+
+  private async clearSessionInternal(agent_id: string): Promise<void> {
+    const record = this.agents.get(agent_id);
+    if (!record) throw new Error(`clear: no active agent for id=${agent_id}`);
+    if (record.mode === "tmux") {
+      throw new Error(
+        `clear: agent ${agent_id} runs under tmux, where its claude is not owned by the daemon and cannot be retired`,
+      );
+    }
+    const log = this.options.logger ?? console;
+    const { agent, origin } = record;
+    const oldId = agent.session_id;
+
+    await this.retireLive(agent_id, record, record.ownership, {
+      quarantineReason: "bus-clear-exit-unconfirmed",
+      logReason: "clear-retire-unconfirmed",
+      failure: "clear failed",
+    });
 
     const fresh = randomUUID();
     const persist =
@@ -991,16 +1079,26 @@ export class SessionManager {
         err,
       );
       // The agent must not stay down for a failed write: bring the old session back, then fail.
-      await this.spawnAgent(agent, origin).catch((e) =>
+      await this.spawnAgentInternal(agent, origin, 0).catch((e) =>
         log.error(`[bus-session] agent=${agent_id} reason=clear-restore-failed`, e),
       );
       throw new Error(`clear failed for agent ${agent_id}: the new session id could not be stored`);
     }
     agent.session_id = fresh;
+    // Spawn completion is not success (#595 r4): a replacement that exits during startup (auth
+    // failure, crash) leaves no agent. The spawn returns after its startup window, so a process that
+    // is not live and registered here did not survive it.
+    const replacement = await this.spawnAgentInternal(agent, origin, 0);
+    const live = this.agents.get(agent_id);
+    if (!live || live.proc !== replacement || live.proc._isExited()) {
+      log.error(
+        `[bus-session] agent=${agent_id} reason=clear-replacement-exited session_id=${fresh} — the clear failed: the replacement claude exited during startup; the agent is not running (old session ${oldId} was retired)`,
+      );
+      throw new ClearReplacementExitedError(agent_id, `new session ${fresh}`);
+    }
     log.warn(
       `[bus-session] agent=${agent_id} reason=session-cleared session_id=${oldId} — restarted on new session ${fresh} (the conversation of the old session is not carried over)`,
     );
-    await this.spawnAgent(agent, origin);
   }
 
   /**
@@ -1069,7 +1167,7 @@ export class SessionManager {
       }
       if (decision.reason === "orphan-reaped") {
         (this.options.logger ?? console).warn(
-          `[bus-session] agent=${agent.id} reason=resume-orphan-reaped session_id=${agent.session_id} pid=${decision.reapedPid} — ended a claude this daemon spawned in an earlier boot before resuming its session`,
+          `[bus-session] agent=${agent.id} reason=resume-orphan-reaped session_id=${agent.session_id} pid=${decision.reapedPid} identity_precision=${decision.lowPrecision ? "low-1s(uid+argv revalidated)" : "high"} — ended a claude this daemon spawned in an earlier boot before resuming its session`,
         );
       }
     }
@@ -1128,6 +1226,11 @@ export class SessionManager {
       throw err;
     }
 
+    // #595 r4: the first statement after the process exists. Everything below until the write settles
+    // is synchronous, so the only gap in which a daemon death leaves an unrecorded claude is the
+    // identity read plus the write itself.
+    const recording = this.recordSpawnOwnership(agent, mode, proc);
+
     // Register the proc + attach the cleanup `onExit` BEFORE awaiting
     // the collision detector. Codex P1 on this PR: if the process exits
     // during the detection window for a non-collision reason (auth
@@ -1145,6 +1248,7 @@ export class SessionManager {
       proc,
       mcpConfigCwd,
       spawnedAt: Date.now(),
+      deliverable: false,
     };
     // #402/#412: number this process's tailer generation and announce it to
     // the bus BEFORE the record goes live — from `agents.set` on, the bus's
@@ -1162,8 +1266,12 @@ export class SessionManager {
       this.options.bus.noteSpawnedGeneration?.(agent.id, tailerGeneration);
     }
     this.agents.set(agent.id, record);
-    // #595 r3: record that THIS daemon spawned this process, so a later start can prove ownership.
-    record.ownership = this.recordSpawnOwnership(agent, mode, proc);
+    // #595 r3: the record that THIS daemon spawned this process, so a later start can prove ownership.
+    // The exit handler and a retirement read it as 'the record, or null': a failed write is handled
+    // below, not here.
+    record.ownership = recording.catch((err) =>
+      err instanceof OwnershipRecordError ? err.record : null,
+    );
     // The collision detector's verdict for this spawn, once it is armed below.
     // The exit log reads it so that "collision" is said by ONE judge (#326):
     // deciding from the screen tail at the instant of the exit mis-described a
@@ -1263,6 +1371,18 @@ export class SessionManager {
       COLLISION_EXIT_DRAIN_MS,
       resume ? RESUME_NOT_FOUND_PATTERN : SESSION_COLLISION_PATTERN,
     );
+    // #595 r4: a claude that could not be recorded must not keep running: after a daemon death the
+    // next boot would read 'no record' as 'nothing of ours' and resume beside it. End it, fail the spawn.
+    // Nothing is delivered to it until the record exists (`getAgent` hides it).
+    const recordFailure = await recording.then(
+      () => null,
+      (err: unknown) =>
+        err instanceof OwnershipRecordError ? err : new OwnershipRecordError("write", null, err),
+    );
+    if (recordFailure) {
+      await this.failUnrecordedSpawn(agent, record, recordFailure, mcpConfigCwd);
+    }
+    record.deliverable = true;
     const collision = await collisionVerdict;
     if (collision && retry === 0) {
       const fresh = randomUUID();
@@ -1368,8 +1488,9 @@ export class SessionManager {
   }
 
   /**
-   * Write the ownership record for a just-spawned process (#595 r3). Never rejects: a spawn must not
-   * fail for want of a record, so a failure is logged by reason code and yields null. tmux is not
+   * Write the ownership record for a just-spawned process (#595 r3). Resolves null when there is
+   * nothing to record (no store, tmux, the process already gone); REJECTS with `OwnershipRecordError`
+   * when the process is alive and could not be recorded (#595 r4), which fails the spawn. tmux is not
    * recorded: the pid is a client that exits at once while the claude lives on in the tmux server.
    */
   private recordSpawnOwnership(
@@ -1387,13 +1508,37 @@ export class SessionManager {
       pid: proc.pid,
       exe: basename(this.options.commandOverride ?? claudeExecutable()),
       bootId: this.options.bootId,
-    }).catch((err) => {
-      (this.options.logger ?? console).warn(
-        `[bus-session] agent=${agent.id} reason=ownership-record-failed session_id=${agent.session_id}`,
-        err,
-      );
-      return null;
     });
+  }
+
+  /**
+   * The spawned claude could not be recorded: log ONE line (a reason code and the errno, never screen
+   * text), end the process through the shared retirement (so #562's fence and quarantine apply), and
+   * throw. Never returns.
+   */
+  private async failUnrecordedSpawn(
+    agent: AgentConfig,
+    record: AgentRecord,
+    failure: OwnershipRecordError,
+    mcpConfigCwd: string | undefined,
+  ): Promise<never> {
+    const cause = failure.cause as { code?: unknown; name?: unknown } | undefined;
+    const detail = String(cause?.code ?? cause?.name ?? "unknown");
+    (this.options.logger ?? console).error(
+      `[bus-session] agent=${agent.id} reason=${failure.code} stage=${failure.stage} cause=${detail} session_id=${agent.session_id} pid=${record.proc.pid} — the spawned claude could not be recorded; it is ended and the spawn fails`,
+    );
+    let retired = true;
+    try {
+      await this.retireLive(agent.id, record, failure.record, {
+        quarantineReason: "bus-spawn-unrecorded-exit-unconfirmed",
+        logReason: "spawn-retire-unconfirmed",
+        failure: "spawn failed",
+      });
+    } catch {
+      retired = false;
+    }
+    this.cleanupAgentMcpConfig(mcpConfigCwd, agent.id);
+    throw new SpawnUnrecordedError(agent.id, failure.stage, retired);
   }
 
   private async spawnPty(
@@ -1640,9 +1785,11 @@ export class SessionManager {
     const inflight = this.restartInFlight.get(agent_id);
     if (inflight) return inflight;
 
-    const p = this.restartInternal(agent_id, opts).finally(() => {
-      this.restartInFlight.delete(agent_id);
-    });
+    const p = this.enqueueLifecycle(agent_id, () => this.restartInternal(agent_id, opts)).finally(
+      () => {
+        this.restartInFlight.delete(agent_id);
+      },
+    );
     this.restartInFlight.set(agent_id, p);
     return p;
   }
@@ -1749,7 +1896,8 @@ export class SessionManager {
       this.restartHistory.set(agent_id, history);
     }
 
-    return this.spawnAgent(agent, origin);
+    // Already inside the lifecycle queue: the internal spawn, never the queued public one.
+    return this.spawnAgentInternal(agent, origin, 0);
   }
 
   /**
@@ -1779,7 +1927,8 @@ export class SessionManager {
    * Adding a small accessor keeps the spawn lifecycle untouched.
    */
   getAgent(agent_id: string): AgentProcess | undefined {
-    return this.agents.get(agent_id)?.proc;
+    const record = this.agents.get(agent_id);
+    return record?.deliverable === false ? undefined : record?.proc;
   }
 
   /** Test helper: list spawned agent_ids. Not part of the public spec. */

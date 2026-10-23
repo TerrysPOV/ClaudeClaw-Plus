@@ -11,11 +11,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createFileOwnershipStore,
+  BSDINFO_OFFSETS,
   createSystemProbe,
   decideResume,
+  decodeBsdInfoStart,
+  libprocStartTime,
   namesOwnedClaude,
+  PROC_BSDINFO_SIZE,
   type ProcessInfo,
   readFromPs,
+  sameStart,
 } from "../session-ownership";
 import { claudeInfo, FakeProbe, MemoryStore, recordFor, SID, UID } from "./ownership-fakes";
 
@@ -64,7 +69,12 @@ describe("decideResume — what a restart may do (#595 r3)", () => {
 
     const d = await decide();
 
-    expect(d).toEqual({ kind: "resume", reason: "orphan-reaped", reapedPid: 900 });
+    expect(d).toEqual({
+      kind: "resume",
+      reason: "orphan-reaped",
+      reapedPid: 900,
+      lowPrecision: false,
+    });
     expect(events).toEqual([
       "store.read",
       "read:900", // does the process the record names still exist?
@@ -427,11 +437,12 @@ describe("the real process readers (#595 r3)", () => {
 
   it("ps: parses one row of stat, uid, lstart and the flat command", async () => {
     const ps = fakePs(`echo " S  501 Thu Oct 23 10:00:00 2026 /opt/bin/claude --resume ${SID}"`);
-    const info = await readFromPs(900, 2000, ps);
+    const info = await readFromPs(900, 2000, ps, () => null);
     expect(info).toMatchObject({
       pid: 900,
       uid: 501,
       identity: "Thu Oct 23 10:00:00 2026",
+      lowPrecision: true,
       zombie: false,
       argv: null,
       command: `/opt/bin/claude --resume ${SID}`,
@@ -452,4 +463,138 @@ describe("the real process readers (#595 r3)", () => {
     await expect(readFromPs(900, 400, ps)).rejects.toThrow();
     expect(Date.now() - t0).toBeLessThan(2000);
   }, 6000);
+  /* ── macOS: sub-second birth identity (#595 r4) ─────────────────── */
+
+  const LSTART = "Thu Oct 23 10:00:00 2026";
+  const LSTART_SEC = Date.parse(`${LSTART} UTC`) / 1000;
+  const psRow = (): string => fakePs(`echo " S  501 ${LSTART} /opt/bin/claude --resume ${SID}"`);
+
+  /** A `struct proc_bsdinfo` as libproc fills it, with only the fields the decoder reads set. */
+  function bsdInfo(pid: number, sec: number, usec: number): Uint8Array {
+    const buf = new Uint8Array(PROC_BSDINFO_SIZE);
+    const view = new DataView(buf.buffer);
+    view.setUint32(BSDINFO_OFFSETS.pid, pid, true);
+    view.setBigUint64(BSDINFO_OFFSETS.startSec, BigInt(sec), true);
+    view.setBigUint64(BSDINFO_OFFSETS.startUsec, BigInt(usec), true);
+    return buf;
+  }
+
+  it("libproc struct: the start time is read at offsets 120 and 128 (pid at 12) of a 136-byte struct", () => {
+    // Fault (site: `decodeBsdInfoStart`, tvusec decoded as 0): the microseconds are lost, so a
+    // replacement born in the same second shares the identity. Predicted result: usec is 0.
+    expect(PROC_BSDINFO_SIZE).toBe(136);
+    expect(BSDINFO_OFFSETS).toEqual({ pid: 12, startSec: 120, startUsec: 128 });
+    expect(decodeBsdInfoStart(bsdInfo(4242, 1792761049, 464209), 4242)).toEqual({
+      sec: 1792761049,
+      usec: 464209,
+    });
+  });
+
+  it("libproc struct: another pid's struct, a short buffer and an out-of-range usec decode to null", () => {
+    expect(decodeBsdInfoStart(bsdInfo(4242, 1792761049, 5), 4243)).toBeNull();
+    expect(decodeBsdInfoStart(new Uint8Array(100), 4242)).toBeNull();
+    expect(decodeBsdInfoStart(bsdInfo(4242, 1792761049, 1_000_000), 4242)).toBeNull();
+    expect(decodeBsdInfoStart(bsdInfo(4242, 0, 5), 4242)).toBeNull();
+  });
+
+  it("ps + libproc: the identity carries the microseconds and is not marked low-precision", async () => {
+    const info = await readFromPs(900, 2000, psRow(), () => ({ sec: LSTART_SEC, usec: 464209 }));
+    expect(info?.identity).toBe(`${LSTART}+464209`);
+    expect(info?.lowPrecision).toBeUndefined();
+    const small = await readFromPs(900, 2000, psRow(), () => ({ sec: LSTART_SEC + 1, usec: 7 }));
+    expect(small?.identity).toBe(`${LSTART}+000007`);
+  });
+
+  it("libproc unavailable, throwing, or disagreeing with ps on the second: lstart alone, marked low-precision", async () => {
+    // Fault (site: `startIdentity`, the second-agreement check removed): a mismatched struct is
+    // trusted. Predicted result: the third case gets a `+` suffix.
+    const cases: Array<(pid: number) => { sec: number; usec: number } | null> = [
+      () => null,
+      () => {
+        throw new Error("ffi");
+      },
+      () => ({ sec: LSTART_SEC + 3600, usec: 1 }),
+    ];
+    for (const startTime of cases) {
+      const info = await readFromPs(900, 2000, psRow(), startTime);
+      expect(info?.identity).toBe(LSTART);
+      expect(info?.lowPrecision).toBe(true);
+    }
+  });
+
+  it("sameStart: microseconds must match; a second-precise side matches on the second only", () => {
+    expect(sameStart(`${LSTART}+000001`, `${LSTART}+000001`)).toBe(true);
+    expect(sameStart(`${LSTART}+000001`, `${LSTART}+000002`)).toBe(false);
+    expect(sameStart(LSTART, `${LSTART}+000002`)).toBe(true);
+    expect(sameStart(`${LSTART}+000002`, LSTART)).toBe(true);
+    expect(sameStart(LSTART, "Thu Oct 23 10:00:01 2026")).toBe(false);
+    expect(sameStart("1700000000:12345", "1700000000:12345")).toBe(true);
+    expect(sameStart("1700000000:12345", "1700000000:12346")).toBe(false);
+  });
+
+  const darwinIt = process.platform === "darwin" ? it : it.skip;
+
+  darwinIt(
+    "macOS: the real libproc call answers for this process, in agreement with ps",
+    async () => {
+      const start = libprocStartTime(process.pid);
+      expect(start).not.toBeNull();
+      const now = Date.now() / 1000;
+      expect(start?.sec).toBeLessThanOrEqual(now);
+      expect(start?.sec).toBeGreaterThan(now - 7 * 86400);
+      const info = await createSystemProbe().read(process.pid, 3000);
+      expect(info?.identity).toMatch(/\+\d{6}$/);
+      expect(info?.lowPrecision).toBeUndefined();
+      expect((await createSystemProbe().read(process.pid, 3000))?.identity).toBe(info?.identity);
+      expect(libprocStartTime(2 ** 30)).toBeNull();
+    },
+  );
+});
+
+describe("decideResume — identity precision (#595 r4)", () => {
+  const S = "Thu Oct 23 10:00:00 2026";
+  let probe: FakeProbe;
+  let store: MemoryStore;
+  beforeEach(() => {
+    probe = new FakeProbe();
+    store = new MemoryStore();
+  });
+  const decide = () =>
+    decideResume({ agentId: "a", sessionId: SID, store, probe, ...FAST, termMs: 150, killMs: 150 });
+
+  it("a replacement born in the SAME SECOND as the recorded process is told apart by its microseconds", async () => {
+    // Fault (site: `departed`, `sameStart` replaced by lstart-only equality, the round-3 behaviour):
+    // the replacement is taken for the recorded process and signalled. Predicted result: a SIGTERM.
+    store.rec.set("a", recordFor({ identity: `${S}+111111` }));
+    probe.table.set(900, claudeInfo({ identity: `${S}+222222` }));
+    const d = await decide();
+    expect(d).toEqual({ kind: "resume", reason: "pid-reused" });
+    expect(probe.kills).toEqual([]);
+  });
+
+  it("a second-precise read of the recorded process still matches it, and the reap says so", async () => {
+    store.rec.set("a", recordFor({ identity: `${S}+111111` }));
+    probe.table.set(900, claudeInfo({ identity: S, lowPrecision: true }));
+    probe.onKill = (pid) => probe.table.delete(pid);
+    const d = await decide();
+    expect(d).toEqual({
+      kind: "resume",
+      reason: "orphan-reaped",
+      reapedPid: 900,
+      lowPrecision: true,
+    });
+    expect(probe.kills.map((k) => k.signal)).toEqual(["SIGTERM"]);
+  });
+
+  it("a second-precise match is still gated on uid and argv: a foreign uid is not signalled", async () => {
+    store.rec.set("a", recordFor({ identity: S }));
+    probe.table.set(900, claudeInfo({ identity: S, lowPrecision: true, uid: UID + 1 }));
+    expect(await decide()).toEqual({ kind: "rotate", reason: "owner-uid-mismatch" });
+    probe.table.set(
+      900,
+      claudeInfo({ identity: S, lowPrecision: true, argv: ["claude", "--resume", "other"] }),
+    );
+    expect(await decide()).toEqual({ kind: "rotate", reason: "owner-argv-mismatch" });
+    expect(probe.kills).toEqual([]);
+  });
 });

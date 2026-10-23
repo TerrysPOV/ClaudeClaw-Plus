@@ -10,7 +10,9 @@
  * Round 3 replaces the search with an OWNERSHIP RECORD written when the bus spawns claude: agent,
  * session id, pid, process start identity, and the daemon's boot id. A restart looks only at that
  * record:
- *   - no record: there is no process we own; resume.
+ *   - no record: there is no process we own; resume. (This holds because a spawn whose record cannot be
+ *     written is ended and fails, #595 r4: a live claude of ours without a record cannot exist, apart
+ *     from the crash window between fork and the write and a child of a pre-upgrade daemon.)
  *   - the pid is gone, or alive with a different start identity (reused): nothing to signal; resume.
  *   - a record from THIS boot whose process is alive: a process the daemon manages; never signalled;
  *     rotate to a fresh id.
@@ -39,6 +41,11 @@ export const ORPHAN_TERM_MS = 3000;
 export const ORPHAN_KILL_MS = 2000;
 /** The most one process read may take (also capped by what is left of the deadline). */
 export const PROBE_TIMEOUT_MS = 1500;
+/**
+ * The most the identity read and the write of a NEW record may each take. Longer than a restart-time
+ * read: a record that is late is a spawn that fails (#595 r4), so a loaded machine gets a margin.
+ */
+export const RECORD_STEP_MS = 4000;
 const POLL_MS = 100;
 
 /* ── Ownership record ───────────────────────────────────────────────────── */
@@ -140,9 +147,13 @@ export interface ProcessInfo {
   /**
    * A birth identity a reused pid cannot share with the process that held it before.
    * Linux: boot time (`/proc/stat` btime) + field 22 of `/proc/<pid>/stat` (start time in clock
-   * ticks, 10 ms on a normal kernel). macOS/BSD: `ps -o lstart=`, which is SECOND precision.
+   * ticks, 10 ms on a normal kernel). macOS: `ps -o lstart=` plus, when libproc answers, `+` and the
+   * start time's microseconds (`<lstart>+<usec>`); without it, `ps -o lstart=` alone is SECOND precision
+   * (`lowPrecision`). Compare identities with `sameStart`, never `===`.
    */
   identity: string;
+  /** True when `identity` is only second-precise (macOS with libproc unavailable or unconvincing). */
+  lowPrecision?: boolean;
   /** Exited and awaiting its parent's wait(): the process no longer runs. */
   zombie: boolean;
   /** The real argument vector (Linux `/proc/<pid>/cmdline`), or null when only flat text exists. */
@@ -207,14 +218,138 @@ async function readFromProc(pid: number, procRoot: string): Promise<ProcessInfo 
 /** `ps -ww -o stat=,uid=,lstart=,command=` rows: lstart is a fixed-shape date under LC_ALL=C. */
 const PS_ROW = /^\s*(\S+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s*(.*)$/;
 
+/* ── macOS: sub-second birth time through libproc ───────────────────────── */
+
+/**
+ * `proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof info)` fills a `struct proc_bsdinfo`.
+ * Source: the macOS SDK header `<sys/proc_info.h>` (checked against MacOSX26.5.sdk): `PROC_PIDTBSDINFO`
+ * is 3, `PROC_PIDTBSDINFO_SIZE` is `sizeof(struct proc_bsdinfo)` = 136. Layout (little-endian; arm64 and
+ * x86_64 agree): twelve 4-byte fields `pbi_flags`..`rfu_1` (0..47, so `pbi_status` is at 4, `pbi_pid` at
+ * 12, `pbi_uid` at 20), `pbi_comm[16]` (48), `pbi_name[32]` (64), seven 4-byte fields `pbi_nfiles`..
+ * `pbi_nice` (96..119), then the two `uint64_t` fields `pbi_start_tvsec` (120) and `pbi_start_tvusec`
+ * (128), which sit on their natural 8-byte alignment with no padding.
+ */
+export const PROC_PIDTBSDINFO = 3;
+export const PROC_BSDINFO_SIZE = 136;
+export const BSDINFO_OFFSETS = { pid: 12, startSec: 120, startUsec: 128 } as const;
+
+export interface StartTime {
+  sec: number;
+  usec: number;
+}
+
+/** Decode `pbi_start_tvsec` / `pbi_start_tvusec` from a `proc_bsdinfo` buffer; null if it is not `pid`'s. */
+export function decodeBsdInfoStart(buf: Uint8Array, pid: number): StartTime | null {
+  if (buf.byteLength < PROC_BSDINFO_SIZE) return null;
+  const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  if (view.getUint32(BSDINFO_OFFSETS.pid, true) !== pid) return null;
+  const sec = Number(view.getBigUint64(BSDINFO_OFFSETS.startSec, true));
+  const usec = Number(view.getBigUint64(BSDINFO_OFFSETS.startUsec, true));
+  if (!Number.isSafeInteger(sec) || sec <= 0 || !(usec >= 0 && usec < 1_000_000)) return null;
+  return { sec, usec };
+}
+
+type ProcPidInfo = (
+  pid: number,
+  flavor: number,
+  arg: bigint,
+  buf: Uint8Array,
+  size: number,
+) => number;
+let procPidInfo: ProcPidInfo | null | undefined;
+
+/** `proc_pidinfo` from libSystem through `bun:ffi` (built in; loaded lazily like runner.ts does). */
+function loadProcPidInfo(): ProcPidInfo | null {
+  if (procPidInfo !== undefined) return procPidInfo;
+  procPidInfo = null;
+  try {
+    const ffi = require("bun:ffi") as {
+      // biome-ignore lint/suspicious/noExplicitAny: bun:ffi is untyped under tsc
+      dlopen: (name: string, symbols: Record<string, unknown>) => { symbols: any };
+      FFIType: Record<string, number>;
+    };
+    for (const name of ["libSystem.B.dylib", "/usr/lib/libSystem.B.dylib"]) {
+      try {
+        const lib = ffi.dlopen(name, {
+          proc_pidinfo: {
+            args: [
+              ffi.FFIType.i32,
+              ffi.FFIType.i32,
+              ffi.FFIType.u64,
+              ffi.FFIType.ptr,
+              ffi.FFIType.i32,
+            ],
+            returns: ffi.FFIType.i32,
+          },
+        });
+        procPidInfo = lib.symbols.proc_pidinfo as ProcPidInfo;
+        break;
+      } catch {
+        // try the next name
+      }
+    }
+  } catch {
+    // no bun:ffi (not Bun): the caller falls back to second precision
+  }
+  return procPidInfo;
+}
+
+/** The microsecond start time of `pid` from libproc, or null when it cannot be had (never throws). */
+export function libprocStartTime(pid: number): StartTime | null {
+  if (process.platform !== "darwin") return null;
+  const call = loadProcPidInfo();
+  if (!call) return null;
+  try {
+    const buf = new Uint8Array(PROC_BSDINFO_SIZE);
+    if (call(pid, PROC_PIDTBSDINFO, 0n, buf, PROC_BSDINFO_SIZE) !== PROC_BSDINFO_SIZE) return null;
+    return decodeBsdInfoStart(buf, pid);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `<lstart>` or `<lstart>+<usec>`. libproc's answer is used only when it agrees with `ps` on the
+ * second (and on the pid, in the decode); anything else leaves the identity second-precise, marked so.
+ */
+function startIdentity(
+  lstart: string,
+  start: StartTime | null,
+): { identity: string; low: boolean } {
+  // `ps` runs with TZ=UTC (see `readFromPs`), so lstart is UTC whatever zone this process has.
+  const psSec = Date.parse(`${lstart} UTC`) / 1000;
+  if (start && Number.isFinite(psSec) && Math.abs(start.sec - psSec) <= 1) {
+    return { identity: `${lstart}+${String(start.usec).padStart(6, "0")}`, low: false };
+  }
+  return { identity: lstart, low: true };
+}
+
+/**
+ * Whether two start identities name the same process birth. Equal strings do. Otherwise they match
+ * only at second precision, and only when one side has no microseconds (libproc was unavailable when
+ * that side was read): `<lstart>` against `<lstart>+<usec>`. Two microsecond identities must be equal.
+ */
+export function sameStart(a: string, b: string): boolean {
+  if (a === b) return true;
+  const split = (v: string): [string, string | undefined] => {
+    const at = v.indexOf("+");
+    return at < 0 ? [v, undefined] : [v.slice(0, at), v.slice(at + 1)];
+  };
+  const [sa, ua] = split(a);
+  const [sb, ub] = split(b);
+  return sa === sb && (ua === undefined || ub === undefined);
+}
+
 /**
  * One targeted `ps` for ONE pid (never a table scan). The subprocess is killed at `timeoutMs`.
- * `ps` exits 1 with no output when the pid does not exist; any other failure rejects.
+ * `ps` exits 1 with no output when the pid does not exist; any other failure rejects. `startTime`
+ * supplies the sub-second start (libproc); it never decides whether the process exists.
  */
 export function readFromPs(
   pid: number,
   timeoutMs: number,
   psCommand = "ps",
+  startTime: (pid: number) => StartTime | null = libprocStartTime,
 ): Promise<ProcessInfo | null> {
   return new Promise((resolve, reject) => {
     execFile(
@@ -225,7 +360,9 @@ export function readFromPs(
         timeout: timeoutMs,
         killSignal: "SIGKILL",
         maxBuffer: 1024 * 1024,
-        env: { ...process.env, LC_ALL: "C" },
+        // TZ=UTC: lstart is local time otherwise, which is ambiguous across a DST change and cannot
+        // be read back against libproc's epoch seconds without knowing the zone.
+        env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
       },
       (err, stdout) => {
         if (err) {
@@ -239,10 +376,18 @@ export function readFromPs(
           reject(new Error("unparseable ps row"));
           return;
         }
+        let start: StartTime | null = null;
+        try {
+          start = startTime(pid);
+        } catch {
+          // second precision
+        }
+        const { identity, low } = startIdentity(m[3] as string, start);
         resolve({
           pid,
           uid: Number(m[2]),
-          identity: m[3] as string,
+          identity,
+          ...(low ? { lowPrecision: true } : {}),
           zombie: (m[1] as string).startsWith("Z"),
           argv: null,
           command: (m[4] ?? "").trim(),
@@ -254,7 +399,12 @@ export function readFromPs(
 
 /** The real probe: `/proc` on Linux (real argv), one targeted `ps` elsewhere (flat command text). */
 export function createSystemProbe(
-  opts: { platform?: NodeJS.Platform; procRoot?: string; psCommand?: string } = {},
+  opts: {
+    platform?: NodeJS.Platform;
+    procRoot?: string;
+    psCommand?: string;
+    startTime?: (pid: number) => StartTime | null;
+  } = {},
 ): ProcessProbe {
   const platform = opts.platform ?? process.platform;
   const procRoot = opts.procRoot ?? "/proc";
@@ -263,7 +413,7 @@ export function createSystemProbe(
       withDeadline(
         platform === "linux"
           ? readFromProc(pid, procRoot)
-          : readFromPs(pid, timeoutMs, opts.psCommand),
+          : readFromPs(pid, timeoutMs, opts.psCommand, opts.startTime),
         timeoutMs,
       ),
     kill: (pid, signal) => process.kill(pid, signal),
@@ -334,9 +484,27 @@ export function namesOwnedClaude(info: ProcessInfo, rec: OwnershipRecord): boole
 /* ── Writing and clearing the record ────────────────────────────────────── */
 
 /**
+ * The daemon could not record a process it just spawned (#595 r4). The process is alive and
+ * unrecorded, so the spawn must end it and fail: "no record" is only safe to read as "nothing of ours
+ * holds the session" if this never goes unhandled. `record` is set when the identity was read but the
+ * write failed (the in-memory record still lets the retirement signal exactly that process).
+ */
+export class OwnershipRecordError extends Error {
+  readonly code = "ownership-record-failed";
+  constructor(
+    readonly stage: "identity-read" | "write",
+    readonly record: OwnershipRecord | null,
+    override readonly cause: unknown,
+  ) {
+    super(`ownership record not written (${stage})`);
+    this.name = "OwnershipRecordError";
+  }
+}
+
+/**
  * Record that the daemon spawned `pid` for `agentId`'s `sessionId`. Returns null when the process is
- * already gone (nothing to own). Rejects when the identity cannot be read or the write fails; the
- * caller logs it and carries on, since a spawn must not fail for want of a record.
+ * already gone (nothing to own). Rejects with `OwnershipRecordError` when the identity cannot be read
+ * or the write fails: the caller ends the process and fails the spawn.
  */
 export async function recordOwnership(a: {
   store: OwnershipStore;
@@ -348,7 +516,13 @@ export async function recordOwnership(a: {
   bootId?: string;
   timeoutMs?: number;
 }): Promise<OwnershipRecord | null> {
-  const info = await a.probe.read(a.pid, a.timeoutMs ?? PROBE_TIMEOUT_MS);
+  let info: ProcessInfo | null;
+  try {
+    const ms = a.timeoutMs ?? RECORD_STEP_MS;
+    info = await withDeadline(a.probe.read(a.pid, ms), ms);
+  } catch (err) {
+    throw new OwnershipRecordError("identity-read", null, err);
+  }
   if (!info || info.zombie) return null;
   const record: OwnershipRecord = {
     agentId: a.agentId,
@@ -359,13 +533,17 @@ export async function recordOwnership(a: {
     exe: a.exe,
     spawnedAt: new Date().toISOString(),
   };
-  await a.store.write(record);
+  try {
+    await withDeadline(a.store.write(record), a.timeoutMs ?? RECORD_STEP_MS);
+  } catch (err) {
+    throw new OwnershipRecordError("write", record, err);
+  }
   return record;
 }
 
 /** True when the process the record names is no longer running (gone, a zombie, or the pid is reused). */
 const departed = (info: ProcessInfo | null, rec: OwnershipRecord): boolean =>
-  info === null || info.identity !== rec.identity || info.zombie;
+  info === null || !sameStart(info.identity, rec.identity) || info.zombie;
 
 /** Poll until the record's process has departed (true) or `withinMs` passes (false). Rejects on a read failure. */
 async function pollDeparted(
@@ -457,7 +635,7 @@ export type RotateReason =
   | "guard-deadline";
 
 export type ResumeDecision =
-  | { kind: "resume"; reason: ResumeReason; reapedPid?: number }
+  | { kind: "resume"; reason: ResumeReason; reapedPid?: number; lowPrecision?: boolean }
   | { kind: "rotate"; reason: RotateReason };
 
 class RotateSignal extends Error {
@@ -522,7 +700,7 @@ export async function decideResume(a: {
     const first = await read();
     if (departed(first, owned)) {
       await clearRecord();
-      const reused = first !== null && first.identity !== owned.identity;
+      const reused = first !== null && !sameStart(first.identity, owned.identity);
       return { kind: "resume", reason: reused ? "pid-reused" : "owner-gone" };
     }
     // Alive with the recorded identity. A process of THIS boot is one the daemon manages.
@@ -530,6 +708,9 @@ export async function decideResume(a: {
 
     // A previous boot's process: our orphan. Signal only after revalidating, each time.
     let gone = false;
+    // Second-precise identity (either side) authorises nothing by itself: the uid and argv
+    // revalidation below is what stands between a same-second pid reuse and a signal.
+    let lowPrecision = false;
     for (const signal of ["SIGTERM", "SIGKILL"] as const) {
       const now = await read();
       if (departed(now, owned)) {
@@ -537,6 +718,9 @@ export async function decideResume(a: {
         break;
       }
       const live = now as ProcessInfo;
+      lowPrecision ||=
+        live.lowPrecision === true ||
+        (live.identity.includes("+") && !owned.identity.includes("+"));
       if (live.uid !== uid) throw new RotateSignal("owner-uid-mismatch");
       if (!namesOwnedClaude(live, owned)) throw new RotateSignal("owner-argv-mismatch");
       try {
@@ -559,7 +743,7 @@ export async function decideResume(a: {
     }
     if (!gone) throw new RotateSignal("orphan-unconfirmed");
     await clearRecord();
-    return { kind: "resume", reason: "orphan-reaped", reapedPid: owned.pid };
+    return { kind: "resume", reason: "orphan-reaped", reapedPid: owned.pid, lowPrecision };
   } catch (err) {
     if (err instanceof RotateSignal) return { kind: "rotate", reason: err.reason };
     if (err instanceof GuardDeadlineError) return { kind: "rotate", reason: "guard-deadline" };

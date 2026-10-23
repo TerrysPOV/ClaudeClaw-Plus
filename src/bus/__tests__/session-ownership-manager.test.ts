@@ -7,6 +7,9 @@
  * records its argv, its pid, and whether the previous process (and any orphan) was alive when it
  * started, so ordering is asserted on what the OS saw, not on a stub. The orphans are REAL
  * processes, read by the production probe.
+ *
+ * Round 4 adds: a spawn whose process cannot be recorded is ended and fails; spawn, restart and
+ * `/clear` share one lifecycle queue per agent; `/clear` succeeds only on a live replacement.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -28,6 +31,7 @@ import {
 } from "../../runner/pty-quarantine";
 import { encodeCwdForProjectsDir } from "../jsonl-line-types";
 import { resolveAgentCwd, SessionManager } from "../session-manager";
+import { ClearReplacementExitedError, SpawnUnrecordedError } from "../session-manager";
 import { createSystemProbe } from "../session-ownership";
 import type { AgentConfig } from "../types";
 import { wireSlashCommands } from "../wiring";
@@ -91,6 +95,7 @@ describe("SessionManager — ownership guard and /clear (#595 r3)", () => {
 n=$(cat "${dir}/count" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "${dir}/count"
 printf '%s\\n' "$@" > "${dir}/argv.$n"
 echo $$ > "${dir}/pid.$n"
+if [ -f "${dir}/die.$n" ]; then exit 1; fi
 if [ "$n" -gt 1 ]; then p=$((n-1)); if kill -0 "$(cat "${dir}/pid.$p")" 2>/dev/null; then echo alive; else echo gone; fi > "${dir}/prev.state.$n"; fi
 if [ -f "${dir}/orphan.pid" ]; then if kill -0 "$(cat "${dir}/orphan.pid")" 2>/dev/null; then echo alive; else echo gone; fi > "${dir}/orphan.state.$n"; fi
 exec sleep 60
@@ -271,7 +276,7 @@ exec sleep 60
     writeTranscript(SID);
     seedFake();
     const probe = new FakeProbe();
-    probe.stall = true;
+    probe.stallPid = 4242; // the seeded record's process; the new spawn's own record still works
     const t0 = Date.now();
     const agent = agentConfig();
     await manager({ probe, guardMs: 400 }).spawnAgent(agent, "cli");
@@ -332,14 +337,109 @@ exec sleep 60
     expect(store.rec.has("a")).toBe(false);
   }, 30_000);
 
-  it("a record that cannot be written does not fail the spawn", async () => {
+  const alive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const pidOf = (n: number): number => Number(stateOf(`pid.${n}`));
+  const errLines = (reason: string): string[] =>
+    errored.filter((l) => l.includes(`reason=${reason}`));
+
+  it("a record that cannot be written ends the child and fails the spawn: no record, and nothing of ours left", async () => {
+    // Fault (site: the `if (recordFailure)` branch in `spawnAgentInternal`, write failure tolerated
+    // again as in round 3): the child keeps running unrecorded. Predicted result: the spawn
+    // resolves and `pid.1` is alive.
     store.write = async () => {
-      throw new Error("ENOSPC");
+      throw Object.assign(new Error("secret path /x/owner.json"), { code: "ENOSPC" });
     };
-    const proc = await manager().spawnAgent(agentConfig(), "cli");
-    expect(proc.pid).toBeGreaterThan(0);
-    await until(() => warned.some((l) => l.includes("reason=ownership-record-failed")));
-    expect(warned.filter((l) => l.includes("reason=ownership-record-failed"))).toHaveLength(1);
+    const m = manager();
+    const err = await m.spawnAgent(agentConfig(), "cli").then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+    expect(err).toBeInstanceOf(SpawnUnrecordedError);
+    expect((err as SpawnUnrecordedError).code).toBe("ownership-record-failed");
+    expect((err as SpawnUnrecordedError).retired).toBe(true);
+    expect(alive(pidOf(1))).toBe(false);
+    expect(store.rec.size).toBe(0);
+    expect(m._list()).toEqual([]);
+    expect(m.getAgent("a")).toBeUndefined();
+    expect(isSessionQuarantined({ sessionId: SID })).toBe(false);
+    // One line, a reason code and the errno; nothing the child or the error message printed.
+    const lines = errLines("ownership-record-failed");
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("cause=ENOSPC");
+    expect(lines[0]).not.toContain("secret path");
+  }, 30_000);
+
+  it("a record that cannot be written AND a child that is not confirmed gone: the session is quarantined", async () => {
+    // Fault (site: `retireLive`, the confirmation ignored): the failed spawn leaves a child that may
+    // still write and no quarantine. Predicted result: `isSessionQuarantined` is false.
+    store.write = async () => {
+      throw new Error("EROFS");
+    };
+    const probe = new FakeProbe();
+    probe.alwaysAlive = claudeInfo({ identity: "T1" });
+    const m = manager({ probe, stageMs: 150 });
+    const err = await m.spawnAgent(agentConfig(), "cli").then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+    expect(err).toBeInstanceOf(SpawnUnrecordedError);
+    expect((err as SpawnUnrecordedError).retired).toBe(false);
+    expect(String((err as Error).message)).toContain("quarantined");
+    expect(isSessionQuarantined({ sessionId: SID })).toBe(true);
+    expect(probe.kills.map((k) => k.signal)).toEqual(["SIGKILL"]);
+    expect(errLines("spawn-retire-unconfirmed")).toHaveLength(1);
+    // The existing #562 gate holds the session until the OS confirms the exit.
+    await expect(assertSessionWritable({ sessionId: SID })).rejects.toThrow("quarantined");
+    probe.alwaysAlive = null;
+    await assertSessionWritable({ sessionId: SID });
+  }, 30_000);
+
+  it("an identity that cannot be read fails the spawn the same way", async () => {
+    const probe = new FakeProbe();
+    probe.failure = new Error("ps: operation not permitted");
+    const m = manager({ probe, stageMs: 150 });
+    const err = await m.spawnAgent(agentConfig(), "cli").then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(SpawnUnrecordedError);
+    expect((err as SpawnUnrecordedError).stage).toBe("identity-read");
+    expect(store.rec.size).toBe(0);
+    expect(errLines("ownership-record-failed")).toHaveLength(1);
+  }, 30_000);
+
+  it("the agent is not reported spawned, and gets no prompt, before its record exists", async () => {
+    // Fault (site: `deliverable` hiding in `getAgent`, removed): the process is handed out while the
+    // write is still pending. Predicted result: `seenBeforeRecord` is true.
+    const write = store.write.bind(store);
+    store.write = async (r) => {
+      await new Promise((res) => setTimeout(res, 400));
+      await write(r);
+    };
+    const m = manager();
+    let seenBeforeRecord = false;
+    const poll = setInterval(() => {
+      if (m.getAgent("a") && !store.rec.has("a")) seenBeforeRecord = true;
+    }, 10);
+    let resolvedWithRecord = false;
+    try {
+      await m.spawnAgent(agentConfig(), "cli");
+      resolvedWithRecord = store.rec.has("a");
+    } finally {
+      clearInterval(poll);
+    }
+    expect(seenBeforeRecord).toBe(false);
+    expect(resolvedWithRecord).toBe(true);
+    expect(m.getAgent("a")).toBeDefined();
   }, 30_000);
 
   it("a same-boot restart that keeps the id resumes it: the earlier process is confirmed exited", async () => {
@@ -450,5 +550,72 @@ exec sleep 60
     await clear("a", "/compact");
     expect(persisted).toHaveLength(0);
     expect(existsSync(join(dir, "argv.2"))).toBe(false);
+  }, 30_000);
+
+  /* ── one lifecycle queue per agent ────────────────────────────────── */
+
+  const idOfStart = (n: number): string | undefined =>
+    flagValue(argvOf(n), "--session-id") ?? flagValue(argvOf(n), "--resume");
+
+  for (const order of ["clear-then-restart", "restart-then-clear"] as const) {
+    it(`/clear and restart issued together (${order}) run one after the other and leave one live process on the stored id`, async () => {
+      // Fault (site: `enqueueLifecycle`, the queue removed so each op runs at once): the two
+      // operations capture the same record and retire it together. Predicted result: a rejection
+      // ("already spawned") or two live processes, or a stored id that is not the live one.
+      writeTranscript(SID);
+      const m = manager();
+      const clear = wired(m);
+      const agent = agentConfig();
+      await m.spawnAgent(agent, "cli");
+      await until(() => store.rec.has("a"));
+
+      const doClear = (): Promise<void> => clear("a", "/clear");
+      const doRestart = (): Promise<unknown> => m.restart("a", { reason: "manual" });
+      const results =
+        order === "clear-then-restart"
+          ? await Promise.allSettled([doClear(), doRestart()])
+          : await Promise.allSettled([doRestart(), doClear()]);
+
+      expect(results.map((r) => r.status)).toEqual(["fulfilled", "fulfilled"]);
+      expect(persisted).toHaveLength(2);
+      // Each start found the previous process already gone: they did not overlap.
+      expect(stateOf("prev.state.2")).toBe("gone");
+      expect(stateOf("prev.state.3")).toBe("gone");
+      expect(existsSync(join(dir, "argv.4"))).toBe(false);
+      // Exactly one live process, and the stored id is the one it runs on.
+      expect([pidOf(1), pidOf(2), pidOf(3)].filter(alive)).toEqual([pidOf(3)]);
+      const last = persisted[1]?.sessionId;
+      expect(idOfStart(3)).toBe(last);
+      expect(agent.session_id).toBe(last);
+      expect(idOfStart(2)).toBe(persisted[0]?.sessionId);
+      expect(m.getAgent("a")?.pid).toBe(pidOf(3));
+    }, 60_000);
+  }
+
+  /* ── /clear succeeds only on a live replacement ───────────────────── */
+
+  it("a /clear whose replacement exits during startup rejects with its reason, and logs no success", async () => {
+    // Fault (site: the liveness check after the replacement spawn, removed: spawn completion taken
+    // as success): the clear resolves with no agent running. Predicted result: the promise resolves
+    // and `reason=session-cleared` is logged.
+    writeTranscript(SID);
+    const m = manager();
+    const clear = wired(m);
+    const agent = agentConfig();
+    await m.spawnAgent(agent, "cli");
+    await until(() => store.rec.has("a"));
+    writeFileSync(join(dir, "die.2"), "");
+
+    const err = await clear("a", "/clear").then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+    expect(err).toBeInstanceOf(ClearReplacementExitedError);
+    expect((err as ClearReplacementExitedError).code).toBe("clear-replacement-exited");
+    expect(warned.filter((l) => l.includes("reason=session-cleared"))).toHaveLength(0);
+    expect(errLines("clear-replacement-exited")).toHaveLength(1);
+    expect(m.getAgent("a")).toBeUndefined();
+    expect(alive(pidOf(1))).toBe(false);
   }, 30_000);
 });
