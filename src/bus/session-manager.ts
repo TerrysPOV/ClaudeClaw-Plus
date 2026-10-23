@@ -32,7 +32,7 @@
 
 import { spawn as nodeSpawnChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -45,6 +45,7 @@ import {
 } from "../runner/pty-mcp-config-writer";
 import { createSession } from "../sessions";
 import type { BusCore } from "./core";
+import { encodeCwdForProjectsDir } from "./jsonl-line-types";
 import { JsonlTailer } from "./jsonl-tailer";
 import { BUS_MCP_TOOLS } from "./mcp-tools";
 import { confirmTurnReceipt } from "./receipt-wiring";
@@ -552,18 +553,28 @@ const RESTART_WINDOW_MS = 60 * 60 * 1000;
 const SESSION_COLLISION_PATTERN = /Session ID [0-9a-fA-F-]{8,} is already in use/;
 
 /**
+ * claude's refusal of `--resume <id>` when it cannot load a conversation for that id
+ * ("No conversation found with session ID: <id>", exit 1). #595: the one genuine resume
+ * failure that rotates the session; any other boot failure of a resumed spawn does not.
+ */
+const RESUME_NOT_FOUND_PATTERN = /No conversation found with session ID/;
+
+/**
  * Watch the spawned agent process for the session-id collision marker
  * during a short window after spawn. Resolves true iff the marker is
  * seen AND the process exits with a non-zero code within the window —
  * both are required because claude can echo a similar string in benign
  * contexts and a stale-id failure always pairs with an immediate
  * exit. Resolves false for: alive past the window, clean exit, exit
- * without the marker.
+ * without the marker. `pattern` names the marker (default: the session-id
+ * collision); #595 reuses the detector for a resumed spawn's "No conversation
+ * found" refusal.
  */
 export function detectSessionIdCollision(
   proc: Pick<AgentProcess, "onData" | "onExit" | "recentOutputTail">,
   windowMs: number,
   exitDrainMs: number = COLLISION_EXIT_DRAIN_MS,
+  pattern: RegExp = SESSION_COLLISION_PATTERN,
 ): Promise<boolean> {
   if (windowMs <= 0) return Promise.resolve(false);
   return new Promise((resolve) => {
@@ -581,7 +592,7 @@ export function detectSessionIdCollision(
     // resumed — the ordering a loaded host produces) counts as seen.
     const tailHasMarker = () => {
       const tail = proc.recentOutputTail?.();
-      return tail !== undefined && SESSION_COLLISION_PATTERN.test(tail);
+      return tail !== undefined && pattern.test(tail);
     };
     let markerSeen = tailHasMarker();
     // The marker can straddle two PTY chunks (Copilot on the PR): match on a
@@ -603,7 +614,7 @@ export function detectSessionIdCollision(
       // detection window closes.
       if (resolved) return;
       recent = (recent + chunk).slice(-COLLISION_MARKER_WINDOW_CHARS);
-      if (!markerSeen && SESSION_COLLISION_PATTERN.test(recent)) {
+      if (!markerSeen && pattern.test(recent)) {
         markerSeen = true;
         // The exit already came in ahead of this chunk (#326): the verdict
         // was only waiting for it.
@@ -669,8 +680,17 @@ export function detectSessionIdCollision(
  *     claude doesn't prompt-via-bus on every outbound reply.
  *
  * Operator-supplied `agent.mcp_config` is passed through unchanged.
+ *
+ * Session flag (#595): `--session-id <id>` CREATES a session, and claude refuses it with
+ * "Session ID <id> is already in use" when `<projects>/<cwd>/<id>.jsonl` exists. A spawn whose
+ * transcript already exists (a restart) must therefore `--resume <id>`; `resume` is that fact,
+ * read from the filesystem by the caller (`sessionTranscriptExists`). Default: create.
  */
-export function buildClaudeArgs(agent: AgentConfig, mode: SupervisionMode): string[] {
+export function buildClaudeArgs(
+  agent: AgentConfig,
+  mode: SupervisionMode,
+  opts: { resume?: boolean } = {},
+): string[] {
   const args: string[] = [];
   if (mode === "process-stream-json") {
     args.push("-p", "--input-format=stream-json", "--output-format=stream-json", "--verbose");
@@ -705,8 +725,26 @@ export function buildClaudeArgs(agent: AgentConfig, mode: SupervisionMode): stri
   if (agent.system_prompt_file) {
     args.push("--append-system-prompt", agent.system_prompt_file);
   }
-  args.push("--session-id", agent.session_id);
+  args.push(opts.resume ? "--resume" : "--session-id", agent.session_id);
   return args;
+}
+
+/**
+ * Whether the transcript claude would write for `sessionId` already exists: the very file the
+ * CLI `stat`s to decide "Session ID is already in use" (#595). `cwd` is the agent's REAL cwd (the
+ * CLI encodes the physical directory). `projectsDir` overrides the projects root (tests, and the
+ * tailer's own override); otherwise it is `$CLAUDE_CONFIG_DIR/projects`, as the child sees it.
+ */
+export function sessionTranscriptExists(opts: {
+  cwd: string;
+  sessionId: string;
+  env: Record<string, string | undefined>;
+  projectsDir?: string;
+}): boolean {
+  const root =
+    opts.projectsDir ??
+    join(opts.env.CLAUDE_CONFIG_DIR || join(opts.env.HOME || homedir(), ".claude"), "projects");
+  return existsSync(join(root, encodeCwdForProjectsDir(opts.cwd), `${opts.sessionId}.jsonl`));
 }
 
 /* ───────────────────────────────────────────────────────────────────── */
@@ -829,7 +867,19 @@ export class SessionManager {
     }
 
     const env = buildChildEnv(agent, busSock);
-    const args = this.options.argsOverride ?? buildClaudeArgs(agent, mode);
+    // #595: a stored session whose transcript exists is RESUMED. `--session-id` would create it
+    // again, and claude refuses that ("already in use"), which used to rotate the id and lose the
+    // conversation on every restart. The test seam (`argsOverride`) replaces the whole argv, so
+    // nothing is resumed there.
+    const resume =
+      this.options.argsOverride === undefined &&
+      sessionTranscriptExists({
+        cwd: realCwd,
+        sessionId: agent.session_id,
+        env,
+        projectsDir: this.options.projectsDir,
+      });
+    const args = this.options.argsOverride ?? buildClaudeArgs(agent, mode, { resume });
 
     // Issue #165: synthesize the multiplexer `--mcp-config` for this agent
     // when the daemon has wired a synthesizer (active multiplexer) and the
@@ -948,18 +998,23 @@ export class SessionManager {
             // armed (the exit replayed before it, or the window is 0).
             const collision = verdictPromise
               ? await verdictPromise
-              : tail !== undefined && SESSION_COLLISION_PATTERN.test(tail);
+              : tail !== undefined &&
+                (resume ? RESUME_NOT_FOUND_PATTERN : SESSION_COLLISION_PATTERN).test(tail);
+            const what = resume ? "resume refused (#595)" : "session-id collision";
             const verdict = collision
               ? retry === 0
-                ? " — session-id collision; the spawn is retried with a fresh id"
-                : " — session-id collision persisted after rotation"
+                ? ` — ${what}; the spawn is retried with a fresh id`
+                : ` — ${what} persisted after rotation`
               : uptimeMs < BOOT_FAILURE_WINDOW_MS
                 ? " — exited during boot; treat as a startup failure"
                 : "";
+            // A refused resume is named by its reason code; the screen adds nothing to it.
             const quoted =
-              tail === undefined
-                ? "    (no output captured in this supervision mode)"
-                : tail || "    (nothing was printed)";
+              collision && resume
+                ? "    (not quoted: the cause is the reason code above)"
+                : tail === undefined
+                  ? "    (no output captured in this supervision mode)"
+                  : tail || "    (nothing was printed)";
             (this.options.logger ?? console).warn(
               `[bus-session] agent=${agent.id} pid=${proc.pid} exited outside stop(): ` +
                 `code=${code} uptime=${(uptimeMs / 1000).toFixed(1)}s${verdict}. Last output:\n${quoted}`,
@@ -995,12 +1050,20 @@ export class SessionManager {
     const collisionWindow =
       this.options.sessionCollisionDetectMs ??
       (this.options.argsOverride !== undefined ? 0 : DEFAULT_COLLISION_DETECT_MS);
-    collisionVerdict = detectSessionIdCollision(proc, collisionWindow);
+    // A resumed spawn is judged on claude's resume refusal, a created one on the id collision.
+    collisionVerdict = detectSessionIdCollision(
+      proc,
+      collisionWindow,
+      COLLISION_EXIT_DRAIN_MS,
+      resume ? RESUME_NOT_FOUND_PATTERN : SESSION_COLLISION_PATTERN,
+    );
     const collision = await collisionVerdict;
     if (collision && retry === 0) {
       const fresh = randomUUID();
+      // The reason is a fixed code: what claude printed is never copied into this line.
+      const reason = resume ? "resume-rejected-no-conversation" : "session-id-in-use";
       (this.options.logger ?? console).warn(
-        `[bus-session] agent=${agent.id} claude rejected session_id=${agent.session_id} as already in use — rotating to ${fresh} and respawning`,
+        `[bus-session] agent=${agent.id} reason=${reason} session_id=${agent.session_id} — rotating to ${fresh} and respawning (the conversation of the old session is not carried over)`,
       );
       // The public option takes `(agentId, sessionId)` for readability;
       // the legacy `createSession` storage layer takes them reversed.
