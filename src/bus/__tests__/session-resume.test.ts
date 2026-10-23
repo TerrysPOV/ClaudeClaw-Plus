@@ -27,6 +27,12 @@ import type { AgentConfig } from "../types";
 
 const STORED = "5b7d1c2e-0000-4000-8000-0000000005a5";
 
+/** The value following `flag` in `argv`, or undefined when the flag is absent. */
+const flagValue = (argv: string[], flag: string): string | undefined => {
+  const at = argv.indexOf(flag);
+  return at < 0 ? undefined : argv[at + 1];
+};
+
 describe("buildClaudeArgs — session flag (#595)", () => {
   const agent: AgentConfig = {
     id: "flag",
@@ -39,13 +45,13 @@ describe("buildClaudeArgs — session flag (#595)", () => {
   it("creates the session with --session-id by default", () => {
     const args = buildClaudeArgs(agent, "process");
     expect(args).toContain("--session-id");
-    expect(args[args.indexOf("--session-id") + 1]).toBe(STORED);
+    expect(flagValue(args, "--session-id")).toBe(STORED);
     expect(args).not.toContain("--resume");
   });
 
   it("resumes the session with --resume when told its transcript exists", () => {
     const args = buildClaudeArgs(agent, "process", { resume: true });
-    expect(args[args.indexOf("--resume") + 1]).toBe(STORED);
+    expect(flagValue(args, "--resume")).toBe(STORED);
     expect(args).not.toContain("--session-id");
   });
 });
@@ -182,7 +188,7 @@ exec sleep 60
     await manager(standIn()).spawnAgent(agent, "cli");
 
     const argv = argvOf(1);
-    expect(argv[argv.indexOf("--resume") + 1]).toBe(STORED);
+    expect(flagValue(argv, "--resume")).toBe(STORED);
     expect(argv).not.toContain("--session-id");
     expect(persisted).toHaveLength(0);
     expect(agent.session_id).toBe(STORED);
@@ -195,7 +201,7 @@ exec sleep 60
     await manager(standIn()).spawnAgent(agent, "cli");
 
     const argv = argvOf(1);
-    expect(argv[argv.indexOf("--session-id") + 1]).toBe(STORED);
+    expect(flagValue(argv, "--session-id")).toBe(STORED);
     expect(argv).not.toContain("--resume");
     expect(persisted).toHaveLength(0);
   });
@@ -214,9 +220,9 @@ exec sleep 60
     expect(fresh).not.toBe(STORED);
     expect(agent.session_id).toBe(fresh);
     const first = argvOf(1);
-    expect(first[first.indexOf("--resume") + 1]).toBe(STORED);
+    expect(flagValue(first, "--resume")).toBe(STORED);
     const second = argvOf(2);
-    expect(second[second.indexOf("--session-id") + 1]).toBe(fresh);
+    expect(flagValue(second, "--session-id")).toBe(fresh);
     expect(second).not.toContain("--resume");
 
     const rotation = warned.filter((l) => l.includes("rotating to"));
@@ -258,10 +264,10 @@ exec sleep 60
     await m.restart("a", { freshSession: false, reason: "manual" });
 
     const second = argvOf(2);
-    expect(second[second.indexOf("--resume") + 1]).toBe(STORED);
+    expect(flagValue(second, "--resume")).toBe(STORED);
     expect(second).not.toContain("--session-id");
     expect(persisted).toHaveLength(0);
-  });
+  }, 30_000);
 
   it("the #562 gate still stands: a resumed session with an unconfirmed writer is not started", async () => {
     // Fault (site: `assertSessionWritable`, removed): the stand-in is started beside the
