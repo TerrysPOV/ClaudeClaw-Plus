@@ -15,7 +15,11 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PtyExitUnconfirmedError, type PtyProcess } from "../../runner/pty-process";
-import { __resetQuarantineForTests, quarantineSession } from "../../runner/pty-quarantine";
+import {
+  __resetQuarantineForTests,
+  fenceKey,
+  quarantineSession,
+} from "../../runner/pty-quarantine";
 import { encodeCwdForProjectsDir } from "../jsonl-line-types";
 import {
   buildClaudeArgs,
@@ -269,25 +273,64 @@ exec sleep 60
     expect(persisted).toHaveLength(0);
   }, 30_000);
 
-  it("the #562 gate still stands: a resumed session with an unconfirmed writer is not started", async () => {
-    // Fault (site: `assertSessionWritable`, removed): the stand-in is started beside the
-    // unconfirmed writer. Predicted result: `argv.1` exists and the call resolves.
-    writeTranscript(STORED);
-    const stuck = {
+  /** A quarantined writer on STORED whose exit confirmation `confirm` decides. */
+  function quarantinedWriter(confirm: () => Promise<void>): PtyProcess {
+    return {
       label: "fake:4242",
       pid: 4242,
       sessionId: STORED,
       cwd,
       canDie: false,
       isAlive: () => true,
-      dispose: async () => {
-        throw new PtyExitUnconfirmedError("fake:4242", 4242);
-      },
-      confirmExit: async () => {
-        throw new PtyExitUnconfirmedError("fake:4242", 4242);
-      },
+      dispose: confirm,
+      confirmExit: confirm,
     } as unknown as PtyProcess;
-    quarantineSession("global", stuck, "retire-exit-unconfirmed");
+  }
+
+  it("gate 1 (`assertSessionWritable`): a quarantined writer whose exit the OS now confirms is released, then the session starts", async () => {
+    // The fixture tells this gate apart from the synchronous one: only the async gate RE-ASKS the
+    // writer to confirm its exit. `assertSessionSpawnable` alone sees the record still standing.
+    // Fault (site: the `assertSessionWritable` call, removed): the quarantine is never re-asked,
+    // `assertSessionSpawnable` refuses, and the spawn rejects. Predicted result: the call rejects
+    // with "quarantined" and `confirmCalls` is 0.
+    writeTranscript(STORED);
+    let confirmCalls = 0;
+    quarantineSession(
+      "global",
+      quarantinedWriter(async () => {
+        confirmCalls++;
+      }),
+      "retire-exit-unconfirmed",
+    );
+
+    await manager(standIn()).spawnAgent(agentConfig(), "cli");
+
+    expect(confirmCalls).toBe(1);
+    expect(flagValue(argvOf(1), "--resume")).toBe(STORED);
+  });
+
+  it("gate 2 (`assertSessionSpawnable`): a retirement in progress on the session refuses the spawn, though nothing is quarantined", async () => {
+    // The fixture tells this gate apart from the async one: `assertSessionWritable` ignores
+    // fences (a retirement in flight is the caller's to wait out), so only the synchronous check
+    // before the process is created refuses here.
+    // Fault (site: the `assertSessionSpawnable` call in `spawnChild`, removed): the stand-in is
+    // started beside the retiring process. Predicted result: the call resolves and `argv.1` exists.
+    writeTranscript(STORED);
+    fenceKey("agent:a", {}, () => STORED);
+
+    await expect(manager(standIn()).spawnAgent(agentConfig(), "cli")).rejects.toThrow(
+      "being retired",
+    );
+    await new Promise((r) => setTimeout(r, 200));
+    expect(() => readFileSync(join(dir, "argv.1"))).toThrow();
+  });
+
+  it("a writer that stays unconfirmed keeps the session closed (either gate refuses it)", async () => {
+    writeTranscript(STORED);
+    const stuck = async () => {
+      throw new PtyExitUnconfirmedError("fake:4242", 4242);
+    };
+    quarantineSession("global", quarantinedWriter(stuck), "retire-exit-unconfirmed");
 
     await expect(manager(standIn()).spawnAgent(agentConfig(), "cli")).rejects.toThrow(
       "quarantined",

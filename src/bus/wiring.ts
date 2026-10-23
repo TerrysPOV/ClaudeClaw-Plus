@@ -48,8 +48,14 @@ export function wireSlashCommands(bus: BusCore, sm: SessionManager): void {
     // (AgentProcess-internal convention); the bare name is what
     // `send_slash` expects.
     const bareCmd = cmd.startsWith("/") ? cmd.slice(1) : cmd;
+    // #595 r3: `/clear` is a controlled restart on a freshly minted session id, not a keystroke
+    // relay: typing it moves the CLI to a transcript whose id the daemon never learns (and
+    // `send_slash` can resolve without clearing anything in `process` mode). It resolves only once
+    // the restart has happened, and rejects, quarantined, when the old claude cannot be retired.
+    if (bareCmd.trim() === "clear") {
+      await sm.clearSession(agent_id);
+      return;
+    }
     await agentProcess.send_slash(bareCmd);
-    // #595 r2: `/clear` moves the CLI to a new transcript; the stored id must not keep naming the old one.
-    if (bareCmd.trim() === "clear") await sm.noteSessionCleared(agent_id);
   });
 }

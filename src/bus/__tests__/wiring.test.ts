@@ -60,7 +60,7 @@ class FakeAgentProcess implements AgentProcess {
 }
 
 /**
- * Minimal SessionManager stand-in exposing only `getAgent` (and `noteSessionCleared`, #595 r2).
+ * Minimal SessionManager stand-in exposing only `getAgent` (and `clearSession`, #595 r3).
  * We don't extend `SessionManager` because that would drag in spawn lifecycle —
  * the wiring contract only depends on those two.
  */
@@ -68,7 +68,7 @@ class FakeSessionManager {
   private readonly registry = new Map<string, FakeAgentProcess>();
   readonly cleared: string[] = [];
 
-  async noteSessionCleared(agent_id: string): Promise<void> {
+  async clearSession(agent_id: string): Promise<void> {
     this.cleared.push(agent_id);
   }
 
@@ -97,6 +97,48 @@ function makeBus(): BusCore {
 /* ───────────────────────────────────────────────────────────────────── */
 /* Unit — handler logic                                                  */
 /* ───────────────────────────────────────────────────────────────────── */
+
+describe("wireSlashCommands — /clear is a controlled restart (#595 r3)", () => {
+  it("/clear goes to SessionManager.clearSession, never to send_slash", async () => {
+    // Fault (site: wiring.ts, `/clear` relayed with send_slash): the keystroke is typed and
+    // nothing restarts. Predicted result: `slashCalls` is ["clear"] and `cleared` is empty.
+    const bus = makeBus();
+    const sm = new FakeSessionManager();
+    const alpha = new FakeAgentProcess("alpha");
+    sm.register(alpha);
+    wireSlashCommands(bus, sm as unknown as SessionManager);
+
+    await bus.invokeSlashCommand("alpha", "/clear");
+
+    expect(sm.cleared).toEqual(["alpha"]);
+    expect(alpha.slashCalls).toEqual([]);
+  });
+
+  it("a failed clear rejects to the caller: success is never reported for a clear that did not happen", async () => {
+    const bus = makeBus();
+    const sm = new FakeSessionManager();
+    sm.register(new FakeAgentProcess("alpha"));
+    sm.clearSession = async () => {
+      throw new Error("not confirmed gone");
+    };
+    wireSlashCommands(bus, sm as unknown as SessionManager);
+
+    await expect(bus.invokeSlashCommand("alpha", "clear")).rejects.toThrow("not confirmed gone");
+  });
+
+  it("other commands are still relayed and do not restart anything", async () => {
+    const bus = makeBus();
+    const sm = new FakeSessionManager();
+    const alpha = new FakeAgentProcess("alpha");
+    sm.register(alpha);
+    wireSlashCommands(bus, sm as unknown as SessionManager);
+
+    await bus.invokeSlashCommand("alpha", "/compact");
+
+    expect(alpha.slashCalls).toEqual(["compact"]);
+    expect(sm.cleared).toEqual([]);
+  });
+});
 
 describe("wireSlashCommands — handler logic", () => {
   it("forwards bus.invokeSlashCommand to AgentProcess.send_slash", async () => {
@@ -148,10 +190,10 @@ describe("wireSlashCommands — handler logic", () => {
     sm.register(beta);
     wireSlashCommands(bus, sm as unknown as SessionManager);
 
-    await bus.invokeSlashCommand("beta", "/clear");
+    await bus.invokeSlashCommand("beta", "/compact");
 
     expect(alpha.slashCalls).toEqual([]);
-    expect(beta.slashCalls).toEqual(["clear"]);
+    expect(beta.slashCalls).toEqual(["compact"]);
   });
 
   it("propagates errors from AgentProcess.send_slash", async () => {

@@ -622,6 +622,7 @@ export async function start(args: string[] = []) {
       const { resolveBusAgentConfigs } = await import("../bus/agent-resolver");
       const { BusCoreImpl } = await import("../bus/core");
       const { SessionManager } = await import("../bus/session-manager");
+      const { createFileOwnershipStore } = await import("../bus/session-ownership");
 
       const resolved = await resolveBusAgentConfigs(settings.agents, {
         defaultCwd: process.cwd(),
@@ -655,7 +656,13 @@ export async function start(args: string[] = []) {
       // safety net. Without this the net is inert in the production daemon
       // (mountBusRuntime's bus-wired default is bypassed when we supply our
       // own SessionManager here).
-      const sessionManager = new SessionManager({ busSocketPath: socketPath, bus });
+      // #595 r3: the daemon keeps an ownership record per spawned claude (agents/<id>/owner.json), so
+      // a restart ends only a process it can prove it spawned. Tests inject their own store.
+      const sessionManager = new SessionManager({
+        busSocketPath: socketPath,
+        bus,
+        ownershipStore: createFileOwnershipStore(),
+      });
       const handle = await mountBusRuntime({
         bus,
         sessionManager,
