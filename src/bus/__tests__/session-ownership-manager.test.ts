@@ -3,16 +3,29 @@
  * proves this daemon spawned in an earlier boot, and proves it gone before the session is resumed;
  * (2) `/clear` is a controlled restart on a freshly minted id.
  *
- * Supervision is `process` throughout: no bun-pty, and no trust self-heal. The stand-in `claude`
- * records its argv, its pid, and whether the previous process (and any orphan) was alive when it
- * started, so ordering is asserted on what the OS saw, not on a stub. The orphans are REAL
- * processes, read by the production probe.
+ * Supervision is `process` throughout: no bun-pty, and no trust self-heal. The orphans are REAL
+ * processes, read by the production probe (`OsProbe` wraps `createSystemProbe`). Ordering is
+ * asserted on what the OS reported about each spawned process (`OsProbe.spawned`), not on a
+ * stand-in script that may not have started yet.
  *
  * Round 4 adds: a spawn whose process cannot be recorded is ended and fails; spawn, restart and
  * `/clear` share one lifecycle queue per agent; `/clear` succeeds only on a live replacement.
+ *
+ * Round 5b: no test here races the wall clock. A loaded machine (load average 100+) made these
+ * fail with no fault injected, from three causes, each removed:
+ *  - the stand-in `claude` had not written its argv/pid files when the test read them, so every
+ *    read of the stand-in's files now waits for its `ready.<pid>` marker (`started`);
+ *  - the production bounds (the guard deadline, the record steps, the orphan's SIGTERM stage, a
+ *    `ps` read) raced a slow `ps` or a slow `sh`, so real-process tests run with those bounds far
+ *    above any runtime (`LOADED`, `OsProbe.READ_MS`), while the fault tests that need a bound to
+ *    EXPIRE use a fake probe that cannot be slow;
+ *  - fixed sleeps and elapsed-time assertions are gone: a pending write is a promise the test
+ *    settles by hand, and "the guard honours its deadline" is read off the `timeoutMs` the guard
+ *    handed the probe (the deadline arithmetic itself is driven by a fake clock in
+ *    `session-ownership.test.ts`).
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -30,14 +43,31 @@ import {
   isSessionQuarantined,
 } from "../../runner/pty-quarantine";
 import { encodeCwdForProjectsDir } from "../jsonl-line-types";
-import { resolveAgentCwd, SessionManager } from "../session-manager";
-import { ClearReplacementExitedError, SpawnUnrecordedError } from "../session-manager";
-import { createSystemProbe } from "../session-ownership";
+import {
+  ClearReplacementExitedError,
+  resolveAgentCwd,
+  SessionManager,
+  type SessionManagerOptions,
+  SpawnUnrecordedError,
+} from "../session-manager";
+import type { ProcessProbe } from "../session-ownership";
 import type { AgentConfig } from "../types";
 import { wireSlashCommands } from "../wiring";
-import { claudeInfo, FakeProbe, MemoryStore, SID } from "./ownership-fakes";
+import {
+  claudeInfo,
+  FakeProbe,
+  manual,
+  MemoryStore,
+  OsProbe,
+  SID,
+  type SpawnedProcess,
+} from "./ownership-fakes";
 
 const BOOT = "boot-now";
+/** Every bound a real-process test must not race, set far above a loaded machine's slowest step. */
+const LOADED = 120_000;
+/** The stand-in `claude` is `sleep 60`: a retirement test that outlasts this is not a retirement. */
+const T = 120_000;
 
 type SlashHandler = (agentId: string, cmd: string) => Promise<void>;
 
@@ -50,7 +80,10 @@ describe("SessionManager — ownership guard and /clear (#595 r3)", () => {
   let errored: string[];
   let persisted: Array<{ agentId: string; sessionId: string }>;
   let store: MemoryStore;
+  let os: OsProbe;
   let orphan: ChildProcess | undefined;
+  /** The options the manager was built with; it reads them at each spawn, so a test may adjust one. */
+  let opts: SessionManagerOptions;
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "ccaw-own-mgr-"));
@@ -62,6 +95,7 @@ describe("SessionManager — ownership guard and /clear (#595 r3)", () => {
     errored = [];
     persisted = [];
     store = new MemoryStore();
+    os = new OsProbe();
     __resetQuarantineForTests();
   });
   afterEach(async () => {
@@ -71,11 +105,13 @@ describe("SessionManager — ownership guard and /clear (#595 r3)", () => {
       /* ignore */
     }
     mgr = undefined;
-    if (orphan && orphan.exitCode === null) orphan.kill("SIGKILL");
+    // SIGTERM: the orphan's trap ends its background `sleep` too.
+    if (orphan && orphan.exitCode === null) orphan.kill("SIGTERM");
     orphan = undefined;
     __resetQuarantineForTests();
     rmSync(dir, { recursive: true, force: true });
-  });
+    // `stop()` always waits its 2 s /quit grace before SIGTERM; the hook default (5 s) is not enough.
+  }, T);
 
   function writeTranscript(id: string): void {
     const d = join(projectsDir, encodeCwdForProjectsDir(cwd));
@@ -84,44 +120,71 @@ describe("SessionManager — ownership guard and /clear (#595 r3)", () => {
   }
 
   /**
-   * Stand-in `claude`: argv to `argv.<n>`, its pid to `pid.<n>`, whether the previous start's
-   * process was alive to `prev.state.<n>`, and whether `orphan.pid` was alive to `orphan.state.<n>`.
+   * Stand-in `claude`: its argv to `argv.<pid>`, then (unless `die` exists) `ready.<pid>`, then it
+   * stays up. Files are keyed by pid, so nothing depends on the order the stand-ins start in, or on
+   * a stand-in that was retired before it ever ran. It does NOT `exec` into `sleep`: its command
+   * line, which `OsProbe` reads from the OS, stays `sh claude.sh <args>` however late it is read.
    */
   function standIn(): string {
     const script = join(dir, "claude.sh");
     writeFileSync(
       script,
       `#!/bin/sh
-n=$(cat "${dir}/count" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "${dir}/count"
-printf '%s\\n' "$@" > "${dir}/argv.$n"
-echo $$ > "${dir}/pid.$n"
-if [ -f "${dir}/die.$n" ]; then exit 1; fi
-if [ "$n" -gt 1 ]; then p=$((n-1)); if kill -0 "$(cat "${dir}/pid.$p")" 2>/dev/null; then echo alive; else echo gone; fi > "${dir}/prev.state.$n"; fi
-if [ -f "${dir}/orphan.pid" ]; then if kill -0 "$(cat "${dir}/orphan.pid")" 2>/dev/null; then echo alive; else echo gone; fi > "${dir}/orphan.state.$n"; fi
-exec sleep 60
+printf '%s\\n' "$@" > "${dir}/argv.$$"
+if [ -f "${dir}/die" ]; then exit 1; fi
+sleep 30 &
+p=$!
+trap 'kill $p 2>/dev/null; exit 0' TERM
+: > "${dir}/ready.$$"
+wait $p
 `,
     );
     chmodSync(script, 0o755);
     return script;
   }
 
-  const argvOf = (n: number): string[] =>
-    readFileSync(join(dir, `argv.${n}`), "utf8")
+  /**
+   * Wait for `cond`, polling a cheap local condition. The bound is far above any realistic runtime
+   * and a miss FAILS (a silent fall-through is how a slow start used to read as a wrong answer).
+   */
+  const until = async (cond: () => boolean, what: string, ms = 90_000): Promise<void> => {
+    const end = Date.now() + ms;
+    while (!cond()) {
+      if (Date.now() > end) throw new Error(`timed out waiting for ${what}`);
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  };
+  /** The stand-in with this pid has run its script (its argv file is complete). */
+  const started = (pid: number): Promise<void> =>
+    until(() => existsSync(join(dir, `ready.${pid}`)), `stand-in ${pid} to start`);
+  const argvOf = (pid: number): string[] =>
+    readFileSync(join(dir, `argv.${pid}`), "utf8")
       .split("\n")
       .filter(Boolean);
   const flagValue = (argv: string[], flag: string): string | undefined => {
     const at = argv.indexOf(flag);
     return at < 0 ? undefined : argv[at + 1];
   };
-  const stateOf = (file: string): string => readFileSync(join(dir, file), "utf8").trim();
-  const until = async (cond: () => boolean, ms = 5000): Promise<void> => {
-    const end = Date.now() + ms;
-    while (!cond() && Date.now() < end) await new Promise((r) => setTimeout(r, 50));
+  const idOfArgv = (argv: string[]): string | undefined =>
+    flagValue(argv, "--session-id") ?? flagValue(argv, "--resume");
+  const alive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
   };
+  /** The OS has finished with `pid` (a reaped zombie takes a moment to leave the table). */
+  const exited = (pid: number): Promise<void> =>
+    until(() => !alive(pid), `pid ${pid} to exit`, 15_000);
+  const livePid = (): number => mgr?.getAgent("a")?.pid as number;
+  const errLines = (reason: string): string[] =>
+    errored.filter((l) => l.includes(`reason=${reason}`));
 
   function manager(
     over: {
-      probe?: FakeProbe;
+      probe?: ProcessProbe;
       persist?: (a: string, s: string) => Promise<void>;
       store?: boolean;
       guardMs?: number;
@@ -129,18 +192,19 @@ exec sleep 60
       platform?: NodeJS.Platform;
     } = {},
   ): SessionManager {
-    mgr = new SessionManager({
+    opts = {
       commandOverride: standIn(),
       busSocketPath: join(dir, "bus.sock"),
       projectsDir,
       sessionCollisionDetectMs: 600,
       postMortemDir: join(dir, "post-mortem"),
       ownershipStore: over.store === false ? undefined : store,
-      processProbe: over.probe,
+      processProbe: over.probe ?? os,
       platform: over.platform,
       bootId: BOOT,
-      ownershipGuardMs: over.guardMs ?? 4000,
-      ownershipTermMs: over.stageMs ?? 2500,
+      ownershipGuardMs: over.guardMs ?? LOADED,
+      ownershipTermMs: over.stageMs ?? 30_000,
+      ownershipRecordMs: LOADED,
       persistRotatedSessionId:
         over.persist ??
         (async (agentId, sessionId) => {
@@ -151,7 +215,8 @@ exec sleep 60
         info: () => {},
         error: (...a) => errored.push(a.join(" ")),
       },
-    });
+    };
+    mgr = new SessionManager(opts);
     return mgr;
   }
 
@@ -163,16 +228,28 @@ exec sleep 60
     supervision: "process",
   });
 
-  /** A real process "left behind": argv `sh fake-claude.sh --resume <id>`, ends on SIGTERM. */
+  /**
+   * A real process "left behind": argv `sh fake-claude.sh --resume <id>`, ends on SIGTERM. It
+   * reports `orphan.ready` once its trap is installed, so no test guesses how long `sh` takes.
+   */
   async function startOrphan(): Promise<{ pid: number; identity: string }> {
     const script = join(dir, "fake-claude.sh");
-    writeFileSync(script, "#!/bin/sh\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n");
+    writeFileSync(
+      script,
+      `#!/bin/sh
+sleep 120 &
+p=$!
+trap 'kill $p 2>/dev/null; exit 0' TERM
+: > "${dir}/orphan.ready"
+wait $p
+`,
+    );
     chmodSync(script, 0o755);
     orphan = spawn("/bin/sh", [script, "--resume", SID], { stdio: "ignore" });
     const pid = orphan.pid as number;
-    writeFileSync(join(dir, "orphan.pid"), String(pid));
-    await new Promise((r) => setTimeout(r, 400));
-    const info = await createSystemProbe().read(pid, 3000);
+    os.watch(pid);
+    await until(() => existsSync(join(dir, "orphan.ready")), "the orphan to start");
+    const info = await os.inspect(pid);
     if (!info) throw new Error("orphan did not start");
     return { pid, identity: info.identity };
   }
@@ -189,105 +266,146 @@ exec sleep 60
     });
   };
 
-  const orphanAlive = (): boolean => {
-    try {
-      process.kill(orphan?.pid as number, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  };
+  const orphanAlive = (): boolean => alive(orphan?.pid as number);
 
   /* ── ownership at restart ─────────────────────────────────────────── */
 
-  it("a previous-boot orphan is revalidated, ended and confirmed gone BEFORE the session is resumed", async () => {
-    // Fault (site: the `decideResume` call in `spawnAgentInternal`, removed): the stand-in starts
-    // beside the live orphan. Predicted result: orphan.state.1 is "alive".
-    writeTranscript(SID);
-    seed(await startOrphan());
-    const agent = agentConfig();
-    await manager().spawnAgent(agent, "cli");
+  it(
+    "a previous-boot orphan is revalidated, ended and confirmed gone BEFORE the session is resumed",
+    async () => {
+      // Fault (site: the `decideResume` call in `spawnAgentInternal`, removed): the new process starts
+      // beside the live orphan. Predicted result: `aliveAtStart` is `[orphan.pid]`, not `[]`.
+      writeTranscript(SID);
+      const o = await startOrphan();
+      seed(o);
+      const agent = agentConfig();
+      const proc = await manager().spawnAgent(agent, "cli");
+      await started(proc.pid);
 
-    expect(stateOf("orphan.state.1")).toBe("gone");
-    expect(flagValue(argvOf(1), "--resume")).toBe(SID);
-    expect(persisted).toHaveLength(0);
-    expect(agent.session_id).toBe(SID);
-    expect(warned.filter((l) => l.includes("reason=resume-orphan-reaped"))).toHaveLength(1);
-  }, 30_000);
+      expect(os.spawned).toHaveLength(1);
+      expect(os.spawned[0]?.aliveAtStart).toEqual([]);
+      expect(os.kills).toEqual([{ pid: o.pid, signal: "SIGTERM" }]);
+      expect(flagValue(argvOf(proc.pid), "--resume")).toBe(SID);
+      expect(persisted).toHaveLength(0);
+      expect(agent.session_id).toBe(SID);
+      expect(warned.filter((l) => l.includes("reason=resume-orphan-reaped"))).toHaveLength(1);
+    },
+    T,
+  );
 
-  it("pid reused by another process (different start identity): not signalled, session resumed", async () => {
-    // Fault (site: identity comparison in `departed`, removed): the stranger is ended.
-    // Predicted result: orphan.state.1 is "gone".
-    writeTranscript(SID);
-    const o = await startOrphan();
-    seed({ pid: o.pid, identity: "a-different-start-identity" });
-    await manager().spawnAgent(agentConfig(), "cli");
+  it(
+    "pid reused by another process (different start identity): not signalled, session resumed",
+    async () => {
+      // Fault (site: identity comparison in `departed`, removed): the stranger is ended.
+      // Predicted result: `kills` is `[SIGTERM → orphan]` and `aliveAtStart` is `[]`.
+      writeTranscript(SID);
+      const o = await startOrphan();
+      seed({ pid: o.pid, identity: "a-different-start-identity" });
+      const proc = await manager().spawnAgent(agentConfig(), "cli");
+      await started(proc.pid);
 
-    expect(stateOf("orphan.state.1")).toBe("alive");
-    expect(orphanAlive()).toBe(true);
-    expect(flagValue(argvOf(1), "--resume")).toBe(SID);
-    expect(persisted).toHaveLength(0);
-  }, 30_000);
+      expect(os.spawned[0]?.aliveAtStart).toEqual([o.pid]);
+      expect(os.kills).toEqual([]);
+      expect(orphanAlive()).toBe(true);
+      expect(flagValue(argvOf(proc.pid), "--resume")).toBe(SID);
+      expect(persisted).toHaveLength(0);
+    },
+    T,
+  );
 
-  it("a record from THIS boot whose process is alive: never signalled, the session rotates", async () => {
-    // Fault (site: the boot-id comparison, removed): the daemon ends a process it manages.
-    // Predicted result: the orphan is gone and nothing is rotated.
-    writeTranscript(SID);
-    seed(await startOrphan(), { bootId: BOOT });
-    const agent = agentConfig();
-    await manager().spawnAgent(agent, "cli");
+  it(
+    "a record from THIS boot whose process is alive: never signalled, the session rotates",
+    async () => {
+      // Fault (site: the boot-id comparison, removed): the daemon ends a process it manages.
+      // Predicted result: `kills` has the orphan and nothing is rotated.
+      writeTranscript(SID);
+      seed(await startOrphan(), { bootId: BOOT });
+      const agent = agentConfig();
+      const proc = await manager().spawnAgent(agent, "cli");
+      await started(proc.pid);
 
-    expect(orphanAlive()).toBe(true);
-    expect(persisted).toHaveLength(1);
-    const fresh = persisted[0]?.sessionId as string;
-    expect(fresh).not.toBe(SID);
-    const argv = argvOf(1);
-    expect(flagValue(argv, "--session-id")).toBe(fresh);
-    expect(argv).not.toContain("--resume");
-    expect(warned.filter((l) => l.includes("reason=current-boot-owner-alive"))).toHaveLength(1);
-  }, 30_000);
+      expect(os.kills).toEqual([]);
+      expect(orphanAlive()).toBe(true);
+      expect(persisted).toHaveLength(1);
+      const fresh = persisted[0]?.sessionId as string;
+      expect(fresh).not.toBe(SID);
+      const argv = argvOf(proc.pid);
+      expect(flagValue(argv, "--session-id")).toBe(fresh);
+      expect(argv).not.toContain("--resume");
+      expect(warned.filter((l) => l.includes("reason=current-boot-owner-alive"))).toHaveLength(1);
+    },
+    T,
+  );
 
-  it("an unrecorded claude that names the session is never signalled; the session is resumed", async () => {
-    // Fault (site: a guard that searches for any process holding the id): it would be ended.
-    // Predicted result: orphan.state.1 is "gone".
-    writeTranscript(SID);
-    await startOrphan();
-    await manager().spawnAgent(agentConfig(), "cli");
+  it(
+    "an unrecorded claude that names the session is never signalled; the session is resumed",
+    async () => {
+      // Fault (site: a guard that searches for any process holding the id): it would be ended.
+      // Predicted result: `kills` has the orphan and `aliveAtStart` is `[]`.
+      writeTranscript(SID);
+      const o = await startOrphan();
+      const proc = await manager().spawnAgent(agentConfig(), "cli");
+      await started(proc.pid);
 
-    expect(stateOf("orphan.state.1")).toBe("alive");
-    expect(orphanAlive()).toBe(true);
-    expect(flagValue(argvOf(1), "--resume")).toBe(SID);
-    expect(persisted).toHaveLength(0);
-  }, 30_000);
+      expect(os.spawned[0]?.aliveAtStart).toEqual([o.pid]);
+      expect(os.kills).toEqual([]);
+      expect(orphanAlive()).toBe(true);
+      expect(flagValue(argvOf(proc.pid), "--resume")).toBe(SID);
+      expect(persisted).toHaveLength(0);
+    },
+    T,
+  );
 
-  it("an unreadable record: nothing is signalled, the session rotates, the reason is logged", async () => {
-    writeTranscript(SID);
-    await startOrphan();
-    store.readError = new Error("EACCES: owner.json");
-    const agent = agentConfig();
-    await manager().spawnAgent(agent, "cli");
+  it(
+    "an unreadable record: nothing is signalled, the session rotates, the reason is logged",
+    async () => {
+      // Fault (site: the `readError` branch of `decideResume`, resuming on a failed read): the
+      // session is resumed beside the orphan. Predicted result: `persisted` is empty.
+      writeTranscript(SID);
+      await startOrphan();
+      store.readError = new Error("EACCES: owner.json");
+      const agent = agentConfig();
+      const proc = await manager().spawnAgent(agent, "cli");
+      await started(proc.pid);
 
-    expect(orphanAlive()).toBe(true);
-    expect(persisted).toHaveLength(1);
-    expect(flagValue(argvOf(1), "--session-id")).toBe(persisted[0]?.sessionId);
-    expect(warned.filter((l) => l.includes("reason=ownership-record-unreadable"))).toHaveLength(1);
-    expect(warned.join("\n")).not.toContain("EACCES");
-  }, 30_000);
+      expect(os.kills).toEqual([]);
+      expect(orphanAlive()).toBe(true);
+      expect(persisted).toHaveLength(1);
+      expect(flagValue(argvOf(proc.pid), "--session-id")).toBe(persisted[0]?.sessionId);
+      expect(warned.filter((l) => l.includes("reason=ownership-record-unreadable"))).toHaveLength(
+        1,
+      );
+      expect(warned.join("\n")).not.toContain("EACCES");
+    },
+    T,
+  );
 
-  it("a process read that times out: nothing is signalled, the session rotates within the guard deadline", async () => {
-    writeTranscript(SID);
-    seedFake();
-    const probe = new FakeProbe();
-    probe.stallPid = 4242; // the seeded record's process; the new spawn's own record still works
-    const t0 = Date.now();
-    const agent = agentConfig();
-    await manager({ probe, guardMs: 400 }).spawnAgent(agent, "cli");
+  it(
+    "a process read that times out: nothing is signalled, the session rotates within the guard deadline",
+    async () => {
+      // Fault (site: `ownershipGuardMs` not forwarded to `decideResume`, so the 5 s default applies):
+      // the guard hands the probe a 1500 ms read timeout instead of one capped by the 400 ms left.
+      // Predicted result: the first read of pid 4242 carries `timeoutMs` 1500, not <= 400.
+      // The deadline itself (that it fires at `deadlineMs`, not before) is driven by a fake clock in
+      // `session-ownership.test.ts`; here a stalled read cannot be answered, so the only way the spawn
+      // resolves is the real 400 ms deadline firing.
+      writeTranscript(SID);
+      seedFake();
+      const probe = new FakeProbe();
+      probe.stallPid = 4242; // the seeded record's process; the new spawn's own record still works
+      const agent = agentConfig();
+      const proc = await manager({ probe, guardMs: 400 }).spawnAgent(agent, "cli");
+      await started(proc.pid);
 
-    expect(Date.now() - t0).toBeLessThan(5000);
-    expect(probe.kills).toEqual([]);
-    expect(persisted).toHaveLength(1);
-    expect(warned.filter((l) => l.includes("reason=guard-deadline"))).toHaveLength(1);
-  }, 30_000);
+      const firstRead = probe.reads.indexOf(4242);
+      expect(firstRead).toBeGreaterThanOrEqual(0);
+      expect(probe.readTimeouts[firstRead]).toBeLessThanOrEqual(400);
+      expect(probe.kills).toEqual([]);
+      expect(persisted).toHaveLength(1);
+      expect(warned.filter((l) => l.includes("reason=guard-deadline"))).toHaveLength(1);
+    },
+    T,
+  );
 
   function seedFake(): void {
     store.rec.set("a", {
@@ -301,183 +419,222 @@ exec sleep 60
     });
   }
 
-  it("a first boot (no transcript) never reads the record", async () => {
-    store.readError = new Error("must not be read");
-    const agent = agentConfig();
-    await manager().spawnAgent(agent, "cli");
+  it(
+    "a first boot (no transcript) never reads the record",
+    async () => {
+      store.readError = new Error("must not be read");
+      const agent = agentConfig();
+      const proc = await manager().spawnAgent(agent, "cli");
+      await started(proc.pid);
 
-    expect(flagValue(argvOf(1), "--session-id")).toBe(SID);
-    expect(persisted).toHaveLength(0);
-    expect(warned.join("\n")).not.toContain("ownership-record-unreadable");
-  }, 30_000);
+      expect(flagValue(argvOf(proc.pid), "--session-id")).toBe(SID);
+      expect(persisted).toHaveLength(0);
+      expect(warned.join("\n")).not.toContain("ownership-record-unreadable");
+    },
+    T,
+  );
 
-  it("with no store configured the bus keeps no records and resumes as before", async () => {
-    writeTranscript(SID);
-    await manager({ store: false }).spawnAgent(agentConfig(), "cli");
-    expect(flagValue(argvOf(1), "--resume")).toBe(SID);
-    expect(store.rec.size).toBe(0);
-  }, 30_000);
+  it(
+    "with no store configured the bus keeps no records and resumes as before",
+    async () => {
+      writeTranscript(SID);
+      const proc = await manager({ store: false }).spawnAgent(agentConfig(), "cli");
+      await started(proc.pid);
+      expect(flagValue(argvOf(proc.pid), "--resume")).toBe(SID);
+      expect(store.rec.size).toBe(0);
+    },
+    T,
+  );
 
-  it("win32 keeps its pre-#595 behaviour: no record is written, none is read, the spawn succeeds and the session is resumed", async () => {
-    // Fault (site: `ownershipGuardApplies` in `recordSpawnOwnership`, removed): on Windows the POSIX
-    // `ps` read fails and the (now fatal) record failure retires every child. Predicted result: the
-    // spawn rejects with `SpawnUnrecordedError`.
-    writeTranscript(SID);
-    store.readError = new Error("must not be read on win32");
-    let writes = 0;
-    store.write = async () => {
-      writes += 1;
-    };
-    const probe = new FakeProbe();
-    probe.failure = new Error("ps: command not found");
-    const proc = await manager({ probe, platform: "win32" }).spawnAgent(agentConfig(), "cli");
+  it(
+    "win32 keeps its pre-#595 behaviour: no record is written, none is read, the spawn succeeds and the session is resumed",
+    async () => {
+      // Fault (site: `ownershipGuardApplies` in `recordSpawnOwnership`, removed): on Windows the POSIX
+      // `ps` read fails and the (now fatal) record failure retires every child. Predicted result: the
+      // spawn rejects with `SpawnUnrecordedError`.
+      writeTranscript(SID);
+      store.readError = new Error("must not be read on win32");
+      let writes = 0;
+      store.write = async () => {
+        writes += 1;
+      };
+      const probe = new FakeProbe();
+      probe.failure = new Error("ps: command not found");
+      const proc = await manager({ probe, platform: "win32" }).spawnAgent(agentConfig(), "cli");
+      await started(proc.pid);
 
-    expect(proc.pid).toBeGreaterThan(0);
-    expect(flagValue(argvOf(1), "--resume")).toBe(SID);
-    expect(persisted).toHaveLength(0);
-    expect(writes).toBe(0);
-    expect(probe.reads).toEqual([]);
-    expect(errored.filter((l) => l.includes("ownership-record-failed"))).toEqual([]);
-    expect(isSessionQuarantined({ sessionId: SID })).toBe(false);
-    expect(mgr?.getAgent("a")?.pid).toBe(proc.pid);
-  }, 30_000);
+      expect(proc.pid).toBeGreaterThan(0);
+      expect(flagValue(argvOf(proc.pid), "--resume")).toBe(SID);
+      expect(persisted).toHaveLength(0);
+      expect(writes).toBe(0);
+      expect(probe.reads).toEqual([]);
+      expect(errored.filter((l) => l.includes("ownership-record-failed"))).toEqual([]);
+      expect(isSessionQuarantined({ sessionId: SID })).toBe(false);
+      expect(mgr?.getAgent("a")?.pid).toBe(proc.pid);
+    },
+    T,
+  );
 
   /* ── the record itself ────────────────────────────────────────────── */
 
-  it("spawn writes an ownership record for the process it started, and it is cleared once the OS confirms the exit", async () => {
-    // Fault (site: `recordSpawnOwnership` call, removed): no record, so a later restart could
-    // never prove ownership. Predicted result: `store.rec.get("a")` is undefined.
-    const m = manager();
-    const proc = await m.spawnAgent(agentConfig(), "cli");
-    await until(() => store.rec.has("a"));
+  it(
+    "spawn writes an ownership record for the process it started, and it is cleared once the OS confirms the exit",
+    async () => {
+      // Fault (site: `recordSpawnOwnership` call, removed): no record, so a later restart could
+      // never prove ownership. Predicted result: `store.rec.get("a")` is undefined.
+      const m = manager();
+      const proc = await m.spawnAgent(agentConfig(), "cli");
 
-    const rec = store.rec.get("a");
-    expect(rec?.pid).toBe(proc.pid);
-    expect(rec?.sessionId).toBe(SID);
-    expect(rec?.bootId).toBe(BOOT);
-    expect(rec?.exe).toBe("claude.sh");
-    expect(rec?.identity.length).toBeGreaterThan(3);
+      const rec = store.rec.get("a");
+      expect(rec?.pid).toBe(proc.pid);
+      expect(rec?.sessionId).toBe(SID);
+      expect(rec?.bootId).toBe(BOOT);
+      expect(rec?.exe).toBe("claude.sh");
+      expect(rec?.identity.length).toBeGreaterThan(3);
 
-    await m.stop("a");
-    await until(() => !store.rec.has("a"));
-    expect(store.rec.has("a")).toBe(false);
-  }, 30_000);
+      await m.stop("a");
+      await until(() => !store.rec.has("a"), "the record to be cleared");
+      expect(store.rec.has("a")).toBe(false);
+    },
+    T,
+  );
 
-  const alive = (pid: number): boolean => {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  };
-  const pidOf = (n: number): number => Number(stateOf(`pid.${n}`));
-  const errLines = (reason: string): string[] =>
-    errored.filter((l) => l.includes(`reason=${reason}`));
+  it(
+    "a record that cannot be written ends the child and fails the spawn: no record, and nothing of ours left",
+    async () => {
+      // Fault (site: the `if (recordFailure)` branch in `spawnAgentInternal`, write failure tolerated
+      // again as in round 3): the child keeps running unrecorded. Predicted result: the spawn
+      // resolves and the child is still alive when `exited` gives up.
+      store.write = async () => {
+        throw Object.assign(new Error("secret path /x/owner.json"), { code: "ENOSPC" });
+      };
+      const m = manager();
+      const err = await m.spawnAgent(agentConfig(), "cli").then(
+        () => null,
+        (e: unknown) => e,
+      );
 
-  it("a record that cannot be written ends the child and fails the spawn: no record, and nothing of ours left", async () => {
-    // Fault (site: the `if (recordFailure)` branch in `spawnAgentInternal`, write failure tolerated
-    // again as in round 3): the child keeps running unrecorded. Predicted result: the spawn
-    // resolves and `pid.1` is alive.
-    store.write = async () => {
-      throw Object.assign(new Error("secret path /x/owner.json"), { code: "ENOSPC" });
-    };
-    const m = manager();
-    const err = await m.spawnAgent(agentConfig(), "cli").then(
-      () => null,
-      (e: unknown) => e,
-    );
+      expect(err).toBeInstanceOf(SpawnUnrecordedError);
+      expect((err as SpawnUnrecordedError).code).toBe("ownership-record-failed");
+      expect((err as SpawnUnrecordedError).retired).toBe(true);
+      // The child's pid is the one its identity was read for (its stand-in may never have run).
+      expect(os.spawned).toHaveLength(1);
+      const child = (os.spawned[0] as SpawnedProcess).pid;
+      await exited(child);
+      expect(alive(child)).toBe(false);
+      expect(store.rec.size).toBe(0);
+      expect(m._list()).toEqual([]);
+      expect(m.getAgent("a")).toBeUndefined();
+      expect(isSessionQuarantined({ sessionId: SID })).toBe(false);
+      // One line, a reason code and the errno; nothing the child or the error message printed.
+      const lines = errLines("ownership-record-failed");
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain("cause=ENOSPC");
+      expect(lines[0]).not.toContain("secret path");
+    },
+    T,
+  );
 
-    expect(err).toBeInstanceOf(SpawnUnrecordedError);
-    expect((err as SpawnUnrecordedError).code).toBe("ownership-record-failed");
-    expect((err as SpawnUnrecordedError).retired).toBe(true);
-    expect(alive(pidOf(1))).toBe(false);
-    expect(store.rec.size).toBe(0);
-    expect(m._list()).toEqual([]);
-    expect(m.getAgent("a")).toBeUndefined();
-    expect(isSessionQuarantined({ sessionId: SID })).toBe(false);
-    // One line, a reason code and the errno; nothing the child or the error message printed.
-    const lines = errLines("ownership-record-failed");
-    expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain("cause=ENOSPC");
-    expect(lines[0]).not.toContain("secret path");
-  }, 30_000);
+  it(
+    "a record that cannot be written AND a child that is not confirmed gone: the session is quarantined",
+    async () => {
+      // Fault (site: `retireLive`, the confirmation ignored): the failed spawn leaves a child that may
+      // still write and no quarantine. Predicted result: `isSessionQuarantined` is false.
+      store.write = async () => {
+        throw new Error("EROFS");
+      };
+      const probe = new FakeProbe();
+      probe.alwaysAlive = claudeInfo({ identity: "T1" });
+      const m = manager({ probe, stageMs: 150 });
+      const err = await m.spawnAgent(agentConfig(), "cli").then(
+        () => null,
+        (e: unknown) => e,
+      );
 
-  it("a record that cannot be written AND a child that is not confirmed gone: the session is quarantined", async () => {
-    // Fault (site: `retireLive`, the confirmation ignored): the failed spawn leaves a child that may
-    // still write and no quarantine. Predicted result: `isSessionQuarantined` is false.
-    store.write = async () => {
-      throw new Error("EROFS");
-    };
-    const probe = new FakeProbe();
-    probe.alwaysAlive = claudeInfo({ identity: "T1" });
-    const m = manager({ probe, stageMs: 150 });
-    const err = await m.spawnAgent(agentConfig(), "cli").then(
-      () => null,
-      (e: unknown) => e,
-    );
+      expect(err).toBeInstanceOf(SpawnUnrecordedError);
+      expect((err as SpawnUnrecordedError).retired).toBe(false);
+      expect(String((err as Error).message)).toContain("quarantined");
+      expect(isSessionQuarantined({ sessionId: SID })).toBe(true);
+      expect(probe.kills.map((k) => k.signal)).toEqual(["SIGKILL"]);
+      expect(errLines("spawn-retire-unconfirmed")).toHaveLength(1);
+      // The existing #562 gate holds the session until the OS confirms the exit.
+      await expect(assertSessionWritable({ sessionId: SID })).rejects.toThrow("quarantined");
+      probe.alwaysAlive = null;
+      await assertSessionWritable({ sessionId: SID });
+    },
+    T,
+  );
 
-    expect(err).toBeInstanceOf(SpawnUnrecordedError);
-    expect((err as SpawnUnrecordedError).retired).toBe(false);
-    expect(String((err as Error).message)).toContain("quarantined");
-    expect(isSessionQuarantined({ sessionId: SID })).toBe(true);
-    expect(probe.kills.map((k) => k.signal)).toEqual(["SIGKILL"]);
-    expect(errLines("spawn-retire-unconfirmed")).toHaveLength(1);
-    // The existing #562 gate holds the session until the OS confirms the exit.
-    await expect(assertSessionWritable({ sessionId: SID })).rejects.toThrow("quarantined");
-    probe.alwaysAlive = null;
-    await assertSessionWritable({ sessionId: SID });
-  }, 30_000);
+  it(
+    "an identity that cannot be read fails the spawn the same way",
+    async () => {
+      const probe = new FakeProbe();
+      probe.failure = new Error("ps: operation not permitted");
+      const m = manager({ probe, stageMs: 150 });
+      const err = await m.spawnAgent(agentConfig(), "cli").then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(SpawnUnrecordedError);
+      expect((err as SpawnUnrecordedError).stage).toBe("identity-read");
+      expect(store.rec.size).toBe(0);
+      expect(errLines("ownership-record-failed")).toHaveLength(1);
+    },
+    T,
+  );
 
-  it("an identity that cannot be read fails the spawn the same way", async () => {
-    const probe = new FakeProbe();
-    probe.failure = new Error("ps: operation not permitted");
-    const m = manager({ probe, stageMs: 150 });
-    const err = await m.spawnAgent(agentConfig(), "cli").then(
-      () => null,
-      (e: unknown) => e,
-    );
-    expect(err).toBeInstanceOf(SpawnUnrecordedError);
-    expect((err as SpawnUnrecordedError).stage).toBe("identity-read");
-    expect(store.rec.size).toBe(0);
-    expect(errLines("ownership-record-failed")).toHaveLength(1);
-  }, 30_000);
+  it(
+    "the agent is not reported spawned, and gets no prompt, before its record exists",
+    async () => {
+      // Fault (site: `deliverable` hiding in `getAgent`, removed): the process is handed out while the
+      // write is still pending. Predicted result: `getAgent("a")` is defined while the write waits.
+      const write = store.write.bind(store);
+      const writing = manual();
+      const release = manual();
+      store.write = async (r) => {
+        writing.resolve();
+        await release.promise;
+        await write(r);
+      };
+      const m = manager();
+      const spawning = m.spawnAgent(agentConfig(), "cli");
+      await writing.promise;
 
-  it("the agent is not reported spawned, and gets no prompt, before its record exists", async () => {
-    // Fault (site: `deliverable` hiding in `getAgent`, removed): the process is handed out while the
-    // write is still pending. Predicted result: `seenBeforeRecord` is true.
-    const write = store.write.bind(store);
-    store.write = async (r) => {
-      await new Promise((res) => setTimeout(res, 400));
-      await write(r);
-    };
-    const m = manager();
-    let seenBeforeRecord = false;
-    const poll = setInterval(() => {
-      if (m.getAgent("a") && !store.rec.has("a")) seenBeforeRecord = true;
-    }, 10);
-    let resolvedWithRecord = false;
-    try {
-      await m.spawnAgent(agentConfig(), "cli");
-      resolvedWithRecord = store.rec.has("a");
-    } finally {
-      clearInterval(poll);
-    }
-    expect(seenBeforeRecord).toBe(false);
-    expect(resolvedWithRecord).toBe(true);
-    expect(m.getAgent("a")).toBeDefined();
-  }, 30_000);
+      // The write is pending right now: the process exists and is not yet the caller's.
+      expect(m.getAgent("a")).toBeUndefined();
+      expect(m.recordingPending("a")).not.toBeNull();
+      expect(store.rec.has("a")).toBe(false);
 
-  it("a same-boot restart that keeps the id resumes it: the earlier process is confirmed exited", async () => {
-    writeTranscript(SID);
-    const m = manager();
-    await m.spawnAgent(agentConfig(), "cli");
-    await until(() => store.rec.has("a"));
-    await m.restart("a", { freshSession: false, reason: "manual" });
+      release.resolve();
+      const proc = await spawning;
+      expect(store.rec.has("a")).toBe(true);
+      expect(m.getAgent("a")?.pid).toBe(proc.pid);
+      expect(m.recordingPending("a")).toBeNull();
+    },
+    T,
+  );
 
-    expect(flagValue(argvOf(2), "--resume")).toBe(SID);
-    expect(persisted).toHaveLength(0);
-  }, 30_000);
+  it(
+    "a same-boot restart that keeps the id resumes it: the earlier process is confirmed exited",
+    async () => {
+      // Fault (site: the confirmation in `retireLive`, skipped): the new process starts while the
+      // earlier one is still running. Predicted result: `aliveAtStart` is `[first.pid]`.
+      writeTranscript(SID);
+      const m = manager();
+      const first = await m.spawnAgent(agentConfig(), "cli");
+      await started(first.pid);
+      await m.restart("a", { freshSession: false, reason: "manual" });
+      const second = livePid();
+      await started(second);
+
+      expect(second).not.toBe(first.pid);
+      expect(flagValue(argvOf(second), "--resume")).toBe(SID);
+      expect(os.spawned).toHaveLength(2);
+      expect(os.spawned[1]?.aliveAtStart).toEqual([]);
+      expect(persisted).toHaveLength(0);
+    },
+    T,
+  );
 
   /* ── /clear as a controlled restart ───────────────────────────────── */
 
@@ -487,161 +644,195 @@ exec sleep 60
     return handler as unknown as SlashHandler;
   }
 
-  it("/clear retires the old process BEFORE the new spawn, on `--session-id <new id>`, and stores that id", async () => {
-    // Fault (site: `wiring.ts`, `/clear` relayed as a keystroke and the id rotated, the round-2
-    // behaviour): no restart. Predicted result: `argv.2` does not exist.
-    writeTranscript(SID);
-    const m = manager();
-    const clear = wired(m);
-    const agent = agentConfig();
-    await m.spawnAgent(agent, "cli");
-    await until(() => store.rec.has("a"));
-    expect(flagValue(argvOf(1), "--resume")).toBe(SID);
+  it(
+    "/clear retires the old process BEFORE the new spawn, on `--session-id <new id>`, and stores that id",
+    async () => {
+      // Fault (site: `wiring.ts`, `/clear` relayed as a keystroke and the id rotated, the round-2
+      // behaviour): no restart. Predicted result: `os.spawned` has one process, so `spawned[1]` is
+      // undefined.
+      writeTranscript(SID);
+      const m = manager();
+      const clear = wired(m);
+      const agent = agentConfig();
+      const first = await m.spawnAgent(agent, "cli");
+      await started(first.pid);
+      expect(flagValue(argvOf(first.pid), "--resume")).toBe(SID);
 
-    await clear("a", "/clear");
+      await clear("a", "/clear");
+      const second = livePid();
+      await started(second);
 
-    expect(persisted).toHaveLength(1);
-    const fresh = persisted[0]?.sessionId as string;
-    expect(fresh).not.toBe(SID);
-    expect(stateOf("prev.state.2")).toBe("gone");
-    const second = argvOf(2);
-    expect(flagValue(second, "--session-id")).toBe(fresh);
-    expect(second).not.toContain("--resume");
-    // The stored id equals the live process's id.
-    expect(agent.session_id).toBe(fresh);
-    expect(persisted[0]?.agentId).toBe("a");
-    expect(warned.filter((l) => l.includes("reason=session-cleared"))).toHaveLength(1);
-    expect(m.getAgent("a")?.pid).toBeGreaterThan(0);
-  }, 30_000);
+      expect(persisted).toHaveLength(1);
+      const fresh = persisted[0]?.sessionId as string;
+      expect(fresh).not.toBe(SID);
+      expect(os.spawned).toHaveLength(2);
+      expect(os.spawned[1]?.pid).toBe(second);
+      expect(os.spawned[1]?.aliveAtStart).toEqual([]);
+      const argv = argvOf(second);
+      expect(flagValue(argv, "--session-id")).toBe(fresh);
+      expect(argv).not.toContain("--resume");
+      // The stored id equals the live process's id.
+      expect(agent.session_id).toBe(fresh);
+      expect(persisted[0]?.agentId).toBe("a");
+      expect(warned.filter((l) => l.includes("reason=session-cleared"))).toHaveLength(1);
+      expect(m.getAgent("a")?.pid).toBeGreaterThan(0);
+    },
+    T,
+  );
 
-  it("/clear whose old process cannot be confirmed gone fails, quarantines the session, and leaves the stored id", async () => {
-    // Fault (site: `clearSessionInternal`, the confirmation result ignored): the clear "succeeds"
-    // on a process that may still write. Predicted result: the promise resolves and a new id is
-    // persisted.
-    writeTranscript(SID);
-    const probe = new FakeProbe();
-    probe.alwaysAlive = claudeInfo({ identity: "T1" });
-    const m = manager({ probe, stageMs: 150 });
-    const clear = wired(m);
-    const agent = agentConfig();
-    await m.spawnAgent(agent, "cli");
-    await until(() => store.rec.has("a"));
+  it(
+    "/clear whose old process cannot be confirmed gone fails, quarantines the session, and leaves the stored id",
+    async () => {
+      // Fault (site: `clearSessionInternal`, the confirmation result ignored): the clear "succeeds"
+      // on a process that may still write. Predicted result: the promise resolves and a new id is
+      // persisted.
+      writeTranscript(SID);
+      const probe = new FakeProbe();
+      probe.alwaysAlive = claudeInfo({ identity: "T1" });
+      const m = manager({ probe, stageMs: 150 });
+      const clear = wired(m);
+      const agent = agentConfig();
+      await m.spawnAgent(agent, "cli");
 
-    await expect(clear("a", "/clear")).rejects.toThrow("not confirmed gone");
+      await expect(clear("a", "/clear")).rejects.toThrow("not confirmed gone");
 
-    expect(persisted).toHaveLength(0);
-    expect(agent.session_id).toBe(SID);
-    expect(existsSync(join(dir, "argv.2"))).toBe(false);
-    expect(isSessionQuarantined({ sessionId: SID })).toBe(true);
-    expect(probe.kills.map((k) => k.signal)).toEqual(["SIGKILL"]);
-    expect(errored.filter((l) => l.includes("reason=clear-retire-unconfirmed"))).toHaveLength(1);
-    // The existing #562 gate: nothing starts on the session while it is quarantined...
-    await expect(assertSessionWritable({ sessionId: SID })).rejects.toThrow("quarantined");
-    // ...and the quarantine lifts once the OS confirms the exit.
-    probe.alwaysAlive = null;
-    await assertSessionWritable({ sessionId: SID });
-    expect(isSessionQuarantined({ sessionId: SID })).toBe(false);
-  }, 30_000);
+      expect(persisted).toHaveLength(0);
+      expect(agent.session_id).toBe(SID);
+      // No second process was spawned: every spawn's identity is read before its `spawnAgent` resolves.
+      expect(new Set(probe.reads).size).toBe(1);
+      expect(isSessionQuarantined({ sessionId: SID })).toBe(true);
+      expect(probe.kills.map((k) => k.signal)).toEqual(["SIGKILL"]);
+      expect(errored.filter((l) => l.includes("reason=clear-retire-unconfirmed"))).toHaveLength(1);
+      // The existing #562 gate: nothing starts on the session while it is quarantined...
+      await expect(assertSessionWritable({ sessionId: SID })).rejects.toThrow("quarantined");
+      // ...and the quarantine lifts once the OS confirms the exit.
+      probe.alwaysAlive = null;
+      await assertSessionWritable({ sessionId: SID });
+      expect(isSessionQuarantined({ sessionId: SID })).toBe(false);
+    },
+    T,
+  );
 
-  it("/clear whose new id cannot be stored fails and brings the old session back", async () => {
-    writeTranscript(SID);
-    const m = manager({
-      persist: async () => {
-        throw new Error("EROFS");
-      },
-    });
-    const clear = wired(m);
-    const agent = agentConfig();
-    await m.spawnAgent(agent, "cli");
-    await until(() => store.rec.has("a"));
+  it(
+    "/clear whose new id cannot be stored fails and brings the old session back",
+    async () => {
+      writeTranscript(SID);
+      const m = manager({
+        persist: async () => {
+          throw new Error("EROFS");
+        },
+      });
+      const clear = wired(m);
+      const agent = agentConfig();
+      await m.spawnAgent(agent, "cli");
 
-    await expect(clear("a", "/clear")).rejects.toThrow("could not be stored");
+      await expect(clear("a", "/clear")).rejects.toThrow("could not be stored");
+      const restored = livePid();
+      await started(restored);
 
-    expect(agent.session_id).toBe(SID);
-    expect(flagValue(argvOf(2), "--resume")).toBe(SID);
-    expect(m.getAgent("a")).toBeDefined();
-    expect(errored.filter((l) => l.includes("reason=clear-persist-failed"))).toHaveLength(1);
-  }, 30_000);
+      expect(agent.session_id).toBe(SID);
+      expect(flagValue(argvOf(restored), "--resume")).toBe(SID);
+      expect(m.getAgent("a")).toBeDefined();
+      expect(errored.filter((l) => l.includes("reason=clear-persist-failed"))).toHaveLength(1);
+    },
+    T,
+  );
 
   it("/clear of an agent that is not running rejects instead of reporting success", async () => {
     const m = manager();
     await expect(m.clearSession("a")).rejects.toThrow("no active agent");
   });
 
-  it("other slash commands neither restart the agent nor touch the stored id", async () => {
-    writeTranscript(SID);
-    const m = manager();
-    const clear = wired(m);
-    await m.spawnAgent(agentConfig(), "cli");
-    await clear("a", "/compact");
-    expect(persisted).toHaveLength(0);
-    expect(existsSync(join(dir, "argv.2"))).toBe(false);
-  }, 30_000);
-
-  /* ── one lifecycle queue per agent ────────────────────────────────── */
-
-  const idOfStart = (n: number): string | undefined =>
-    flagValue(argvOf(n), "--session-id") ?? flagValue(argvOf(n), "--resume");
-
-  for (const order of ["clear-then-restart", "restart-then-clear"] as const) {
-    it(`/clear and restart issued together (${order}) run one after the other and leave one live process on the stored id`, async () => {
-      // Fault (site: `enqueueLifecycle`, the queue removed so each op runs at once): the two
-      // operations capture the same record and retire it together. Predicted result: a rejection
-      // ("already spawned") or two live processes, or a stored id that is not the live one.
+  it(
+    "other slash commands neither restart the agent nor touch the stored id",
+    async () => {
       writeTranscript(SID);
       const m = manager();
       const clear = wired(m);
-      const agent = agentConfig();
-      await m.spawnAgent(agent, "cli");
-      await until(() => store.rec.has("a"));
+      await m.spawnAgent(agentConfig(), "cli");
+      await clear("a", "/compact");
+      expect(persisted).toHaveLength(0);
+      expect(os.spawned).toHaveLength(1);
+    },
+    T,
+  );
 
-      const doClear = (): Promise<void> => clear("a", "/clear");
-      const doRestart = (): Promise<unknown> => m.restart("a", { reason: "manual" });
-      const results =
-        order === "clear-then-restart"
-          ? await Promise.allSettled([doClear(), doRestart()])
-          : await Promise.allSettled([doRestart(), doClear()]);
+  /* ── one lifecycle queue per agent ────────────────────────────────── */
 
-      expect(results.map((r) => r.status)).toEqual(["fulfilled", "fulfilled"]);
-      expect(persisted).toHaveLength(2);
-      // Each start found the previous process already gone: they did not overlap.
-      expect(stateOf("prev.state.2")).toBe("gone");
-      expect(stateOf("prev.state.3")).toBe("gone");
-      expect(existsSync(join(dir, "argv.4"))).toBe(false);
-      // Exactly one live process, and the stored id is the one it runs on.
-      expect([pidOf(1), pidOf(2), pidOf(3)].filter(alive)).toEqual([pidOf(3)]);
-      const last = persisted[1]?.sessionId;
-      expect(idOfStart(3)).toBe(last);
-      expect(agent.session_id).toBe(last);
-      expect(idOfStart(2)).toBe(persisted[0]?.sessionId);
-      expect(m.getAgent("a")?.pid).toBe(pidOf(3));
-    }, 60_000);
+  for (const order of ["clear-then-restart", "restart-then-clear"] as const) {
+    it(
+      `/clear and restart issued together (${order}) run one after the other and leave one live process on the stored id`,
+      async () => {
+        // Fault (site: `enqueueLifecycle`, the queue removed so each op runs at once): the two
+        // operations capture the same record and retire it together. Predicted result: a rejection
+        // ("already spawned") or two live processes, or a stored id that is not the live one.
+        writeTranscript(SID);
+        const m = manager();
+        const clear = wired(m);
+        const agent = agentConfig();
+        await m.spawnAgent(agent, "cli");
+
+        const doClear = (): Promise<void> => clear("a", "/clear");
+        const doRestart = (): Promise<unknown> => m.restart("a", { reason: "manual" });
+        const results =
+          order === "clear-then-restart"
+            ? await Promise.allSettled([doClear(), doRestart()])
+            : await Promise.allSettled([doRestart(), doClear()]);
+
+        expect(results.map((r) => r.status)).toEqual(["fulfilled", "fulfilled"]);
+        expect(persisted).toHaveLength(2);
+        // Three processes, in this order, read from the OS (a retired one may never have run its script).
+        expect(os.spawned).toHaveLength(3);
+        const [p1, p2, p3] = os.spawned as [SpawnedProcess, SpawnedProcess, SpawnedProcess];
+        // Each start found every earlier process already gone: they did not overlap.
+        expect(p2.aliveAtStart).toEqual([]);
+        expect(p3.aliveAtStart).toEqual([]);
+        // Exactly one live process, and the stored id is the one it runs on.
+        await exited(p1.pid);
+        await exited(p2.pid);
+        expect(alive(p3.pid)).toBe(true);
+        const last = persisted[1]?.sessionId;
+        expect(idOfArgv(p3.argv)).toBe(last);
+        expect(agent.session_id).toBe(last);
+        expect(idOfArgv(p2.argv)).toBe(persisted[0]?.sessionId);
+        expect(m.getAgent("a")?.pid).toBe(p3.pid);
+      },
+      T,
+    );
   }
 
   /* ── /clear succeeds only on a live replacement ───────────────────── */
 
-  it("a /clear whose replacement exits during startup rejects with its reason, and logs no success", async () => {
-    // Fault (site: the liveness check after the replacement spawn, removed: spawn completion taken
-    // as success): the clear resolves with no agent running. Predicted result: the promise resolves
-    // and `reason=session-cleared` is logged.
-    writeTranscript(SID);
-    const m = manager();
-    const clear = wired(m);
-    const agent = agentConfig();
-    await m.spawnAgent(agent, "cli");
-    await until(() => store.rec.has("a"));
-    writeFileSync(join(dir, "die.2"), "");
+  it(
+    "a /clear whose replacement exits during startup rejects with its reason, and logs no success",
+    async () => {
+      // Fault (site: the liveness check after the replacement spawn, removed: spawn completion taken
+      // as success): the clear resolves with no agent running. Predicted result: the promise resolves
+      // and `reason=session-cleared` is logged.
+      // The replacement's startup window is far longer than its life: its spawn returns when it
+      // exits, however slowly `sh` gets going, rather than when 600 ms have passed.
+      writeTranscript(SID);
+      const m = manager();
+      const clear = wired(m);
+      const agent = agentConfig();
+      const first = await m.spawnAgent(agent, "cli");
+      await started(first.pid);
+      writeFileSync(join(dir, "die"), "");
+      opts.sessionCollisionDetectMs = 60_000;
 
-    const err = await clear("a", "/clear").then(
-      () => null,
-      (e: unknown) => e,
-    );
+      const err = await clear("a", "/clear").then(
+        () => null,
+        (e: unknown) => e,
+      );
 
-    expect(err).toBeInstanceOf(ClearReplacementExitedError);
-    expect((err as ClearReplacementExitedError).code).toBe("clear-replacement-exited");
-    expect(warned.filter((l) => l.includes("reason=session-cleared"))).toHaveLength(0);
-    expect(errLines("clear-replacement-exited")).toHaveLength(1);
-    expect(m.getAgent("a")).toBeUndefined();
-    expect(alive(pidOf(1))).toBe(false);
-  }, 30_000);
+      expect(err).toBeInstanceOf(ClearReplacementExitedError);
+      expect((err as ClearReplacementExitedError).code).toBe("clear-replacement-exited");
+      expect(warned.filter((l) => l.includes("reason=session-cleared"))).toHaveLength(0);
+      expect(errLines("clear-replacement-exited")).toHaveLength(1);
+      expect(m.getAgent("a")).toBeUndefined();
+      await exited(first.pid);
+      expect(alive(first.pid)).toBe(false);
+    },
+    T,
+  );
 });

@@ -22,7 +22,7 @@ import { FrameDecoder } from "../core-ipc";
 import { canStreamToAgent } from "../receipt-wiring";
 import { resolveAgentCwd, SessionManager, SpawnUnrecordedError } from "../session-manager";
 import type { AgentConfig, IpcMessage } from "../types";
-import { MemoryStore } from "./ownership-fakes";
+import { MemoryStore, OsProbe } from "./ownership-fakes";
 
 function mockEventLog() {
   let seq = 0;
@@ -85,7 +85,7 @@ async function connectAgent(bus: BusCore, socketPath: string, agent_id: string) 
   );
   const start = Date.now();
   while (!bus.state().connectedAgents.includes(agent_id)) {
-    if (Date.now() - start > 5000) throw new Error(`hello for ${agent_id} never registered`);
+    if (Date.now() - start > 60_000) throw new Error(`hello for ${agent_id} never registered`);
     await new Promise((r) => setTimeout(r, 5));
   }
   return {
@@ -95,9 +95,13 @@ async function connectAgent(bus: BusCore, socketPath: string, agent_id: string) 
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const until = async (cond: () => boolean, ms = 8000): Promise<void> => {
+/** Wait for a cheap local condition, far longer than a loaded machine needs; a miss FAILS. */
+const until = async (cond: () => boolean, ms = 90_000): Promise<void> => {
   const end = Date.now() + ms;
-  while (!cond() && Date.now() < end) await sleep(10);
+  while (!cond()) {
+    if (Date.now() > end) throw new Error("timed out waiting for a condition");
+    await sleep(10);
+  }
 };
 
 const prompt = (text: string) => ({
@@ -143,6 +147,8 @@ async function startBus(over: { deliveryBackstopMs?: number } = {}) {
     eventLogAppend: mockEventLog(),
     turnEndSettleMs: 0,
     socketPath: sockPath,
+    // The 4 s default races a loaded machine; the one test of the backstop passes its own.
+    deliveryBackstopMs: 120_000,
     ...over,
   });
   await bus.start();
@@ -241,7 +247,6 @@ describe("recording pending holds prompts on both transports (#595 r5), at the b
     b.setRecordingPendingHandler?.(() => new Promise<void>(() => {}));
     client = await connectAgent(b, sockPath, "alpha");
 
-    const t0 = Date.now();
     const err = await b.sendPrompt(prompt("hello")).then(
       () => null,
       (e: unknown) => e,
@@ -249,10 +254,10 @@ describe("recording pending holds prompts on both transports (#595 r5), at the b
 
     expect(err).toBeInstanceOf(AgentNotRecordedError);
     expect((err as AgentNotRecordedError).reason).toBe("recording-timeout");
-    expect(Date.now() - t0).toBeLessThan(3000);
     expect(typed).toEqual([]);
     expect(client.prompts()).toEqual([]);
-  });
+    // A backstop that is not applied never settles the prompt, and the test times out.
+  }, 30_000);
 
   it("prompts held for one agent are delivered in the order they arrived", async () => {
     const { bus: b, sockPath } = await startBus();
@@ -322,6 +327,9 @@ describe("recording pending, end to end with a real SessionManager (#595 r5)", (
       postMortemDir: join(tempDir, "post-mortem"),
       ownershipStore: store,
       bootId: "boot-now",
+      // The real probe with no per-read timeout, and a record bound far above a loaded `ps`.
+      processProbe: new OsProbe(),
+      ownershipRecordMs: 120_000,
       logger: { warn: () => {}, info: () => {}, error: () => {} },
     });
     const m = mgr;

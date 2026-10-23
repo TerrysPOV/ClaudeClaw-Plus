@@ -146,6 +146,11 @@ export interface SessionManagerOptions {
   bootId?: string;
   ownershipGuardMs?: number;
   ownershipTermMs?: number;
+  /**
+   * Test seam: the bound in ms on each step of writing a NEW ownership record (the identity read
+   * and the write). Unset keeps `RECORD_STEP_MS`.
+   */
+  ownershipRecordMs?: number;
   /** Test seam for the platform the ownership guard keys on (default: `process.platform`). */
   platform?: NodeJS.Platform;
   /**
@@ -1536,6 +1541,7 @@ export class SessionManager {
       pid: proc.pid,
       exe: basename(this.options.commandOverride ?? claudeExecutable()),
       bootId: this.options.bootId,
+      timeoutMs: this.options.ownershipRecordMs,
     });
   }
 

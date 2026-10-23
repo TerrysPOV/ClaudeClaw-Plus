@@ -442,28 +442,46 @@ export class GuardDeadlineError extends Error {
   }
 }
 
+/**
+ * TEST SEAM: the clock and timer `decideResume` runs on. Unset, the guard uses the real `Date.now`
+ * and `setTimeout`, so production behaviour is exactly what it was; a test passes a fake to move the
+ * deadline by hand instead of racing it against a loaded machine.
+ */
+export interface GuardClock {
+  now(): number;
+  setTimeout(fn: () => void, ms: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
+
+const REAL_CLOCK: GuardClock = {
+  now: () => Date.now(),
+  setTimeout: (fn, ms) => setTimeout(fn, ms),
+  clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+};
+
 /** `p`, or `GuardDeadlineError` when `ms` passes first. `p` is not cancelled; its outcome is absorbed. */
-function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
+function withDeadline<T>(p: Promise<T>, ms: number, clock: GuardClock = REAL_CLOCK): Promise<T> {
   if (ms <= 0) {
     p.catch(() => {});
     return Promise.reject(new GuardDeadlineError());
   }
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new GuardDeadlineError()), ms);
+    const timer = clock.setTimeout(() => reject(new GuardDeadlineError()), ms);
     p.then(
       (v) => {
-        clearTimeout(timer);
+        clock.clearTimeout(timer);
         resolve(v);
       },
       (e) => {
-        clearTimeout(timer);
+        clock.clearTimeout(timer);
         reject(e);
       },
     );
   });
 }
 
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number, clock: GuardClock = REAL_CLOCK): Promise<void> =>
+  new Promise((r) => clock.setTimeout(r, ms));
 
 /* ── What the argv must still say ───────────────────────────────────────── */
 
@@ -672,12 +690,15 @@ export async function decideResume(a: {
   deadlineMs?: number;
   termMs?: number;
   killMs?: number;
+  /** TEST SEAM (`GuardClock`): inert when unset. */
+  clock?: GuardClock;
 }): Promise<ResumeDecision> {
   const bootId = a.bootId ?? DAEMON_BOOT_ID;
   const uid = a.uid ?? process.getuid?.() ?? -1;
-  const end = Date.now() + (a.deadlineMs ?? GUARD_DEADLINE_MS);
-  const left = (): number => end - Date.now();
-  const bounded = <T>(p: Promise<T>): Promise<T> => withDeadline(p, left());
+  const clock = a.clock ?? REAL_CLOCK;
+  const end = clock.now() + (a.deadlineMs ?? GUARD_DEADLINE_MS);
+  const left = (): number => end - clock.now();
+  const bounded = <T>(p: Promise<T>): Promise<T> => withDeadline(p, left(), clock);
 
   try {
     let rec: OwnershipRecord | null;
@@ -746,14 +767,14 @@ export async function decideResume(a: {
       }
       const stageMs =
         signal === "SIGTERM" ? (a.termMs ?? ORPHAN_TERM_MS) : (a.killMs ?? ORPHAN_KILL_MS);
-      const until = Math.min(end, Date.now() + stageMs);
+      const until = Math.min(end, clock.now() + stageMs);
       for (;;) {
         if (departed(await read(), owned)) {
           gone = true;
           break;
         }
-        if (Date.now() >= until) break;
-        await bounded(sleep(Math.min(POLL_MS, Math.max(1, until - Date.now()))));
+        if (clock.now() >= until) break;
+        await bounded(sleep(Math.min(POLL_MS, Math.max(1, until - clock.now())), clock));
       }
       if (gone) break;
     }

@@ -22,10 +22,26 @@ import {
   readFromPs,
   sameStart,
 } from "../session-ownership";
-import { claudeInfo, FakeProbe, MemoryStore, recordFor, SID, UID } from "./ownership-fakes";
+import {
+  claudeInfo,
+  FakeClock,
+  FakeProbe,
+  MemoryStore,
+  recordFor,
+  SID,
+  UID,
+} from "./ownership-fakes";
 
 const BOOT = "boot-now";
-const FAST = { uid: UID, bootId: BOOT, deadlineMs: 2000, termMs: 150, killMs: 150 };
+/** A bound a real subprocess read must not race: far above a loaded machine's slowest `ps`. */
+const LOADED = 120_000;
+/**
+ * The deadline is far above any realistic runtime so a loaded machine cannot turn "orphan
+ * unconfirmed" into "guard deadline"; the stage bounds are what these tests mean to expire (the
+ * fake probe answers at once, so a longer wall-clock only delays the stage ending, never changes it).
+ * The deadline itself is tested on a fake clock below.
+ */
+const FAST = { uid: UID, bootId: BOOT, deadlineMs: 120_000, termMs: 150, killMs: 150 };
 
 describe("decideResume — what a restart may do (#595 r3)", () => {
   let events: string[];
@@ -96,7 +112,7 @@ describe("decideResume — what a restart may do (#595 r3)", () => {
   it("an orphan that survives SIGKILL is unconfirmed: rotate, never resume beside it", async () => {
     store.rec.set("a", recordFor());
     probe.table.set(900, claudeInfo());
-    const d = await decide({ deadlineMs: 2000, termMs: 150, killMs: 150 });
+    const d = await decide({ termMs: 150, killMs: 150 });
     expect(d).toEqual({ kind: "rotate", reason: "orphan-unconfirmed" });
     expect(probe.kills.map((k) => k.signal)).toEqual(["SIGTERM", "SIGKILL"]);
     expect(store.rec.has("a")).toBe(true);
@@ -210,48 +226,71 @@ describe("decideResume — what a restart may do (#595 r3)", () => {
 });
 
 describe("decideResume — one deadline for the whole guard (#595 r3)", () => {
-  it("a process read that never returns: rotates within the bound, nothing signalled", async () => {
+  // Round 5b: the deadline runs on a `FakeClock` (the `GuardClock` test seam), moved by hand. No
+  // test here waits on, or measures, the wall clock, so a loaded machine cannot fail them.
+  const flush = (): Promise<void> => new Promise((r) => setImmediate(r));
+  const base = { agentId: "a", sessionId: SID, uid: UID, bootId: BOOT };
+
+  it("a process read that never returns: rotates at the bound, not before it, nothing signalled", async () => {
     // Fault (site: the deadline wrapper around `probe.read`, removed): the read is awaited
     // forever. Predicted result: the call does not return and the test times out.
+    const clock = new FakeClock();
     const probe = new FakeProbe();
     const store = new MemoryStore();
     store.rec.set("a", recordFor());
     probe.stall = true;
-    const t0 = Date.now();
-    const d = await decideResume({
-      agentId: "a",
-      sessionId: SID,
-      store,
-      probe,
-      uid: UID,
-      bootId: BOOT,
-      deadlineMs: 300,
+    const decided = decideResume({ ...base, store, probe, deadlineMs: 300, clock });
+    let settled = false;
+    void decided.then(() => {
+      settled = true;
     });
-    const took = Date.now() - t0;
-    expect(d).toEqual({ kind: "rotate", reason: "guard-deadline" });
-    expect(took).toBeGreaterThanOrEqual(250);
-    expect(took).toBeLessThan(900);
+
+    await probe.readIssued(1); // the stalled read is out and its deadline is armed
+    clock.advance(299);
+    await flush();
+    expect(settled).toBe(false);
+    clock.advance(1);
+    expect(await decided).toEqual({ kind: "rotate", reason: "guard-deadline" });
+    expect(clock.now()).toBe(300);
     expect(probe.kills).toEqual([]);
-  }, 5000);
+  }, 10_000);
+
+  it("the read is handed what is left of the deadline, capped at the probe timeout", async () => {
+    // Fault (site: `Math.min(PROBE_TIMEOUT_MS, left())` in `read`, the cap on `left()` dropped):
+    // a read can be told it has longer than the guard does. Predicted result: 1500, not 300.
+    const clock = new FakeClock();
+    const probe = new FakeProbe();
+    const store = new MemoryStore();
+    store.rec.set("a", recordFor());
+    probe.stall = true;
+    const decided = decideResume({ ...base, store, probe, deadlineMs: 300, clock });
+    await probe.readIssued(1);
+    expect(probe.readTimeouts).toEqual([300]);
+    clock.advance(300);
+    await decided;
+  }, 10_000);
 
   it("a record read that never returns is bounded too", async () => {
+    const clock = new FakeClock();
     const store = new MemoryStore();
     store.stallRead = true;
-    const t0 = Date.now();
-    const d = await decideResume({
-      agentId: "a",
-      sessionId: SID,
+    const decided = decideResume({
+      ...base,
       store,
       probe: new FakeProbe(),
-      uid: UID,
-      bootId: BOOT,
       deadlineMs: 300,
+      clock,
     });
-    expect(d).toEqual({ kind: "rotate", reason: "guard-deadline" });
-    expect(Date.now() - t0).toBeLessThan(900);
-  }, 5000);
+    await clock.armed();
+    clock.advance(300);
+    expect(await decided).toEqual({ kind: "rotate", reason: "guard-deadline" });
+    expect(clock.now()).toBe(300);
+  }, 10_000);
 
-  it("a stall AFTER the SIGTERM is bounded by the same deadline", async () => {
+  it("a stall AFTER the SIGTERM is bounded by the same deadline, not by the longer SIGTERM stage", async () => {
+    // Fault (site: `bounded(...)` around the post-signal `read`, removed): the confirmation read
+    // hangs for the whole 3 s stage and beyond. Predicted result: the call does not return.
+    const clock = new FakeClock();
     const probe = new FakeProbe();
     const store = new MemoryStore();
     store.rec.set("a", recordFor());
@@ -259,21 +298,20 @@ describe("decideResume — one deadline for the whole guard (#595 r3)", () => {
     probe.onKill = () => {
       probe.stall = true; // the table read hangs once the signal is out
     };
-    const t0 = Date.now();
-    const d = await decideResume({
-      agentId: "a",
-      sessionId: SID,
+    const decided = decideResume({
+      ...base,
       store,
       probe,
-      uid: UID,
-      bootId: BOOT,
       deadlineMs: 400,
       termMs: 3000,
+      clock,
     });
-    expect(d).toEqual({ kind: "rotate", reason: "guard-deadline" });
-    expect(Date.now() - t0).toBeLessThan(1000);
+    await probe.readIssued(3); // first read, revalidation, then the read after the signal
+    clock.advance(400);
+    expect(await decided).toEqual({ kind: "rotate", reason: "guard-deadline" });
+    expect(clock.now()).toBe(400);
     expect(probe.kills.map((k) => k.signal)).toEqual(["SIGTERM"]);
-  }, 5000);
+  }, 10_000);
 
   it("the shipped defaults keep the whole guard at or under 6 s", async () => {
     const { GUARD_DEADLINE_MS, ORPHAN_KILL_MS, ORPHAN_TERM_MS, PROBE_TIMEOUT_MS } = await import(
@@ -413,13 +451,13 @@ describe("the real process readers (#595 r3)", () => {
   });
 
   it("reads this very process on the host's own platform", async () => {
-    const info = await createSystemProbe().read(process.pid, 3000);
+    const info = await createSystemProbe().read(process.pid, LOADED);
     expect(info?.pid).toBe(process.pid);
     expect(info?.uid).toBe(process.getuid?.() as number);
     expect(info?.identity.length).toBeGreaterThan(3);
     expect(info?.zombie).toBe(false);
     // And it is stable: the identity of a live process does not change between reads.
-    expect((await createSystemProbe().read(process.pid, 3000))?.identity).toBe(info?.identity);
+    expect((await createSystemProbe().read(process.pid, LOADED))?.identity).toBe(info?.identity);
   });
 
   /** A stand-in `ps`: prints `body` and exits `code`, or sleeps. */
@@ -432,7 +470,7 @@ describe("the real process readers (#595 r3)", () => {
 
   it("ps: parses one row of stat, uid, lstart and the flat command", async () => {
     const ps = fakePs(`echo " S  501 Thu Oct 23 10:00:00 2026 /opt/bin/claude --resume ${SID}"`);
-    const info = await readFromPs(900, 2000, ps, () => null);
+    const info = await readFromPs(900, LOADED, ps, () => null);
     expect(info).toMatchObject({
       pid: 900,
       uid: 501,
@@ -445,19 +483,22 @@ describe("the real process readers (#595 r3)", () => {
   });
 
   it("ps: exit 1 with no output is 'no such process'; any other failure rejects", async () => {
-    expect(await readFromPs(900, 2000, fakePs("exit 1"))).toBeNull();
-    await expect(readFromPs(900, 2000, fakePs("exit 2"))).rejects.toThrow();
-    await expect(readFromPs(900, 2000, fakePs("echo garbage"))).rejects.toThrow();
+    expect(await readFromPs(900, LOADED, fakePs("exit 1"))).toBeNull();
+    await expect(readFromPs(900, LOADED, fakePs("exit 2"))).rejects.toThrow();
+    await expect(readFromPs(900, LOADED, fakePs("echo garbage"))).rejects.toThrow();
   });
 
   it("ps: a stalled subprocess is killed at its timeout and rejects", async () => {
     // Fault (site: `timeout` in readFromPs's execFile options, removed): the stand-in runs its
-    // full 8 s. Predicted result: the call takes ~8 s and the elapsed bound below fails.
-    const ps = fakePs("sleep 8");
+    // full 20 s. Predicted result: the call takes ~20 s and the elapsed bound below fails.
+    // The stand-in sleeps 20 s; the 400 ms timeout is what ends it. The bound below is far above a
+    // loaded machine's slowest `sh` start and far below the stand-in's 20 s, so only a timeout that
+    // is not applied can fail it.
+    const ps = fakePs("sleep 20");
     const t0 = Date.now();
     await expect(readFromPs(900, 400, ps)).rejects.toThrow();
-    expect(Date.now() - t0).toBeLessThan(2000);
-  }, 6000);
+    expect(Date.now() - t0).toBeLessThan(15_000);
+  }, 60_000);
   /* ── macOS: sub-second birth identity (#595 r4) ─────────────────── */
 
   const LSTART = "Thu Oct 23 10:00:00 2026";
@@ -493,10 +534,10 @@ describe("the real process readers (#595 r3)", () => {
   });
 
   it("ps + libproc: the identity carries the microseconds and is not marked low-precision", async () => {
-    const info = await readFromPs(900, 2000, psRow(), () => ({ sec: LSTART_SEC, usec: 464209 }));
+    const info = await readFromPs(900, LOADED, psRow(), () => ({ sec: LSTART_SEC, usec: 464209 }));
     expect(info?.identity).toBe(`${LSTART}+464209`);
     expect(info?.lowPrecision).toBeUndefined();
-    const small = await readFromPs(900, 2000, psRow(), () => ({ sec: LSTART_SEC + 1, usec: 7 }));
+    const small = await readFromPs(900, LOADED, psRow(), () => ({ sec: LSTART_SEC + 1, usec: 7 }));
     expect(small?.identity).toBe(`${LSTART}+000007`);
   });
 
@@ -511,7 +552,7 @@ describe("the real process readers (#595 r3)", () => {
       () => ({ sec: LSTART_SEC + 3600, usec: 1 }),
     ];
     for (const startTime of cases) {
-      const info = await readFromPs(900, 2000, psRow(), startTime);
+      const info = await readFromPs(900, LOADED, psRow(), startTime);
       expect(info?.identity).toBe(LSTART);
       expect(info?.lowPrecision).toBe(true);
     }
@@ -537,10 +578,10 @@ describe("the real process readers (#595 r3)", () => {
       const now = Date.now() / 1000;
       expect(start?.sec).toBeLessThanOrEqual(now);
       expect(start?.sec).toBeGreaterThan(now - 7 * 86400);
-      const info = await createSystemProbe().read(process.pid, 3000);
+      const info = await createSystemProbe().read(process.pid, LOADED);
       expect(info?.identity).toMatch(/\+\d{6}$/);
       expect(info?.lowPrecision).toBeUndefined();
-      expect((await createSystemProbe().read(process.pid, 3000))?.identity).toBe(info?.identity);
+      expect((await createSystemProbe().read(process.pid, LOADED))?.identity).toBe(info?.identity);
       expect(libprocStartTime(2 ** 30)).toBeNull();
     },
   );
