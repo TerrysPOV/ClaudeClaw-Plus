@@ -131,7 +131,9 @@ async function connectSocket(sockPath: string) {
       close() {},
     },
   });
-  closers.push(() => socket.end());
+  closers.push(() => {
+    socket.end();
+  });
   return { socket, frames, listeners };
 }
 
