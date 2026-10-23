@@ -14,6 +14,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
 import {
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -38,6 +39,7 @@ import {
 import type { AgentConfig, BusOrigin } from "../types";
 import { createBusCore, type BusCore } from "../core";
 import { createPromptStreamHandler } from "../receipt-wiring";
+import { _setClaudeExecutableForTests } from "../../runner";
 
 const IS_DARWIN = process.platform === "darwin";
 const IS_UNIX = process.platform !== "win32";
@@ -1305,4 +1307,85 @@ describe("detectSessionIdCollision — exit ahead of its own output (#326)", () 
     const s = scripted();
     expect(await detectSessionIdCollision(s.proc, 0)).toBe(false);
   });
+});
+
+/* ───────────────────────────────────────────────────────────────────── */
+/* Spawned executable (#573)                                             */
+/* ───────────────────────────────────────────────────────────────────── */
+
+describe("spawns the resolved claude executable (#573)", () => {
+  if (!IS_UNIX) {
+    it.skip("skipped on non-Unix (shell stand-ins)", () => {});
+    return;
+  }
+
+  // On Windows the resolved executable is claude.exe: neither bun-pty nor
+  // node's spawn can start the bare `claude` (a .cmd shim). The seam stands in
+  // for the resolver, and a fake `claude` first on PATH catches a spawn of the
+  // bare name — the real CLI is never launched, even on a host that has one.
+  let dir: string;
+  let pmDir: string;
+  let savedPath: string | undefined;
+  let mgr: SessionManager;
+  const spawned: AgentProcess[] = [];
+
+  const script = (name: string, marker: string) => {
+    const file = join(dir, name);
+    writeFileSync(file, `#!/bin/sh\nread line\necho "${marker}:$line"\nexec cat\n`);
+    chmodSync(file, 0o755);
+    return file;
+  };
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "ccaw-573-"));
+    pmDir = mkdtempSync(join(tmpdir(), "ccaw-pm-"));
+    script("claude", "BARE_CLAUDE_573");
+    _setClaudeExecutableForTests(script("resolved-claude", "RESOLVED_CLAUDE_573"));
+    savedPath = process.env.PATH;
+    process.env.PATH = `${dir}:${savedPath ?? ""}`;
+    mgr = new SessionManager({
+      argsOverride: [],
+      busSocketPath: "/tmp/test-bus.sock",
+      persistRotatedSessionId: async () => {},
+      postMortemDir: pmDir,
+    });
+  });
+
+  afterEach(async () => {
+    for (const p of spawned) {
+      try {
+        await mgr.stop(p.agent_id);
+      } catch {
+        /* ignore */
+      }
+    }
+    spawned.length = 0;
+    _setClaudeExecutableForTests(null);
+    process.env.PATH = savedPath;
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(pmDir, { recursive: true, force: true });
+  });
+
+  for (const [mode, origin] of [
+    ["pty-stdin", "discord"],
+    ["process-stream-json", "cron"],
+  ] as const) {
+    it(`${mode} spawns claudeExecutable() when no commandOverride is given`, async () => {
+      // Declared, not defaulted: PTY is the default for every origin here, so cron would
+      // otherwise land on pty-stdin and never reach the process-stream-json spawn.
+      const proc = await mgr.spawnAgent(
+        mkAgent({ id: `exe-573-${origin}`, supervision: mode }),
+        origin,
+      );
+      spawned.push(proc);
+      expect(proc.supervision).toBe(mode);
+      let received = "";
+      proc.onData((chunk) => {
+        received += chunk;
+      });
+      await proc.send_slash("compact");
+      await waitFor(() => received.includes("_573:"), 3000).catch(() => {});
+      expect(received).toContain("RESOLVED_CLAUDE_573:");
+    });
+  }
 });

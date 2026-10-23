@@ -15,6 +15,11 @@ export interface JobRunResult {
   exitCode: number;
   stdout: string;
   stderr: string;
+  /**
+   * Set by the PTY path when the turn failed with an unknown outcome (#562). Such a turn may
+   * have completed and done its side effects, so the job's `retry` is not applied to it.
+   */
+  failureKind?: "uncertain" | "timeout";
 }
 
 export interface JobLoopDeps {
@@ -128,6 +133,13 @@ export function createJobLoop(deps: JobLoopDeps): JobLoop {
           });
           if (r.exitCode === 0) {
             retryState.delete(job.name);
+          } else if (r.failureKind) {
+            // The turn may have completed: a retry can repeat its side effects. The failure is
+            // still forwarded below, and a one-time job's schedule is cleared as if exhausted.
+            retryState.delete(job.name);
+            log(
+              `[${ts()}] Job ${job.name} not retried: PTY turn ${r.failureKind === "timeout" ? "timed out" : "uncertain"}, it may have completed`,
+            );
           } else if (job.retry && job.retry > 0) {
             // Preserve existing state so failCount accumulates correctly across retries.
             const state = retryState.get(job.name) ?? { failCount: 0, retryAt: 0 };

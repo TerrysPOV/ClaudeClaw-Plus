@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "plus-bus": {
-      "command": "${CLAUDE_PLUGIN_ROOT}/scripts/start-bus-mcp",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/src/bus/mcp-server.ts"]
+      "command": "${CCAW_BUS_BUN_PATH:-bun}",
+      "args": ["run", "${CLAUDE_PLUGIN_ROOT}/src/bus/mcp-server.ts"]
     }
   }
 }

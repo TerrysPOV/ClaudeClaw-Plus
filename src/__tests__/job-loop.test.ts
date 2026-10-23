@@ -52,6 +52,7 @@ function loop(results: JobRunResult[] = [], opts: LoopOpts = {}) {
   const forwarded: { label: string; result: JobRunResult }[] = [];
   const warnings: string[] = [];
   const cleared: string[] = [];
+  const logs: string[] = [];
   const l = createJobLoop({
     run: async (name, _prompt, threadId, model, timeoutMs, agent) => {
       runs.push({ name, threadId, model, timeoutMs, agent });
@@ -71,7 +72,7 @@ function loop(results: JobRunResult[] = [], opts: LoopOpts = {}) {
     isRateLimited: () => opts.rateLimited ?? false,
     timezoneOffsetMinutes: () => 0,
     now: () => now,
-    log: () => {},
+    log: (line) => logs.push(line),
     warn: (line) => warnings.push(line),
     logError: () => {},
   });
@@ -81,6 +82,7 @@ function loop(results: JobRunResult[] = [], opts: LoopOpts = {}) {
     forwarded,
     warnings,
     cleared,
+    logs,
     at: (ms: number) => {
       now = ms;
     },
@@ -259,6 +261,62 @@ describe("job fields the loop applies", () => {
     await t.l.runJob(job({ name: "once", recurring: false }));
     await t.l.runJob(job({ name: "once-retry", recurring: false, retry: 1 }));
     expect(t.cleared).toEqual(["once"]);
+  });
+});
+
+describe("#562 round 9 add-on: cron does not retry a PTY turn that may have completed", () => {
+  const cases = [
+    ["uncertain", "uncertain"],
+    ["timeout", "timed out"],
+  ] as const;
+  for (const [failureKind, words] of cases) {
+    it(`${failureKind}: retry: 2 is not used, the failure is forwarded, a one-time job's schedule is cleared`, async () => {
+      // Fault: ignore failureKind in the loop and retryState gets { failCount: 1 }, the
+      // schedule is kept for the pending retry, and no "not retried" line is logged.
+      const failed = {
+        exitCode: failureKind === "timeout" ? 124 : 1,
+        stdout: "",
+        stderr: "x",
+        failureKind,
+      };
+      const t = loop([failed, failed]);
+      await t.l.runJob(job({ name: "once", recurring: false, retry: 2 }));
+      expect(t.l.retryState.has("once")).toBe(false);
+      expect(t.cleared).toEqual(["once"]);
+      expect(t.forwarded.map((f) => f.result.exitCode)).toEqual([failed.exitCode]);
+      expect(
+        t.logs.some((l) =>
+          l.endsWith(`Job once not retried: PTY turn ${words}, it may have completed`),
+        ),
+      ).toBe(true);
+      expect(t.l.lastResult.get("once")?.result).toBe("error");
+    });
+  }
+
+  it("a recurring job keeps no retry debt and runs again only on its schedule", async () => {
+    const failed = { exitCode: 1, stdout: "", stderr: "", failureKind: "uncertain" as const };
+    const t = loop([failed, failed]);
+    const j = job({ name: "r", schedule: "0 0 1 1 *", retry: 2, retryDelay: 1 });
+    await t.l.runJob(j);
+    t.at(START + 5_000);
+    t.l.tick([j], new Date(START + 5_000));
+    await flush();
+    expect(t.runs.length).toBe(1);
+  });
+
+  it("a definite PTY failure (no failureKind) still retries as configured", async () => {
+    const fail = { exitCode: 1, stdout: "", stderr: "[pty-supervisor] PTY closed during turn" };
+    const t = loop([fail]);
+    await t.l.runJob(job({ name: "once-retry", recurring: false, retry: 2, retryDelay: 60 }));
+    expect(t.l.retryState.get("once-retry")).toEqual({ failCount: 1, retryAt: START + 60_000 });
+    expect(t.cleared).toEqual([]);
+    expect(t.logs.some((l) => l.includes("not retried"))).toBe(false);
+  });
+
+  it("a timeout exit code (124) without failureKind is not PTY-specific and still retries", async () => {
+    const t = loop([{ exitCode: 124, stdout: "", stderr: "timed out" }]);
+    await t.l.runJob(job({ name: "r", retry: 1 }));
+    expect(t.l.retryState.get("r")?.failCount).toBe(1);
   });
 });
 

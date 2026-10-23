@@ -1965,6 +1965,28 @@ export const pageStyles = String.raw`    /* Served by the daemon (src/ui/assets.
   .lr-row { flex-direction: column; align-items: flex-start; }
 }
 
+/* #552: Engines modal (Settings → Engines). */
+.en-card { max-height: 90vh; overflow-y: auto; }
+.en-block { display: flex; flex-direction: column; gap: 8px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; padding: 10px 12px; }
+.en-block-head { font-size: 13px; font-weight: 600; }
+.en-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.en-note { font-size: 11px; opacity: 0.65; }
+.en-warn { font-size: 12px; color: var(--warn); }
+.en-warn[hidden] { display: none; }
+.en-routes { display: flex; flex-direction: column; gap: 4px; }
+.en-route { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: center; gap: 8px; }
+.en-route-name { font-family: ui-monospace, monospace; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.en-route .hb-input { padding: 4px 8px; font-size: 12px; }
+.en-engines { display: flex; flex-direction: column; gap: 4px; }
+.en-engine { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 8px; border-radius: 4px; background: rgba(255,255,255,0.02); }
+.en-engine-meta { min-width: 0; flex: 1; font-size: 11px; }
+.en-engine-id { font-family: ui-monospace, monospace; font-size: 12px; }
+.en-engine .hb-toggle { font-size: 10px; padding: 2px 6px; }
+.en-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+@media (max-width: 600px) {
+  .en-form, .en-route { grid-template-columns: 1fr; }
+}
+
 /* #325: operator-alerts panel (polled via /api/state). Hidden when empty. */
 .operator-alerts {
   margin: 12px auto 0;

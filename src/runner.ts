@@ -1,6 +1,5 @@
 import { mkdir, readFile, writeFile, realpath } from "fs/promises";
 import { join, dirname, resolve, sep } from "path";
-import { execSync } from "child_process";
 import { existsSync, writeFileSync, mkdirSync, readFileSync } from "fs";
 import {
   getSession,
@@ -78,9 +77,16 @@ import {
   killAllPtys,
   supervisorEntryCount,
   retirePtySession,
+  liveSessionKeys,
   type PtySessionStore,
+  type PtyUnsafeReplayKind,
   runEphemeralWithDeadline,
 } from "./runner/pty-supervisor";
+import {
+  assertSessionSpawnable,
+  assertSessionWritable,
+  PtyQuarantinedError,
+} from "./runner/pty-quarantine";
 import { encodeCwdForProjectsDir } from "./bus/jsonl-line-types";
 import { PTY_OUTPUT_FORMAT_CONSTRAINT } from "./runner/pty-output-format";
 import { SPAWN_ENV_STRIP_KEYS, cleanSpawnEnv, shouldStripSpawnEnvKey } from "./runner/spawn-env";
@@ -88,6 +94,11 @@ import {
   endsInRenderedSignatureError,
   signatureErrorWarrantsReset,
 } from "./runner/signature-error";
+import {
+  CLAUDE_EXECUTABLE,
+  _setClaudeExecutableForTests,
+  claudeExecutable,
+} from "./runner/claude-executable";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
 
@@ -120,36 +131,7 @@ const LEGACY_PROJECT_CLAUDE_MD = join(process.cwd(), ".claude", "CLAUDE.md");
 const CLAUDECLAW_BLOCK_START = "<!-- claudeclaw:managed:start -->";
 const CLAUDECLAW_BLOCK_END = "<!-- claudeclaw:managed:end -->";
 
-/**
- * On Windows, `claude` resolves to `claude.cmd`, a batch wrapper that must
- * be run through cmd.exe (8191-char command-line limit). Resolving the
- * underlying `claude.exe` lets us call it directly via CreateProcessW
- * (32767-char limit). Required because --append-system-prompt + prompt
- * files + CLAUDE.md can easily exceed 8K.
- */
-function resolveClaudeExecutable(): string {
-  if (process.platform !== "win32") return "claude";
-  try {
-    const out = execSync("where claude", { encoding: "utf8" });
-    const cmdPath = out
-      .split(/\r?\n/)
-      .map((s) => s.trim())
-      .find((s) => s.toLowerCase().endsWith(".cmd"));
-    if (!cmdPath) return "claude";
-    const exePath = join(
-      dirname(cmdPath),
-      "node_modules",
-      "@anthropic-ai",
-      "claude-code",
-      "bin",
-      "claude.exe",
-    );
-    return existsSync(exePath) ? exePath : "claude";
-  } catch {
-    return "claude";
-  }
-}
-const CLAUDE_EXECUTABLE = resolveClaudeExecutable();
+export { _setClaudeExecutableForTests, claudeExecutable };
 
 /** Versions of the Claude Code CLI whose interactive TTY output the PTY parser
  *  has been validated against (see .planning/pty-migration/SPEC.md §2 and the
@@ -399,6 +381,13 @@ export interface RunResult {
   usedFallback?: true;
   /** Whether the final fallback attempt delivered nonempty text via onChunk. */
   fallbackStreamedText?: boolean;
+  /**
+   * #562: set only when a PTY turn failed with an unknown outcome (no turn boundary,
+   * ambiguous attribution, timeout): it may have completed and done its side effects, so a
+   * caller must not replay it. Absent on a success, on a definite failure and on every
+   * non-PTY engine, which keep their old behaviour.
+   */
+  failureKind?: PtyUnsafeReplayKind;
 }
 
 export interface AgentStreamEvent {
@@ -772,10 +761,38 @@ let _claudeSpawnForTests: ClaudeSpawn | null = null;
 export function _setClaudeSpawnForTests(fn: ClaudeSpawn | null): void {
   _claudeSpawnForTests = fn;
 }
-function spawnClaude(
+/**
+ * #562 round 8: a legacy `claude -p --resume <id>` passes the same gate as every other start
+ * on a session. A transcript whose previous process the OS has not confirmed gone is not
+ * resumed beside it.
+ */
+async function gateResume(args: string[]): Promise<void> {
+  const id = resumeIdOf(args);
+  if (id) await assertSessionWritable({ sessionId: id });
+}
+
+function resumeIdOf(args: string[]): string | undefined {
+  const i = args.indexOf("--resume");
+  return i >= 0 ? args[i + 1] : undefined;
+}
+
+/**
+ * #562 round 9: the synchronous final word, run on the line before the process is created.
+ * `gateResume` is async, so a retirement that fails after it passed would quarantine a session
+ * the spawn then goes ahead on.
+ */
+function assertResumeSpawnable(args: string[]): void {
+  const id = resumeIdOf(args);
+  if (id) assertSessionSpawnable({ sessionId: id });
+}
+
+async function spawnClaude(
   args: string[],
   opts: { env: Record<string, string>; cwd?: string },
-): ClaudeProc {
+): Promise<ClaudeProc> {
+  await gateResume(args);
+  // Synchronous check; no await between it and the spawn below (#562 round 9).
+  assertResumeSpawnable(args);
   if (_claudeSpawnForTests) return _claudeSpawnForTests(args, opts);
   return Bun.spawn(args, {
     stdin: "ignore",
@@ -784,6 +801,21 @@ function spawnClaude(
     env: opts.env,
     ...(opts.cwd ? { cwd: opts.cwd } : {}),
   });
+}
+
+/**
+ * #562 connector P1: `pty.enabled` can flip to false while a PTY still owns a session key, and
+ * the next turn then resumes that session on print. Two processes would write one transcript
+ * (or the CLI refuses with "Session ID ... is already in use"). Retire the live PTY on each of
+ * `keys` BEFORE the legacy spawn. `retirePtySession` applies the round 8/9 fence and rejects
+ * with `PtyQuarantinedError` when the exit is unconfirmed, so the turn fails instead of
+ * resuming beside a process that may still be writing. A print-only install has no live key
+ * and pays one empty-array check.
+ */
+async function retireLivePtysBeforePrint(keys: string[]): Promise<void> {
+  const live = liveSessionKeys();
+  if (live.length === 0) return;
+  for (const key of keys) if (live.includes(key)) await retirePtySession(key);
 }
 
 /** A one-shot agent turn on its own PTY (#546); see `runEphemeralWithDeadline`. */
@@ -817,7 +849,7 @@ export async function runClaudeOnce(
   if (model.trim() && normalizedModel !== "glm" && normalizedModel !== "kimi-k2p6")
     args.push("--model", model.trim());
 
-  const proc = spawnClaude(args, { env: buildChildEnv(baseEnv, model, api), cwd });
+  const proc = await spawnClaude(args, { env: buildChildEnv(baseEnv, model, api), cwd });
 
   mainActiveProcs.add(proc);
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
@@ -999,7 +1031,7 @@ async function runClaudeStream(
   const normalizedModel = model.trim().toLowerCase();
   if (model.trim() && normalizedModel !== "glm") args.push("--model", model.trim());
 
-  const proc = spawnClaude(args, { env: buildChildEnv(baseEnv, model, api), cwd });
+  const proc = await spawnClaude(args, { env: buildChildEnv(baseEnv, model, api), cwd });
 
   mainActiveProcs.add(proc);
   let sessionId: string | undefined;
@@ -1632,9 +1664,21 @@ export interface PrimaryExecCall {
   timeoutMs: number;
   route: "legacy" | "pty";
 }
-type PrimaryExec = (
-  call: PrimaryExecCall,
-) => Promise<{ rawStdout: string; stderr: string; exitCode: number; sessionId?: string }>;
+type PrimaryExec = (call: PrimaryExecCall) => Promise<{
+  rawStdout: string;
+  stderr: string;
+  exitCode: number;
+  sessionId?: string;
+  failureKind?: PtyUnsafeReplayKind;
+}>;
+/** What one exec (print or PTY) hands back; `failureKind` is set only by the PTY path. */
+type ExecOutcome = {
+  rawStdout: string;
+  stderr: string;
+  exitCode: number;
+  sessionId?: string;
+  failureKind?: PtyUnsafeReplayKind;
+};
 let _primaryExecForTests: PrimaryExec | null = null;
 export function _setPrimaryExecForTests(fn: PrimaryExec | null): void {
   _primaryExecForTests = fn;
@@ -1900,7 +1944,13 @@ async function execClaude(
         ? `agent:${agentName}`
         : "global";
     const appendSystemPrompt = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
-    let exec: { rawStdout: string; stderr: string; exitCode: number; sessionId?: string };
+    // A flip to print leaves the PTY of this turn's key alive; retire it before the primary
+    // legacy spawn can resume its session. The fallback key is retired only where the
+    // fallback is about to run (below): a quarantined fallback must not fail a healthy primary.
+    if (useLegacyPath) {
+      await retireLivePtysBeforePrint([ptySessionKey]);
+    }
+    let exec: ExecOutcome;
     if (_primaryExecForTests) {
       exec = await _primaryExecForTests({
         name,
@@ -1956,7 +2006,11 @@ async function execClaude(
           onChunk(text);
         }
       : undefined;
-    const execRecovery = async (legacyArgs: string[], config: ModelConfig, fallback = false) => {
+    const execRecovery = async (
+      legacyArgs: string[],
+      config: ModelConfig,
+      fallback = false,
+    ): Promise<ExecOutcome> => {
       if (useLegacyPath) {
         return runClaudeStream(legacyArgs, config.model, config.api, baseEnv, timeoutMs, spawnCwd);
       }
@@ -2061,7 +2115,21 @@ async function execClaude(
               onToolEvent,
             });
       };
-      exec = await execFallback(fallbackArgs);
+      // The fallback resumes its own session, which a flip to print can leave with a live
+      // PTY: retire it immediately before use. A fallback session that cannot be retired
+      // (quarantined) fails this fallback attempt only; the primary has already run.
+      let fallbackRefused: PtyQuarantinedError | undefined;
+      if (useLegacyPath) {
+        try {
+          await retireLivePtysBeforePrint([fallbackPtyKey]);
+        } catch (err) {
+          if (!(err instanceof PtyQuarantinedError)) throw err;
+          fallbackRefused = err;
+        }
+      }
+      exec = fallbackRefused
+        ? { rawStdout: "", stderr: fallbackRefused.message, exitCode: 1 }
+        : await execFallback(fallbackArgs);
       usedFallback = true;
       let fallbackRateLimit = extractRateLimitMessage(exec.rawStdout, exec.stderr);
 
@@ -2281,6 +2349,8 @@ async function execClaude(
         return reported && reported !== "unknown" ? { sessionId: reported } : {};
       })(),
       ...(usedFallback ? { usedFallback: true as const, fallbackStreamedText } : {}),
+      // From the exec that produced THIS result, and only while it is a failure.
+      ...(exitCode !== 0 && exec.failureKind ? { failureKind: exec.failureKind } : {}),
     };
 
     // Record successful completion WITH the real token usage + cost so the
@@ -2493,6 +2563,9 @@ async function execClaude(
           exitCode: retryExec.exitCode,
           ...(retryExec.sessionId || existing?.sessionId
             ? { sessionId: retryExec.sessionId || existing?.sessionId }
+            : {}),
+          ...(retryExec.exitCode !== 0 && retryExec.failureKind
+            ? { failureKind: retryExec.failureKind }
             : {}),
         };
         emitCompactEvent({
@@ -2727,7 +2800,9 @@ async function streamClaude(
     `[${new Date().toLocaleTimeString()}] Running: ${name} (stream-json, session: ${existing?.sessionId?.slice(0, 8) ?? "new"})`,
   );
 
-  const proc = spawnClaude(args, { env: childEnv });
+  // The dashboard chat resumes the global session on print; retire its PTY first (see above).
+  await retireLivePtysBeforePrint(["global"]);
+  const proc = await spawnClaude(args, { env: childEnv });
 
   // Collect stderr in the background so it doesn't back-pressure the process.
   // We need it after proc.exited for stale session detection.
@@ -3014,7 +3089,7 @@ export async function runFork(prompt: string): Promise<RunResult> {
     FORK_SYSTEM_PROMPT,
   ];
 
-  const proc = spawnClaude(args, { env: buildChildEnv(baseEnv, FORK_MODEL, api) });
+  const proc = await spawnClaude(args, { env: buildChildEnv(baseEnv, FORK_MODEL, api) });
 
   let timeoutId: ReturnType<typeof setTimeout> | null = null;
   const timeoutPromise = new Promise<never>((_, reject) => {

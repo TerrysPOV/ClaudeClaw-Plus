@@ -7,6 +7,7 @@ import { discord } from "./commands/discord";
 import { slack } from "./commands/slack";
 import { send } from "./commands/send";
 import { runFireCommand } from "./commands/fire";
+import { runOneshotCommand } from "./commands/oneshot";
 import { autoLoadClaudeClawEnv } from "./cli-env-autoload";
 
 const args = process.argv.slice(2);
@@ -21,6 +22,7 @@ const HELP = [
   "  claudeclaw send <message>           Send a message to the active session",
   "  claudeclaw fire <agent>:<label>     Fire an agent job once, immediately",
   "  claudeclaw fire <agent> <label>     Same, alternate form",
+  "  claudeclaw oneshot <list|set|engine|test>  One-shot engine routing (see oneshot --help)",
   "  claudeclaw telegram                 Run Telegram adapter",
   "  claudeclaw discord                  Run Discord adapter",
   "  claudeclaw --stop                   Stop the daemon",
@@ -55,6 +57,9 @@ if (command === "--help" || command === "-h" || command === "help") {
 } else if (command === "fire") {
   autoLoadClaudeClawEnv();
   runFireCommand(args.slice(1)).then((code) => process.exit(code));
+} else if (command === "oneshot") {
+  autoLoadClaudeClawEnv();
+  runOneshotCommand(args.slice(1)).then((code) => process.exit(code));
 } else {
   start();
 }

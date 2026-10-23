@@ -67,7 +67,12 @@ Changing one does not change the other.
 
 Runner paths read `pty.enabled` on each turn. The daemon reloads settings about
 every 30 seconds, so a flip applies to subsequent runner turns and cron jobs
-after that reload. Bus-agent supervision and runtime selection require a
+after that reload. On a flip to print, the next runner turn on a session first retires that
+session's live PTY, waiting for a spawn still booting on it to settle, then resumes on print, so two
+processes never write one transcript; if the old process's exit cannot be confirmed the turn fails
+rather than resuming beside it. The fallback session's PTY is retired only when a turn actually
+falls back, immediately before the fallback runs, so an unusable fallback never fails a healthy
+primary turn. Bus-agent supervision and runtime selection require a
 restart: changing settings on disk does not replace their existing processes.
 Restarting also produces a fresh startup summary of the engine choices.
 

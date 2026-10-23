@@ -8,7 +8,7 @@ import {
   readFileSync,
   chmodSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { recordToolCall, recordToolCallIntent } from "../observability/tool-call-sink.js";
 import type { ToolCallStatus } from "../observability/tool-call.js";
@@ -76,8 +76,7 @@ export class PluginMcpBridge {
         : resolve(homedir(), ".config", "plus", "plugin-audit.jsonl");
 
     // Ensure audit directory exists
-    const auditDir = this.auditPath.substring(0, this.auditPath.lastIndexOf("/"));
-    mkdirSync(auditDir, { recursive: true });
+    mkdirSync(dirname(this.auditPath), { recursive: true });
   }
 
   // ── Tool registration ──────────────────────────────────────────────────

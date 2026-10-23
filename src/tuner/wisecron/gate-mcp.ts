@@ -753,7 +753,9 @@ export function registerWisecronGateTools(
     name: "mature",
     description:
       "Run the maturation pass: compute post/delta/verdict for matured baselines; " +
-      "LOW-risk regressions auto-revert, higher tiers enqueue for human approval.",
+      "LOW-risk regressions auto-revert, higher tiers enqueue for human approval. " +
+      "'held_unregistered' (when present) counts matured rows of a subject no longer " +
+      "registered: held, then closed neutral once the grace period is over.",
     schema: MatureArgs,
     handler: async (args: z.infer<typeof MatureArgs>) => {
       const asOf = args.asOf ? new Date(args.asOf) : new Date();
@@ -768,9 +770,20 @@ export function registerWisecronGateTools(
           return true;
         },
       });
-      audit?.append({ event: "gate_mature", detail: { source, matured: results.length } });
+      // Matured rows of a subject that is no longer registered are held (then
+      // closed after the grace period), not judged: say how many, so
+      // `matured: 0` does not read as "nothing pending".
+      const held = db
+        .listMaturableOutcomes(asOf)
+        .filter((r) => !registry.getSubject(r.subject)).length;
+      const heldField = held > 0 ? { held_unregistered: held } : {};
+      audit?.append({
+        event: "gate_mature",
+        detail: { source, matured: results.length, ...heldField },
+      });
       return {
         matured: results.length,
+        ...heldField,
         outcomes: results.map((r) => ({
           id: r.proposal_id,
           subject: r.subject,

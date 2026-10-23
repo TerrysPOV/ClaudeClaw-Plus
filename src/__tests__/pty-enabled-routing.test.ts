@@ -16,7 +16,9 @@
  * deleted ones included.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { mkdtempSync } from "node:fs";
 import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import * as configMod from "../config";
@@ -596,14 +598,17 @@ describe("#559 a fresh chat turn with the clock prefix is submitted", () => {
     await resetSession();
     expect(await peekSession()).toBeNull();
     const tui = join(import.meta.dir, "fixtures", "paste-burst-tui.ts");
+    const tx559 = join(mkdtempSync(join(tmpdir(), "pty-559-")), "session.jsonl");
     injectSpawnPty(async (opts) => {
       ptySpawns.push(opts);
       return spawnPty({
         ...opts,
+        env: { ...opts.env, PASTE_BURST_TRANSCRIPT: tx559 },
+        transcriptPath: tx559,
         _commandOverride: process.execPath,
         _argsOverride: [tui],
         quietWindowMs: 300,
-        sentinelMaxWaitMs: 2_000,
+        settleCapMs: 500,
       });
     });
     const prompt = "Reply with exactly the word FRESH559 and nothing else.";
@@ -618,16 +623,18 @@ describe("#559 a fresh chat turn with the clock prefix is submitted", () => {
 
   it("a prompt carrying a paste end marker cannot close the paste early", async () => {
     const tui = join(import.meta.dir, "fixtures", "paste-burst-tui.ts");
+    const tx559 = join(mkdtempSync(join(tmpdir(), "pty-559-")), "session.jsonl");
     const pty = await spawnPty({
       sessionId: "",
       cwd: process.cwd(),
       security: { level: "unrestricted", allowedTools: [], disallowedTools: [] },
-      env: { ...process.env } as Record<string, string>,
+      env: { ...process.env, PASTE_BURST_TRANSCRIPT: tx559 } as Record<string, string>,
       agentName: "t559",
+      transcriptPath: tx559,
       _commandOverride: process.execPath,
       _argsOverride: [tui],
       quietWindowMs: 300,
-      sentinelMaxWaitMs: 2_000,
+      settleCapMs: 500,
     });
     try {
       const r = await pty.runTurn(

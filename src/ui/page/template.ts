@@ -80,6 +80,13 @@ ${pageStyles}
       </div>
       <div class="setting-item">
         <div class="setting-main">
+          <div class="settings-label">⚙️ Engines</div>
+          <div class="settings-meta" id="en-info">Agent turns, one-shot calls, HTTP engines</div>
+        </div>
+        <button class="hb-config" id="en-config" type="button">Configure</button>
+      </div>
+      <div class="setting-item">
+        <div class="setting-main">
           <div class="settings-label">🧾 Advanced</div>
           <div class="settings-meta">Technical runtime and JSON files</div>
         </div>
@@ -146,6 +153,72 @@ ${pageStyles}
           <div class="hb-buttons">
             <button class="hb-btn ghost" id="lr-cancel-btn" type="button">Cancel</button>
             <button class="hb-btn solid" id="lr-save-btn" type="button">Save</button>
+          </div>
+        </div>
+      </div>
+    </article>
+  </section>
+  <section class="info-modal" id="en-modal" aria-live="polite" aria-hidden="true">
+    <article class="hb-card lr-card en-card">
+      <div class="info-head">
+        <span>Engines</span>
+        <button class="settings-close" id="en-modal-close" type="button" aria-label="Close engines">×</button>
+      </div>
+      <div class="lr-body">
+        <section class="en-block" id="en-agent-block">
+          <div class="en-block-head">Agent turns</div>
+          <div class="en-line">
+            <span class="hb-label">Engine</span>
+            <button class="hb-toggle" id="en-pty-toggle" type="button">Loading...</button>
+          </div>
+          <div class="en-note" id="en-pty-state"></div>
+          <div class="en-note" id="en-agents"></div>
+          <div class="en-warn" id="en-restart" hidden>Restart required: the daemon is still running the engine it started with.</div>
+        </section>
+        <section class="en-block" id="en-oneshot-block">
+          <div class="en-block-head">One-shot calls</div>
+          <div class="en-note">Only engines allowed on a route are listed. Applies on the next call, no restart.</div>
+          <div class="en-routes" id="en-routes"></div>
+          <div class="hb-buttons">
+            <button class="hb-btn solid" id="en-routes-save" type="button">Save routes</button>
+          </div>
+        </section>
+        <section class="en-block" id="en-engines-block">
+          <div class="en-block-head">Engines</div>
+          <div class="en-engines" id="en-engines"></div>
+          <form class="en-form" id="en-engine-form">
+            <label class="hb-field" for="en-name-input">
+              <span class="hb-label">Name</span>
+              <input class="hb-input" id="en-name-input" type="text" placeholder="local" autocomplete="off" required />
+            </label>
+            <label class="hb-field" for="en-kind-input">
+              <span class="hb-label">Kind</span>
+              <select class="hb-input" id="en-kind-input">
+                <option value="openai-compatible">openai-compatible</option>
+                <option value="ollama">ollama</option>
+              </select>
+            </label>
+            <label class="hb-field" for="en-url-input">
+              <span class="hb-label">Base URL</span>
+              <input class="hb-input" id="en-url-input" type="url" placeholder="http://127.0.0.1:11434/v1" autocomplete="off" />
+            </label>
+            <label class="hb-field" for="en-model-input">
+              <span class="hb-label">Model</span>
+              <input class="hb-input" id="en-model-input" type="text" placeholder="llama3.2" autocomplete="off" required />
+            </label>
+            <label class="hb-field" for="en-keyenv-input">
+              <span class="hb-label">Key env variable (name, not the key)</span>
+              <input class="hb-input" id="en-keyenv-input" type="text" placeholder="OPENAI_API_KEY" autocomplete="off" />
+            </label>
+            <div class="hb-buttons">
+              <button class="hb-btn solid" id="en-engine-save" type="submit">Save engine</button>
+            </div>
+          </form>
+        </section>
+        <div class="hb-actions">
+          <div class="hb-status" id="en-modal-status"></div>
+          <div class="hb-buttons">
+            <button class="hb-btn ghost" id="en-cancel-btn" type="button">Close</button>
           </div>
         </div>
       </div>

@@ -359,3 +359,162 @@ Final validation used Bun with --preload <repo>/scripts/test-preload.ts and abso
 | git diff --check | clean |
 
 No requested fix remains undone. Version 2.2.341 is deliberately unchanged under the explicit no-bump dispatch instruction. No new Ultra code was reused. No live Claude, browser or production SSE check was performed; dashboard delivery is proved at its runner stream callback boundary. README and issue 559 remain untouched, existing external integration/operator soak gates remain applicable, and no GitHub comment or thread resolution was posted.
+
+## Hot-switch to print (connector P1)
+
+Codex connector P1 on `docs/pty-migration.md:71` (thread PRRT_kwDOR1KQD86t-zcC): when `pty.enabled`
+flips true → false, the next runner turn resumed the session on `claude -p --resume` while an idle
+PTY still owned the session key, so two writers shared one transcript (or the CLI refused with
+"Session ID ... is already in use").
+
+**Fix.** `retireLivePtysBeforePrint(keys)` in `src/runner.ts`: reads `liveSessionKeys()` first (an
+empty list returns at once, so a print-only install pays nothing), then `retirePtySession(key)` for
+each of the turn's keys that is live. `retirePtySession` carries the round 8/9 fence and rejects
+with `PtyQuarantinedError` when the exit is unconfirmed; nothing catches it, so the turn rejects and
+no legacy process starts (the same propagation as the existing PTY recovery retire).
+
+| Call site | Keys retired | Why |
+| --- | --- | --- |
+| `execClaude`, before the primary/recovery/fallback legacy spawns | `ptySessionKey` (global / `agent:<n>` / `thread:<id>`) and `fallback:<key>` | one retire covers `runClaudeStream` for the primary, `execRecovery` and `execFallback` |
+| `streamClaude`, before its `spawnClaude` | `global` | the dashboard chat resumes the global session on print |
+
+Not changed, because they never resume a session: `runFork` (fresh `fork:<uuid>`), `runAgentJobHeadless`
+(fresh `job:<agent>:<id>`), and `bootstrap` (goes through `execClaude`). Bus agents stay out of scope.
+
+**Tests** (`src/__tests__/pty-hot-switch-to-print.test.ts`, 5): live PTY on `global` and on
+`agent:<name>` then `pty.enabled` false, the PTY is already disposed at the moment of the legacy
+spawn; the dashboard chat does the same; a rejected retirement means no legacy spawn and the turn
+rejects with `PtyQuarantinedError`; no PTY entry means `retirePtySession` is never called.
+
+**Injections**, one site at a time on `git archive` copies (predicted before running):
+
+| Injection | Predicted | Result |
+| --- | --- | --- |
+| remove the `execClaude` retire block | global, agent, quarantine tests RED | 3 fail: `Expected to contain: "global"  Received: []`; `Expected to contain: "agent:hotswitch-agent-30598"  Received: []`; `expect(received).rejects.toBeInstanceOf(expected)  Received promise that resolved` |
+| move the `execClaude` retire block after the legacy exec | global, agent, quarantine RED | 3 fail: `expect(received).toEqual(expected)  [ - true, + false ]` (PTY not yet disposed at the spawn) on global and agent; `Expected length: 0  Received length: 1` on quarantine |
+| remove the `streamClaude` retire call | dashboard test RED | 1 fail: dashboard chat test |
+| move the `streamClaude` retire call after `spawnClaude` | dashboard test RED | 1 fail: `expect(received).toEqual(expected)  [ - true, + false ]` |
+
+A first run of the injections also turned the "no PTY entry" test red, which exposed a test defect:
+`spy.mockRestore()` at the end of a test is skipped when an assertion throws, so recorded calls leaked
+into the next test. Spies are now restored in `afterEach` (`mock.restore()`), and the rerun above is
+the clean one.
+
+## Final round: pending spawns and fallback retirement
+
+Terry's ruling (2026-10-22): one last round on #562 for Codex's review of `d55ed950` (HIGH, issue #592,
+and a MEDIUM). Nothing else was changed; other observations are under Residuals.
+
+### Fix 1 (HIGH, #592): retirement owns pending spawns
+
+`retireEntry` fenced the session only when a PTY had landed and finished without joining
+`entry.spawnInFlight`. A spawn or respawn still in its ready-settle (`spawnPty`, ~3 s) survived the
+retirement; print, or a replacement admission, then resumed the same transcript before `landPty`
+disposed the late arrival.
+
+| Site | What |
+| --- | --- |
+| `src/runner/pty-quarantine.ts:118` `fenceKey(sessionKey, owner, sessionId?)` | key-level fence with no `PtyProcess`; the owner is the retiring entry, the session id is read at check time (`isFenced`, `:161`) |
+| `src/runner/pty-quarantine.ts:135` `quarantineSession(..., alsoLift)` | the fence and the record change hands in one synchronous step for the entry owner too |
+| `src/runner/pty-supervisor.ts:2056` `retireEntry` (fence at `:2066`) | fences the key before the first await whether or not `entry.pty` is set |
+| `src/runner/pty-supervisor.ts:2090` | `joinPendingSpawns(entry)` is a third member of the disposal/release settle; the entry stays in the map and the fence is held until it ends |
+| `src/runner/pty-supervisor.ts:2122` `joinPendingSpawns` | waits for `spawnInFlight` to settle (it is cleared only after `landPty` has disposed and confirmed the late arrival, or recorded its own quarantine), looping over a spawn started meanwhile |
+| `src/runner/pty-supervisor.ts:2101`, `:2154` | bound exceeded: a stand-in `PtyProcess` (pid 0, `confirmExit` true only once the spawn has settled) becomes the quarantine record, reason `pending-spawn-unsettled`, in the same step that drops the entry fence |
+| `src/runner/pty-supervisor.ts:452` `PENDING_SPAWN_BOUND_MS` | **15 000 ms** (injectable timer `injectPendingSpawnWait`, reset by `__resetSupervisorForTests`) |
+
+**Bound.** No existing constant fits (`DEFAULT_EXIT_CAP_MS` 7 s bounds a disposal, not a spawn). 15 s is
+the 3 s ready-settle plus the 7 s disposal cap a late arrival may need, plus margin for boot work ahead of
+the spawn. It is derived, not measured. Past it the session is quarantined and stays so; the next gate
+passes only once the spawn has settled (then `landPty` has disposed what it produced).
+
+**Does a rejecting `spawnPty` leave a process?** Read `src/runner/pty-process.ts:1558`. The only
+rejections after the OS process exists are "exited before TUI settled" (`:1630`), where the process
+already reported its own exit, and nothing else; a failed `ptySpawn` throws before any child exists. So
+no rejection path leaves a live child for the retirement to kill. The one thing not proved is that the
+self-exit is OS-probed (it is the pty's exit event). Recorded as a residual, not changed.
+
+**Item 4 (presence test).** `liveSessionKeys()` already counts an entry with `spawnInFlight`
+(`pty-supervisor.ts`, `!entry.retiring && !entry.spawnInFlight && !entry.pty?.isAlive()`), and
+`retirePtySession` looks the entry up in `state.ptys`. No change; a test pins it.
+
+### Fix 2 (MEDIUM): retire the fallback key only where it is used
+
+| Site | What |
+| --- | --- |
+| `src/runner.ts:2070` | before the primary legacy spawn only `ptySessionKey` is retired (was `[key, fallback:key]`) |
+| `src/runner.ts:2240`-`2250` | inside the fallback branch, immediately before the fallback runs, `retireLivePtysBeforePrint([fallbackPtyKey])`; a `PtyQuarantinedError` there fails the fallback attempt only: the fallback outcome is `exitCode 1` with the error as stderr, the primary already ran |
+| `streamClaude` (`src/runner.ts:2923`) | has no fallback path; still retires `["global"]` |
+
+### Tests
+
+`src/__tests__/pty-pending-spawn-retire.test.ts` (5): deferred first spawn (retirement unresolved,
+`assertSessionSpawnable` by key and by session id throws synchronously, ends after the late PTY is
+disposed, the next resume proceeds); a replacement admission waits for the retirement and does not
+spawn beside the child; deferred respawn; late PTY dispose unconfirmed leaves the session quarantined
+after the retirement; a spawn that never settles (fake timer asked for exactly 15 000 ms) is
+quarantined, refused again by the gate while pending, and released by the next gate after it settles.
+`src/__tests__/pty-hot-switch-to-print.test.ts` (+4, now 9): pending spawn on `global` then
+`pty.enabled` false, print spawns only after the late PTY is disposed (order asserted); quarantined
+`fallback:global` does not fail a healthy primary turn; a turn that needs the fallback has only the
+fallback attempt refused (primary ran, `retirePtySession("fallback:global")` called once, after the
+primary spawn); a live fallback PTY is retired after the primary and before the fallback spawn.
+
+Existing tests whose scenario assumed `/kill` returns while a spawn is still held were adapted, not
+weakened (`src/__tests__/pty-supervisor.test.ts`): the kill is now started, the held spawn released, and
+the kill awaited (5 tests); `invariant 2` (a failed old spawn must not revoke the replacement's
+identity) now starts the replacement while the old spawn is pending and asserts it waits, which is the
+stronger property; `afterEach` expires the pending-spawn bound at once so a test that abandons a spawn
+which never settles does not hold shutdown for 15 s.
+
+### Injections
+
+One site at a time on `git archive` copies of the fix commit, prediction written first. Verbatim RED lines:
+
+| Injection | Predicted | RED lines |
+| --- | --- | --- |
+| (a) `joinPendingSpawns(entry)` -> `Promise.resolve(null)` | every pending-spawn test and the hot-switch order test RED | `(fail) a retirement while the first spawn is pending > is held, refuses a resume on the session synchronously, and ends after the late PTY is confirmed dead [261.03ms]`<br>`(fail) a retirement while the first spawn is pending > is fenced from its first step, and a replacement admission waits instead of resuming beside the child [103.83ms]`<br>`(fail) a retirement while a respawn is pending > is held until the late respawn is disposed [544.19ms]`<br>`(fail) a late PTY whose exit cannot be confirmed > quarantines the session after the retirement [114.23ms]`<br>`(fail) a pending spawn that never settles > is quarantined once the bound passes, never released [108.81ms]`<br>`(fail) #562 final round: a pending spawn is the retirement's to settle (#592) > global: print spawns only after the late PTY is confirmed dead [175.02ms]`<br>`6 fail` |
+| (b) drop the `fenceKey(...)` call (the old `if (entry.pty)` only) | the three synchronous-fence tests RED | `(fail) a retirement while the first spawn is pending > is held, refuses a resume on the session synchronously, and ends after the late PTY is confirmed dead [6280.16ms]`<br>`(fail) a retirement while the first spawn is pending > is fenced from its first step, and a replacement admission waits instead of resuming beside the child [6070.24ms]`<br>`(fail) a retirement while a respawn is pending > is held until the late respawn is disposed [6553.86ms]`<br>`3 fail` |
+| (c) bound exceeded: lift instead of quarantine | the never-settles test RED | `(fail) a pending spawn that never settles > is quarantined once the bound passes, never released [101.60ms]`<br>`1 fail` |
+| (d) fallback key back in the primary retirement | the three fallback tests RED | `(fail) #562 final round: the fallback key is retired only where the fallback runs > a quarantined fallback does not fail a healthy primary turn [1.70ms]`<br>`(fail) #562 final round: the fallback key is retired only where the fallback runs > a turn that needs the fallback: only the fallback attempt is refused [1.24ms]`<br>`(fail) #562 final round: the fallback key is retired only where the fallback runs > a live fallback PTY is retired immediately before the fallback spawn, after the primary [10.67ms]`<br>`3 fail` |
+| (f) ephemeral caller awaits the retirement even after its deadline (`src/runner/pty-supervisor.ts` finally of `runOnPty`) | the two one-shot deadline tests RED (the five `one-shot configuration` failures are a cascade of their timeouts) | `(fail) one-shot isolation contract > PTY deadline retires a process whose spawn lands late [6051.27ms]`<br>`(fail) one-shot isolation contract > untrusted PTY temporary cwd > is removed when the spawn never lands [6010.02ms]`<br>`(fail) one-shot configuration > rejects bad routing during settings load [6.95ms]`<br>`(fail) one-shot configuration > rejects untrusted PTY before the isolation spike: {"routes":{"tuner.judge":"pty"}} [7.73ms]`<br>`(fail) one-shot configuration > rejects untrusted PTY before the isolation spike: {"default":"pty"} [6.00ms]`<br>`(fail) one-shot configuration > rejects untrusted PTY before the isolation spike: {"routes":{"tuner.*":"pty"}} [6.93ms]`<br>`(fail) one-shot configuration > the PTY engine does not advertise isolation until the spike is green [7.71ms]`<br>`51 pass`<br>`7 fail` |
+| (e) `landPty` stops quarantining an unconfirmed late PTY | the unconfirmed-dispose test RED | `(fail) a late PTY whose exit cannot be confirmed > quarantines the session after the retirement [95.00ms]`<br>`1 fail` |
+
+### Gates
+
+- `env -u ANTHROPIC_BASE_URL bun test src > /tmp/final-src.txt 2>&1`: first run (head `19427777`) exit 1, 5006 pass / 9 fail.
+  Two were caused by this change (`src/oneshot/engine.test.ts`: `PTY deadline retires a process whose spawn lands
+  late`, `untrusted PTY temporary cwd > is removed when the spawn never lands`) and five more
+  (`one-shot configuration`) cascaded from them. Cause: `runOnPty`'s ephemeral `finally` awaited the
+  retirement, which now waits for the pending spawn, so a one-shot with a 30 ms deadline was held up to
+  the 15 s bound. Fixed by not holding an aborted or timed-out ephemeral caller on a pending spawn
+  (`src/runner/pty-supervisor.ts`, the `finally` of `runOnPty`); the retirement carries on in the
+  background with the session fenced. `engine.test.ts` now expires the bound and resets the supervisor in
+  `afterEach`. Injection (f) above proves the rule. The other two failures
+  (`buildHostTelemetryProvider extraProducers` timeout, `SkillsSubject judge failure cooldown` 5 s timeout)
+  pass on rerun alone (106 pass, 0 fail across the five host-telemetry and skills files).
+  The full `src` run was not repeated after the fix: it takes ~6 min and the touched surface is covered
+  by the wide set below. Say so if you want it re-run.
+- Wide PTY set (`src/__tests__/pty-*.test.ts`, `oneshot-pty-tools`, `live-session-actions`, `runner`,
+  `execution-engines`, `src/oneshot`, `session-manager-quarantine`): normal 898 pass / 0 fail, and with
+  `CLAUDECLAW_TEST_PLATFORM=linux` 898 pass / 0 fail, both after the ephemeral fix.
+- Touched suites again after the last edit: 194 pass / 0 fail.
+- `bun run lint` exit 0. `bun run typecheck` exit 0, 149 against baseline 149 (a first run showed 150: my
+  stand-in `PtyClosedError` call lacked its third argument; fixed).
+- `git diff --check` clean. Version 2.2.354 unchanged: `povai/main` is 2.2.353 and the branch is 0 behind it.
+
+
+### Residuals (not implemented)
+
+- **Shared session lease through the print process's lifetime** (Codex's "hold a shared session lease
+  through the print process's lifetime to exclude replacement admissions"). The retirement now holds
+  the session until pending spawns settle, but nothing holds a lease while a `claude -p` child runs, so
+  a PTY admission on a key during a long print turn is not excluded by the supervisor. Not done.
+- The self-exit in `spawnPty`'s "exited before TUI settled" path is trusted from the pty's exit event,
+  not probed with `process.kill(pid, 0)`.
+- The 15 s bound is derived from the settle and disposal caps, not measured on a loaded host.
+- A retirement now waits on a pending spawn, so `/kill`, shutdown and a hot-switched print turn can
+  each be held up to the bound; the runner's global queue slot is held meanwhile.
+- A one-shot that times out while its spawn is pending is no longer held by the retirement; its
+  temporary cwd is removed while the late child may still run until `landPty` disposes it (as before
+  this round).
+- The stand-in quarantine record has no pid (`0`); a status listing shows it as `pending-spawn-unsettled`.

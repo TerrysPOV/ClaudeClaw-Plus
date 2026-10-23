@@ -29,6 +29,7 @@ import {
   runOneShot as realRunOneShot,
 } from "../oneshot/engine.js";
 import { memoryFileGrant } from "../memory.js";
+import { assertSessionWritable } from "./pty-quarantine.js";
 import { retirePtySession, sendToLiveSession } from "./pty-supervisor.js";
 
 type OneShotFn = (req: OneShotRequest) => Promise<OneShotResult>;
@@ -83,6 +84,7 @@ const stamp = (): string => new Date().toLocaleTimeString();
 export async function actOnSession(req: SessionActionRequest): Promise<SessionActionResult> {
   if (req.sessionKey && req.skipLive) {
     try {
+      // Rejects when the exit could not be confirmed (#562 round 8): no one-shot beside it.
       await retirePtySession(req.sessionKey);
     } catch (err) {
       return {
@@ -112,6 +114,15 @@ export async function actOnSession(req: SessionActionRequest): Promise<SessionAc
     console.log(
       `[${stamp()}] ${req.route}: ${req.sessionKey} is not live (${sent.reason}) — one-shot resume`,
     );
+  }
+
+  // #562 round 8: every path that reaches the one-shot (`not-live`, `skipLive`, no live key at
+  // all) passes the gate, by key and by session id. A process the OS has not confirmed gone
+  // may still write this transcript.
+  try {
+    await assertSessionWritable({ sessionKey: req.sessionKey, sessionId: req.sessionId });
+  } catch (err) {
+    return { ok: false, via: "live", text: "", detail: (err as Error).message };
   }
 
   try {

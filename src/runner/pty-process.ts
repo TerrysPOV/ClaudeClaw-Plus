@@ -4,25 +4,35 @@
  * Knows nothing about supervisors, sessions, or adapters. Stateless beyond
  * the PTY handle it owns. Implements the contract from SPEC §3.1 verbatim.
  *
- * ─── Turn detection: sentinel-echo round-trip (issue #81) ────────────────────
+ * ─── Turn evidence: the session transcript, never the screen (#562 round 2) ────
  *
- * Claude 2.1.89 dropped the OSC 9;4 progress markers earlier versions emitted
- * around each turn. To detect turn completion without those markers, runTurn
- * uses a sentinel-echo round-trip implemented in `pty-output-parser.ts`:
+ * Whether a prompt was accepted, what the answer is and when the turn is over are read
+ * from the session transcript the CLI itself writes (`pty-transcript.ts`), not from the
+ * TUI's rendering. Repaints of the old conversation, chunk splits, a prompt echoed into
+ * the input box and changes to the CLI's chrome all produced false successes (#559, the
+ * #562 soak). The screen is used only for readiness (boot settle, dialogs), liveness
+ * (exit, tail diagnostics) and timing (wait for a repaint to quiet before the next
+ * prompt), and only ever to delay, fail or abort a turn, never to complete one.
  *
- *   1. Write the user prompt + `\r` to the PTY (claude submits on Enter).
- *   2. Accumulate every byte that comes back.
- *   3. When the stream has been silent for `quietWindowMs` (default 500ms),
- *      write a unique sentinel string into claude's prompt buffer WITHOUT a
- *      trailing `\r`. claude's TUI echoes the bytes straight back into stdout.
- *   4. When the echo is seen, the turn is complete. The response is the slice
- *      from `turn-start.offset` up to `sentinel-found.offset`.
- *   5. Send Ctrl-U (0x15, `kill-line`) to clear the sentinel from claude's
- *      input buffer before the next turn.
- *
- * Fallback: if the sentinel never echoes back within `sentinelMaxWaitMs`
- * (claude crashed, TUI stalled), the turn completes with `cleanBoundary=false`
- * and whatever bytes were captured.
+ *   1. Mark the transcript (size and file identity), write the prompt as a bracketed paste
+ *      + `\r`.
+ *   2. Accepted = a `user` (or `enqueue`) entry whose payload IS this prompt, appended after
+ *      the mark. Not seen within `submitConfirmMs`: one bare CR; again: Ctrl-U and
+ *      `PtyPromptNotAcceptedError`.
+ *   3. Answer = the text of the turn's FINAL assistant message in the transcript (the print
+ *      path's `result`), never between-tool narration and never a later turn.
+ *   4. Done = the turn's final assistant message carries a terminal stop reason AND the
+ *      transcript shows an authoritative boundary after it: the CLI's `turn_duration` or the
+ *      next real user prompt (`/compact`: `compact_boundary`). No quiet-file timer. Failed =
+ *      the CLI's own API error (anywhere before the boundary), a command's stderr, an
+ *      uncertain attribution, or a reply with no text (`PtyTurnFailedError`); a transcript
+ *      that was replaced fails with `TranscriptReplacedError`. A final message with no
+ *      boundary by the timeout is `PtyTranscriptUncertainError`: not a success, not replayed.
+ *   5. The moment the transcript establishes the outcome it is COMMITTED (`_commitTurn`): the
+ *      hard timeout is cancelled and a PTY exit no longer rejects. The screen settle that
+ *      follows only delays the return.
+ *   6. No transcript to read (untrusted one-shot, no session id, switched off) = the
+ *      turn fails before anything is written: `PtyTranscriptUnavailableError`.
  *
  * ─── OR-6 decision (session-ID) ──────────────────────────────────────────────
  *   Pre-allocate via `--session-id <uuid>` for fresh spawns when
@@ -36,25 +46,55 @@ import { spawn as ptySpawn, type IPty } from "bun-pty";
 import type { SecurityConfig } from "../config";
 import { UNTRUSTED_CLAUDE_ARGS } from "../oneshot/isolation.js";
 import { cliModelFlag } from "../oneshot/model.js";
-import { withCleanProcessEnv } from "../runner";
-import {
-  createParser,
-  decodeTurn,
-  encodeSentinel,
-  feed,
-  buildSentinel,
-  markSentinelWritten,
-  resetTurn,
-  startTurn,
-  stripAnsi,
-  tick,
-  type Parser,
-} from "./pty-output-parser";
+import { claudeExecutable, withCleanProcessEnv } from "../runner";
+// Screen text is used for readiness and dialogs only (`_waitForReadySettle`): the
+// parser's completion/answer API is deliberately NOT imported here (#562 round 2; the
+// guard test `pty-turn-evidence-guard.test.ts` fails the build if it comes back).
+import { stripAnsi } from "./pty-output-parser";
+import { assertSessionSpawnable } from "./pty-quarantine";
 // Re-export the sanitiser from its standalone home so existing callers that
 // pull it from `pty-process` (and through `runner/index`) keep working without
 // loading bun-pty just to get the helper.
 import { preparePtyPromptForWrite, sanitizePtyPromptText } from "./pty-prompt-sanitizer";
-import { appendFileSync } from "node:fs";
+import {
+  resolveTranscriptPath,
+  TranscriptReplacedError,
+  TranscriptTurn,
+  type TurnFailureKind,
+} from "./pty-transcript";
+
+export { TranscriptReplacedError };
+import { spawnSync } from "node:child_process";
+import { appendFileSync, readFileSync } from "node:fs";
+
+/**
+ * A process's birth identity: something a reused pid cannot share with the process that held
+ * it before. Linux: field 22 of `/proc/<pid>/stat` (start time in clock ticks since boot, read
+ * with a plain file read). macOS/BSD: `ps -o lstart=` (the start time to the second; one
+ * `ps` spawn, about 10-20 ms, paid once at spawn and once per signal, never per poll).
+ * Reuse inside the same second would need the pid counter to wrap in that second. `null`:
+ * the pid is gone or the identity cannot be read (Windows, no `ps`).
+ */
+export function readPidIdentity(pid: number): string | null {
+  try {
+    if (process.platform === "win32") return null;
+    if (process.platform === "linux") {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      // `comm` (field 2) may hold spaces and parens: split after the LAST ")".
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      return fields[19] || null; // field 22 = index 19 once fields 1-2 are cut
+    }
+    const r = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf8",
+      env: { ...process.env, LC_ALL: "C" },
+      timeout: 2000,
+    });
+    const out = (r.stdout ?? "").trim();
+    return r.status === 0 && out ? out : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Raw PTY trace, off unless `CLAUDECLAW_PTY_DUMP=<file>` is set. Every chunk
@@ -130,12 +170,25 @@ export interface PtyProcessOptions {
   /** Idle-timeout safety net for runTurn (cap on absolute response time when
    *  the sentinel echo never arrives). Default 30000ms. */
   turnIdleTimeoutMs?: number;
-  /** Quiet window (ms) of inactivity before runTurn writes the sentinel.
+  /** Quiet window (ms) the screen must show after the transcript says the reply is
+   *  complete, before the next prompt may be sent (readiness; it only delays).
    *  Default: 500. */
   quietWindowMs?: number;
-  /** Hard cap (ms) waiting for the sentinel echo after we write it. After
-   *  this elapses with no echo, the turn completes with cleanBoundary=false.
-   *  Default: 30_000. */
+  /** How long (ms) to wait for evidence the prompt was ACCEPTED (the turn-start
+   *  edge, #562) before re-sending the submit key once, and again before failing
+   *  the turn with `PtyPromptNotAcceptedError`. Default: 3000. */
+  submitConfirmMs?: number;
+  /**
+   * Where the CLI writes this session's transcript. Derived from the session id, cwd
+   * and config dir when omitted; an untrusted one-shot (`--no-session-persistence`) and
+   * a process spawned through a test hook have none. With a transcript, acceptance, the
+   * answer and the end of the turn come from it, not from the screen (#562 round 2).
+   */
+  transcriptPath?: string;
+  /** Longest (ms) a finished reply waits for the screen to go quiet. Past it the turn
+   *  resolves anyway: the wait is readiness, never evidence. Default: 2000. */
+  settleCapMs?: number;
+  /** @deprecated No sentinel any more (#562 round 2); accepted so callers compile. */
   sentinelMaxWaitMs?: number;
   /**
    * INTERNAL TEST HOOK: command path to spawn instead of `claude`.
@@ -178,11 +231,25 @@ export interface PtyProcessOptions {
    */
   _skipReadySettle?: boolean;
   /**
-   * INTERNAL TEST HOOK: override the per-turn sentinel UUID. When set, the
-   * supervisor uses this string instead of a fresh crypto.randomUUID(). Lets
-   * tests pin the exact sentinel bytes the PTY will write.
+   * INTERNAL TEST HOOK: send a signal to a pid (`0` probes). Default `process.kill`. Retirement
+   * proves death with it, so a stand-in process with a made-up pid needs a stand-in here.
    */
-  _sentinelUuidOverride?: () => string;
+  _signalPid?: (pid: number, signal: NodeJS.Signals | 0) => void;
+  /**
+   * INTERNAL TEST HOOK: read a pid's birth identity (`readPidIdentity`). A test that stands in
+   * for the pid with `_signalPid` gets "no identity" unless it names a reader too.
+   */
+  _readPidIdentity?: (pid: number) => string | null;
+  /**
+   * INTERNAL TEST HOOK: replace bun-pty's `spawn`. A test that needs a stand-in child uses this
+   * instead of `mock.module("bun-pty")`, which is process-wide in bun and is not undone by
+   * `mock.restore`: it leaks into every later file of a single-process `bun test src` (CI).
+   */
+  _ptySpawn?: typeof ptySpawn;
+  /** INTERNAL TEST HOOK: wait for a graceful exit before SIGKILL (default 2000ms). */
+  _exitGraceMs?: number;
+  /** INTERNAL TEST HOOK: total wait for the OS to confirm the exit (default 7000ms). */
+  _exitCapMs?: number;
 }
 
 /**
@@ -227,14 +294,73 @@ export interface PtyProcess {
       allowReplCommand?: boolean;
     },
   ): Promise<PtyTurnResult>;
+  /**
+   * Retire the process. Resolves only once the OS has confirmed the pid is gone (a probe, not
+   * bun-pty's exit event); rejects with `PtyExitUnconfirmedError` when it is not.
+   */
   dispose(): Promise<void>;
+  /**
+   * Re-run the exit confirmation of a process whose `dispose()` rejected: probe, SIGKILL,
+   * probe. Resolves once the pid is gone. Used to release a quarantine.
+   */
+  confirmExit?(): Promise<void>;
 }
 
 export interface PtyTurnResult {
   text: string;
   bytesCaptured: number;
+  /** Always true from a real process: a turn resolves only on a complete transcript
+   *  reply. A result that says false is a failure for both callers, whatever else it
+   *  carries (#562 round 3: there is no "complete anyway" exception). */
   cleanBoundary: boolean;
   sessionId: string;
+}
+
+/**
+ * A result whose boundary is not confirmed. A real process never returns one (it rejects
+ * instead); the type and the callers keep the contract, so a stand-in that does is a
+ * failure, not a success with whatever text it carried. The turn may have run: never
+ * resubmit.
+ */
+export class PtyBoundaryUnconfirmedError extends Error {
+  constructor(public readonly label: string) {
+    super(
+      `PTY turn boundary unconfirmed for ${label}: no complete reply was confirmed in the session transcript; the turn may have run`,
+    );
+    this.name = "PtyBoundaryUnconfirmedError";
+  }
+}
+
+/**
+ * What to do with a finished turn: `ok`, or `failed` when the boundary is not clean. There
+ * is no third verdict: a reply that arrived without a clean boundary used to be returned
+ * as a success and the entry retired (#562 round 3, M2). Both callers of `runTurn` in the
+ * supervisor apply it.
+ */
+export function boundaryVerdict(result: PtyTurnResult): "ok" | "failed" {
+  return result.cleanBoundary ? "ok" : "failed";
+}
+
+/**
+ * The transcript says the turn ended in failure: the CLI's own API error, a command's
+ * stderr, or something that leaves it uncertain whose reply this is (`ambiguous`). The
+ * prompt did run (or may have), so the turn is never retried or resubmitted. For an
+ * `api-error`, `text` is the CLI's error text, which the runner reads to decide whether the
+ * stored session is corrupt (the print path does the same from its output).
+ */
+export class PtyTurnFailedError extends Error {
+  constructor(
+    public readonly label: string,
+    public readonly kind: TurnFailureKind,
+    public readonly text: string,
+  ) {
+    super(
+      kind === "ambiguous"
+        ? `PTY turn outcome uncertain for ${label}: ${text}; the turn may have run`
+        : `PTY turn failed for ${label} (${kind}): ${text}`,
+    );
+    this.name = "PtyTurnFailedError";
+  }
 }
 
 /**
@@ -243,6 +369,25 @@ export interface PtyTurnResult {
  * importing the concrete `spawnPty` symbol from this file at top-level.
  */
 export type SpawnPty = (opts: PtyProcessOptions) => Promise<PtyProcess>;
+
+/**
+ * A message of the turn carries a terminal stop reason, but the transcript never showed an
+ * authoritative boundary after it (`turn_duration`, the next real prompt) before the
+ * timeout. The reply may be incomplete (a later block can still arrive), so it is not
+ * delivered and the turn is not replayed. The supervisor kills the process and resumes the
+ * session in a new one.
+ */
+export class PtyTranscriptUncertainError extends Error {
+  constructor(
+    public readonly label: string,
+    public readonly elapsedMs: number,
+  ) {
+    super(
+      `PTY turn outcome uncertain for ${label}: the reply ended but the transcript showed no turn boundary within ${elapsedMs}ms; the turn may have run`,
+    );
+    this.name = "PtyTranscriptUncertainError";
+  }
+}
 
 export class PtyTurnTimeoutError extends Error {
   constructor(
@@ -254,11 +399,66 @@ export class PtyTurnTimeoutError extends Error {
   }
 }
 
+/**
+ * The prompt was written but claude never showed a turn running (#562): the
+ * paste sat unsubmitted in the input box, or the TUI is wedged. Raised instead
+ * of completing the turn on whatever the screen happened to show. NOT retried by
+ * the supervisor: the process is alive, and a re-sent prompt could land twice.
+ */
+export class PtyPromptNotAcceptedError extends Error {
+  constructor(
+    public readonly label: string,
+    public readonly elapsedMs: number,
+    detail?: string,
+  ) {
+    super(
+      `PTY prompt not accepted for ${label}: no turn started within ${elapsedMs}ms of the send and one submit retry${detail ? ` (${detail})` : ""}`,
+    );
+    this.name = "PtyPromptNotAcceptedError";
+  }
+}
+
+/**
+ * This process has no transcript to read, so no turn on it can be verified (#562 round
+ * 2). Raised before anything is written: the screen is not an acceptable substitute.
+ */
+export class PtyTranscriptUnavailableError extends Error {
+  constructor(
+    public readonly label: string,
+    public readonly why: string,
+  ) {
+    super(`PTY turn refused for ${label}: no session transcript to read (${why})`);
+    this.name = "PtyTranscriptUnavailableError";
+  }
+}
+
+/**
+ * The OS still shows the process after SIGTERM, SIGKILL and the hard cap. It may still be
+ * writing its transcript, so nothing may resume that session until a later confirmation
+ * succeeds (the supervisor quarantines the key).
+ */
+export class PtyExitUnconfirmedError extends Error {
+  constructor(
+    public readonly label: string,
+    public readonly pid: number,
+  ) {
+    super(
+      `PTY process ${label} (pid ${pid}) is still alive after SIGKILL; its exit is unconfirmed`,
+    );
+    this.name = "PtyExitUnconfirmedError";
+  }
+}
+
 export class PtyClosedError extends Error {
   constructor(
     public readonly label: string,
     public readonly exitCode: number | null,
     public readonly signal: string | null,
+    /**
+     * The turn's prompt had been written when the process went away, so it may have run.
+     * False (the default) means it never went out and the supervisor may retry it.
+     */
+    public readonly promptSent = false,
   ) {
     super(`PTY closed during turn for ${label} (exit=${exitCode} signal=${signal})`);
     this.name = "PtyClosedError";
@@ -268,8 +468,14 @@ export class PtyClosedError extends Error {
 // ─── Internal helpers ───────────────────────────────────────────────────────
 
 const DEFAULT_QUIET_WINDOW_MS = 500;
-const DEFAULT_SENTINEL_MAX_WAIT_MS = 30_000;
-const DEFAULT_QUIET_TICK_MS = 50;
+const DEFAULT_SETTLE_CAP_MS = 2000;
+const DEFAULT_SUBMIT_CONFIRM_MS = 3000;
+/** How often a turn's transcript is read. */
+const DEFAULT_POLL_MS = 50;
+/** Retirement: how long SIGTERM gets before SIGKILL, and the total wait for the OS to agree. */
+const DEFAULT_EXIT_GRACE_MS = 2000;
+const DEFAULT_EXIT_CAP_MS = 7000;
+const EXIT_PROBE_MS = 20;
 const DEFAULT_COLS = 100;
 const DEFAULT_ROWS = 30;
 const DEFAULT_PERMISSION_MODE_ARGS = ["--dangerously-skip-permissions"];
@@ -457,19 +663,13 @@ class PtyProcessImpl implements PtyProcess {
   private _lastTurnEndedAt: number = 0;
   private _pty: IPty;
   private readonly _quietWindowMs: number;
-  private readonly _sentinelMaxWaitMs: number;
+  private readonly _settleCapMs: number;
+  private readonly _submitConfirmMs: number;
   private readonly _now: () => number;
   private readonly _setTimeout: (cb: () => void, ms: number) => ReturnType<typeof setTimeout>;
   private readonly _clearTimeout: (handle: ReturnType<typeof setTimeout>) => void;
   private readonly _setInterval: (cb: () => void, ms: number) => ReturnType<typeof setInterval>;
   private readonly _clearInterval: (handle: ReturnType<typeof setInterval>) => void;
-  private readonly _sentinelUuidGen: () => string;
-
-  /** Accumulated bytes for the in-flight turn, OR all bytes when no turn
-   *  is in flight (kept so idle-fallback can produce a defensible response). */
-  private _turnBuf: Uint8Array[] = [];
-  private _turnBufLen = 0;
-  private _parser: Parser;
 
   /** Whether we are currently inside a runTurn call. */
   private _turnInProgress = false;
@@ -477,21 +677,42 @@ class PtyProcessImpl implements PtyProcess {
   private _turnResolve: ((result: PtyTurnResult) => void) | null = null;
   private _turnReject: ((err: Error) => void) | null = null;
   private _turnHardTimeoutHandle: ReturnType<typeof setTimeout> | null = null;
-  private _quietTickHandle: ReturnType<typeof setInterval> | null = null;
-  private _sentinelDeadlineHandle: ReturnType<typeof setTimeout> | null = null;
+  private _pollHandle: ReturnType<typeof setInterval> | null = null;
+  /** #562: fires while the transcript does not show the prompt; retries the submit once. */
+  private _submitConfirmHandle: ReturnType<typeof setTimeout> | null = null;
+  private _submitRetried = false;
   private _turnStartedAt = 0;
-  /** Sentinel state for the current turn. */
-  private _activeSentinelBytes: Uint8Array | null = null;
-  private _activeSentinelString = "";
+  /** Where the CLI writes this session's transcript; null when there is none to read. */
+  private readonly _transcriptPath: string | null;
+  /** Why there is no transcript path (for the refusal message). */
+  private readonly _noTranscriptWhy: string;
+  /** The transcript reader for the turn in flight. */
+  private _tx: TranscriptTurn | null = null;
+  /** Assistant text already handed to `onChunk`. */
+  private _txStreamed = "";
+  /** Tool lines already handed to `onToolEvent`. */
+  private _txToolsEmitted = 0;
+  /** The transcript has shown this turn's prompt. */
+  private _accepted = false;
+  /** When the transcript first showed the reply complete; 0 until then. */
+  private _endedAt = 0;
+  /** When the screen last painted: readiness timing only. */
+  private _lastDataAt = 0;
   private _disposed = false;
+  /** The retirement in flight or last settled OK; cleared when it rejects so a retry runs. */
+  private _disposal: Promise<void> | null = null;
+  private readonly _signalPid: (pid: number, signal: NodeJS.Signals | 0) => void;
+  private readonly _readIdentity: (pid: number) => string | null;
+  /** The child's birth identity, read at spawn; null when it could not be read. */
+  private readonly _identity: string | null;
+  private readonly _exitGraceMs: number;
+  private readonly _exitCapMs: number;
   /** Listener disposables from bun-pty. */
   private _onDataDisposable: { dispose(): void } | null = null;
   private _onExitDisposable: { dispose(): void } | null = null;
   /** Optional callbacks from the current runTurn. */
   private _onChunk?: (text: string) => void;
   private _onToolEvent?: (line: string) => void;
-  /** Decoder shared across chunks for onChunk emission (UTF-8 stream). */
-  private _streamDecoder = new TextDecoder("utf-8");
   /** Tracks whether any data has been received since spawn — used by
    *  `_waitForReadySettle` to flag a "TUI is alive" signal. */
   private _firstDataAt = 0;
@@ -515,18 +736,41 @@ class PtyProcessImpl implements PtyProcess {
     this._sessionId =
       opts.sessionId && opts.sessionId.length > 0 ? opts.sessionId : (opts.newSessionId ?? "");
     this.cwd = opts.cwd;
+    // A process spawned through a test hook is not a real claude: it writes no
+    // transcript unless the test names one.
+    const hooked = Boolean(opts._commandOverride || opts._argsOverride || opts._skipClaudeArgs);
+    const untrusted = opts.isolation === "untrusted";
+    this._transcriptPath =
+      opts.transcriptPath ??
+      (hooked
+        ? null
+        : resolveTranscriptPath({
+            cwd: opts.cwd,
+            sessionId: this._sessionId,
+            env: opts.env,
+            untrusted,
+          }));
+    this._noTranscriptWhy = untrusted
+      ? "an untrusted one-shot runs with --no-session-persistence"
+      : hooked
+        ? "spawned through a test hook without a transcriptPath"
+        : "no session id";
     this._secretValues = collectSecretValues(opts.env);
     this.label = `${opts.agentName ?? "pty"}:${pty.pid}`;
     this._quietWindowMs = opts.quietWindowMs ?? DEFAULT_QUIET_WINDOW_MS;
-    this._sentinelMaxWaitMs = opts.sentinelMaxWaitMs ?? DEFAULT_SENTINEL_MAX_WAIT_MS;
+    this._settleCapMs = opts.settleCapMs ?? DEFAULT_SETTLE_CAP_MS;
+    this._submitConfirmMs = opts.submitConfirmMs ?? DEFAULT_SUBMIT_CONFIRM_MS;
     this._now = opts._now ?? (() => Date.now());
+    this._signalPid = opts._signalPid ?? ((pid, signal) => void process.kill(pid, signal));
+    this._readIdentity = opts._readPidIdentity ?? (opts._signalPid ? () => null : readPidIdentity);
+    this._identity = this._readIdentity(pty.pid);
+    this._exitGraceMs = opts._exitGraceMs ?? DEFAULT_EXIT_GRACE_MS;
+    this._exitCapMs = opts._exitCapMs ?? DEFAULT_EXIT_CAP_MS;
     this._setTimeout = opts._setTimeout ?? ((cb, ms) => setTimeout(cb, ms));
     this._clearTimeout = opts._clearTimeout ?? ((h) => clearTimeout(h));
     this._setInterval = opts._setInterval ?? ((cb, ms) => setInterval(cb, ms));
     this._clearInterval = opts._clearInterval ?? ((h) => clearInterval(h));
-    this._sentinelUuidGen = opts._sentinelUuidOverride ?? (() => crypto.randomUUID());
     this._spawnedAt = this._now();
-    this._parser = createParser({ quietWindowMs: this._quietWindowMs });
 
     this._onDataDisposable = pty.onData((data) => this._handleData(data));
     this._onExitDisposable = pty.onExit((info) => this._handleExit(info));
@@ -607,62 +851,104 @@ class PtyProcessImpl implements PtyProcess {
   // ─── data flow ────────────────────────────────────────────────────────
 
   private _handleData(data: string): void {
-    // bun-pty delivers strings; re-encode for the byte-level parser.
+    // bun-pty delivers strings; the byte count is all the screen is used for here.
     const bytes = new TextEncoder().encode(data);
     const now = this._now();
-    dumpPtyTrace(
-      `<< pid=${this._pid} state=${this._parser.state} turn=${this._turnInProgress} n=${bytes.length}`,
-      data,
-    );
+    dumpPtyTrace(`<< pid=${this._pid} turn=${this._turnInProgress} n=${bytes.length}`, data);
     if (this._firstDataAt === 0) this._firstDataAt = now;
+    // Liveness only: when did the TUI last paint. A finished reply waits for this to go
+    // quiet before the next prompt is accepted (readiness); it never decides the outcome.
+    this._lastDataAt = now;
 
-    // Buffer for the current turn (so idle-fallback can return content).
-    this._turnBuf.push(bytes);
-    this._turnBufLen += bytes.length;
-
-    // Issue #176: maintain a separate rolling tail of recent bytes so we
-    // can diagnose "PTY exited before TUI settled" failures. _turnBuf gets
-    // reset between turns; the tail buffer persists across the spawn → exit
-    // window, which is exactly when we need it.
+    // Issue #176: maintain a rolling tail of recent bytes so we can diagnose
+    // "PTY exited before TUI settled" failures; the tail persists across spawn → exit.
     this._appendToTail(bytes);
+  }
 
-    const events = feed(this._parser, bytes, now);
+  private _emitChunk(text: string): void {
+    if (text.length === 0 || !this._onChunk) return;
+    try {
+      this._onChunk(text);
+    } catch {
+      // Caller bug; never let it kill the PTY pipeline.
+    }
+  }
 
-    // onChunk streaming — opportunistic delta delivery.
-    if (this._turnInProgress && this._onChunk) {
-      const decoded = this._streamDecoder.decode(bytes, { stream: true });
-      const stripped = stripAnsiInline(decoded);
-      if (stripped.length > 0) {
+  /**
+   * One poll of the turn's transcript: acceptance (the submit-retry timer stands down),
+   * the assistant's own text and tool calls for the streaming callbacks, and the end of the
+   * reply. The only place a turn can come to succeed (#562 round 2).
+   */
+  private _pollTurn(): void {
+    const tx = this._tx;
+    if (!tx || !this._turnInProgress) return;
+    let state: ReturnType<TranscriptTurn["poll"]>;
+    try {
+      state = tx.poll();
+    } catch (err) {
+      // The file is no longer the one the turn started on: nothing in it can be trusted
+      // as new evidence, and the prompt may have run. Fail, never resubmit.
+      if (err instanceof TranscriptReplacedError) this._rejectTurn(err);
+      return; // Any other failed read is a poll that saw nothing; the next one retries.
+    }
+    if (state.accepted) {
+      this._accepted = true;
+      this._clearSubmitConfirm();
+    }
+    if (this._onChunk && state.answer.length > 0 && state.answer !== this._txStreamed) {
+      const delta = state.answer.startsWith(this._txStreamed)
+        ? state.answer.slice(this._txStreamed.length)
+        : `${this._txStreamed.length > 0 ? "\n" : ""}${state.answer}`;
+      this._txStreamed = state.answer;
+      this._emitChunk(delta);
+    }
+    if (this._onToolEvent) {
+      for (; this._txToolsEmitted < state.toolLines.length; this._txToolsEmitted++) {
         try {
-          this._onChunk(stripped);
+          this._onToolEvent(state.toolLines[this._txToolsEmitted] as string);
         } catch {
-          // Caller bug; never let it kill the PTY pipeline.
+          /* swallow */
         }
       }
     }
+    if (state.ended && this._endedAt === 0) this._commitTurn();
+  }
 
-    // onToolEvent — best-effort detection of `⏺ <ToolName>(<args>)` and
-    // `  ⎿ <result>` lines.
-    if (this._turnInProgress && this._onToolEvent) {
-      const text = new TextDecoder().decode(bytes);
-      const stripped = stripAnsiInline(text).replace(/\r\n/g, "\n").replace(/\r/g, "");
-      for (const line of stripped.split("\n")) {
-        if (line.startsWith("⏺ ") || line.trim().startsWith("⎿ ")) {
-          try {
-            this._onToolEvent(line);
-          } catch {
-            /* swallow */
-          }
-        }
-      }
+  /**
+   * The transcript has established the outcome: the turn is COMMITTED. From here the hard
+   * timeout, the submit retry and a PTY exit can no longer change it; the screen settling
+   * that follows only delays the return (#562 round 3, H5). A timeout that fired during
+   * the settle would turn a finished reply into `PtyTurnTimeoutError`, which the supervisor
+   * retries: the same prompt would run a second time.
+   */
+  private _commitTurn(): void {
+    this._endedAt = this._now();
+    this._clearSubmitConfirm();
+    if (this._turnHardTimeoutHandle != null) {
+      this._clearTimeout(this._turnHardTimeoutHandle);
+      this._turnHardTimeoutHandle = null;
     }
+  }
 
-    // Did this chunk reveal the sentinel echo?
-    for (const ev of events) {
-      if (ev.type === "sentinel-found" && this._turnInProgress) {
-        this._completeTurn(true, ev.offset);
-        return;
-      }
+  /**
+   * Every tick: read the transcript, and once it shows the reply complete, resolve. The
+   * screen's only say is TIMING: wait until it has been quiet for `quietWindowMs`, so the
+   * next paste does not land on a repaint, but never past `settleCapMs`. That wait can
+   * only delay the resolution; it cannot complete a turn (nothing but the transcript
+   * does), change the answer or turn a success into a failure.
+   */
+  private _tick(): void {
+    if (!this._turnInProgress) return;
+    this._pollTurn();
+    if (this._endedAt === 0) return;
+    // A failed turn is retired by the caller, so there is no next paste to wait for.
+    if (this._tx?.state().failure) {
+      this._completeTurn();
+      return;
+    }
+    const now = this._now();
+    if (now - this._lastDataAt >= this._quietWindowMs || now - this._endedAt >= this._settleCapMs) {
+      this._completeTurn();
     }
   }
 
@@ -685,10 +971,20 @@ class PtyProcessImpl implements PtyProcess {
     // which causes subsequent listeners to be skipped.
 
     if (this._turnInProgress) {
+      // A reply the transcript committed (even one not read yet) stays the outcome: the
+      // process exiting while the screen settles must not make the supervisor respawn and
+      // run it again.
+      this._pollTurn();
+      if (!this._turnInProgress) return;
+      if (this._endedAt !== 0) {
+        this._completeTurn();
+        return;
+      }
       const err = new PtyClosedError(
         this.label,
         info.exitCode ?? null,
         info.signal != null ? String(info.signal) : null,
+        true,
       );
       this._rejectTurn(err);
     }
@@ -717,24 +1013,33 @@ class PtyProcessImpl implements PtyProcess {
         new Error(`runTurn called concurrently on ${this.label}; supervisor must serialise`),
       );
     }
+    // Nothing but the session transcript can say a turn was accepted, what the answer is
+    // or that it is over. A process with no transcript to read has no way to succeed, so
+    // it fails BEFORE the prompt is written rather than after a turn it cannot verify.
+    if (!this._transcriptPath) {
+      return Promise.reject(new PtyTranscriptUnavailableError(this.label, this._noTranscriptWhy));
+    }
 
     this._turnInProgress = true;
     this._onChunk = opts.onChunk;
     this._onToolEvent = opts.onToolEvent;
-    this._turnBuf = [];
-    this._turnBufLen = 0;
-    this._streamDecoder = new TextDecoder("utf-8");
+    this._txStreamed = "";
+    this._txToolsEmitted = 0;
+    this._accepted = false;
+    this._endedAt = 0;
     this._turnStartedAt = this._now();
 
-    // Build the sentinel for this turn.
-    const uuid = this._sentinelUuidGen();
-    const sentinelString = buildSentinel(uuid);
-    const sentinelBytes = encodeSentinel(sentinelString);
-    this._activeSentinelString = sentinelString;
-    this._activeSentinelBytes = sentinelBytes;
-
-    // Tell the parser we're starting a turn (offset = current totalBytes).
-    startTurn(this._parser, uuid, sentinelBytes, this._turnStartedAt);
+    // What goes on the wire, once: the transcript is matched against exactly this. Marked
+    // BEFORE the write, so only what the CLI appends after it can count.
+    const written = preparePtyPromptForWrite(prompt, {
+      allowReplCommand: opts.allowReplCommand,
+    });
+    this._tx = new TranscriptTurn({
+      path: this._transcriptPath,
+      written,
+      replCommand: opts.allowReplCommand === true,
+    });
+    this._tx.mark();
 
     // Write prompt + CR (TUI submits on Enter). Sanitize embedded CR/LF so
     // they don't submit mid-prompt.
@@ -749,14 +1054,10 @@ class PtyProcessImpl implements PtyProcess {
     // ESC, so the prompt cannot close the paste early.
     try {
       dumpPtyTrace(`>> pid=${this._pid} write prompt`, `${JSON.stringify(prompt).slice(0, 80)}+CR`);
-      this._pty.write(
-        `${PASTE_START}${preparePtyPromptForWrite(prompt, { allowReplCommand: opts.allowReplCommand })}${PASTE_END}\r`,
-      );
+      this._pty.write(`${PASTE_START}${written}${PASTE_END}\r`);
     } catch (err) {
       this._turnInProgress = false;
-      this._activeSentinelBytes = null;
-      this._activeSentinelString = "";
-      resetTurn(this._parser);
+      this._tx = null;
       return Promise.reject(err instanceof Error ? err : new Error(String(err)));
     }
 
@@ -766,143 +1067,123 @@ class PtyProcessImpl implements PtyProcess {
 
       if (opts.timeoutMs > 0) {
         this._turnHardTimeoutHandle = this._setTimeout(() => {
+          // The outcome may already be in the file, unread (the poll runs every 50 ms): a
+          // reply that finished before the deadline is not a timeout.
+          this._pollTurn();
+          if (!this._turnInProgress || this._endedAt !== 0) return;
           const elapsed = this._now() - this._turnStartedAt;
-          this._rejectTurn(new PtyTurnTimeoutError(this.label, elapsed));
+          // A final message with no boundary is UNCERTAIN (it may still gain blocks), which
+          // is not the same as a turn still running.
+          this._rejectTurn(
+            this._tx?.state().finalSeen
+              ? new PtyTranscriptUncertainError(this.label, elapsed)
+              : new PtyTurnTimeoutError(this.label, elapsed),
+          );
         }, opts.timeoutMs);
       }
 
-      // Tick the quiet timer until the parser fires `quiet`, then write the
-      // sentinel; once written, the timer continues to enforce the sentinel
-      // max-wait deadline.
-      this._quietTickHandle = this._setInterval(() => {
-        if (!this._turnInProgress) return;
-        const now = this._now();
-        const evs = tick(this._parser, now);
-        for (const ev of evs) {
-          if (ev.type === "quiet") {
-            this._writeSentinel();
-          }
-        }
-      }, DEFAULT_QUIET_TICK_MS);
+      this._armSubmitConfirm();
+      this._pollHandle = this._setInterval(() => this._tick(), DEFAULT_POLL_MS);
     });
   }
 
   /**
-   * Write the per-turn sentinel into claude's input buffer (no `\r`, so it
-   * stays in the prompt area). Schedule the max-wait deadline. Tell the
-   * parser to start scanning for the echo.
+   * #562: the transcript is the evidence the prompt was accepted. Until it shows, the
+   * paste may sit unsubmitted in the input box (or its CR landed inside the paste). Wait
+   * `submitConfirmMs`, press Enter once more (a bare CR is harmless on an empty input box
+   * if the first one WAS accepted; the prompt is never written again), wait again, then
+   * fail the turn: never complete it on anything but the transcript.
    */
-  private _writeSentinel(): void {
-    if (!this._turnInProgress || !this._activeSentinelBytes) return;
-    if (this._parser.state !== "accumulating") return;
-    try {
-      dumpPtyTrace(`>> pid=${this._pid} write sentinel`, "");
-      this._pty.write(this._activeSentinelString);
-    } catch (err) {
-      this._rejectTurn(err instanceof Error ? err : new Error(String(err)));
-      return;
+  private _clearSubmitConfirm(): void {
+    if (this._submitConfirmHandle != null) {
+      this._clearTimeout(this._submitConfirmHandle);
+      this._submitConfirmHandle = null;
     }
-    markSentinelWritten(this._parser);
-
-    // Arm the sentinel max-wait deadline. If the echo never lands, fall
-    // back to a non-clean completion using whatever bytes we have.
-    if (this._sentinelDeadlineHandle != null) {
-      this._clearTimeout(this._sentinelDeadlineHandle);
-    }
-    this._sentinelDeadlineHandle = this._setTimeout(() => {
-      if (this._turnInProgress) {
-        // Sentinel never came back — emit whatever we've got.
-        // Codex PR #82 P1: `_completeTurn` treats `responseEndOffset` as an
-        // ABSOLUTE stream offset (matching the units used by
-        // sentinel-found events on the parser). Passing `_turnBufLen` here
-        // (which is the LENGTH of the accumulated turn buffer, not an
-        // absolute offset) made the slice arithmetic clamp `sliceEnd` to
-        // `sliceStart` whenever any pre-turn bytes existed in
-        // `parser.totalBytes` (e.g. claude's startup banner), producing
-        // an empty fallback response. The current end of the stream IS
-        // `this._parser.totalBytes` — that's the absolute offset we want.
-        this._completeTurn(false, this._parser.totalBytes);
-      }
-    }, this._sentinelMaxWaitMs);
   }
 
-  /**
-   * Send cleanup bytes to clear the sentinel from claude's input buffer
-   * before the next turn. We use Ctrl-U (0x15, `kill-line`) which claude's
-   * raw-mode input editor honours by wiping the pending input back to the
-   * start of the line — verified against claude 2.1.89 on Hetzner. Backspace
-   * × N also clears the cursor visually but leaves stale bytes in claude's
-   * TUI input state; Ctrl-U produces a cleaner state for the next turn.
-   *
-   * No trailing `\r` — the supervisor's next `runTurn` submits via its own
-   * prompt write.
-   */
-  private _writeSentinelCleanup(): void {
-    if (!this._activeSentinelBytes) return;
+  private _armSubmitConfirm(): void {
+    this._submitRetried = false;
+    const check = (): void => {
+      this._submitConfirmHandle = null;
+      // The evidence may already be in the file, unread: look before deciding.
+      this._pollTurn();
+      if (!this._turnInProgress || this._accepted) return;
+      if (!this._submitRetried) {
+        this._submitRetried = true;
+        try {
+          dumpPtyTrace(`>> pid=${this._pid} retry submit (prompt not in transcript)`, "");
+          this._pty.write("\r");
+        } catch (err) {
+          this._rejectTurn(err instanceof Error ? err : new Error(String(err)));
+          return;
+        }
+        this._submitConfirmHandle = this._setTimeout(check, this._submitConfirmMs);
+        return;
+      }
+      // Still nothing: clear whatever sits in the input box so it cannot be submitted by
+      // the NEXT turn's CR, then fail.
+      this._clearInputBox();
+      const foreign = this._tx?.state().foreignUserEntries ?? 0;
+      this._rejectTurn(
+        new PtyPromptNotAcceptedError(
+          this.label,
+          this._now() - this._turnStartedAt,
+          foreign > 0
+            ? `the transcript recorded ${foreign} user entr${foreign === 1 ? "y" : "ies"} that did not match this prompt`
+            : undefined,
+        ),
+      );
+    };
+    this._submitConfirmHandle = this._setTimeout(check, this._submitConfirmMs);
+  }
+
+  /** Ctrl-U (0x15, `kill-line`) empties claude's input box. Input hygiene on a failed turn. */
+  private _clearInputBox(): void {
     try {
       this._pty.write("\x15");
     } catch {
-      // PTY may have died; ignore — next turn will fail loudly.
+      // PTY may have died; ignore — the next turn will fail loudly.
     }
   }
 
-  private _completeTurn(cleanBoundary: boolean, responseEndOffset: number): void {
-    if (!this._turnInProgress) return;
-
-    // Slice out the response: everything from turn start (just after our
-    // prompt write — which we never see because prompts go OUT, not back IN)
-    // up to the sentinel echo. We don't see our own prompt-write echo from
-    // claude either; claude submits on Enter and doesn't re-echo the line.
-    const turnStart = this._parser.turnStartOffset;
-    const allBytes = concatBytes(this._turnBuf, this._turnBufLen);
-    // turnStart is an offset into the stream; the buffer starts at the same
-    // origin (we cleared it at runTurn entry), so we slice directly.
-    const sliceStart = Math.max(0, turnStart - (this._parser.totalBytes - allBytes.length));
-    const sliceEnd = Math.max(
-      sliceStart,
-      Math.min(allBytes.length, responseEndOffset - (this._parser.totalBytes - allBytes.length)),
-    );
-    const responseBytes = allBytes.slice(sliceStart, sliceEnd);
-
-    let { text } = decodeTurn(responseBytes);
-    // Belt-and-braces: strip any leaked sentinel string from the extracted
-    // text (the response slice cuts BEFORE the sentinel, but if claude
-    // chunks bytes mid-sentinel and the carry-over math is off by a UTF-8
-    // boundary we'd rather show "" than the raw marker).
-    if (this._activeSentinelString && text.includes(this._activeSentinelString)) {
-      text = text.replace(this._activeSentinelString, "").trim();
-    }
-
-    this._turnInProgress = false;
-    this._lastTurnEndedAt = this._now();
-    this._onChunk = undefined;
-    this._onToolEvent = undefined;
-
+  private _clearTurnTimers(): void {
     if (this._turnHardTimeoutHandle != null) {
       this._clearTimeout(this._turnHardTimeoutHandle);
       this._turnHardTimeoutHandle = null;
     }
-    if (this._quietTickHandle != null) {
-      this._clearInterval(this._quietTickHandle);
-      this._quietTickHandle = null;
+    if (this._pollHandle != null) {
+      this._clearInterval(this._pollHandle);
+      this._pollHandle = null;
     }
-    if (this._sentinelDeadlineHandle != null) {
-      this._clearTimeout(this._sentinelDeadlineHandle);
-      this._sentinelDeadlineHandle = null;
+    this._clearSubmitConfirm();
+  }
+
+  private _completeTurn(): void {
+    if (!this._turnInProgress) return;
+    // One more read so nothing written since the last poll is missed. The answer is the
+    // assistant's own text from the transcript; the screen contributes nothing to it.
+    this._pollTurn();
+    if (!this._turnInProgress) return; // that read found the file replaced: already failed
+    const state = this._tx?.state();
+    const text = state?.answer ?? "";
+    const failure = state?.failure ?? null;
+    if (failure) {
+      this._lastTurnEndedAt = this._now();
+      this._rejectTurn(new PtyTurnFailedError(this.label, failure.kind, failure.text));
+      return;
     }
-
-    // Send cleanup bytes to clear claude's prompt buffer.
-    this._writeSentinelCleanup();
-
-    // Reset parser for the next turn (preserves totalBytes counter).
-    resetTurn(this._parser);
-    this._activeSentinelBytes = null;
-    this._activeSentinelString = "";
+    this._turnInProgress = false;
+    this._tx = null;
+    this._lastTurnEndedAt = this._now();
+    this._onChunk = undefined;
+    this._onToolEvent = undefined;
+    this._clearTurnTimers();
 
     const result: PtyTurnResult = {
       text,
-      bytesCaptured: responseBytes.length,
-      cleanBoundary,
+      bytesCaptured: Buffer.byteLength(text),
+      // A turn resolves only on a complete transcript reply; anything else rejects.
+      cleanBoundary: true,
       sessionId: this._sessionId,
     };
     const resolve = this._turnResolve;
@@ -913,24 +1194,14 @@ class PtyProcessImpl implements PtyProcess {
 
   private _rejectTurn(err: Error): void {
     if (!this._turnInProgress) return;
+    // The prompt may have run and its record may still arrive. Nothing is remembered here:
+    // the supervisor kills this process and waits for its exit before any later turn marks
+    // its offset (`retireEntry`), so no writer is left to append a late record.
     this._turnInProgress = false;
+    this._tx = null;
     this._onChunk = undefined;
     this._onToolEvent = undefined;
-    if (this._turnHardTimeoutHandle != null) {
-      this._clearTimeout(this._turnHardTimeoutHandle);
-      this._turnHardTimeoutHandle = null;
-    }
-    if (this._quietTickHandle != null) {
-      this._clearInterval(this._quietTickHandle);
-      this._quietTickHandle = null;
-    }
-    if (this._sentinelDeadlineHandle != null) {
-      this._clearTimeout(this._sentinelDeadlineHandle);
-      this._sentinelDeadlineHandle = null;
-    }
-    resetTurn(this._parser);
-    this._activeSentinelBytes = null;
-    this._activeSentinelString = "";
+    this._clearTurnTimers();
     const reject = this._turnReject;
     this._turnResolve = null;
     this._turnReject = null;
@@ -939,44 +1210,60 @@ class PtyProcessImpl implements PtyProcess {
 
   // ─── dispose ────────────────────────────────────────────────────────
 
-  async dispose(): Promise<void> {
-    if (this._disposed) return;
-    this._disposed = true;
-
-    if (this._turnInProgress) {
-      this._rejectTurn(new PtyClosedError(this.label, null, "SIGTERM"));
-    }
-
-    if (this._alive) {
-      const exited = new Promise<void>((resolve) => {
-        if (!this._alive) {
-          resolve();
-          return;
-        }
-        const sub = this._pty.onExit(() => resolve());
-        if (!this._alive) {
-          resolve();
-          try {
-            sub.dispose();
-          } catch {}
-        }
+  /**
+   * Retire the process and prove it. bun-pty 0.4.9 `kill()` ignores its signal argument, fires
+   * `onExit` synchronously whether or not the child died, and turns every later `kill()` into a
+   * no-op, so neither its event nor a second `kill("SIGKILL")` says anything about the OS. Death
+   * is read from the OS: `process.kill(pid, 0)` throws ESRCH once the pid is gone (EPERM means
+   * it still exists). If the child outlives the grace period it gets SIGKILL straight from here,
+   * to its process group too (the child is its own group leader, so its MCP children go with it).
+   * Rejects with `PtyExitUnconfirmedError` when the pid is still there at the hard cap.
+   */
+  dispose(): Promise<void> {
+    if (!this._disposal) {
+      const run = this._retire();
+      this._disposal = run;
+      // A rejected retirement is retried by the next `dispose()` / `confirmExit()`.
+      run.catch(() => {
+        if (this._disposal === run) this._disposal = null;
       });
-
-      try {
-        this._pty.kill("SIGTERM");
-      } catch {
-        // Already dead.
-      }
-
-      const killTimer = this._setTimeout(() => {
-        try {
-          this._pty.kill("SIGKILL");
-        } catch {}
-      }, 2000);
-
-      await exited;
-      this._clearTimeout(killTimer);
     }
+    return this._disposal;
+  }
+
+  confirmExit(): Promise<void> {
+    return this.dispose();
+  }
+
+  private async _retire(): Promise<void> {
+    const firstRun = !this._disposed;
+    this._disposed = true;
+    // Read before kill(): bun-pty's own exit event flips this synchronously.
+    const wasAlive = this._alive;
+
+    if (firstRun && this._turnInProgress) {
+      this._rejectTurn(new PtyClosedError(this.label, null, "SIGTERM", true));
+    }
+
+    // Win32 has no signal 0 probe; keep waiting for the exit event there.
+    const probeable = process.platform !== "win32" && Number.isInteger(this._pid) && this._pid > 1;
+
+    if (firstRun && wasAlive) {
+      if (probeable) {
+        // Not through bun-pty if the pid now belongs to someone else.
+        if (this._pidState(this._pid) !== "replaced") {
+          try {
+            this._pty.kill("SIGTERM");
+          } catch {
+            // Already dead.
+          }
+        }
+      } else {
+        await this._retireByExitEvent();
+      }
+    }
+
+    if (probeable && (wasAlive || !firstRun)) await this._confirmGoneByPid(firstRun);
 
     try {
       this._onDataDisposable?.dispose();
@@ -986,6 +1273,111 @@ class PtyProcessImpl implements PtyProcess {
     } catch {}
     this._onDataDisposable = null;
     this._onExitDisposable = null;
+  }
+
+  private _pidExists(pid: number): boolean {
+    try {
+      this._signalPid(pid, 0);
+      return true;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code !== "ESRCH";
+    }
+  }
+
+  /**
+   * What the pid is now, against the child we spawned (#562 round 8). Existence alone proves
+   * nothing: a later confirmation can run long after the child exited, and the OS reuses pids.
+   *   gone      no process has the pid: the original exited.
+   *   replaced  a process with a different birth identity has it: the original exited.
+   *   same      the identity matches: the original is still there.
+   *   unknown   the pid exists but the identity could not be compared: cannot tell.
+   */
+  private _pidState(pid: number): "gone" | "replaced" | "same" | "unknown" {
+    if (!this._pidExists(pid)) return "gone";
+    if (this._identity === null) return "unknown";
+    const now = this._readIdentity(pid);
+    if (now === null) return "unknown";
+    return now === this._identity ? "same" : "replaced";
+  }
+
+  private _originalGone(pid: number): boolean {
+    const s = this._pidState(pid);
+    return s === "gone" || s === "replaced";
+  }
+
+  /**
+   * May this process be signalled? Only a pid proven to still be the child we spawned. With
+   * no identity recorded at spawn, only inside the initial retirement window (the child was
+   * seen alive moments ago, so reuse is not plausible); a later confirmation sends nothing.
+   */
+  private _maySignal(pid: number, initial: boolean): boolean {
+    const s = this._pidState(pid);
+    return s === "same" || (s === "unknown" && initial && this._identity === null);
+  }
+
+  /**
+   * Poll until the original is gone or `ms` pass. Wall clock and real timers on purpose: the
+   * injected clock and timers drive turn timing, and a frozen one must not hang retirement.
+   * The cheap existence probe runs every tick; the identity (a `ps` spawn on macOS) is read
+   * on the first and the last check only.
+   */
+  private async _waitGone(pid: number, ms: number): Promise<boolean> {
+    const until = Date.now() + ms;
+    let first = true;
+    for (;;) {
+      const last = Date.now() >= until;
+      if (first || last ? this._originalGone(pid) : !this._pidExists(pid)) return true;
+      if (last) return false;
+      first = false;
+      await new Promise<void>((r) => setTimeout(r, EXIT_PROBE_MS));
+    }
+  }
+
+  private async _confirmGoneByPid(initial: boolean): Promise<void> {
+    const pid = this._pid;
+    if (await this._waitGone(pid, this._exitGraceMs)) return;
+    // Not obeying SIGTERM: kill the group (MCP children) and the leader directly, not through
+    // bun-pty, whose `kill()` has already run and is now a no-op. The identity is checked
+    // before EACH signal, so a pid the OS has handed to someone else is never signalled.
+    for (const target of [-pid, pid]) {
+      if (!this._maySignal(pid, initial)) continue;
+      try {
+        this._signalPid(target, "SIGKILL");
+      } catch {
+        // ESRCH: already gone.
+      }
+    }
+    if (await this._waitGone(pid, Math.max(0, this._exitCapMs - this._exitGraceMs))) return;
+    throw new PtyExitUnconfirmedError(this.label, pid);
+  }
+
+  /** The pre-probe behaviour, for platforms that cannot probe a pid. */
+  private async _retireByExitEvent(): Promise<void> {
+    const exited = new Promise<void>((resolve) => {
+      if (!this._alive) {
+        resolve();
+        return;
+      }
+      const sub = this._pty.onExit(() => resolve());
+      if (!this._alive) {
+        resolve();
+        try {
+          sub.dispose();
+        } catch {}
+      }
+    });
+    try {
+      this._pty.kill("SIGTERM");
+    } catch {
+      // Already dead.
+    }
+    const killTimer = this._setTimeout(() => {
+      try {
+        this._pty.kill("SIGKILL");
+      } catch {}
+    }, this._exitGraceMs);
+    await exited;
+    this._clearTimeout(killTimer);
   }
 
   // ─── internal: used only by spawnPty to await TUI settle ─────────────
@@ -1165,7 +1557,12 @@ function concatBytes(parts: Uint8Array[], totalLen: number): Uint8Array {
  */
 export function spawnPty(opts: PtyProcessOptions): Promise<PtyProcess> {
   return new Promise<PtyProcess>((resolve, reject) => {
-    const cmd = opts._commandOverride ?? "claude";
+    // #562 round 9: the synchronous final word for a session that is already named. No
+    // await between this check and the `_ptySpawn` call below.
+    if (opts.sessionId && opts.sessionId.length > 0) {
+      assertSessionSpawnable({ sessionId: opts.sessionId });
+    }
+    const cmd = opts._commandOverride ?? claudeExecutable();
     const args = buildClaudeArgs(opts);
     const cols = opts.cols ?? DEFAULT_COLS;
     const rows = opts.rows ?? DEFAULT_ROWS;
@@ -1182,7 +1579,7 @@ export function spawnPty(opts: PtyProcessOptions): Promise<PtyProcess> {
       // the PTY (visible on Discord/Telegram). withCleanProcessEnv strips
       // those keys from process.env around the synchronous FFI call.
       pty = withCleanProcessEnv(() =>
-        ptySpawn(cmd, args, {
+        (opts._ptySpawn ?? ptySpawn)(cmd, args, {
           name: "xterm-256color",
           cols,
           rows,

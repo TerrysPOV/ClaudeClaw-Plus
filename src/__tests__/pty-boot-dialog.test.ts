@@ -71,6 +71,83 @@ describe("PtyAgentProcess boot-dialog watcher (issue #193)", () => {
     expect(writes).toEqual(["\r"]);
   });
 
+  test("answers the dev-channels dialog as win32 ConPTY renders it: ASCII '>' pointer, cursor-addressed lines (#586)", () => {
+    const { pty, writes, emit } = makeFakePty();
+    new PtyAgentProcess("main", pty);
+    // The chunk claude 2.1.229 printed on Windows 11 through bun-pty, byte for
+    // byte. Without a Unicode-capable terminal claude draws the selected option
+    // with ">" instead of "❯", and ConPTY lays lines out with CUP
+    // (`\x1b[<row>;<col>H`), not newlines.
+    emit(
+      "\x1b[38;2;255;107;128m\r\n" +
+        "─".repeat(120) +
+        "\x1b[1m\x1b[3;3HWARNING:\x1b[1CLoading\x1b[1Cdevelopment\x1b[1Cchannels\x1b[m\x1b[5;3H--dangerously-load-development-channels\x1b[1Cis\x1b[1Cfor\x1b[1Clocal\x1b[1Cchannel\x1b[1Cdevelopment\x1b[1Conly.\x1b[1CDo\x1b[1Cnot\x1b[1Cuse\x1b[1Cthis\x1b[1Coption\x1b[1Cto\x1b[1Crun\x1b[6;3Hchannels\x1b[1Cyou\x1b[1Chave\x1b[1Cdownloaded\x1b[1Coff\x1b[1Cthe\x1b[1Cinternet.\x1b[8;3HPlease\x1b[1Cuse\x1b[1C--channels\x1b[1Cto\x1b[1Crun\x1b[1Ca\x1b[1Clist\x1b[1Cof\x1b[1Capproved\x1b[1Cchannels.\x1b[38;2;153;153;153m\x1b[10;3HChannels:\x1b[1Cplugin:claudeclaw-plus@inline\x1b[38;2;177;185;249m\x1b[12;3H>\x1b[38;2;153;153;153m\x1b[1C1.\x1b[38;2;177;185;249m\x1b[1CI\x1b[1Cam\x1b[1Cusing\x1b[1Cthis\x1b[1Cfor\x1b[1Clocal\x1b[1Cdevelopment\x1b[38;2;153;153;153m\x1b[13;5H2.\x1b[m\x1b[1CExit\x1b[38;2;153;153;153m\x1b[3m\x1b[15;3HEnter\x1b[1Cto\x1b[1Cconfirm\x1b[1C\u00b7\x1b[1CEsc\x1b[1Cto\x1b[1Ccancel",
+    );
+    expect(writes).toEqual(["\r"]);
+  });
+
+  test("an ASCII '>' that is not in front of an option number is not taken for the selection (#586)", () => {
+    const { pty, writes, emit } = makeFakePty();
+    new PtyAgentProcess("main", pty);
+    // The real selection is the destructive "> 1. Exit"; a later prose line
+    // starting with "> yes" must not be read as the selected option.
+    emit(
+      "> 1. Exit\n  2. I am using this for local development\n" +
+        "  > yes, that is a quote, not an option\n" +
+        "Enter to confirm · Esc to cancel",
+    );
+    expect(writes).toEqual([]);
+  });
+
+  /** A dialog laid out the way win32 ConPTY draws it: one CUP per row, CUF
+   *  between words, no newline anywhere. */
+  function conptyScreen(rows: string[]): string {
+    return rows.map((r, i) => `\x1b[${i + 3};3H${r.split(" ").join("\x1b[1C")}`).join("");
+  }
+
+  test("win32 layout: a destructive default is not confirmed because a LATER option reads as proceed (#586)", () => {
+    const { pty, writes, emit } = makeFakePty();
+    new PtyAgentProcess("main", pty);
+    emit(
+      conptyScreen([
+        "Something changed",
+        "> 1. No, exit",
+        "  2. Yes, continue",
+        "Enter to confirm · Esc to cancel",
+      ]),
+    );
+    expect(writes).toEqual([]);
+  });
+
+  test("win32 layout: the new-MCP-server dialog is not approved through its 'Continue without' option (#586, #469)", () => {
+    const { pty, writes, emit } = makeFakePty();
+    new PtyAgentProcess("main", pty);
+    emit(
+      conptyScreen([
+        "New MCP server found in .mcp.json: example",
+        "> 1. Use this and all future MCP servers in this project",
+        "  2. Use this MCP server",
+        "  3. Continue without using this MCP server",
+        "Enter to confirm · Esc to cancel",
+      ]),
+    );
+    expect(writes).toEqual([]);
+  });
+
+  test("win32 layout: a '>' before a number inside prose is not the selection (#586)", () => {
+    const { pty, writes, emit } = makeFakePty();
+    new PtyAgentProcess("main", pty);
+    emit(
+      conptyScreen([
+        "> 1. Exit",
+        "  2. I am using this for local development",
+        "  Needs claude > 2.1 to continue",
+        "Enter to confirm · Esc to cancel",
+      ]),
+    );
+    expect(writes).toEqual([]);
+  });
+
   test("does not trigger on the REPL footer that also says 'bypass permissions on'", () => {
     const { pty, writes, emit } = makeFakePty();
     new PtyAgentProcess("main", pty);

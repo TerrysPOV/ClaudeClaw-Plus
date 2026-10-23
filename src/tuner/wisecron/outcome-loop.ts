@@ -172,7 +172,10 @@ export class OutcomeRecorder {
     for (const [proposalId, rows] of byProposal) {
       const subjectName = rows[0]?.subject;
       const subject = this.registry.getSubject(subjectName);
-      if (!subject) continue;
+      if (!subject) {
+        this.closeUnregistered(proposalId, subjectName, asOf);
+        continue;
+      }
       const declared = subject.fitnessSignals();
       const measured = await this.measureActive(subject, declared, asOf);
       const counts = await this.measureCounts(subject, declared, asOf);
@@ -319,6 +322,45 @@ export class OutcomeRecorder {
       });
     }
     return results;
+  }
+
+  /**
+   * Rows whose subject is no longer registered (disabled after the proposal was
+   * applied) can't be measured, and the subject that would revert the change is
+   * gone. Keep the proposal's rows pending through the same grace period as an
+   * un-measurable row — counted from its LAST row's window_end, so a subject
+   * re-enabled in time still gets its target judged with its guardrails — then
+   * finalize every open row together to a terminal `neutral` with an audit
+   * record, so they leave the pending set instead of being re-selected and
+   * dropped on every pass.
+   */
+  private closeUnregistered(proposalId: string, subjectName: string, asOf: Date): void {
+    const open = this.db.getOutcomes(proposalId).filter((r) => r.verdict === null);
+    const ends = open.map((r) => new Date(r.window_end).getTime());
+    if (ends.length === 0 || !ends.every(Number.isFinite)) return;
+    const graceMs = this.unmeasurableGraceDays * 86_400_000;
+    if (!(asOf.getTime() >= Math.max(...ends) + graceMs)) return;
+    for (const row of open) {
+      this.db.finalizeOutcome({
+        proposal_id: proposalId,
+        metric: row.metric,
+        post: row.baseline ?? 0,
+        delta: 0,
+        verdict: "neutral",
+      });
+      this.audit.append({
+        event: "verdict",
+        subject: subjectName,
+        metric: row.metric,
+        proposal_id: proposalId,
+        ...(row.commit_sha ? { commit_sha: row.commit_sha } : {}),
+        detail: {
+          verdict: "neutral",
+          reason: "subject_unregistered",
+          grace_days: this.unmeasurableGraceDays,
+        },
+      });
+    }
   }
 
   private toDelta(

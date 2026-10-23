@@ -2120,4 +2120,290 @@ setInterval(loadKanban, 10000);
 
       // Initial info-line load (so the Settings panel shows the count before the modal is opened).
       loadCurrent();
+    })();
+    // --- Engines (#552) — Settings → ⚙️ Engines → modal ---
+    (function enInit() {
+      const enConfig = $("en-config");
+      const enModal = $("en-modal");
+      const enModalClose = $("en-modal-close");
+      const enCancelBtn = $("en-cancel-btn");
+      const enStatus = $("en-modal-status");
+      const enInfo = $("en-info");
+      const ptyToggle = $("en-pty-toggle");
+      const ptyState = $("en-pty-state");
+      const agentsEl = $("en-agents");
+      const restartEl = $("en-restart");
+      const routesEl = $("en-routes");
+      const routesSave = $("en-routes-save");
+      const enginesEl = $("en-engines");
+      const engineForm = $("en-engine-form");
+      const nameInput = $("en-name-input");
+      const kindInput = $("en-kind-input");
+      const urlInput = $("en-url-input");
+      const modelInput = $("en-model-input");
+      const keyEnvInput = $("en-keyenv-input");
+      if (!enConfig || !enModal) return;
+
+      let oneShot = null;
+      let agentEngine = null;
+      let routeEdits = {};
+
+      function setStatus(text) {
+        if (enStatus) enStatus.textContent = text;
+      }
+
+      async function postJson(url, payload) {
+        const res = await mutatingFetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        return { ok: res.ok && data && data.ok === true, data: data || {} };
+      }
+
+      function renderAgent() {
+        if (!agentEngine || !ptyToggle) return;
+        const saved = agentEngine.saved.pty.enabled;
+        const running = agentEngine.running.pty.enabled;
+        ptyToggle.textContent = saved ? "PTY" : "claude -p";
+        ptyToggle.classList.toggle("on", saved);
+        if (ptyState) ptyState.textContent = "Saved: " + (saved ? "PTY" : "claude -p") + " · running: " + (running ? "PTY" : "claude -p");
+        if (agentsEl) {
+          agentsEl.textContent = "Bus supervision: " + (agentEngine.saved.agents.length
+            ? agentEngine.saved.agents.map(function(a) { return a.id + " → " + a.supervision; }).join(", ")
+            : "(no agents)") + " (per agent, edited in agents[])";
+        }
+        if (restartEl) restartEl.hidden = !agentEngine.restartRequired;
+      }
+
+      function engineLabel(id) {
+        return id === oneShot.default ? id + " (default)" : id;
+      }
+
+      function routeRow(route, label) {
+        const row = document.createElement("div");
+        row.className = "en-route";
+        const name = document.createElement("span");
+        name.className = "en-route-name";
+        name.textContent = label;
+        const select = document.createElement("select");
+        select.className = "hb-input";
+        select.setAttribute("data-route", route);
+        select.setAttribute("aria-label", "Engine for " + label);
+        const current = route === "default"
+          ? oneShot.default
+          : (Object.prototype.hasOwnProperty.call(oneShot.routes, route) ? oneShot.routes[route] : "");
+        if (route !== "default") {
+          const inherit = document.createElement("option");
+          inherit.value = "";
+          inherit.textContent = "inherit → " + oneShot.effective[route];
+          select.appendChild(inherit);
+        }
+        (oneShot.choices[route] || []).forEach(function(id) {
+          const opt = document.createElement("option");
+          opt.value = id;
+          opt.textContent = route === "default" ? id : engineLabel(id);
+          select.appendChild(opt);
+        });
+        if (current && (oneShot.choices[route] || []).indexOf(current) === -1) {
+          const opt = document.createElement("option");
+          opt.value = current;
+          opt.textContent = current + " (not allowed here)";
+          select.appendChild(opt);
+        }
+        select.value = Object.prototype.hasOwnProperty.call(routeEdits, route) ? routeEdits[route] : current;
+        select.addEventListener("change", function() {
+          routeEdits[route] = select.value;
+        });
+        row.appendChild(name);
+        row.appendChild(select);
+        return row;
+      }
+
+      function renderRoutes() {
+        if (!routesEl || !oneShot) return;
+        routesEl.replaceChildren();
+        routesEl.appendChild(routeRow("default", "default"));
+        oneShot.knownRoutes.forEach(function(route) {
+          const tag = oneShot.resumeRoutes.indexOf(route) !== -1 ? " · resume"
+            : (oneShot.untrustedRoutes.indexOf(route) !== -1 ? " · untrusted" : "");
+          routesEl.appendChild(routeRow(route, route + tag));
+        });
+      }
+
+      function fillForm(engine) {
+        if (nameInput) nameInput.value = engine.name;
+        if (kindInput) kindInput.value = engine.type;
+        if (urlInput) urlInput.value = engine.baseUrl || "";
+        if (modelInput) modelInput.value = engine.model || "";
+        if (keyEnvInput) keyEnvInput.value = engine.apiKeyEnv || "";
+      }
+
+      function renderEngines() {
+        if (!enginesEl || !oneShot) return;
+        enginesEl.replaceChildren();
+        if (!oneShot.engines.length) {
+          const empty = document.createElement("div");
+          empty.className = "lr-empty";
+          empty.textContent = "No HTTP engine declared.";
+          enginesEl.appendChild(empty);
+        }
+        oneShot.engines.forEach(function(engine) {
+          const row = document.createElement("div");
+          row.className = "en-engine";
+          const meta = document.createElement("div");
+          meta.className = "en-engine-meta";
+          const id = document.createElement("div");
+          id.className = "en-engine-id";
+          id.textContent = engine.name + " · " + engine.type;
+          const sub = document.createElement("div");
+          sub.textContent = [engine.baseUrl || engine.tier || "", engine.model || "",
+            engine.apiKeyEnv ? ("key " + engine.apiKeyEnv + " present: " + (engine.keyPresent ? "yes" : "no")) : "no key"]
+            .filter(Boolean).join(" · ");
+          meta.appendChild(id);
+          meta.appendChild(sub);
+          const btns = document.createElement("div");
+          btns.className = "lr-row-btns";
+          // The form edits the chat engines only; other kinds (llm-router tier) stay JSON-only.
+          const editable = engine.type === "openai-compatible" || engine.type === "ollama";
+          [["Test", function() { testEngine(engine.name); }],
+           editable ? ["Edit", function() { fillForm(engine); }] : null,
+           ["Remove", function() { removeEngine(engine.name); }]].filter(Boolean).forEach(function(spec) {
+            const b = document.createElement("button");
+            b.type = "button";
+            b.className = "hb-toggle";
+            b.textContent = spec[0];
+            b.setAttribute("data-engine", engine.name);
+            b.addEventListener("click", spec[1]);
+            btns.appendChild(b);
+          });
+          row.appendChild(meta);
+          row.appendChild(btns);
+          enginesEl.appendChild(row);
+        });
+      }
+
+      function renderInfo() {
+        if (!enInfo || !agentEngine || !oneShot) return;
+        enInfo.textContent = "Agent turns: " + (agentEngine.saved.pty.enabled ? "PTY" : "claude -p") +
+          " · one-shot default: " + oneShot.default +
+          (oneShot.engines.length ? " · " + oneShot.engines.length + " HTTP engine(s)" : "");
+      }
+
+      async function load() {
+        try {
+          const [a, b] = await Promise.all([fetch("/api/settings/engines"), fetch("/api/settings/oneshot")]);
+          const ad = await a.json();
+          const bd = await b.json();
+          if (ad && ad.ok) agentEngine = ad;
+          if (bd && bd.ok) oneShot = bd.oneShot;
+          if (!bd || !bd.ok) setStatus((bd && bd.error) || "Failed to load one-shot settings");
+        } catch (_e) {
+          setStatus("Failed to load engine settings");
+        }
+        routeEdits = {};
+        renderAgent();
+        renderRoutes();
+        renderEngines();
+        renderInfo();
+      }
+
+      async function testEngine(name) {
+        setStatus("Testing " + name + "…");
+        try {
+          const r = await postJson("/api/oneshot/test", { engine: name });
+          if (!r.ok) return setStatus(name + ": " + (r.data.error || "test failed"));
+          setStatus(name + ": isolation " + r.data.isolation + ", " + r.data.latencyMs + " ms — " + (r.data.output || "(empty)"));
+        } catch (_e) {
+          setStatus(name + ": test failed");
+        }
+      }
+
+      async function saveOneShot(patch, done) {
+        setStatus("Saving…");
+        try {
+          const r = await postJson("/api/settings/oneshot", patch);
+          if (!r.ok) return setStatus(r.data.error || "Save failed");
+          oneShot = r.data.oneShot;
+          routeEdits = {};
+          renderRoutes();
+          renderEngines();
+          renderInfo();
+          setStatus(done);
+        } catch (_e) {
+          setStatus("Save failed");
+        }
+      }
+
+      function removeEngine(name) {
+        const patch = { engines: {} };
+        patch.engines[name] = null;
+        saveOneShot(patch, "Engine " + name + " removed.");
+      }
+
+      if (ptyToggle) {
+        ptyToggle.addEventListener("click", async function() {
+          if (!agentEngine) return;
+          setStatus("Saving…");
+          try {
+            const r = await postJson("/api/settings/engines", { pty: { enabled: !agentEngine.saved.pty.enabled } });
+            if (!r.ok) return setStatus(r.data.error || "Save failed");
+            agentEngine = r.data;
+            renderAgent();
+            renderInfo();
+            setStatus(agentEngine.restartRequired ? "Saved. Restart the daemon to apply." : "Saved.");
+          } catch (_e) {
+            setStatus("Save failed");
+          }
+        });
+      }
+
+      if (routesSave) {
+        routesSave.addEventListener("click", function() {
+          const patch = {};
+          const routes = {};
+          Object.keys(routeEdits).forEach(function(route) {
+            if (route === "default") patch.default = routeEdits[route];
+            else routes[route] = routeEdits[route] === "" ? null : routeEdits[route];
+          });
+          if (Object.keys(routes).length) patch.routes = routes;
+          if (!Object.keys(patch).length) return setStatus("Nothing to save.");
+          saveOneShot(patch, "Routes saved. Applies on the next call.");
+        });
+      }
+
+      if (engineForm) {
+        engineForm.addEventListener("submit", function(e) {
+          e.preventDefault();
+          const name = (nameInput && nameInput.value || "").trim();
+          if (!name) return setStatus("Name is required");
+          const config = { type: kindInput ? kindInput.value : "openai-compatible" };
+          const url = (urlInput && urlInput.value || "").trim();
+          const model = (modelInput && modelInput.value || "").trim();
+          const keyEnv = (keyEnvInput && keyEnvInput.value || "").trim();
+          if (url) config.baseUrl = url;
+          if (model) config.model = model;
+          if (keyEnv) config.apiKeyEnv = keyEnv;
+          const patch = { engines: {} };
+          patch.engines[name] = config;
+          saveOneShot(patch, "Engine " + name + " saved.");
+        });
+      }
+
+      function openModal() {
+        setStatus("");
+        load();
+        enModal.setAttribute("aria-hidden", "false");
+        enModal.classList.add("open");
+      }
+      function closeModal() {
+        enModal.setAttribute("aria-hidden", "true");
+        enModal.classList.remove("open");
+      }
+      enConfig.addEventListener("click", openModal);
+      if (enModalClose) enModalClose.addEventListener("click", closeModal);
+      if (enCancelBtn) enCancelBtn.addEventListener("click", closeModal);
+
+      load();
     })();`;

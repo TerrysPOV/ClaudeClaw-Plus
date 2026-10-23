@@ -522,6 +522,134 @@ describe("OutcomeRecorder — baseline → maturation → verdict", () => {
   });
 });
 
+describe("OutcomeRecorder — a subject that left the registry (#588)", () => {
+  const artifactProvider: TelemetryProvider = {
+    contractVersion: () => "1.0.0",
+    capabilities: () => [
+      { stream: "session_cost", schemaVersion: "1.0.0", available: true },
+      { stream: "cron_run", schemaVersion: "1.0.0", available: true },
+    ],
+    query: async () => [],
+  };
+
+  async function appliedThenUnregistered(audit: AuditLog, clock: { t: Date }) {
+    const registry = new Registry();
+    const subj = new ScriptedSubject(
+      "hook",
+      "low",
+      [cost, guardrail],
+      [{ cron_cost: 100, critical_fire_success: 1.0 }],
+    );
+    registry.registerSubject(subj);
+    const rec0 = new OutcomeRecorder(registry, db, artifactProvider, audit, () => clock.t);
+    await rec0.snapshotBaseline(proposal(50, "hook"));
+    // The operator disables the subject: the next boot builds a registry without it.
+    const rec = new OutcomeRecorder(new Registry(), db, artifactProvider, audit, () => clock.t);
+    return { rec, subj };
+  }
+
+  it("keeps the rows pending inside the grace period, so a re-enabled subject can still score them", async () => {
+    const audit = new AuditLog();
+    const clock = { t: new Date("2026-05-01T00:00:00Z") };
+    const { rec } = await appliedThenUnregistered(audit, clock);
+    clock.t = new Date("2026-05-10T00:00:00Z"); // window_end 05-08, grace runs to 05-15
+    expect(await rec.runMaturation({})).toEqual([]);
+    expect(db.getOutcomes("50").every((r) => r.verdict === null)).toBe(true);
+  });
+
+  it("finalizes the rows to neutral with an audit record once the grace period is over", async () => {
+    const audit = new AuditLog();
+    const clock = { t: new Date("2026-05-01T00:00:00Z") };
+    const { rec } = await appliedThenUnregistered(audit, clock);
+    const reverted: string[] = [];
+    const revert = async (id: string): Promise<boolean> => {
+      reverted.push(id);
+      return true;
+    };
+    clock.t = new Date("2026-05-16T00:00:00Z");
+    expect(await rec.runMaturation({ revert })).toEqual([]);
+    expect(reverted).toEqual([]);
+    const rows = db.getOutcomes("50");
+    expect(rows).toHaveLength(2);
+    expect(rows.every((r) => r.verdict === "neutral")).toBe(true);
+    const verdicts = audit.all().filter((r) => r.event === "verdict" && r.proposal_id === "50");
+    expect(
+      verdicts
+        .map((r) => [r.subject, r.metric, (r.detail as Record<string, unknown>).reason])
+        .sort((a, b) => String(a[1]).localeCompare(String(b[1]))),
+    ).toEqual([
+      ["hook", "critical_fire_success", "subject_unregistered"],
+      ["hook", "cron_cost", "subject_unregistered"],
+    ]);
+    // Left the pending set: the next pass selects nothing.
+    expect(db.listMaturableOutcomes(clock.t)).toEqual([]);
+  });
+
+  it("still scores the rows when the subject is registered again before the grace period ends", async () => {
+    const audit = new AuditLog();
+    const clock = { t: new Date("2026-05-01T00:00:00Z") };
+    const { subj } = await appliedThenUnregistered(audit, clock);
+    clock.t = new Date("2026-05-10T00:00:00Z");
+    const registry = new Registry();
+    registry.registerSubject(
+      new ScriptedSubject(
+        subj.name,
+        "low",
+        [cost, guardrail],
+        [{ cron_cost: 50, critical_fire_success: 1.0 }],
+      ),
+    );
+    const rec = new OutcomeRecorder(registry, db, artifactProvider, audit, () => clock.t);
+    const results = await rec.runMaturation({});
+    expect(results.map((r) => r.verdict)).toEqual(["improved"]);
+  });
+
+  it("holds a closed-early guardrail until the target's own grace, so a re-enabled subject judges both", async () => {
+    const audit = new AuditLog();
+    const longCost: Metric = { ...cost, windowDays: 30 };
+    const registry = new Registry();
+    registry.registerSubject(
+      new ScriptedSubject(
+        "hook",
+        "low",
+        [longCost, guardrail],
+        [{ cron_cost: 100, critical_fire_success: 1.0 }],
+      ),
+    );
+    let t = new Date("2026-05-01T00:00:00Z");
+    await new OutcomeRecorder(registry, db, artifactProvider, audit, () => t).snapshotBaseline(
+      proposal(51, "hook"),
+    );
+    // Disabled: guardrail (7 d) is past its own grace on 05-16, the target (30 d) is not.
+    t = new Date("2026-05-16T00:00:00Z");
+    expect(
+      await new OutcomeRecorder(new Registry(), db, artifactProvider, audit, () => t).runMaturation(
+        {},
+      ),
+    ).toEqual([]);
+    expect(db.getOutcomes("51").every((r) => r.verdict === null)).toBe(true);
+    // Re-enabled; the target matures with a regressed guardrail → regressed, not improved.
+    const back = new Registry();
+    back.registerSubject(
+      new ScriptedSubject(
+        "hook",
+        "low",
+        [longCost, guardrail],
+        [{ cron_cost: 50, critical_fire_success: 0.4 }],
+      ),
+    );
+    t = new Date("2026-06-01T00:00:00Z");
+    const results = await new OutcomeRecorder(
+      back,
+      db,
+      artifactProvider,
+      audit,
+      () => t,
+    ).runMaturation({});
+    expect(results.map((r) => r.verdict)).toEqual(["regressed"]);
+  });
+});
+
 describe("OutcomeRecorder — a guardrail never becomes the verdict target", () => {
   const artifactProvider: TelemetryProvider = {
     contractVersion: () => "1.0.0",

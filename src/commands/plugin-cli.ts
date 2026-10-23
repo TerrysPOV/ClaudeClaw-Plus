@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { readdir, readFile } from "node:fs/promises";
+import { claudeExecutable } from "../runner/claude-executable";
 
 const SPAWN_TIMEOUT_MS = 30_000;
 
@@ -32,25 +33,25 @@ export interface PluginManifest {
 function buildArgs(action: PluginAction): string[] {
   switch (action.kind) {
     case "marketplace-add":
-      return ["claude", "plugin", "marketplace", "add", action.source];
+      return [claudeExecutable(), "plugin", "marketplace", "add", action.source];
     case "marketplace-list":
-      return ["claude", "plugin", "marketplace", "list"];
+      return [claudeExecutable(), "plugin", "marketplace", "list"];
     case "marketplace-update":
       return action.name
-        ? ["claude", "plugin", "marketplace", "update", action.name]
-        : ["claude", "plugin", "marketplace", "update"];
+        ? [claudeExecutable(), "plugin", "marketplace", "update", action.name]
+        : [claudeExecutable(), "plugin", "marketplace", "update"];
     case "marketplace-remove":
-      return ["claude", "plugin", "marketplace", "remove", action.name];
+      return [claudeExecutable(), "plugin", "marketplace", "remove", action.name];
     case "install":
-      return ["claude", "plugin", "install", action.plugin, "-s", action.scope];
+      return [claudeExecutable(), "plugin", "install", action.plugin, "-s", action.scope];
     case "list":
-      return ["claude", "plugin", "list"];
+      return [claudeExecutable(), "plugin", "list"];
     case "uninstall":
-      return ["claude", "plugin", "uninstall", action.plugin];
+      return [claudeExecutable(), "plugin", "uninstall", action.plugin];
     case "enable":
-      return ["claude", "plugin", "enable", action.plugin];
+      return [claudeExecutable(), "plugin", "enable", action.plugin];
     case "disable":
-      return ["claude", "plugin", "disable", action.plugin];
+      return [claudeExecutable(), "plugin", "disable", action.plugin];
   }
 }
 

@@ -110,6 +110,29 @@ async function tryRun(opts?: string | { modelOverride?: string }): Promise<void>
   }
 }
 
+describe("#562 round 9 add-on: RunResult carries failureKind from the exec that produced it", () => {
+  const runWith = async (exec: {
+    exitCode: number;
+    failureKind?: "uncertain" | "timeout";
+  }): Promise<runnerMod.RunResult> => {
+    runnerMod._setPrimaryExecForTests(async () => ({ rawStdout: "", stderr: "x", ...exec }));
+    return runnerMod.run("test-job", "hello world", undefined, "haiku");
+  };
+
+  it("a failed exec's failureKind reaches the result (the cron loop reads it)", async () => {
+    // Fault: drop the field where the result is built and both come back undefined.
+    expect((await runWith({ exitCode: 124, failureKind: "timeout" })).failureKind).toBe("timeout");
+    expect((await runWith({ exitCode: 1, failureKind: "uncertain" })).failureKind).toBe(
+      "uncertain",
+    );
+  });
+
+  it("a definite failure and a success carry none", async () => {
+    expect("failureKind" in (await runWith({ exitCode: 1 }))).toBe(false);
+    expect("failureKind" in (await runWith({ exitCode: 0, failureKind: "uncertain" }))).toBe(false);
+  });
+});
+
 describe("Phase 18: runner modelOverride wiring", () => {
   it("forwards modelOverride to the primary exec as primaryConfig.model", async () => {
     await tryRun({ modelOverride: "opus" });
@@ -644,7 +667,10 @@ describe("killActive reaches a PTY session that is still booting (#394)", () => 
     // retired. The gate now reads the entry count.
     const sup = await import("../runner/pty-supervisor");
     const count = spyOn(sup, "supervisorEntryCount").mockReturnValue(1);
-    const snapshot = spyOn(sup, "snapshotSupervisor").mockReturnValue({ ptys: [] });
+    const snapshot = spyOn(sup, "snapshotSupervisor").mockReturnValue({
+      ptys: [],
+      quarantined: [],
+    });
     const kill = spyOn(sup, "killAllPtys").mockResolvedValue(0);
     try {
       expect(runnerMod.killActive()).toBe(true);

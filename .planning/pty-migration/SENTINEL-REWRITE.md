@@ -1,5 +1,7 @@
 # PTY parser rewrite — sentinel-echo round-trip (issue #81)
 
+> **Superseded for turn success (#562 round 2, 2026-10-21).** The sentinel round trip described here no longer decides whether a turn succeeded: that is read from the session transcript only (see `SPEC.md`, frozen decision 1, and `pty-transcript.ts`). The parser and sentinel remain as screen helpers and tests; `pty-process.ts` does not use them.
+
 ## Summary
 
 Claude 2.1.89 dropped the OSC 9;4 progress markers earlier versions emitted around each turn, breaking the original PTY parser (zero turn boundaries → empty response). This branch replaces the OSC-marker detection with a sentinel-echo round-trip and adds a trust-prompt self-heal for the parallel failure mode (trust-dialog blocks first invocation).

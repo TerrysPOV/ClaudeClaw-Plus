@@ -18,6 +18,7 @@ Missing PTY settings default true; literal false is preserved; invalid enabled v
 
 - Work is based on povai/main d81bd579, on feat/550-pty-default; read #550, #553 and #559.
 - Preserve explicit legacy paths and their tests. Retire a failed/stale PTY before fresh recovery; after compaction retire the old process before resuming the changed transcript.
+- A retirement holds the session until every spawn or respawn still pending on the entry has settled and the process it produced is confirmed dead (past a 15 s bound the session is quarantined, never released; #592). The fallback key is retired only immediately before the fallback runs.
 - Preserve the #361 confirmation mechanism; exercise it for actual cron and job dispatch surfaces without inventing a new BusOrigin value if jobs use an existing origin.
 - Utilities (classifier, tuner, recall, compact, memory saves, rotation summaries) are owned by #548/#549 and stay outside this change. Inventory their remaining print calls in REPORT.md.
 - Do not fix #559, alter README.md (PR #558 owns it), or perform the operator's 48-hour soak. Record dependencies and exact soak checklist.

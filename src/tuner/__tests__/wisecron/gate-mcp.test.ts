@@ -698,6 +698,54 @@ describe("tuner__mature", () => {
     expect(auditEvents.some((e) => e.event === "gate_mature")).toBe(true);
   });
 
+  it("counts matured rows of an unregistered subject as held, so matured: 0 is not silent (#588)", async () => {
+    db.snapshotBaseline({
+      proposal_id: "60",
+      metric: "m",
+      subject: "gone",
+      baseline: 1,
+      window_start: new Date("2026-05-01T00:00:00Z"),
+      window_end: new Date("2026-05-08T00:00:00Z"),
+    });
+    db.snapshotBaseline({
+      proposal_id: "60",
+      metric: "g",
+      subject: "gone",
+      baseline: 1,
+      window_start: new Date("2026-05-01T00:00:00Z"),
+      window_end: new Date("2026-05-08T00:00:00Z"),
+    });
+    db.snapshotBaseline({
+      proposal_id: "61",
+      metric: "m",
+      subject: "fake",
+      baseline: 1,
+      window_start: new Date("2026-05-01T00:00:00Z"),
+      window_end: new Date("2026-05-08T00:00:00Z"),
+    });
+    registerWisecronGateTools(bridge, makeBundle());
+    const res = (await bridge.invokeTool(TUNER_MATURE_TOOL, {
+      asOf: "2026-05-10T00:00:00Z",
+    })) as { matured: number; held_unregistered?: number };
+    expect(res.matured).toBe(0);
+    expect(res.held_unregistered).toBe(2); // rows, not proposals; the registered one is not held
+    const ev = auditEvents.find((e) => e.event === "gate_mature");
+    expect(ev?.detail).toMatchObject({ matured: 0, held_unregistered: 2 });
+    // Counted after the pass: once rows are closed they are no longer held.
+    db.finalizeOutcome({ proposal_id: "60", metric: "m", post: 1, delta: 0, verdict: "neutral" });
+    db.finalizeOutcome({ proposal_id: "60", metric: "g", post: 1, delta: 0, verdict: "neutral" });
+    const after = (await bridge.invokeTool(TUNER_MATURE_TOOL, {
+      asOf: "2026-05-10T00:00:00Z",
+    })) as Record<string, unknown>;
+    expect("held_unregistered" in after).toBe(false);
+  });
+
+  it("omits held_unregistered when nothing is held", async () => {
+    registerWisecronGateTools(bridge, makeBundle());
+    const res = (await bridge.invokeTool(TUNER_MATURE_TOOL, {})) as Record<string, unknown>;
+    expect("held_unregistered" in res).toBe(false);
+  });
+
   it("rejects an invalid asOf timestamp", async () => {
     registerWisecronGateTools(bridge, makeBundle());
     await expect(bridge.invokeTool(TUNER_MATURE_TOOL, { asOf: "not-a-date" })).rejects.toThrow(

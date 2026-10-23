@@ -1,4 +1,7 @@
-import { describe, test, expect } from "bun:test";
+import { afterAll, describe, test, expect } from "bun:test";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   spawnPty,
   sanitizePtyPromptText,
@@ -15,10 +18,9 @@ import {
   neutralizeLeadingReplCommand,
   preparePtyPromptForWrite,
 } from "../runner/pty-prompt-sanitizer";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { _setClaudeExecutableForTests } from "../runner";
 import type { SecurityConfig } from "../config";
+import { append, assistantLine, fakeTurn, userLine } from "./fixtures/fake-claude-tui";
 
 // ─── Shared test helpers ────────────────────────────────────────────────────
 
@@ -38,10 +40,27 @@ function baseOpts(over: Partial<PtyProcessOptions>): PtyProcessOptions {
     agentName: "test",
     _skipReadySettle: true,
     _skipClaudeArgs: true,
+    transcriptPath: TX_PATH,
     cols: 80,
     rows: 24,
     ...over,
   };
+}
+
+/**
+ * Every PtyProcess below is handed this transcript path: a turn resolves only on the
+ * session transcript (#562 round 2), and a process with none is refused. Tests that care
+ * what the transcript says write their own (`pty-false-completion.test.ts`); the ones here
+ * only need a turn to be able to run. A turn "completes" when the fake TUI appends the
+ * user and assistant entries, never because of what it paints.
+ */
+const TX_DIR = mkdtempSync(join(tmpdir(), "pty-process-tx-"));
+const TX_PATH = join(TX_DIR, "session.jsonl");
+afterAll(() => rmSync(TX_DIR, { recursive: true, force: true }));
+
+/** A fake TUI that takes `prompt`, records it, answers with `prompt` itself, then `cat`s. */
+function tuiScript(prompt: string): string {
+  return `${fakeTurn({ tx: TX_PATH, prompt, answer: prompt })}; exec cat`;
 }
 
 // ─── Lifecycle: spawn → dispose ──────────────────────────────────────────────
@@ -434,37 +453,132 @@ describe("PtyProcess — lifecycle", () => {
 // first byte. The tests below simulate a slow paint with /bin/sh and assert
 // spawnPty doesn't resolve until the paint goes quiet.
 
+/** Manual clock for the settle timers: nothing fires until `advance`. */
+function manualClock() {
+  let now = 0;
+  let nextId = 0;
+  const timers = new Map<number, { due: number; ms: number; cb: () => void }>();
+  const armed: number[] = [];
+  return {
+    setTimeout: ((cb: () => void, ms: number) => {
+      const id = ++nextId;
+      timers.set(id, { due: now + ms, ms, cb });
+      armed.push(ms);
+      return id;
+    }) as unknown as (cb: () => void, ms: number) => ReturnType<typeof setTimeout>,
+    clearTimeout: ((id: number) => {
+      timers.delete(id);
+    }) as unknown as (handle: ReturnType<typeof setTimeout>) => void,
+    advance(ms: number) {
+      now += ms;
+      const due = [...timers].filter(([, t]) => t.due <= now).sort((a, b) => a[1].due - b[1].due);
+      for (const [id, t] of due) {
+        if (!timers.delete(id)) continue;
+        t.cb();
+      }
+    },
+    /** Resolves once `count` timers of `ms` have been armed (real time, 3s cap). */
+    async untilArmed(ms: number, count: number) {
+      const deadline = Date.now() + 3000;
+      while (armed.filter((m) => m === ms).length < count) {
+        if (Date.now() > deadline) throw new Error(`timer of ${ms}ms not armed ${count} time(s)`);
+        await Bun.sleep(5);
+      }
+    },
+  };
+}
+
 describe("PtyProcess — _waitForReadySettle two-phase (issue #84)", () => {
   test("does NOT resolve on first byte — waits for quiet window after paint", async () => {
-    // Script: emit bytes immediately, again at 200ms, again at 400ms, then
-    // stay silent. With quietWindowMs=300, the quiet timer should reset on
-    // each chunk and only fire ~300ms after the last (400ms) chunk — so
-    // spawnPty should resolve at ~700ms, NOT at first-byte (~0ms).
-    const t0 = Date.now();
-    const proc = await spawnPty(
+    // The settle timers run on a manual clock and the child paints only when
+    // the test lets it, so the assertion is about ordering, not wall time:
+    // every chunk restarts the quiet window, and only a full window after
+    // the LAST chunk resolves. Against wall time this flaked (issue #567):
+    // with paints 200ms apart and a 300ms window, a child delayed by ~100ms
+    // on a loaded runner let the window expire after the first paint.
+    const clock = manualClock();
+    const dir = mkdtempSync(join(tmpdir(), "pty-settle-"));
+    const go2 = join(dir, "go2");
+    const go3 = join(dir, "go3");
+    const exit = join(dir, "exit");
+    // Each paint after the first waits for its go-file ($1, $2), and the child
+    // stays alive until cleanup creates $3 — spawnPty rejects if the child
+    // exits before settle, and the settle timers do not run on real time.
+    const waitFor = (arg: string) => `while [ ! -e "${arg}" ]; do sleep 0.01; done`;
+    let settled = false;
+    const spawning = spawnPty(
       baseOpts({
         _commandOverride: "/bin/sh",
         _argsOverride: [
           "-c",
-          // Trailing `sleep 5` keeps the process alive past the quiet
-          // window — spawnPty rejects if the child exits before settle.
-          "printf paint1; sleep 0.2; printf paint2; sleep 0.2; printf paint3; sleep 5",
+          `printf paint1; ${waitFor("$1")}; printf paint2; ${waitFor("$2")}; printf paint3; ${waitFor("$3")}`,
+          "sh",
+          go2,
+          go3,
+          exit,
         ],
         _skipReadySettle: false,
         quietWindowMs: 300,
+        _setTimeout: clock.setTimeout,
+        _clearTimeout: clock.clearTimeout,
       }),
-    );
-    const elapsed = Date.now() - t0;
+    ).then((p) => {
+      settled = true;
+      return p;
+    });
 
-    // Quiet timer fires 300ms after the last chunk (paint3 at ~400ms) →
-    // expect ≥ ~600ms total. Pre-fix this resolved at ~0ms.
-    // Loose bound to avoid flakiness across CI environments.
-    expect(elapsed).toBeGreaterThanOrEqual(500);
-    // And not absurdly long either — the hard timeout is 3s.
-    expect(elapsed).toBeLessThan(3000);
+    try {
+      // paint1 → a quiet window is armed. Pre-fix this already resolved.
+      await clock.untilArmed(300, 1);
+      await Bun.sleep(20);
+      expect(settled).toBe(false);
+      clock.advance(299);
+      await Bun.sleep(20);
+      expect(settled).toBe(false);
 
-    await proc.dispose();
-  });
+      // paint2 at t=299 restarts the window: the old one, due at t=300, must
+      // not resolve.
+      writeFileSync(go2, "");
+      await clock.untilArmed(300, 2);
+      clock.advance(299);
+      await Bun.sleep(20);
+      expect(settled).toBe(false);
+
+      // paint3, the last chunk, then a full quiet window → resolves.
+      writeFileSync(go3, "");
+      await clock.untilArmed(300, 3);
+      clock.advance(299);
+      await Bun.sleep(20);
+      expect(settled).toBe(false);
+      clock.advance(1);
+      // Real-time cap so a settle that never resolves fails here, not on the
+      // test timeout, and the cleanup below still runs.
+      let cap: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        spawning,
+        new Promise((_, reject) => {
+          cap = setTimeout(
+            () => reject(new Error("not settled after the last quiet window")),
+            3000,
+          );
+        }),
+      ]).finally(() => clearTimeout(cap));
+      expect(settled).toBe(true);
+    } finally {
+      // On an early failure, release the child and fire the hard timeout so
+      // the spawn settles and the PTY is disposed.
+      writeFileSync(go2, "");
+      writeFileSync(go3, "");
+      clock.advance(10_000);
+      const proc = await Promise.race([
+        spawning.catch(() => null),
+        Bun.sleep(1000).then(() => null),
+      ]);
+      await proc?.dispose();
+      writeFileSync(exit, "");
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15000);
 
   test("hard timeout fires when the TUI never paints", async () => {
     // Script: silent for 2s then exit. With _waitForReadySettle's 3s hard
@@ -521,28 +635,30 @@ describe("PtyProcess — _waitForReadySettle two-phase (issue #84)", () => {
 
 // Words are separated by CHA cursor moves (`ESC[<n>G`), as the real CLI
 // renders them, so a matcher that only strips escapes sees "Yes,Iaccept".
-const FAKE_BYPASS_DIALOG_CLI = [
-  "printf 'WARNING: Claude\\033[13GCode\\033[18Grunning\\033[26Gin\\033[29GBypass\\033[36GPermissions\\033[48Gmode\\r\\n'",
-  "printf '\\342\\235\\257 No,\\033[7Gexit\\r\\n  Yes,\\033[8GI\\033[10Gaccept\\r\\n\\r\\nEnter to confirm \\302\\267 Esc to cancel\\r\\n'",
-  "IFS= read -r key",
-  'case "$key" in "$(printf "\\033[B")") ;; *) exit 1 ;; esac',
-  "printf 'bypass\\033[8Gpermissions\\033[20Gon\\033[23G(shift+tab\\033[34Gto\\033[37Gcycle)\\r\\n'",
-  "exec cat",
-].join("; ");
+function fakeBypassDialogCli(prompt: string): string {
+  return [
+    "printf 'WARNING: Claude\\033[13GCode\\033[18Grunning\\033[26Gin\\033[29GBypass\\033[36GPermissions\\033[48Gmode\\r\\n'",
+    "printf '\\342\\235\\257 No,\\033[7Gexit\\r\\n  Yes,\\033[8GI\\033[10Gaccept\\r\\n\\r\\nEnter to confirm \\302\\267 Esc to cancel\\r\\n'",
+    "IFS= read -r key",
+    'case "$key" in "$(printf "\\033[B")") ;; *) exit 1 ;; esac',
+    "printf 'bypass\\033[8Gpermissions\\033[20Gon\\033[23G(shift+tab\\033[34Gto\\033[37Gcycle)\\r\\n'",
+    tuiScript(prompt),
+  ].join("; ");
+}
 
 describe("PtyProcess — Bypass Permissions boot dialog (issue #460)", () => {
   test("accepts the dialog during settle so the first turn reaches the REPL", async () => {
     const proc = await spawnPty(
       baseOpts({
         _commandOverride: "/bin/sh",
-        _argsOverride: ["-c", FAKE_BYPASS_DIALOG_CLI],
+        _argsOverride: ["-c", fakeBypassDialogCli("after-dialog")],
         _skipReadySettle: false,
         quietWindowMs: 200,
         sentinelMaxWaitMs: 5000,
       }),
     );
     expect(proc.isAlive()).toBe(true);
-    const result = await proc.runTurn("✻ after-dialog shift+tab to cycle", { timeoutMs: 5000 });
+    const result = await proc.runTurn("after-dialog", { timeoutMs: 5000 });
     expect(proc.isAlive()).toBe(true);
     expect(result.text).toContain("after-dialog");
     await proc.dispose();
@@ -552,11 +668,11 @@ describe("PtyProcess — Bypass Permissions boot dialog (issue #460)", () => {
     // The REPL paints 600ms after the answer — three quiet windows later.
     // Resolving on that gap would hand the first prompt to a TUI that is
     // still switching screens.
-    const slowRepl = FAKE_BYPASS_DIALOG_CLI.replace(
+    const slowRepl = fakeBypassDialogCli("unused").replace(
       "; printf 'bypass",
       "; sleep 0.6; printf 'bypass",
     );
-    expect(slowRepl).not.toBe(FAKE_BYPASS_DIALOG_CLI);
+    expect(slowRepl).not.toBe(fakeBypassDialogCli("unused"));
     const t0 = Date.now();
     const proc = await spawnPty(
       baseOpts({
@@ -590,7 +706,7 @@ describe("PtyProcess — Bypass Permissions boot dialog (issue #460)", () => {
 // Echo stays off until the next screen paints: a prompt typed too early
 // must not come back as the reply.
 
-function fakeMcpDialogCli(dialog: string, gapAfterAnswer = ""): string {
+function fakeMcpDialogCli(dialog: string, prompt: string, gapAfterAnswer = ""): string {
   return [
     `printf '${dialog}'`,
     "stty raw -echo",
@@ -604,7 +720,7 @@ function fakeMcpDialogCli(dialog: string, gapAfterAnswer = ""): string {
     '[ "$key" = "$(printf "\\033")" ] || exit 1',
     gapAfterAnswer,
     "stty echo",
-    FAKE_BYPASS_DIALOG_CLI,
+    fakeBypassDialogCli(prompt),
   ]
     .filter(Boolean)
     .join("; ");
@@ -629,14 +745,14 @@ describe("PtyProcess — project MCP server approval dialog (issue #469)", () =>
       const proc = await spawnPty(
         baseOpts({
           _commandOverride: "/bin/sh",
-          _argsOverride: ["-c", fakeMcpDialogCli(dialog)],
+          _argsOverride: ["-c", fakeMcpDialogCli(dialog, "after-mcp-dialog")],
           _skipReadySettle: false,
           quietWindowMs: 200,
           sentinelMaxWaitMs: 5000,
         }),
       );
       expect(proc.isAlive()).toBe(true);
-      const result = await proc.runTurn("✻ after-mcp-dialog shift+tab to cycle", {
+      const result = await proc.runTurn("after-mcp-dialog", {
         timeoutMs: 5000,
       });
       expect(proc.isAlive()).toBe(true);
@@ -651,13 +767,13 @@ describe("PtyProcess — project MCP server approval dialog (issue #469)", () =>
     const proc = await spawnPty(
       baseOpts({
         _commandOverride: "/bin/sh",
-        _argsOverride: ["-c", fakeMcpDialogCli(MCP_DIALOG_SINGLE, "sleep 0.6")],
+        _argsOverride: ["-c", fakeMcpDialogCli(MCP_DIALOG_SINGLE, "slow-next-screen", "sleep 0.6")],
         _skipReadySettle: false,
         quietWindowMs: 200,
         sentinelMaxWaitMs: 5000,
       }),
     );
-    const result = await proc.runTurn("✻ slow-next-screen shift+tab to cycle", {
+    const result = await proc.runTurn("slow-next-screen", {
       timeoutMs: 5000,
     });
     expect(proc.isAlive()).toBe(true);
@@ -672,7 +788,7 @@ describe("PtyProcess — project MCP server approval dialog (issue #469)", () =>
     // the first prompt lands in the bypass dialog.
     const lateDialog =
       "i=0; while [ $i -lt 25 ]; do printf .; sleep 0.1; i=$((i+1)); done; " +
-      fakeMcpDialogCli(MCP_DIALOG_SINGLE, "sleep 1");
+      fakeMcpDialogCli(MCP_DIALOG_SINGLE, "late-dialog", "sleep 1");
     const proc = await spawnPty(
       baseOpts({
         _commandOverride: "/bin/sh",
@@ -682,7 +798,7 @@ describe("PtyProcess — project MCP server approval dialog (issue #469)", () =>
         sentinelMaxWaitMs: 5000,
       }),
     );
-    const result = await proc.runTurn("✻ late-dialog shift+tab to cycle", { timeoutMs: 5000 });
+    const result = await proc.runTurn("late-dialog", { timeoutMs: 5000 });
     expect(proc.isAlive()).toBe(true);
     expect(result.text).toContain("late-dialog");
     await proc.dispose();
@@ -740,149 +856,50 @@ describe("PtyProcess — project MCP server approval dialog (issue #469)", () =>
 // the echo the parser scans for. Each test below proves a specific aspect of
 // the new flow without invoking real claude.
 
-describe("PtyProcess — runTurn sentinel-echo (clean boundary)", () => {
-  // NOTE: prompts include `✻` (U+273B, a claude spinner glyph)
-  // because the parser's activity-indicator gate (added in
-  // fix/pty-premature-sentinel) refuses to fire `quiet` until a
-  // spinner glyph has been seen. Marker glyphs (`●`/`⏺`) were dropped
-  // from the gate per Codex P1 on PR #124 — they appear in the TUI
-  // status-box row and in resumed scrollback. Real claude emits
-  // spinners while generating; `/bin/cat` doesn't, so we slip one
-  // into the prompt and let cat echo it back to satisfy the gate.
-  // The prompts ALSO carry the idle REPL footer "to cycle" (issue #316):
-  // the parser only treats quiet as turn-completion once claude has returned
-  // to the idle prompt. `/bin/cat` echoes it back, standing in for the footer
-  // real claude paints when a turn finishes.
-
-  test("cat echoes the sentinel back → cleanBoundary=true", async () => {
+describe("PtyProcess — runTurn resolves on the transcript", () => {
+  // The fake TUI records the user and assistant entries itself (`tuiScript`) and paints
+  // its own chrome; the prompts carry none of it, so none of these turns can be
+  // "accepted" by the echo of the prompt (#562 round 2, finding 6).
+  async function turnOn(
+    prompt: string,
+    over: Partial<PtyProcessOptions> = {},
+    onChunk?: (s: string) => void,
+  ) {
     const proc = await spawnPty(
       baseOpts({
-        _commandOverride: "/bin/cat",
-        _argsOverride: [],
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", tuiScript(prompt)],
         quietWindowMs: 100,
-        sentinelMaxWaitMs: 5000,
+        ...over,
       }),
     );
-    const result = await proc.runTurn("✻ hello world shift+tab to cycle", { timeoutMs: 5000 });
+    try {
+      const result = await proc.runTurn(prompt, { timeoutMs: 5000, onChunk });
+      return { result, ended: proc.lastTurnEndedAt() };
+    } finally {
+      await proc.dispose();
+    }
+  }
+
+  test("a turn the transcript shows complete resolves with the transcript's answer", async () => {
+    const { result, ended } = await turnOn("hello world");
     expect(result.cleanBoundary).toBe(true);
-    // cat echoes the prompt; the response should contain it.
-    expect(result.text.toLowerCase()).toContain("hello world");
-    expect(result.bytesCaptured).toBeGreaterThan(0);
-    expect(proc.lastTurnEndedAt()).toBeGreaterThan(0);
-    await proc.dispose();
+    expect(result.text).toBe("hello world");
+    expect(result.bytesCaptured).toBe(Buffer.byteLength("hello world"));
+    expect(ended).toBeGreaterThan(0);
   });
 
   test("long prompts are captured in full", async () => {
-    const proc = await spawnPty(
-      baseOpts({
-        _commandOverride: "/bin/cat",
-        _argsOverride: [],
-        quietWindowMs: 100,
-        sentinelMaxWaitMs: 5000,
-      }),
-    );
-    const longPrompt = `✻ ${"x".repeat(500)} shift+tab to cycle`;
-    const result = await proc.runTurn(longPrompt, { timeoutMs: 5000 });
-    expect(result.cleanBoundary).toBe(true);
-    expect(result.text).toContain("x".repeat(20));
-    await proc.dispose();
+    const longPrompt = "x".repeat(500);
+    const { result } = await turnOn(longPrompt);
+    expect(result.text).toBe(longPrompt);
   });
 
-  test("onChunk fires for streaming deltas", async () => {
-    const proc = await spawnPty(
-      baseOpts({
-        _commandOverride: "/bin/cat",
-        _argsOverride: [],
-        quietWindowMs: 100,
-        sentinelMaxWaitMs: 5000,
-      }),
-    );
-    let chunkBytes = 0;
-    const result = await proc.runTurn("✻ streaming-test-payload shift+tab to cycle", {
-      timeoutMs: 5000,
-      onChunk: (s) => {
-        chunkBytes += s.length;
-      },
-    });
-    expect(result.cleanBoundary).toBe(true);
-    expect(chunkBytes).toBeGreaterThan(0);
-    await proc.dispose();
-  });
-});
-
-describe("PtyProcess — runTurn sentinel max-wait fallback", () => {
-  test("when the echo never comes, completes with cleanBoundary=false", async () => {
-    // We need a PTY target that produces output but does NOT echo our writes
-    // back. Pure `sleep` does this — emits nothing, ignores stdin entirely.
-    // The parser stays in `accumulating` (no bytes ever arrive), the quiet
-    // timer fires, the supervisor writes the sentinel, but `sleep` never
-    // echoes it. sentinelMaxWaitMs elapses → cleanBoundary=false.
-    //
-    // The PTY's kernel cooked-mode echo would still echo our writes, so we
-    // disable it via `stty -echo` first.
-    // `\xe2\x9c\xbb` = `✻` (U+273B) — one of claude's spinner glyphs,
-    // the only signal the parser's activity-indicator gate accepts
-    // (Codex P1 on PR #124 — markers were dropped from the gate
-    // because they appear in TUI status-box rows + scrollback). Without
-    // it, quiet would never fire and the test would time out at the
-    // hard timeoutMs instead of exercising the sentinel-max-wait path.
-    const proc = await spawnPty(
-      baseOpts({
-        _commandOverride: "/bin/sh",
-        // #304: two reasons this used to time out. The output must arrive
-        // DURING the turn — the parser's quiet gate ignores bytes seen before
-        // `runTurn` (#87) — so the shell waits for our prompt line (`read`)
-        // before painting. And `/bin/sh` is dash on Debian/Ubuntu (CI too),
-        // whose `printf` has no `\xHH` escapes — the spinner glyph the
-        // activity gate looks for never appeared; octal is portable.
-        _argsOverride: [
-          "-c",
-          "stty -echo; read _; printf '\\342\\234\\273 shift+tab to cycle'; sleep 5",
-        ],
-        quietWindowMs: 50,
-        sentinelMaxWaitMs: 250,
-      }),
-    );
-    const result = await proc.runTurn("anything", { timeoutMs: 5000 });
-    expect(result.cleanBoundary).toBe(false);
-    await proc.dispose();
-  });
-
-  // Codex PR #82 P1 regression — when the sentinel max-wait expires, the
-  // fallback must use the ABSOLUTE end-of-stream offset, not the relative
-  // buffer length. Pre-fix, `_completeTurn` was passed `_turnBufLen`
-  // (relative); paired with the slice math that subtracts
-  // `parser.totalBytes - allBytes.length`, any pre-turn bytes (like
-  // claude's startup banner) would push `responseEndOffset` below
-  // `sliceStart` and the response would clamp to empty. Production
-  // symptom: `(empty response)` on every sentinel-echo failure.
-  test("sentinel-timeout fallback returns captured bytes even after pre-turn banner", async () => {
-    // BANNER emits BEFORE we send our prompt — advances parser.totalBytes
-    // without contributing to the turn buffer (turn hasn't started). Then
-    // stty -echo disables kernel cooked-mode echo (so our prompt + sentinel
-    // writes don't trivially come back). `printf 'response-bytes'` emits
-    // bytes that the parser accumulates AFTER the turn starts. Then sleep
-    // burns time until sentinelMaxWaitMs fires.
-    // `\xe2\x9c\xbb` = `✻` (U+273B) — spinner glyph the parser's
-    // activity-indicator gate scans for. Markers (`●`/`⏺`) were
-    // dropped from the gate per Codex P1 on PR #124.
-    const proc = await spawnPty(
-      baseOpts({
-        _commandOverride: "/bin/sh",
-        _argsOverride: [
-          "-c",
-          "echo BANNER_BANNER_BANNER_PRETURN; stty -echo; read _; printf '\\342\\234\\273 response-bytes-during-turn shift+tab to cycle'; sleep 5",
-        ],
-        quietWindowMs: 100,
-        sentinelMaxWaitMs: 400,
-      }),
-    );
-    const result = await proc.runTurn("trigger", { timeoutMs: 5000 });
-    expect(result.cleanBoundary).toBe(false);
-    // Without the absolute-offset fix, result.text would be empty (slice
-    // clamped to zero). With the fix, the captured bytes survive.
-    expect(result.text).toContain("response-bytes-during-turn");
-    await proc.dispose();
+  test("onChunk streams the assistant text", async () => {
+    const chunks: string[] = [];
+    const { result } = await turnOn("streaming-test-payload", {}, (s) => chunks.push(s));
+    expect(result.text).toBe("streaming-test-payload");
+    expect(chunks.join("")).toBe("streaming-test-payload");
   });
 });
 
@@ -912,47 +929,23 @@ describe("PtyProcess — runTurn hard timeout", () => {
   });
 });
 
-// ─── runTurn: sentinel UUID override (test-hook contract) ───────────────────
-
-describe("PtyProcess — sentinel UUID override hook", () => {
-  test("_sentinelUuidOverride pins the sentinel string written into the PTY", async () => {
-    // cat echoes the sentinel back; we don't observe the wire bytes here,
-    // but we DO observe that runTurn completes cleanly, proving the override
-    // produced a valid sentinel the parser found.
-    const proc = await spawnPty(
-      baseOpts({
-        _commandOverride: "/bin/cat",
-        _argsOverride: [],
-        quietWindowMs: 100,
-        sentinelMaxWaitMs: 5000,
-        _sentinelUuidOverride: () => "pinned-uuid-1234",
-      }),
-    );
-    const result = await proc.runTurn("✻ hi shift+tab to cycle", { timeoutMs: 5000 });
-    expect(result.cleanBoundary).toBe(true);
-    await proc.dispose();
-  });
-});
-
 // ─── runTurn: concurrency guard ─────────────────────────────────────────────
 
 describe("PtyProcess — concurrency", () => {
   test("concurrent runTurn rejects the second call", async () => {
     const proc = await spawnPty(
       baseOpts({
-        _commandOverride: "/bin/cat",
-        _argsOverride: [],
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", tuiScript("first")],
         turnIdleTimeoutMs: 300,
       }),
     );
-    // `✻` so cat's echo trips the activity-indicator gate (spinner-only
-    // per Codex P1 on PR #124); without it the first turn never
-    // completes and the test times out instead of exercising the
-    // concurrency rejection.
-    const t1 = proc.runTurn("✻ first shift+tab to cycle", { timeoutMs: 5000 });
+    const t1 = proc.runTurn("first", {
+      timeoutMs: 5000,
+    });
     let err: unknown;
     try {
-      await proc.runTurn("✻ second", { timeoutMs: 5000 });
+      await proc.runTurn("second", { timeoutMs: 5000 });
     } catch (e) {
       err = e;
     }
@@ -1299,4 +1292,48 @@ describe("preparePtyPromptForWrite / neutralizeLeadingReplCommand", () => {
     expect(preparePtyPromptForWrite("/compactx", { allowReplCommand: true })).toBe(" /compactx");
     expect(preparePtyPromptForWrite("/compact", {})).toBe(" /compact");
   });
+});
+
+// ─── Spawned executable (#573) ───────────────────────────────────────────────
+
+describe("PtyProcess — spawns the resolved claude executable (#573)", () => {
+  // On Windows the resolved executable is claude.exe: bun-pty cannot start
+  // the bare `claude` (a .cmd shim). Here the seam stands in for the resolver,
+  // and a fake `claude` first on PATH catches a spawn of the bare name — so
+  // the real CLI is never launched, even on a host that has one.
+  test.skipIf(process.platform === "win32")(
+    "spawns claudeExecutable() when no _commandOverride is given",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "pty-573-"));
+      const script = (name: string, body: string) => {
+        const file = join(dir, name);
+        writeFileSync(file, `#!/bin/sh\n${body}\n`);
+        chmodSync(file, 0o755);
+        return file;
+      };
+      script("claude", "echo BARE_CLAUDE_573; exit 4");
+      const resolved = script("resolved-claude", "echo RESOLVED_CLAUDE_573; exit 3");
+      const savedPath = process.env.PATH;
+      process.env.PATH = `${dir}:${savedPath ?? ""}`;
+      _setClaudeExecutableForTests(resolved);
+      try {
+        const proc = await spawnPty(
+          baseOpts({ env: { ...process.env } as Record<string, string>, _argsOverride: [] }),
+        );
+        // Poll for the fake binary's exit rather than sleep: a fixed wait fails under load.
+        const deadline = Date.now() + 5000;
+        while (!proc.exitInfo() && Date.now() < deadline) {
+          await new Promise<void>((r) => setTimeout(r, 25));
+        }
+        const info = proc.exitInfo();
+        await proc.dispose();
+        expect(info?.tail).toContain("RESOLVED_CLAUDE_573");
+        expect(info?.exitCode).toBe(3);
+      } finally {
+        _setClaudeExecutableForTests(null);
+        process.env.PATH = savedPath;
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
 });

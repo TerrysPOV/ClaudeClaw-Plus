@@ -428,7 +428,7 @@ describe("PTY integration — crash + retry (synthetic)", () => {
     expect(observedBackoffs).toEqual([10]);
   });
 
-  test("PtyTurnTimeoutError is also retryable", async () => {
+  test("PtyTurnTimeoutError is NOT retried: 124, the process is stopped, the next call spawns a new one (#562 round 5)", async () => {
     let spawnCount = 0;
     injectSleep(async () => {});
     const spawn: SpawnPty = async () => {
@@ -455,7 +455,11 @@ describe("PTY integration — crash + retry (synthetic)", () => {
       timeoutMs: 1000,
       threadId: "to",
     });
-    expect(r.exitCode).toBe(0);
+    // The prompt may have run and its process may still write: no replay on a new process.
+    expect(r.exitCode).toBe(124);
+    expect(spawnCount).toBe(1);
+    const next = await runOnPty("thread:to", "again", { timeoutMs: 1000, threadId: "to" });
+    expect(next.exitCode).toBe(0);
     expect(spawnCount).toBe(2);
   });
 

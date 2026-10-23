@@ -4,7 +4,7 @@
  * Run with: bun test src/__tests__/escalation/triggers.test.ts
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, afterAll } from "bun:test";
 import { rm, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
@@ -33,6 +33,14 @@ import { listNotifications, resetNotificationManager } from "../../escalation/no
 import type { WatchdogDecision } from "../../governance/watchdog";
 
 const ESCALATION_DIR = join(process.cwd(), ".claude", "claudeclaw");
+
+// The pause controller caches its state in the module, and the last tests here really pause the
+// system. Left set, every later file of a single-process `bun test src` (what CI runs) sees a
+// paused system: `Gateway.processInboundEvent` refuses admission and the gateway tests fail.
+afterAll(async () => {
+  resetEscalationPolicy();
+  await resetPauseController();
+});
 
 describe("Escalation Triggers - Policy Management", () => {
   beforeEach(() => {

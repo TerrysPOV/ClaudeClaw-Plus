@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import { spawnSync } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import {
   mkdtempSync,
   mkdirSync,
@@ -21,6 +21,13 @@ import {
 const NOW = "2026-06-30T00:00:00Z";
 const SKILLS = "/home/x/.claude/skills";
 const HOOK = join(import.meta.dir, "..", "..", "hooks", "log-skill-access.mjs");
+// Hook-integration cases spawn node (up to twice in sequence in one case). On CI two of
+// them overran bun's 5 s per-test default (#577); node startup on a slow runner is the
+// suspected cause (unconfirmed pending CI evidence), so give them headroom. Each child
+// gets a deadline below the test timeout so a hung hook fails with a clear message
+// instead of waiting for bun's timeout, which does not kill the child.
+const HOOK_DEADLINE_MS = 8_000;
+const HOOK_TEST_TIMEOUT_MS = 20_000;
 
 describe("skill_access producer — skillAccessEntry (pure)", () => {
   it("logs a Read under the skills dir (path resolved)", () => {
@@ -111,48 +118,95 @@ describe("skill_access producer — hook integration", () => {
     skillsDir = join(dir, "skills");
     mkdirSync(skillsDir, { recursive: true });
   });
-  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+  // Live hook children, so a failing or timed-out case never leaks a node process.
+  const children = new Set<ChildProcess>();
+  afterEach(() => {
+    for (const child of children) child.kill("SIGKILL");
+    children.clear();
+    rmSync(dir, { recursive: true, force: true });
+  });
   const run = (payload: unknown) => runRaw(JSON.stringify(payload));
   // Sends the stdin bytes verbatim (no JSON.stringify) so we can feed genuinely
-  // malformed JSON, not a valid JSON string.
+  // malformed JSON, not a valid JSON string. Resolves only once the hook process has
+  // EXITED ("close"), so a "nothing was written" assertion made afterwards is made
+  // against a finished hook, not a fixed sleep. A spawn failure or a hook that outlives
+  // HOOK_DEADLINE_MS rejects loudly (and the child is killed) rather than looking like
+  // "the hook chose not to log".
   const runRaw = (input: string) =>
-    spawnSync("node", [HOOK], {
-      input,
-      env: { ...process.env, CLAUDECLAW_SKILL_ACCESS_LOG: log, CLAUDECLAW_SKILLS_DIR: skillsDir },
-      encoding: "utf8",
+    new Promise<{ status: number | null; stderr: string }>((resolveRun, reject) => {
+      const child = spawn("node", [HOOK], {
+        env: { ...process.env, CLAUDECLAW_SKILL_ACCESS_LOG: log, CLAUDECLAW_SKILLS_DIR: skillsDir },
+        stdio: ["pipe", "ignore", "pipe"],
+      });
+      children.add(child);
+      const deadline = setTimeout(() => {
+        child.kill("SIGKILL");
+        reject(new Error(`hook did not exit within ${HOOK_DEADLINE_MS} ms`));
+      }, HOOK_DEADLINE_MS);
+      let stderr = "";
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (c: string) => {
+        stderr += c;
+      });
+      child.on("error", (err) => {
+        clearTimeout(deadline);
+        reject(err);
+      });
+      child.on("close", (status) => {
+        clearTimeout(deadline);
+        children.delete(child);
+        resolveRun({ status, stderr });
+      });
+      child.stdin.on("error", () => {}); // the hook may exit before reading all of stdin
+      child.stdin.end(input);
     });
 
-  it("appends one line for a skill read, nothing for a non-skill read", () => {
-    const skill = join(skillsDir, "a.md");
-    writeFileSync(skill, "skill");
-    run({ tool_name: "Read", tool_input: { file_path: skill } });
-    run({ tool_name: "Read", tool_input: { file_path: "/tmp/other.md" } });
-    expect(existsSync(log)).toBe(true);
-    const lines = readFileSync(log, "utf8").trim().split("\n").filter(Boolean);
-    expect(lines).toHaveLength(1);
-    const e = JSON.parse(lines[0]!);
-    expect(e.skill_path).toContain("a.md");
-    expect(e.accessed_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
-  });
+  it(
+    "appends one line for a skill read, nothing for a non-skill read",
+    async () => {
+      const skill = join(skillsDir, "a.md");
+      writeFileSync(skill, "skill");
+      const first = await run({ tool_name: "Read", tool_input: { file_path: skill } });
+      const second = await run({ tool_name: "Read", tool_input: { file_path: "/tmp/other.md" } });
+      expect(first.status).toBe(0);
+      expect(second.status).toBe(0);
+      // Both children have exited and the hook appends synchronously before exiting.
+      expect(existsSync(log)).toBe(true);
+      const lines = readFileSync(log, "utf8").trim().split("\n").filter(Boolean);
+      expect(lines).toHaveLength(1);
+      const e = JSON.parse(lines[0]!);
+      expect(e.skill_path).toContain("a.md");
+      expect(e.accessed_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    },
+    HOOK_TEST_TIMEOUT_MS,
+  );
 
-  it("rejects a symlink under skills that points OUTSIDE (realpath resolution)", () => {
-    const outside = join(dir, "secret.txt");
-    writeFileSync(outside, "secret");
-    const link = join(skillsDir, "evil.md");
-    symlinkSync(outside, link);
-    run({ tool_name: "Read", tool_input: { file_path: link } });
-    expect(existsSync(log)).toBe(false); // resolved target is outside skills → not logged
-  });
+  it(
+    "rejects a symlink under skills that points OUTSIDE (realpath resolution)",
+    async () => {
+      const outside = join(dir, "secret.txt");
+      writeFileSync(outside, "secret");
+      const link = join(skillsDir, "evil.md");
+      symlinkSync(outside, link);
+      const r = await run({ tool_name: "Read", tool_input: { file_path: link } });
+      expect(r.status).toBe(0); // hook has exited, so a missing log means "rejected", not "not yet"
+      expect(existsSync(log)).toBe(false); // resolved target is outside skills → not logged
+    },
+    HOOK_TEST_TIMEOUT_MS,
+  );
 
-  it("never errors on genuinely malformed JSON (does not block the tool)", () => {
-    // Raw bytes, NOT JSON.stringify'd — this actually breaks JSON.parse (a bare
-    // stringified value would have parsed fine and not exercised the catch).
-    for (const bad of ["{ broken", "not json at all", "", "{"]) {
-      const r = runRaw(bad);
-      expect(r.status).toBe(0);
-    }
-    expect(existsSync(log)).toBe(false);
-  });
+  it(
+    "never errors on genuinely malformed JSON (does not block the tool)",
+    async () => {
+      // Raw bytes, NOT JSON.stringify'd — this actually breaks JSON.parse (a bare
+      // stringified value would have parsed fine and not exercised the catch).
+      // Independent inputs, so spawn them together: sequential cold starts would multiply.
+      const results = await Promise.all(["{ broken", "not json at all", "", "{"].map(runRaw));
+      for (const r of results) expect(r.status).toBe(0);
+      expect(existsSync(log)).toBe(false);
+    },
+    HOOK_TEST_TIMEOUT_MS,
+  );
 });
 
 describe("skill_access producer — log rotation (producer owns the trim)", () => {

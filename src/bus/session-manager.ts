@@ -37,7 +37,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { NATIVE_SCHEDULING_TOOLS_BLOCKLIST } from "../config";
-import { cleanSpawnEnv, withCleanProcessEnv } from "../runner";
+import { claudeExecutable, cleanSpawnEnv, withCleanProcessEnv } from "../runner";
 import {
   deleteConfigForPty,
   type PtyIdentity,
@@ -50,6 +50,7 @@ import { BUS_MCP_TOOLS } from "./mcp-tools";
 import { confirmTurnReceipt } from "./receipt-wiring";
 import { capturePostMortem, type PostMortemOptions } from "./post-mortem";
 import type { ReceiptRecord } from "./receipt";
+import { assertSessionSpawnable, assertSessionWritable } from "../runner/pty-quarantine";
 import { ensureTrustAccepted } from "../runner/pty-trust-prompt";
 import {
   type AgentProcess,
@@ -80,7 +81,8 @@ export interface AgentHealth {
 
 export interface SessionManagerOptions {
   /**
-   * Test seam: override the spawned executable (default `"claude"`). The same
+   * Test seam: override the spawned executable (default: `claudeExecutable()`
+   * from `src/runner.ts`, which is `"claude"` outside Windows). The same
    * trick is used by `src/runner/pty-process.ts` so unit tests can swap in
    * `/bin/cat`, `/bin/sh`, etc.
    */
@@ -392,7 +394,9 @@ function buildChildEnv(agent: AgentConfig, busSocketPath: string): Record<string
   env.CCAW_PERMISSION_MODE = agent.permission_mode ?? "bypassPermissions";
   // Pin the bun runtime path to the daemon's own bun rather than
   // whatever `which bun` resolves to in the spawned claude's PATH.
-  // Used by `scripts/start-bus-mcp` to launch the plus-bus MCP server.
+  // The plugin's `.mcp.json` launches the plus-bus MCP server with
+  // `${CCAW_BUS_BUN_PATH:-bun}` (claude expands it), so no shell script sits
+  // in between — a bash launcher never started on win32 (#586).
   // Codex P2 on PR #133 — without this, restricted-PATH deployments
   // (e.g. daemons launched via absolute bun path with a stripped PATH)
   // would fail to start plus-bus.
@@ -862,6 +866,10 @@ export class SessionManager {
           );
         }
       }
+      // #562 round 8: the same gate every other start on a session passes. The bus names its
+      // agent's session with `--session-id`, so a transcript the PTY supervisor still has an
+      // unconfirmed writer on is not started beside it.
+      await assertSessionWritable({ sessionId: agent.session_id });
       if (mode === "pty-stdin") {
         proc = await this.spawnPty(agent, args, env, realCwd);
       } else if (mode === "process-stream-json" || mode === "process") {
@@ -1096,7 +1104,7 @@ export class SessionManager {
     env: Record<string, string>,
     realCwd: string,
   ): Promise<PtyAgentProcess> {
-    const cmd = this.options.commandOverride ?? "claude";
+    const cmd = this.options.commandOverride ?? claudeExecutable();
     // Dynamic import keeps `bun-pty` (native) out of the cold path for tests
     // that exercise non-PTY modes.
     const { spawn: ptySpawn } = (await import("bun-pty")) as {
@@ -1127,6 +1135,9 @@ export class SessionManager {
     // fork-time read of `environ`). The bun-pty handle is the first thing
     // returned so the post-spawn restore happens after the child has
     // inherited the stripped env.
+    // #562 round 9: the synchronous final word, after the `bun-pty` import above. No await
+    // between this check and the spawn.
+    assertSessionSpawnable({ sessionId: agent.session_id });
     const pty = withCleanProcessEnv(() =>
       ptySpawn(cmd, args, {
         name: "xterm-256color",
@@ -1151,7 +1162,9 @@ export class SessionManager {
     env: Record<string, string>,
     realCwd: string,
   ): ChildAgentProcess {
-    const cmd = this.options.commandOverride ?? "claude";
+    const cmd = this.options.commandOverride ?? claudeExecutable();
+    // #562 round 9: the synchronous final word; no await between it and the spawn below.
+    assertSessionSpawnable({ sessionId: agent.session_id });
     // Use node:child_process for broad compatibility and a stable
     // `ChildProcess` interface across Bun + Node runtimes. (`Bun.spawn`
     // returns a different shape; using node:child_process avoids the
@@ -1191,6 +1204,8 @@ export class SessionManager {
         `is not implemented in Sprint 1; stop() will use SIGTERM. Use 'pty-stdin' ` +
         `or 'process-stream-json' for graceful slash-command lifecycle.\n`,
     );
+    // #562 round 9: the synchronous final word; no await between it and the spawn below.
+    assertSessionSpawnable({ sessionId: agent.session_id });
     const claudeBin = this.options.commandOverride ?? "claude";
     const sessionName = `claudeclaw-${agent.id}`;
     const tmuxArgs = ["new-session", "-d", "-s", sessionName, claudeBin, ...args];

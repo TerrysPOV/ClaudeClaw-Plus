@@ -74,7 +74,7 @@ describe("pty-output-parser — sentinel flow (synthetic)", () => {
     // The response must also leave claude back at the idle REPL prompt — its
     // footer's "to cycle" hint is what tells the parser the turn is genuinely
     // done (issue #316); without it, quiet is correctly withheld.
-    feed(parser, new TextEncoder().encode("✻ a\nshift+tab to cycle"), now);
+    feed(parser, new TextEncoder().encode("\x1b]0;◐ Work\x07✻ a\nshift+tab to cycle"), now);
     expect(parser.sawByteSinceTurnStart).toBe(true);
 
     // Within the quiet window after that byte → still no quiet.
@@ -108,7 +108,7 @@ describe("pty-output-parser — sentinel flow (synthetic)", () => {
     // gate is satisfied, and the idle REPL footer ("to cycle") so the
     // turn-done gate (issue #316) is satisfied alongside the byte-seen gate.
     now += 10;
-    expect(feed(parser, enc.encode("✻ ack\nshift+tab to cycle"), now)).toEqual([]);
+    expect(feed(parser, enc.encode("\x1b]0;◐ Work\x07✻ ack\nshift+tab to cycle"), now)).toEqual([]);
     expect(parser.state).toBe("accumulating");
 
     // tick fires before the quiet window elapses → no event.
@@ -149,7 +149,7 @@ describe("pty-output-parser — sentinel flow (synthetic)", () => {
     // Include `✻` (activity gate) and the idle footer "to cycle" (turn-done
     // gate, issue #316) — the debounce test isn't about gating, but quiet
     // can't fire without both being satisfied.
-    feed(parser, enc.encode("✻ first chunk\nshift+tab to cycle"), now);
+    feed(parser, enc.encode("\x1b]0;◐ Work\x07✻ first chunk\nshift+tab to cycle"), now);
 
     // Quiet window elapses → quiet fires.
     now += 200;
@@ -379,7 +379,7 @@ describe("pty-output-parser — sentinel flow (synthetic)", () => {
 
     // Spinner appears (activity gate opens), then claude returns to the idle
     // prompt (footer "to cycle" — turn-done gate, issue #316).
-    feed(parser, enc.encode("✻ thinking\nshift+tab to cycle"), now);
+    feed(parser, enc.encode("\x1b]0;◐ Work\x07✻ thinking\nshift+tab to cycle"), now);
     expect(parser.sawActivityIndicatorThisTurn).toBe(true);
 
     // Quiet window elapses → quiet now fires.
@@ -589,7 +589,11 @@ describe("pty-output-parser — sentinel flow (synthetic)", () => {
     // sequences, so the footer arrives as "to\x1b[1Ccycle" (no literal space)
     // wrapped in colour codes. The parser must expand CUF back to spaces and
     // strip ANSI before matching, or the gate would never open.
-    feed(parser, enc.encode("✻ ok\x1b[38;5;244mshift+tab\x1b[1Cto\x1b[1Ccycle"), now);
+    feed(
+      parser,
+      enc.encode("\x1b]0;◐ Work\x07✻ ok\x1b[38;5;244mshift+tab\x1b[1Cto\x1b[1Ccycle"),
+      now,
+    );
     expect(parser.sawActivityIndicatorThisTurn).toBe(true);
 
     const qEvs = tick(parser, now + 200);
@@ -615,7 +619,7 @@ describe("pty-output-parser — sentinel flow (synthetic)", () => {
     feed(
       parser,
       enc.encode(
-        "✻ ok\x1b[28G(shift+tab\x1b[39Gto\x1b[42Gcycle)\x1b[49G·\x1b[51G←\x1b[53Gfor\x1b[57Gagents",
+        "\x1b]0;◐ Work\x07✻ ok\x1b[28G(shift+tab\x1b[39Gto\x1b[42Gcycle)\x1b[49G·\x1b[51G←\x1b[53Gfor\x1b[57Gagents",
       ),
       now,
     );
@@ -640,7 +644,7 @@ describe("pty-output-parser — sentinel flow (synthetic)", () => {
     // footer's anchored "tab to cycle" hint is NOT present. Matching the bare
     // "to cycle" here would falsely satisfy the gate and let a subsequent
     // tool-wait quiet complete the turn early — the exact bug #316 fixes.
-    feed(parser, enc.encode("✻ Here's a loop to cycle through the frames:"), now);
+    feed(parser, enc.encode("\x1b]0;◐ Work\x07✻ Here's a loop to cycle through the frames:"), now);
     expect(parser.sawByteSinceTurnStart).toBe(true);
     expect(parser.sawActivityIndicatorThisTurn).toBe(true);
 
@@ -671,7 +675,7 @@ describe("pty-output-parser — sentinel flow (synthetic)", () => {
     // scrollback replay), then the turn keeps generating well past the
     // 2048-byte footerTail cap — the stale marker must be evicted so it cannot
     // satisfy the gate during a later mid-turn tool-wait quiet.
-    feed(parser, enc.encode("✻ shift+tab to cycle"), now); // stale marker + spinner
+    feed(parser, enc.encode("\x1b]0;◐ Work\x07✻ shift+tab to cycle"), now); // stale marker + spinner
     feed(parser, enc.encode("x".repeat(3000)), now); // push it out of the 2048-byte tail
     expect(parser.sawActivityIndicatorThisTurn).toBe(true);
 
@@ -1077,5 +1081,108 @@ describe("decodeTurn", () => {
     const { stripped, text } = decodeTurn(bytes);
     expect(stripped).toBe("⏺ hello there✻ Worked for 1s");
     expect(text).toBe("hello there");
+  });
+});
+
+// ─── Turn-start edge (#562) ───────────────────────────────────────────────────
+//
+// The spinner glyph, the done-summary, the idle footer and the ✳ title are all
+// painted by a REPAINT of the previous conversation as well. A paste that was
+// never submitted got exactly that repaint, passed every gate, and completed with
+// the old scrollback. The gate now also needs proof the turn is running.
+
+describe("pty-output-parser — turn-start edge (#562)", () => {
+  const enc = new TextEncoder();
+  const RUNNING_TITLE = "\x1b]0;◐ Work\x07";
+  /** The previous conversation, repainted: spinner glyph, done-summary, idle title, footer. */
+  const REPAINT =
+    "\n● OLD-ANSWER\n✻ Sautéed for 1s · done 16:36\n\x1b]0;✳ Work\x07shift+tab to cycle\n";
+
+  function turn(): { parser: ReturnType<typeof createParser>; start: (now: number) => void } {
+    const parser = createParser({ quietWindowMs: 100 });
+    const uuid = "uuid-562";
+    return {
+      parser,
+      start: (now) => startTurn(parser, uuid, encodeSentinel(buildSentinel(uuid)), now),
+    };
+  }
+
+  test("a repaint of the old conversation (spinner + summary + ✳ title + footer) never opens the gate", () => {
+    const { parser, start } = turn();
+    start(1000);
+    feed(parser, enc.encode(REPAINT), 1000);
+    expect(parser.sawActivityIndicatorThisTurn).toBe(true); // the old gate WAS open here
+    expect(parser.sawTurnStartEdge).toBe(false);
+    expect(tick(parser, 1200)).toEqual([]);
+    expect(tick(parser, 60_000)).toEqual([]);
+  });
+
+  test("completion evidence painted BEFORE the edge does not count; evidence after it does", () => {
+    const { parser, start } = turn();
+    start(1000);
+    feed(parser, enc.encode(REPAINT), 1000);
+    feed(parser, enc.encode(`${RUNNING_TITLE}✻ Working… esc to interrupt`), 1100);
+    expect(parser.sawTurnStartEdge).toBe(true);
+    // The stale summary and footer are still inside the 2048-byte window, but they
+    // predate the edge: a mid-turn tool-wait quiet must not complete the turn (#316).
+    expect(tick(parser, 1400)).toEqual([]);
+    feed(parser, enc.encode("\n● NEW\n✻ Baked for 2s · done 16:40\n"), 1500);
+    expect(tick(parser, 1700).length).toBe(1);
+  });
+
+  test("the edge is the running chrome: ◐ and braille titles and `esc to interrupt`, not the idle ✳ title", () => {
+    for (const [label, bytes, expected] of [
+      ["◐ title", "\x1b]0;◐ x\x07", true],
+      ["braille title (older CLI)", "\x1b]0;⠂ x\x07", true],
+      ["busy footer", "· esc to interrupt", true],
+      ["busy footer, CUF gaps", "esc\x1b[1Cto\x1b[1Cinterrupt", true],
+      ["busy footer, CHA gaps", "esc\x1b[60Gto\x1b[63Ginterrupt", true],
+      ["compacting", "Compacting conversation…", true],
+      ["idle ✳ title", "\x1b]0;✳ x\x07", false],
+      ["done summary", "✻ Baked for 2s · done 16:40", false],
+      ["idle footer", "shift+tab to cycle", false],
+    ] as const) {
+      const { parser, start } = turn();
+      start(1000);
+      feed(parser, enc.encode(bytes), 1000);
+      expect([label, parser.sawTurnStartEdge]).toEqual([label, expected]);
+    }
+  });
+
+  test("a marker split across two chunks is found", () => {
+    const { parser, start } = turn();
+    start(1000);
+    feed(parser, enc.encode("· esc to int"), 1000);
+    expect(parser.sawTurnStartEdge).toBe(false);
+    feed(parser, enc.encode("errupt"), 1001);
+    expect(parser.sawTurnStartEdge).toBe(true);
+  });
+
+  test("a marker at the start of a chunk larger than the footer window is not lost to the tail cap", () => {
+    const { parser, start } = turn();
+    start(1000);
+    feed(parser, enc.encode(`${RUNNING_TITLE}${"x".repeat(5000)}`), 1000);
+    expect(parser.sawTurnStartEdge).toBe(true);
+  });
+
+  test("the response slice starts at the chunk that holds the edge, not at the send", () => {
+    const { parser, start } = turn();
+    start(1000);
+    feed(parser, enc.encode(REPAINT), 1000);
+    const edgeChunkAt = parser.totalBytes;
+    feed(parser, enc.encode(`${RUNNING_TITLE}✻ Working… esc to interrupt`), 1100);
+    expect(parser.turnEdgeOffset).toBe(edgeChunkAt);
+    expect(parser.turnEdgeOffset).toBeGreaterThan(parser.turnStartOffset);
+  });
+
+  test("the edge does not leak into the next turn", () => {
+    const { parser, start } = turn();
+    start(1000);
+    feed(parser, enc.encode(`${RUNNING_TITLE}x`), 1000);
+    expect(parser.sawTurnStartEdge).toBe(true);
+    resetTurn(parser);
+    expect(parser.sawTurnStartEdge).toBe(false);
+    start(2000);
+    expect(parser.sawTurnStartEdge).toBe(false);
   });
 });

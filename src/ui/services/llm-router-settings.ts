@@ -8,9 +8,9 @@
  * UI surface.
  */
 
-import { readFile, writeFile } from "fs/promises";
+import { readFile } from "fs/promises";
 import { getSettingsFile } from "../../config";
-import { parseSettingsForRewrite } from "../../settings-json";
+import { parseSettingsForRewrite, writeSettingsAtomic } from "../../settings-json";
 
 export interface LlmRouterTiers {
   fast: string[];
@@ -84,6 +84,6 @@ export async function updateLlmRouterSettings(
     if (patch.tiers.reasoning !== undefined) tiers.reasoning = toIdList(patch.tiers.reasoning);
   }
 
-  await writeFile(getSettingsFile(), `${JSON.stringify(data, null, 2)}\n`);
+  await writeSettingsAtomic(getSettingsFile(), data);
   return canonical(data);
 }

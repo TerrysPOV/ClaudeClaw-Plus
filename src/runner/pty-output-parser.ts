@@ -69,6 +69,34 @@ export const DEFAULT_QUIET_WINDOW_MS = 500;
  *  small enough to stay cheap. Issue #316. */
 const FOOTER_TAIL_MAX = 2048;
 
+/** Bytes of the previous tail scanned with each new chunk for the turn-start
+ *  edge, so a marker split across two chunks is still found. Issue #562. */
+const TURN_EDGE_CARRY = 96;
+
+/**
+ * What claude paints ONLY while a turn is running, and never while it sits idle
+ * with text in the input box. Issue #562: this is the evidence the prompt was
+ * accepted. Repainted scrollback cannot forge it, because a finished turn's
+ * running chrome is replaced by its done-summary.
+ *
+ *   - a window title whose glyph is the running one (◐◑◒◓, or a braille spinner on
+ *     older CLIs), not the idle ✳ (#369 measured ◐/◑ on 2.1.269);
+ *   - the busy footer `esc to interrupt` (captured verbatim on 2.1.269, #369), with
+ *     the word gaps as CUF/CHA moves or spaces;
+ *   - `Compacting conversation`, which is what `/compact` paints instead.
+ */
+// ESC is spliced in rather than written as `\x1b` so the pattern stays one readable line.
+const ESC = String.fromCharCode(0x1b);
+const WORD_GAP = `(?:${ESC}\\[\\d*[CG]|\\s)+`; // CUF/CHA move or space between words
+const TURN_RUNNING_RE = new RegExp(
+  `${ESC}\\]0;[◐◑◒◓\\u2800-\\u28ff]|esc${WORD_GAP}to${WORD_GAP}(?:interrupt|cancel)|compacting${WORD_GAP}conversation`,
+  "i",
+);
+
+function capFooterTail(bytes: Uint8Array): Uint8Array {
+  return bytes.length > FOOTER_TAIL_MAX ? bytes.slice(bytes.length - FOOTER_TAIL_MAX) : bytes;
+}
+
 /** Lenient decoder for the footer tail. The tail can start mid-UTF-8-char, so
  *  fatal:false lets partial leading bytes decode to replacement chars without
  *  throwing — fine for a substring match. */
@@ -138,6 +166,21 @@ export interface Parser {
    *  `sentinelMaxWaitMs` (default 30s) times the turn out. That's the
    *  correct outcome — visible failure beats returning garbage. */
   sawActivityIndicatorThisTurn: boolean;
+  /** Whether claude has shown that THIS turn is running: a running window title
+   *  (◐/◑/braille glyph) or the busy footer (`esc to interrupt`), seen after
+   *  `startTurn`. Issue #562: the spinner glyph and the done-summary, footer and
+   *  ✳ title are all painted by a REPAINT of the previous conversation too (a
+   *  resumed session redraws its old screen when a paste lands), so none of them
+   *  proves the prompt was accepted. A paste that was never submitted sat in the
+   *  input box, the repaint opened the quiet gate, the sentinel echoed, and the
+   *  old answer came back as this turn's. `tick` withholds `quiet` until this is
+   *  set; a turn that never starts fails visibly instead of completing. */
+  sawTurnStartEdge: boolean;
+  /** Stream offset of the chunk (or carry) holding the turn-start edge. The
+   *  response is sliced from here, never from the send, so a repaint that
+   *  arrived before the turn started is not part of the answer. Meaningful only
+   *  once `sawTurnStartEdge`. */
+  turnEdgeOffset: number;
   /** Carryover for activity-indicator byte-sequence scanning. The
    *  indicators are all 2-3 UTF-8 bytes; we keep up to 2 bytes from the
    *  previous chunk so a byte sequence straddling a chunk boundary
@@ -171,6 +214,8 @@ export function createParser(opts?: { quietWindowMs?: number }): Parser {
     quietEmitted: false,
     sawByteSinceTurnStart: false,
     sawActivityIndicatorThisTurn: false,
+    sawTurnStartEdge: false,
+    turnEdgeOffset: 0,
     activityScanCarry: new Uint8Array(0),
     pending: new Uint8Array(0),
     pendingBaseOffset: 0,
@@ -202,6 +247,8 @@ export function startTurn(
   parser.quietEmitted = false;
   parser.sawByteSinceTurnStart = false;
   parser.sawActivityIndicatorThisTurn = false;
+  parser.sawTurnStartEdge = false;
+  parser.turnEdgeOffset = parser.totalBytes;
   parser.activityScanCarry = new Uint8Array(0);
   parser.pending = new Uint8Array(0);
   parser.pendingBaseOffset = parser.totalBytes;
@@ -236,12 +283,35 @@ export function feed(parser: Parser, chunk: Uint8Array, now: number): ParserEven
     // Issue #316: keep a rolling tail of raw output so `tick` can detect the
     // idle REPL footer that only reappears when the turn is truly done, and
     // NOT during a mid-turn tool/sub-agent wait (which also goes quiet).
-    const footerCombined =
-      parser.footerTail.length === 0 ? chunk : concatBytes(parser.footerTail, chunk);
-    parser.footerTail =
-      footerCombined.length > FOOTER_TAIL_MAX
-        ? footerCombined.slice(footerCombined.length - FOOTER_TAIL_MAX)
-        : footerCombined;
+    const priorTail = parser.footerTail;
+    const footerCombined = priorTail.length === 0 ? chunk : concatBytes(priorTail, chunk);
+    parser.footerTail = capFooterTail(footerCombined);
+    // Issue #562: has this turn actually started? Scanned over the chunk plus a
+    // short carry (the marker can straddle a chunk boundary), NOT over the capped
+    // tail: a large repaint chunk would slide the marker out of it unseen.
+    if (!parser.sawTurnStartEdge) {
+      const carry = priorTail.slice(Math.max(0, priorTail.length - TURN_EDGE_CARRY));
+      const scan = carry.length === 0 ? chunk : concatBytes(carry, chunk);
+      const m = TURN_RUNNING_RE.exec(_footerDecoder.decode(scan));
+      if (m) {
+        parser.sawTurnStartEdge = true;
+        // Chunk granularity: the response starts at the chunk holding the edge (or
+        // the carry, when the marker began in the previous chunk). Everything
+        // before it is the repaint that preceded the turn. Cutting at the marker
+        // itself could drop the first words of an answer painted ahead of the busy
+        // footer in the same frame.
+        const scanBase = chunkBaseOffset - carry.length;
+        const inCarry = m.index < _footerDecoder.decode(carry).length;
+        parser.turnEdgeOffset = Math.max(
+          parser.turnStartOffset,
+          inCarry ? scanBase : chunkBaseOffset,
+        );
+        // Completion evidence must POSTDATE the edge: a done-summary or footer from
+        // the repaint, still in the tail, would otherwise open the gate for this turn.
+        const edgeBytes = chunk.slice(Math.max(0, parser.turnEdgeOffset - chunkBaseOffset));
+        parser.footerTail = capFooterTail(edgeBytes);
+      }
+    }
   }
 
   // We only scan for the sentinel after the supervisor has actually written
@@ -418,6 +488,12 @@ export function tick(parser: Parser, now: number): ParserEvent[] {
   // supervisor's `sentinelMaxWaitMs` (default 30s) fails the turn
   // visibly — better than returning garbage.
   if (!parser.sawActivityIndicatorThisTurn) return [];
+  // Issue #562: ...and the turn must have STARTED. The spinner glyph and every
+  // completion signal below are also painted by a repaint of the previous
+  // conversation, so on their own they say nothing about this prompt. A paste
+  // that was never submitted passed all of them, got the sentinel echoed into
+  // the input box, and returned the old scrollback as its answer.
+  if (!parser.sawTurnStartEdge) return [];
   // Issue #316: a mid-turn tool call / sub-agent wait ALSO makes the stream go
   // quiet, but claude has not returned to its idle prompt — its footer shows
   // the running/interrupt state, not the mode-cycler "to cycle" hint. Only
@@ -459,6 +535,8 @@ export function resetTurn(parser: Parser): void {
   parser.lastByteAt = 0;
   parser.quietEmitted = false;
   parser.sawActivityIndicatorThisTurn = false;
+  parser.sawTurnStartEdge = false;
+  parser.turnEdgeOffset = 0;
   parser.activityScanCarry = new Uint8Array(0);
   parser.pending = new Uint8Array(0);
   parser.pendingBaseOffset = parser.totalBytes;

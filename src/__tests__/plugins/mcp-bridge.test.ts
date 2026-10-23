@@ -769,3 +769,27 @@ describe("path traversal protection (pluginId validation)", () => {
     expect(() => bridge.loadOrCreateSecret("-plugin")).toThrow(/invalid pluginId/);
   });
 });
+
+// ── Audit directory (#573) ───────────────────────────────────────────────────
+
+describe("audit directory", () => {
+  // The audit dir used to be cut at the last "/": a Windows path has none, so
+  // the dir came out "" and mkdirSync("") killed the daemon at startup. A file
+  // directly under the root hits the same empty cut on POSIX.
+  it("constructs with an audit file directly under the filesystem root", () => {
+    expect(() => new PluginMcpBridge("/plus-573-audit.jsonl")).not.toThrow();
+  });
+
+  it.skipIf(process.platform !== "win32")(
+    "constructs with a backslash-separated audit path",
+    () => {
+      const tmpDir = mkdtempSync(join(tmpdir(), "mcp-bridge-573-"));
+      try {
+        const auditPath = `${tmpDir}\\sub\\audit.jsonl`;
+        expect(() => new PluginMcpBridge(auditPath)).not.toThrow();
+      } finally {
+        rmSync(tmpDir, { recursive: true, force: true });
+      }
+    },
+  );
+});

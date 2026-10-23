@@ -310,3 +310,5 @@ Location: `.claude/claudeclaw/settings.json`
 | `web.port`                 | number     | Port number (default `4632`)                   |
 
 The daemon hot-reloads this file every 30 seconds. No restart needed after changes.
+
+One-shot engine routing (`oneShot`: routes, default, HTTP engines) has its own commands: `claudeclaw oneshot list | set <route|default> <engine> | unset <route> | engine add|rm | test <engine>`, also in the web dashboard under Settings → Engines.

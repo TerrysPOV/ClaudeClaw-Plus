@@ -21,24 +21,31 @@
  *     on the same PTY (per the §3.1 concurrency contract). Different keys
  *     proceed in parallel.
  *
- *   - Crash-respawn-replay: on PtyClosedError or PtyTurnTimeoutError, the
- *     supervisor disposes the dead PTY, sleeps `backoffMs[i]`, respawns
- *     (via cached spawn options + last-known sessionId for --resume), and
- *     retries the SAME prompt up to `maxRetries` times (outer loop). Each
- *     outer retry first tries to respawn the PTY up to `respawnRetries`
- *     times (inner loop — issue #175). If the inner loop is exhausted the
- *     outer loop terminates early with a "respawn failed after N attempts"
- *     error rather than consuming the remaining outer budget. After
- *     exhaustion the supervisor surfaces a structured error in
- *     RunOnPtyResult.stderr and exitCode=1, or exitCode=124 when the last
- *     failure was a turn timeout (`PtyTurnTimeoutError`), so the watchdog and
- *     the "timed out" messages see it as they do for `claude -p`. A PTY turn
- *     timeout also RETIRES the entry before returning (the TUI may still be
- *     busy with the old answer; the next call on the key respawns and
- *     `--resume`s the stored session id, which is untouched). runner.ts does
- *     NOT compact or re-run on a PTY 124: PTY timeouts are often detection
- *     misses on a healthy session (#369, #316/#317), and the interactive REPL
- *     compacts its own context.
+ *   - Crash-respawn-replay: on a `PtyClosedError` whose prompt was never sent (the
+ *     process was already gone when the turn started), the supervisor disposes the dead
+ *     PTY, sleeps `backoffMs[i]`, respawns (via cached spawn options + last-known
+ *     sessionId for --resume), and retries the SAME prompt up to `maxRetries` times
+ *     (outer loop). Each outer retry first tries to respawn the PTY up to
+ *     `respawnRetries` times (inner loop — issue #175). If the inner loop is exhausted the
+ *     outer loop terminates early with a "respawn failed after N attempts" error rather
+ *     than consuming the remaining outer budget. After exhaustion the supervisor surfaces
+ *     a structured error in RunOnPtyResult.stderr and exitCode=1.
+ *
+ *   - Kill-and-resume (#562 round 5): a turn that ends in ANYTHING but a proven OK (a
+ *     timeout, an uncertain end, a prompt not accepted, an ambiguous or failed turn, an
+ *     API error, a replaced transcript, a process that closed after the prompt went out) is
+ *     never retried or replayed. The supervisor RETIRES the entry before returning the
+ *     error: the PTY is disposed (SIGTERM, SIGKILL after a grace period) and the call waits
+ *     for the process to have exited. The only writer that could append a late record for
+ *     the failed turn is therefore gone before any later turn marks its offset, which is
+ *     what makes the transcript's exact payload match safe without per-submission ids.
+ *     The next call on the key spawns a NEW process that `--resume`s the stored session
+ *     id (untouched), so history is kept, and not before the old one is confirmed exited
+ *     (`admitEntry` waits on `retiring`). A timeout returns exitCode 124 so the watchdog
+ *     and the "timed out" messages see it as they do for `claude -p`. runner.ts does NOT
+ *     compact or re-run on a PTY 124: PTY timeouts are often detection misses on a
+ *     healthy session (#369, #316/#317), and the interactive REPL compacts its own
+ *     context.
  *
  *   - Settings are re-read via getSettings() on every call — never cached
  *     across calls — so hot-reload works. The reap interval is rebuilt
@@ -62,7 +69,31 @@
 // mixing forms makes greps lie and risks breakage if we ever flip to
 // `moduleResolution: nodenext` (which requires the extension).
 import type { PtyProcess, PtyProcessOptions, PtyTurnResult, SpawnPty } from "./pty-process.js";
-import { PtyClosedError, PtyTurnTimeoutError } from "./pty-process.js";
+import {
+  boundaryVerdict,
+  PtyBoundaryUnconfirmedError,
+  PtyClosedError,
+  PtyExitUnconfirmedError,
+  PtyTranscriptUnavailableError,
+  PtyTurnFailedError,
+  PtyTurnTimeoutError,
+} from "./pty-process.js";
+import {
+  __resetQuarantineForTests,
+  assertSessionSpawnable,
+  assertSessionWritable,
+  confirmAllQuarantined,
+  fenceKey,
+  fenceSession,
+  isSessionQuarantined,
+  liftFence,
+  PtyQuarantinedError,
+  quarantinedKeys,
+  quarantineSession,
+  type QuarantineInfo,
+  quarantineSnapshot,
+  SessionGateInterrupted,
+} from "./pty-quarantine.js";
 import { ensureTrustAccepted } from "./pty-trust-prompt.js";
 import type { OneShotRequest, OneShotResult } from "../oneshot/engine.js";
 import { trustedToolFlags, validateIsolation } from "../oneshot/isolation.js";
@@ -240,11 +271,21 @@ export interface SupervisorOptions {
   namedAgentsAlwaysAlive: boolean;
 }
 
+/**
+ * Why a PTY turn that failed MAY HAVE COMPLETED: its outcome is unknown, so a caller must
+ * not replay it (a replay can repeat the turn's side effects). Absent on a success and on a
+ * definite failure (prompt never sent, empty reply, API error record, spawn failure,
+ * quarantine refusal), which are safe to retry.
+ */
+export type PtyUnsafeReplayKind = "uncertain" | "timeout";
+
 export interface RunOnPtyResult {
   rawStdout: string;
   stderr: string;
   exitCode: number;
   sessionId?: string;
+  /** Set only when the turn may have run; see `PtyUnsafeReplayKind`. */
+  failureKind?: PtyUnsafeReplayKind;
 }
 
 /**
@@ -297,7 +338,11 @@ export interface SupervisorSnapshot {
     /** "named" → never reaped when `namedAgentsAlwaysAlive` is on; "adhoc"/"global" → reaped after idle. */
     kind: "named" | "adhoc" | "global";
   }>;
+  /** Sessions whose process the OS has not confirmed gone (#562 round 8): nothing starts on them. */
+  quarantined: QuarantineInfo[];
 }
+
+export { PtyQuarantinedError };
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test seams.
@@ -398,6 +443,30 @@ export function resetSleep(): void {
   _sleep = (ms) => new Promise<void>((r) => setTimeout(r, ms));
 }
 
+/**
+ * How long a retirement waits for a pending (re)spawn to settle (#562 #592): the ready-settle
+ * (3 s, `spawnPty`) plus the disposal cap that follows when the spawn lands on a retired entry
+ * (7 s, `DEFAULT_EXIT_CAP_MS`), plus a margin for boot work ahead of the spawn. Past it the
+ * session is quarantined, never released: an unknown process may still be alive.
+ */
+export const PENDING_SPAWN_BOUND_MS = 15_000;
+let _pendingSpawnWait: (ms: number) => Promise<void> = (ms) =>
+  new Promise<void>((r) => {
+    const t = setTimeout(r, ms);
+    (t as { unref?: () => void }).unref?.();
+  });
+
+/** For tests only. Replace the timer that bounds the wait for a pending spawn. */
+export function injectPendingSpawnWait(fn: ((ms: number) => Promise<void>) | null): void {
+  _pendingSpawnWait =
+    fn ??
+    ((ms) =>
+      new Promise<void>((r) => {
+        const t = setTimeout(r, ms);
+        (t as { unref?: () => void }).unref?.();
+      }));
+}
+
 /** For tests only. Inject a deterministic UUID generator so fresh-session
  *  persistence can be pinned without randomness. */
 export function injectNewSessionId(fn: (() => string) | null): void {
@@ -435,6 +504,7 @@ export function __resetSupervisorForTests(): void {
     void releaseMcpIdentityFor(entry);
   }
   state.ptys.clear();
+  __resetQuarantineForTests();
   if (state.reapTimer) {
     clearInterval(state.reapTimer);
     state.reapTimer = null;
@@ -444,6 +514,7 @@ export function __resetSupervisorForTests(): void {
   _initPromise = null;
   _admissionLock = Promise.resolve();
   _spawnPty = null;
+  injectPendingSpawnWait(null);
   _ensureAgentDir = null;
   _cleanSpawnEnv = null;
   _buildSecurityArgs = null;
@@ -624,9 +695,11 @@ export async function initSupervisor(): Promise<void> {
 }
 
 /**
- * Graceful shutdown. Disposes all live PTYs.
+ * Graceful shutdown. Disposes all live PTYs, then asks every quarantined process to prove its
+ * exit once more. Returns how many exits are STILL unconfirmed (logged when not zero), so a
+ * caller can tell a clean shutdown from one that left a process behind.
  */
-export async function shutdownSupervisor(): Promise<void> {
+export async function shutdownSupervisor(): Promise<number> {
   if (state.reapTimer) {
     clearInterval(state.reapTimer);
     state.reapTimer = null;
@@ -652,6 +725,13 @@ export async function shutdownSupervisor(): Promise<void> {
   state.initialised = false;
   _initPromise = null;
   _admissionLock = Promise.resolve();
+  const unconfirmed = await confirmAllQuarantined();
+  if (unconfirmed > 0) {
+    console.warn(
+      `[pty-supervisor] shutdown: ${unconfirmed} process exit(s) still unconfirmed (quarantined)`,
+    );
+  }
+  return unconfirmed;
 }
 
 /**
@@ -677,21 +757,39 @@ export async function shutdownSupervisor(): Promise<void> {
  * `dispose()` are swallowed.
  */
 export async function killAllPtys(): Promise<number> {
+  return (await killAllPtysReport()).killed;
+}
+
+/**
+ * `killAllPtys` plus the quarantined processes (#562 round 8): after the entries are retired,
+ * every quarantined process is asked to prove its exit again, and `unconfirmed` is how many
+ * still cannot. Logged when not zero (the sync `/kill` boolean has no room for it).
+ */
+export async function killAllPtysReport(): Promise<{ killed: number; unconfirmed: number }> {
   const entries = [...state.ptys.values()].filter((e) => !e.scope.survivesKill);
-  if (entries.length === 0) return 0;
   const killed = entries.filter((e) => e.pty).length;
   await Promise.allSettled(entries.map(retireEntry));
-  return killed;
+  const unconfirmed = await confirmAllQuarantined();
+  if (unconfirmed > 0) {
+    console.warn(
+      `[pty-supervisor] /kill: ${unconfirmed} process exit(s) still unconfirmed (quarantined)`,
+    );
+  }
+  return { killed, unconfirmed };
 }
 
 /**
  * Retire the entry on `sessionKey`, if any (#546): dispose its PTY and drop
  * the entry, so the next call on the key spawns fresh from its session store.
  * Used when the caller has just reset that store (corrupted fallback session).
+ *
+ * Rejects with `PtyQuarantinedError` when the exit could not be confirmed: the caller must not
+ * go on to start another process on the session (#562 round 8).
  */
 export async function retirePtySession(sessionKey: string): Promise<void> {
   const entry = state.ptys.get(sessionKey);
   if (entry) await retireEntry(entry);
+  await assertSessionWritable({ sessionKey });
 }
 
 /**
@@ -709,7 +807,8 @@ export function supervisorEntryCount(): number {
   // #546: entries `/kill` does not reach (forks) are not counted either.
   let n = 0;
   for (const entry of state.ptys.values()) if (!entry.scope.survivesKill) n += 1;
-  return n;
+  // A quarantined process is something `/kill` still has to deal with (#562 round 8).
+  return n + quarantinedKeys().length;
 }
 
 export function snapshotSupervisor(): SupervisorSnapshot {
@@ -729,7 +828,7 @@ export function snapshotSupervisor(): SupervisorSnapshot {
       kind: entry.kind,
     });
   }
-  return { ptys };
+  return { ptys, quarantined: quarantineSnapshot() };
 }
 
 /**
@@ -890,7 +989,14 @@ export async function runOnPty(
     return await runOnAdmittedEntry(entry, sessionKey, prompt, opts, supervisorOpts);
   } finally {
     opts.signal?.removeEventListener("abort", onAbort);
-    if (entry.scope.ephemeral) await retireEntry(entry);
+    if (entry.scope.ephemeral) {
+      const retired = retireEntry(entry);
+      // #592: the retirement now waits for a pending spawn. A caller that timed out or was
+      // aborted has spent its deadline and is not held for it: the retirement carries on in the
+      // background with the session fenced, and ends in a confirmed exit or a quarantine.
+      if (opts.signal?.aborted && entry.spawnInFlight) void retired.catch(() => {});
+      else await retired;
+    }
   }
 }
 
@@ -1041,6 +1147,36 @@ async function settleBy(
 }
 
 /**
+ * `failed` for a session with an unconfirmed process (after one more attempt to confirm it),
+ * else null. The wait for that confirmation is bounded by the caller's `deadline` (a
+ * `_clock()` time) and `signal` (#562 round 9): it ends as `timedOut` / `aborted` like every
+ * other wait in `sendToLiveSession`, and the confirmation goes on in the background with the
+ * quarantine kept.
+ */
+async function sessionBlocked(
+  sessionKey: string,
+  sessionId: string | undefined,
+  deadline: number,
+  signal: AbortSignal | undefined,
+): Promise<LiveSendResult | null> {
+  try {
+    await assertSessionWritable(
+      { sessionKey, sessionId },
+      { deadline: Date.now() + Math.max(0, deadline - _clock()), signal },
+    );
+    return null;
+  } catch (err) {
+    const how = err instanceof SessionGateInterrupted ? err.how : undefined;
+    return {
+      status: "failed",
+      error: (err as Error).message,
+      timedOut: how === "timeout",
+      aborted: how === "aborted",
+    };
+  }
+}
+
+/**
  * Write `text` as one turn into the live PTY for `sessionKey` and wait for its end
  * of turn (#549). Used for `/compact`, memory saves and the rotation summary, which
  * used to resume the same session in a second `claude -p`.
@@ -1082,6 +1218,17 @@ export async function sendToLiveSession(
       return { status: "failed", error: "aborted before send", timedOut: false, aborted: true };
     }
     const entry = state.ptys.get(sessionKey);
+    // #562 round 8: the gate comes FIRST, before any "is it alive" decision. A quarantined
+    // session still has a process whether or not an entry is tracked (a failed crash recovery
+    // keeps the entry, a retirement drops it), so neither "no entry" nor "dead process" may
+    // reach the caller as `not-live`: it would resume the transcript in a one-shot beside it.
+    const blocked = await sessionBlocked(sessionKey, entry?.pty?.sessionId, deadline, opts.signal);
+    if (blocked) return blocked;
+    // The gate may have waited: an abort that landed meanwhile stops us before anything is
+    // written or resumed.
+    if (opts.signal?.aborted) {
+      return { status: "failed", error: "aborted before send", timedOut: false, aborted: true };
+    }
     // No entry: no process (a finished retirement removes it), whatever the
     // supervisor is doing.
     if (!entry) return { status: "not-live", reason: "no-entry" };
@@ -1113,7 +1260,27 @@ export async function sendToLiveSession(
       void previousLock.then(release, release);
       return gaveUp("the running turn to end", waited);
     }
-    // The world may have changed while we queued: re-check under the lock.
+    // An abort that landed while we queued, before anything was written: nothing to kill.
+    if (opts.signal?.aborted) {
+      release();
+      return { status: "failed", error: "aborted before send", timedOut: false, aborted: true };
+    }
+    // The world may have changed while we queued: re-check under the lock, the quarantine
+    // included (a process can enter it while we waited, and `release` must run first).
+    const blockedNow = await sessionBlocked(
+      sessionKey,
+      entry.pty?.sessionId,
+      deadline,
+      opts.signal,
+    );
+    if (blockedNow) {
+      release();
+      return blockedNow;
+    }
+    if (opts.signal?.aborted) {
+      release();
+      return { status: "failed", error: "aborted before send", timedOut: false, aborted: true };
+    }
     if (!isCurrentEntry(entry) || entry.spawnInFlight || !entry.pty?.isAlive()) {
       release();
       continue;
@@ -1147,11 +1314,34 @@ export async function sendToLiveSession(
       },
       () => undefined,
     );
-    persisted.then(release, release);
+    // #562 round 6: the prompt is out, so an abort is not "stop waiting". The process may
+    // still write a record for it, and the next identical prompt would read that record as
+    // its own. The abort retires the entry (kill and await the exit) the moment it fires,
+    // before the turn can settle, and the lock stays held until that disposal has finished,
+    // however soon the abandoned turn rejects.
+    let abortRetirement: Promise<void> | undefined;
+    const onAbort = (): void => {
+      abortRetirement = retireEntry(entry);
+    };
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
+    persisted.then(() => abortRetirement?.catch(() => undefined)).then(release, release);
 
     try {
       const result = await raceAbort(turn, opts.signal);
+      opts.signal?.removeEventListener("abort", onAbort);
       await persisted;
+      // #562 round 3: a result whose boundary is not clean is a failure, whatever text it
+      // carries. The turn may have run, so the entry goes (its TUI is in a state we cannot
+      // read) and the send is reported failed rather than sent.
+      if (boundaryVerdict(result) === "failed") {
+        await retireEntry(entry);
+        return {
+          status: "failed",
+          error: new PtyBoundaryUnconfirmedError(pty.label).message,
+          timedOut: false,
+          aborted: false,
+        };
+      }
       return {
         status: "sent",
         text: result.text,
@@ -1159,11 +1349,19 @@ export async function sendToLiveSession(
         cleanBoundary: result.cleanBoundary,
       };
     } catch (err) {
+      opts.signal?.removeEventListener("abort", onAbort);
       if (err instanceof LiveSendAborted) {
+        // Awaited: the writer is gone before the caller hears of the abort.
+        await (abortRetirement ?? retireEntry(entry));
         return { status: "failed", error: "aborted", timedOut: false, aborted: true };
       }
       const timedOut = err instanceof PtyTurnTimeoutError;
-      if (timedOut) await retireEntry(entry);
+      // #562 round 5, kill-and-resume: any turn that did not end in a proven OK (a timeout,
+      // an uncertain end, a prompt not accepted, a failed or ambiguous turn, a replaced
+      // transcript, a process that closed after the send) leaves a process that may still
+      // write a record for it. Stop it and wait for its exit before reporting; the next
+      // call resumes the stored session in a new one.
+      await retireEntry(entry);
       return { status: "failed", error: (err as Error).message, timedOut, aborted: false };
     }
   }
@@ -1186,6 +1384,7 @@ export function liveSessionKeys(): string[] {
     if (!entry.retiring && !entry.spawnInFlight && !entry.pty?.isAlive()) continue;
     keys.push(entry.sessionKey);
   }
+  for (const key of quarantinedKeys()) if (!keys.includes(key)) keys.push(key);
   return keys.sort();
 }
 
@@ -1323,6 +1522,9 @@ async function admitEntry(
       await retiring.catch(() => {});
       continue;
     }
+    // #562 round 8: a key (or the session an ephemeral run resumes) whose last process was
+    // not proven dead gets no replacement; this also retries the confirmation.
+    await assertSessionWritable({ sessionKey, sessionId: opts.resumeSessionId });
     const prev = _admissionLock;
     let release: () => void = () => {};
     _admissionLock = new Promise<void>((resolve) => {
@@ -1333,6 +1535,9 @@ async function admitEntry(
       // A retirement may have started on this key while we queued for the
       // lock; go back to waiting for it without holding the lock.
       if (state.ptys.get(sessionKey)?.retiring) continue;
+      if (isSessionQuarantined({ sessionKey, sessionId: opts.resumeSessionId })) {
+        throw new PtyQuarantinedError(sessionKey);
+      }
       refuseIfShuttingDown();
       // #546: a one-shot run neither counts against the cap nor evicts.
       if (!opts.ephemeral) await enforceMaxConcurrent(sessionKey);
@@ -1823,10 +2028,16 @@ async function landPty(entry: PtyEntry, pty: PtyProcess): Promise<void> {
     entry.pty = pty;
     return;
   }
+  // #562 round 9: fenced from the start of the disposal, before its first await.
+  fenceSession(entry.sessionKey, pty);
   try {
     await pty.dispose();
-  } catch {
-    // best-effort
+  } catch (err) {
+    if (err instanceof PtyExitUnconfirmedError) {
+      quarantineSession(entry.sessionKey, pty, "late-pty-exit-unconfirmed");
+    }
+  } finally {
+    liftFence(pty);
   }
   throw new EntryRemovedError(entry.sessionKey, "disposed the late PTY");
 }
@@ -1851,6 +2062,19 @@ function isCurrentEntry(entry: PtyEntry): boolean {
  */
 function retireEntry(entry: PtyEntry): Promise<void> {
   if (entry.retiring) return entry.retiring;
+  // #562 round 9: the session is fenced the moment its retirement begins, before the first
+  // await below, so a spawn that has already passed the async gate is refused by the
+  // synchronous check at the spawn. The fence becomes the quarantine record if the exit is
+  // not confirmed, with no gap, and is lifted when the retirement ends.
+  const fencedPty = entry.pty;
+  if (fencedPty) fenceSession(entry.sessionKey, fencedPty);
+  // #592: the key is fenced too, whether or not a process has landed. A spawn still in its
+  // ready-settle has a running child and no `entry.pty`; this fence is what covers it.
+  fenceKey(
+    entry.sessionKey,
+    entry,
+    () => entry.pty?.sessionId || entry.spawnOpts?.sessionId || entry.spawnOpts?.newSessionId,
+  );
   const run = (async () => {
     // A first-turn spawn failure may be releasing this key right now; let it
     // finish before releasing again, so nothing keyed by sessionKey is still
@@ -1862,20 +2086,95 @@ function retireEntry(entry: PtyEntry): Promise<void> {
     // same PTY returns immediately, which would let this retirement finish
     // while the old process is still being torn down.
     try {
-      const disposal = entry.disposing ?? entry.pty?.dispose() ?? Promise.resolve();
-      await Promise.allSettled([
+      const pty = entry.pty;
+      const disposal = entry.disposing ?? pty?.dispose() ?? Promise.resolve();
+      const [disposed, , joined] = await Promise.allSettled([
         disposal,
         // Release multiplexer identity + delete synthesized config (SPEC §4.5).
         releaseMcpIdentityFor(entry),
+        // #592: a pending spawn or respawn is the entry's to settle. It lands on a retired
+        // entry, so `landPty` disposes and confirms it; the retirement ends after that.
+        joinPendingSpawns(entry),
       ]);
+      // #562 round 7: a disposal that could not prove the exit leaves a process that may
+      // still write. Quarantine the key before the entry leaves the map, with no await in
+      // between, so there is no moment when a replacement could be admitted.
+      if (disposed.status === "rejected" && pty) {
+        quarantineSession(entry.sessionKey, pty, "retire-exit-unconfirmed");
+      }
+      // #592: a pending spawn that did not settle within the bound may have a process alive.
+      // The fence turns into its quarantine record in this same synchronous step.
+      if (joined.status === "fulfilled" && joined.value) {
+        quarantineSession(entry.sessionKey, joined.value, "pending-spawn-unsettled", entry);
+      }
     } finally {
       // Unconditional: an entry left in the map with `retiring` settled would
       // spin every admission on its key (and the shutdown loop) forever.
+      if (fencedPty) liftFence(fencedPty);
+      if (entry.pty) liftFence(entry.pty);
+      liftFence(entry);
       if (state.ptys.get(entry.sessionKey) === entry) state.ptys.delete(entry.sessionKey);
     }
   })();
   entry.retiring = run;
   return run;
+}
+
+/**
+ * Wait, within `PENDING_SPAWN_BOUND_MS`, for every (re)spawn pending on `entry` to settle (#592).
+ * `spawnInFlight` is cleared only after `landPty` has disposed and confirmed a late arrival (or
+ * quarantined it itself), so settled means the spawn left no unaccounted process. Returns null
+ * when it settled, or a stand-in process for the one that did not: its quarantine record.
+ */
+async function joinPendingSpawns(entry: PtyEntry): Promise<PtyProcess | null> {
+  if (!entry.spawnInFlight) return null;
+  let expired = false;
+  const bound = _pendingSpawnWait(PENDING_SPAWN_BOUND_MS).then(() => {
+    expired = true;
+  });
+  while (entry.spawnInFlight) {
+    const pending = entry.spawnInFlight;
+    let settled = false;
+    const done = pending.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await Promise.race([done, bound]);
+    if (settled) {
+      if (entry.spawnInFlight === pending) break;
+      continue;
+    }
+    if (expired) return pendingSpawnStandIn(entry, () => settled);
+  }
+  return null;
+}
+
+/**
+ * The quarantine record for a spawn that did not settle: a process we cannot name. It is
+ * confirmed gone once the spawn has settled (then `landPty` has disposed what it produced,
+ * and recorded its own quarantine if that disposal was unconfirmed).
+ */
+function pendingSpawnStandIn(entry: PtyEntry, isSettled: () => boolean): PtyProcess {
+  const label = `pending-spawn:${entry.sessionKey}`;
+  const confirm = async (): Promise<void> => {
+    if (!isSettled()) throw new PtyExitUnconfirmedError(label, 0);
+  };
+  return {
+    label,
+    pid: 0,
+    sessionId: entry.spawnOpts?.sessionId || entry.spawnOpts?.newSessionId || "",
+    cwd: entry.spawnOpts?.cwd ?? "",
+    isAlive: () => !isSettled(),
+    lastTurnEndedAt: () => 0,
+    exitInfo: () => null,
+    runTurn: () => Promise.reject(new PtyClosedError(label, null, null)),
+    dispose: confirm,
+    confirmExit: confirm,
+  };
 }
 
 /**
@@ -1936,7 +2235,14 @@ async function spawnEntry(
     if (!isCurrentEntry(entry)) {
       throw new EntryRemovedError(entry.sessionKey, "not spawning for a retired entry");
     }
-    await landPty(entry, await spawn(spawnOpts));
+    // #562 round 8: the gate for a first spawn. `spawnOpts.sessionId` is the stored or
+    // resumed session, so a transcript another process still holds is refused whatever key
+    // asks for it.
+    await assertSessionWritable({ sessionKey: entry.sessionKey, sessionId: spawnOpts.sessionId });
+    // #562 round 9: the final word, synchronous. No await between this check and `spawn`.
+    assertSessionSpawnable({ sessionKey: entry.sessionKey, sessionId: spawnOpts.sessionId });
+    const spawned = spawn(spawnOpts);
+    await landPty(entry, await spawned);
     // Stamp the (re)spawn time so the reaper's spawn-grace window restarts
     // from now — see PtyEntry.lastSpawnedAt + reapIdle.
     entry.lastSpawnedAt = _clock();
@@ -2075,14 +2381,25 @@ async function respawnEntry(
   // Best-effort dispose of the dead one (may already be exited). Kept on the
   // entry while it runs so a retirement racing this respawn joins it (#385).
   if (entry.pty) {
-    const disposal = entry.pty.dispose().finally(() => {
+    const dying = entry.pty;
+    // #562 round 9: fenced from the start of this disposal (before its first await).
+    fenceSession(entry.sessionKey, dying);
+    const disposal = dying.dispose().finally(() => {
       if (entry.disposing === disposal) entry.disposing = undefined;
     });
     entry.disposing = disposal;
     try {
       await disposal;
-    } catch {
-      // ignore
+    } catch (err) {
+      // #562 round 7: not proven dead is not "ignore". Resuming onto the same transcript
+      // with a possibly live writer is the failure this guards. `entry.pty` stays so the
+      // retirement that follows joins it.
+      if (err instanceof PtyExitUnconfirmedError) {
+        quarantineSession(entry.sessionKey, dying, "crash-recovery-exit-unconfirmed");
+        throw new PtyQuarantinedError(entry.sessionKey);
+      }
+    } finally {
+      liftFence(dying);
     }
   }
   entry.pty = null;
@@ -2091,7 +2408,13 @@ async function respawnEntry(
   if (!isCurrentEntry(entry)) {
     throw new EntryRemovedError(entry.sessionKey, "not respawning a retired entry");
   }
-  await landPty(entry, await spawn(opts));
+  // #562 round 8: the gate for a respawn (it also lifts a quarantine the dispose above
+  // recorded and has since confirmed).
+  await assertSessionWritable({ sessionKey: entry.sessionKey, sessionId: opts.sessionId });
+  // #562 round 9: the final word, synchronous. No await between this check and `spawn`.
+  assertSessionSpawnable({ sessionKey: entry.sessionKey, sessionId: opts.sessionId });
+  const respawned = spawn(opts);
+  await landPty(entry, await respawned);
   entry.spawnOpts = opts;
   // Reset the spawn-grace window on respawn so a healthy long-lived PTY that
   // crashes doesn't get immediately reaped before its first post-respawn turn
@@ -2191,7 +2514,7 @@ async function respawnEntryWithRetries(
       }
       // Same reason as the check above: the attempt landed on a removed entry.
       // A retry is not a recovery, it is a second spawn for a dead key.
-      if (err instanceof EntryRemovedError) throw err;
+      if (err instanceof EntryRemovedError || err instanceof PtyQuarantinedError) throw err;
       lastErr = err;
       if (isFinalAttempt) break;
       const delay = pickBackoff(opts.backoffMs, i);
@@ -2286,6 +2609,17 @@ async function runTurnWithRetries(
       });
       // Persist session ID if newly captured.
       await persistSessionId(entry, result.sessionId);
+      // #562 round 3: a result whose boundary is not clean is a failure (exit 1), not a
+      // success with whatever text it carries. The turn may have run, so it is not retried
+      // and the entry goes (its TUI is in a state we cannot read).
+      if (boundaryVerdict(result) === "failed") {
+        await retireEntry(entry);
+        return errorResult(
+          `[pty-supervisor] non-retryable error on ${entry.sessionKey}: ${new PtyBoundaryUnconfirmedError(entry.pty?.label ?? entry.sessionKey).message}`,
+          1,
+          "uncertain",
+        );
+      }
       return {
         rawStdout: result.text,
         stderr: "",
@@ -2294,10 +2628,58 @@ async function runTurnWithRetries(
       };
     } catch (err) {
       lastErr = err;
-      const retryable = err instanceof PtyClosedError || err instanceof PtyTurnTimeoutError;
+      // Only a process that was already gone BEFORE the prompt went out is retried: nothing
+      // ran, so a replay cannot double anything. Every other outcome is final for this
+      // turn (#562 round 5).
+      const retryable = err instanceof PtyClosedError && !err.promptSent;
       if (!retryable) {
+        // #546: an aborted call retires the entry itself (which closes the process under
+        // the turn); that is an abort, not a failure to report.
+        if (err instanceof PtyClosedError && callOpts.signal?.aborted) {
+          await retireEntry(entry);
+          return errorResult(`[pty-supervisor] ${entry.sessionKey} aborted`);
+        }
+        // #562 round 5, kill-and-resume: the turn did not end in a proven OK (timeout,
+        // uncertain end, prompt not accepted, failed or ambiguous, replaced transcript, a
+        // process that closed after the send), so the prompt may have run and a record for
+        // it may still be written by the process that is still alive. Kill that process and
+        // WAIT for it to exit before returning; the next call spawns a new one that
+        // resumes the same session. No retry, no replay. Only a turn refused before
+        // anything was written has nothing to kill.
+        if (!(err instanceof PtyTranscriptUnavailableError)) await retireEntry(entry);
+        // #562 round 3: the transcript says the turn FAILED. Matched to the print path: a
+        // non-zero exit, not retried, the session reset left to the runner. For an API
+        // error the CLI's own text goes out as the output, because that is what the
+        // runner reads to tell a corrupt session from any other failure
+        // (`signatureErrorWarrantsReset`, the same input the print path gives it).
+        // Only `ambiguous` leaves it unknown whose reply this is; the other kinds are a
+        // definite failure the transcript recorded, so a caller may retry them.
+        if (err instanceof PtyTurnFailedError) {
+          return {
+            ...errorResult(
+              `[pty-supervisor] non-retryable error on ${entry.sessionKey}: ${err.message}`,
+              1,
+              err.kind === "ambiguous" ? "uncertain" : undefined,
+            ),
+            rawStdout: err.kind === "api-error" ? err.text : "",
+          };
+        }
+        // 124 so the watchdog and the "timed out" messages see a timeout as they do for
+        // `claude -p`.
+        if (err instanceof PtyTurnTimeoutError) {
+          return errorResult(
+            `[pty-supervisor] turn timed out on ${entry.sessionKey}: ${err.message}; not retried (the prompt may have run), the process was stopped and the next call resumes the session`,
+            124,
+            "timeout",
+          );
+        }
+        // A refusal before anything was written is definite. Everything else that ends a
+        // turn here (no turn boundary, prompt not accepted, a process that closed after the
+        // send, a replaced transcript) may have run.
         return errorResult(
           `[pty-supervisor] non-retryable error on ${entry.sessionKey}: ${(err as Error).message}`,
+          1,
+          err instanceof PtyTranscriptUnavailableError ? undefined : "uncertain",
         );
       }
       // #546: an aborted call does not respawn what the abort just retired.
@@ -2321,14 +2703,8 @@ async function runTurnWithRetries(
     }
   }
 
-  // A timed-out turn leaves the TUI possibly still busy with the previous answer, so the
-  // next paste on this key could land mid-turn. Retire it, as `sendToLiveSession` does on
-  // timeout; the stored session id stays, so the next call respawns and resumes.
-  const timedOut = lastErr instanceof PtyTurnTimeoutError;
-  if (timedOut) await retireEntry(entry);
   return errorResult(
     `[pty-supervisor] max retries (${supervisorOpts.maxRetries}) exhausted for ${entry.sessionKey}: ${(lastErr as Error)?.message ?? "unknown"}`,
-    timedOut ? 124 : 1,
   );
 }
 
@@ -2338,12 +2714,17 @@ function pickBackoff(backoffMs: number[], attempt: number): number {
   return Math.max(0, backoffMs[idx] ?? 0);
 }
 
-function errorResult(message: string, exitCode = 1): RunOnPtyResult {
+function errorResult(
+  message: string,
+  exitCode = 1,
+  failureKind?: PtyUnsafeReplayKind,
+): RunOnPtyResult {
   return {
     rawStdout: "",
     stderr: message,
     exitCode,
     sessionId: undefined,
+    ...(failureKind ? { failureKind } : {}),
   };
 }
 

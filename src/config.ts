@@ -716,20 +716,16 @@ export interface PtyConfig {
    */
   maxConcurrent: number;
   /**
-   * Quiet window before the supervisor writes the turn-end sentinel into the
-   * PTY (issue #81 — claude 2.1.89 dropped OSC 9;4 progress markers, so we
-   * detect turn completion via a sentinel-echo round-trip instead). When the
-   * byte stream has been silent for this many ms, the supervisor writes the
-   * sentinel and waits for claude's TUI to echo it back. Lower values reduce
-   * per-turn latency overhead but risk false-positives during legitimate
-   * mid-turn pauses (model thinking, slow streaming, etc.). Default: 500.
+   * How long the TUI's output must be quiet, after the session transcript shows the
+   * reply complete, before the next prompt may be sent (#562 round 2). It is a
+   * readiness delay only: it can postpone the end of a turn (by at most 2 s), never
+   * decide it. Default: 500.
    */
   quietWindowMs: number;
   /**
-   * Hard cap on how long the supervisor waits for the sentinel echo after
-   * writing it. If the sentinel never echoes back (claude crashed, TUI
-   * stalled), the turn completes with `cleanBoundary=false` and whatever
-   * bytes have been captured so far. Default: 30000 (30s).
+   * Unused since #562 round 2: there is no sentinel any more, and a turn ends only when
+   * the session transcript shows the reply complete. Kept so existing settings files
+   * and callers still parse. Default: 30000.
    */
   sentinelMaxWaitMs: number;
 }
