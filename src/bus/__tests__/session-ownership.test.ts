@@ -256,18 +256,24 @@ describe("decideResume — one deadline for the whole guard (#595 r3)", () => {
   }, 10_000);
 
   it("the read is handed what is left of the deadline, capped at the probe timeout", async () => {
-    // Fault (site: `Math.min(PROBE_TIMEOUT_MS, left())` in `read`, the cap on `left()` dropped):
-    // a read can be told it has longer than the guard does. Predicted result: 1500, not 300.
-    const clock = new FakeClock();
-    const probe = new FakeProbe();
-    const store = new MemoryStore();
-    store.rec.set("a", recordFor());
-    probe.stall = true;
-    const decided = decideResume({ ...base, store, probe, deadlineMs: 300, clock });
-    await probe.readIssued(1);
-    expect(probe.readTimeouts).toEqual([300]);
-    clock.advance(300);
-    await decided;
+    // Two faults at the one site `Math.min(PROBE_TIMEOUT_MS, left())` in `read`, one at a time:
+    // `left()` dropped (a read told it has longer than the guard does: 1500 where 300 is left) and
+    // the probe cap dropped (a read told it has the whole deadline: 10000 where 1500 is the cap).
+    const handed = async (deadlineMs: number): Promise<number[]> => {
+      const clock = new FakeClock();
+      const probe = new FakeProbe();
+      const store = new MemoryStore();
+      store.rec.set("a", recordFor());
+      probe.stall = true;
+      const decided = decideResume({ ...base, store, probe, deadlineMs, clock });
+      await probe.readIssued(1);
+      const timeouts = [...probe.readTimeouts];
+      clock.advance(deadlineMs);
+      await decided;
+      return timeouts;
+    };
+    expect(await handed(300)).toEqual([300]);
+    expect(await handed(10_000)).toEqual([1500]);
   }, 10_000);
 
   it("a record read that never returns is bounded too", async () => {
