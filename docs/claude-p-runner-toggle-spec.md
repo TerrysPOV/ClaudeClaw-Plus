@@ -7,7 +7,7 @@
 
 ## 1. TL;DR
 
-The toggle is **already in the data model** — `AgentConfig.supervision` overrides the per-origin runner. `claude -p` is the `process-stream-json` supervision mode, which the Bus already runs in production for non-channel origins. Making it a real *user* option for chat agents is **scoping + wiring + graceful degradation**, not a new runtime.
+The toggle is **already in the data model** — `AgentConfig.supervision` overrides the per-origin runner. `claude -p` is the `process-stream-json` supervision mode, which, since #550, the Bus uses by default only for non-channel origins on win32 (every other origin and platform defaults to `pty-stdin`). Making it a real *user* option for chat agents is **scoping + wiring + graceful degradation**, not a new runtime.
 
 The decision that shaped this spec: I empirically re-tested the two things people assume block `claude -p`. Results below.
 
@@ -32,8 +32,8 @@ That reversal is reversible *now*, and specifically *additively*, for two reason
 ## 3. What already exists
 
 - `SupervisionMode = "pty-stdin" | "process-stream-json" | "tmux" | "process"` (`src/bus/types.ts`).
-- `defaultSupervisionFor(origin)` → `pty-stdin` for channel-driven origins, `process-stream-json` (= `claude -p --input-format=stream-json --output-format=stream-json --verbose`) otherwise.
-- **Per-agent override already wired:** `session-manager.ts:593` → `const mode = agent.supervision ?? defaultSupervisionFor(origin)`. So `AgentConfig.supervision: "process-stream-json"` already forces `claude -p` for that agent, including channel-driven ones.
+- `defaultSupervisionFor(origin)` → `pty-stdin` for every origin (#550), except that non-channel origins on win32 get `process-stream-json` (= `claude -p --input-format=stream-json --output-format=stream-json --verbose`).
+- **Per-agent override already wired:** `session-manager.ts:815` → `const mode = agent.supervision ?? defaultSupervisionFor(origin)`. So `AgentConfig.supervision: "process-stream-json"` already forces `claude -p` for that agent, including channel-driven ones.
 
 So a power user can *technically* flip it today. This spec is about making it **safe, documented, and complete**.
 

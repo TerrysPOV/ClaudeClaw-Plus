@@ -21,8 +21,9 @@
  *     the directory (authoritative), so the job runs with that agent's persona.
  *   - the default/global session (no `agents/default/` scaffold) → the flat
  *     `getJobsDir()`, exactly where its `reminder-*.md` files already live.
- * Either way the 60 s job loop runs the task as a one-shot `claude -p`, not in
- * the calling agent's live session (#506); its output goes to the configured
+ * Either way the 60 s job loop runs the task as a one-shot `run()` turn on the
+ * configured engine (PTY by default; `claude -p` only with `pty.enabled: false`
+ * or on win32), not in the calling agent's live session (#506); its output goes to the configured
  * Telegram/Discord users.
  * This keeps the round-trip correct for either caller without a magic
  * "is this the default agent" string check.
