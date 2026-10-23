@@ -74,7 +74,7 @@ import { recordResult, abortReason, clearSession, startSession } from "./watchdo
 import { getPluginManager, type EventContext } from "./plugins";
 import {
   runOnPty,
-  killAllPtys,
+  killAllPtysReport,
   supervisorEntryCount,
   retirePtySession,
   liveSessionKeys,
@@ -533,52 +533,109 @@ function enqueue<T>(fn: () => Promise<T>, threadId?: string): Promise<T> {
 // outside the main queue and must not be killed by /kill.
 const mainActiveProcs = new Set<ReturnType<typeof Bun.spawn>>();
 
+/** How many of the processes `/kill` asked to end are proven gone, and how many are not (#591). */
+export interface KillOutcome {
+  confirmed: number;
+  unconfirmed: number;
+  /** Of `unconfirmed`, the PTY processes, whose sessions are quarantined (listed in /status). */
+  quarantined: number;
+  /** The PTY report itself failed: the counts are unknown, not zero. */
+  failed?: true;
+}
+
+/** How long `/kill` waits for a legacy `claude -p` child to exit after its signal (#591). */
+export const LEGACY_EXIT_CONFIRM_DEFAULT_MS = 7_000;
+let LEGACY_EXIT_CONFIRM_MS = LEGACY_EXIT_CONFIRM_DEFAULT_MS;
+
+/** For tests only: track a fake legacy child, and set the exit wait (default restores it). */
+export function _trackMainProcForTests(
+  proc: ReturnType<typeof Bun.spawn> | null,
+  exitConfirmMs = LEGACY_EXIT_CONFIRM_DEFAULT_MS,
+): void {
+  if (proc) mainActiveProcs.add(proc);
+  else mainActiveProcs.clear();
+  LEGACY_EXIT_CONFIRM_MS = exitConfirmMs;
+}
+
+async function confirmLegacyExit(proc: ReturnType<typeof Bun.spawn>): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<false>((r) => {
+    timer = setTimeout(() => r(false), LEGACY_EXIT_CONFIRM_MS);
+  });
+  try {
+    return await Promise.race([
+      proc.exited.then(
+        () => true,
+        () => true,
+      ),
+      timeout,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Kill all running main-queue claude subprocesses AND dispose every live PTY
  * managed by the supervisor.
  *
  * Two cohorts:
- *   1. Legacy `Bun.spawn` handles tracked in `mainActiveProcs` — killed
- *      synchronously via `proc.kill()`.
- *   2. PTY-mode processes owned by the supervisor — disposed asynchronously
- *      via `killAllPtys()`. The supervisor's per-key serial lock turns the
- *      in-flight `runTurn` promise into a `PtyClosedError` rejection,
+ *   1. Legacy `Bun.spawn` handles tracked in `mainActiveProcs` — signalled
+ *      synchronously via `proc.kill()`, then their exit is awaited (bounded).
+ *   2. PTY-mode processes owned by the supervisor, and the quarantined ones —
+ *      retired via `killAllPtysReport()`. The supervisor's per-key serial lock
+ *      turns the in-flight `runTurn` promise into a `PtyClosedError` rejection,
  *      mirroring the SIGTERM-style failure surface of the legacy path.
  *
- * The fire-and-forget pattern on the PTY disposal preserves the synchronous
- * boolean-return contract (legacy `/kill` callsites assume immediate
- * truthy/falsy without awaiting). PTYs detect the kill on their next event
- * tick; the caller does not need to await disposal.
- *
- * Returns true iff anything was killed (legacy procs OR live PTYs).
+ * `killed` is known at once (anything to kill); `settled` resolves once every
+ * exit is confirmed or given up on, with the counts (#591: `/kill` must not
+ * report success before that). It never rejects.
  *
  * Phase D fix #4 (FA-6a): without this, `/kill` was a silent no-op against
  * PTY-mode sessions — a runaway PTY could only be killed by manual PID
  * intervention.
  */
-export function killActive(): boolean {
-  let killed = false;
-  if (mainActiveProcs.size > 0) {
-    for (const proc of mainActiveProcs) {
-      try {
-        proc.kill();
-      } catch {}
-    }
-    mainActiveProcs.clear();
-    killed = true;
+export function killActiveReport(): { killed: boolean; settled: Promise<KillOutcome> } {
+  const legacy = [...mainActiveProcs];
+  mainActiveProcs.clear();
+  for (const proc of legacy) {
+    try {
+      proc.kill();
+    } catch {}
   }
-  // Best-effort async PTY disposal. We don't await because killActive is
-  // historically synchronous; PTY callers see PtyClosedError on their next
-  // tick which surfaces as a structured error via the supervisor's lock.
   // #394: count entries, not live PTYs — an entry whose spawn has not landed
   // yet has no pid and is absent from the snapshot, and `/kill` must reach it
   // (the retirement refuses its late landing) rather than skip it.
   const ptyCountBefore = supervisorEntryCount();
-  if (ptyCountBefore > 0) {
-    void killAllPtys();
-    killed = true;
-  }
-  return killed;
+  const ptys =
+    ptyCountBefore > 0
+      ? killAllPtysReport().catch((err) => {
+          console.error(`[runner] /kill: PTY retirement report failed: ${err}`);
+          return { killed: 0, confirmed: 0, unconfirmed: 0, failed: true as const };
+        })
+      : Promise.resolve({ killed: 0, confirmed: 0, unconfirmed: 0 });
+  const settled = Promise.all([Promise.all(legacy.map(confirmLegacyExit)), ptys]).then(
+    ([legacyExits, pty]) => {
+      const legacyConfirmed = legacyExits.filter(Boolean).length;
+      const outcome: KillOutcome = {
+        confirmed: legacyConfirmed + pty.confirmed,
+        unconfirmed: legacy.length - legacyConfirmed + pty.unconfirmed,
+        quarantined: pty.unconfirmed,
+      };
+      if ("failed" in pty) outcome.failed = true;
+      return outcome;
+    },
+  );
+  return { killed: legacy.length > 0 || ptyCountBefore > 0, settled };
+}
+
+/**
+ * `killActiveReport` for callers that only need to know whether anything was
+ * running (the watchdog's terminate). Returns true iff anything was killed
+ * (legacy procs OR PTY entries OR quarantined processes); does not wait.
+ */
+export function killActive(): boolean {
+  return killActiveReport().killed;
 }
 
 /** True while any main-queue agent is processing a task (excludes fork). */

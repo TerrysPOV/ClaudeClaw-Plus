@@ -276,6 +276,11 @@ export function quarantineSnapshot(): QuarantineInfo[] {
     .sort((a, b) => a.sessionKey.localeCompare(b.sessionKey));
 }
 
+/** The quarantined processes themselves, for `/kill` to tell which exits it confirmed (#591). */
+export function quarantinedProcesses(): PtyProcess[] {
+  return records.map((r) => r.pty);
+}
+
 /** Keys of the quarantined sessions (unique). */
 export function quarantinedKeys(): string[] {
   return [...new Set(records.map((r) => r.sessionKey))];

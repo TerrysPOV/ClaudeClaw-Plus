@@ -3,7 +3,9 @@ import {
   run,
   runUserMessage,
   runFork,
-  killActive,
+  killActiveReport,
+  type KillOutcome,
+  LEGACY_EXIT_CONFIRM_DEFAULT_MS,
   isMainBusy,
   compactCurrentSession,
   compactCurrentThreadSession,
@@ -14,6 +16,8 @@ import {
   type PermissionMode,
 } from "../runner";
 import { extractErrorDetail } from "../messaging";
+import type { QuarantineInfo } from "../runner/pty-quarantine";
+import { formatQuarantineStatus } from "../runner/quarantine-status";
 import { loadPendingResume } from "../pending-resume";
 import { getSettings, loadSettings } from "../config";
 import { describeAllowlist, isUserAllowed } from "../allowlist";
@@ -1113,6 +1117,84 @@ export function telegramSessionKey(
 
 // --- Message handler ---
 
+interface StatusSession {
+  sessionId: string;
+  turnCount?: number;
+  createdAt: string;
+  lastUsedAt: string;
+}
+
+/**
+ * `/status` body. The quarantined sessions are listed whether or not this chat has an active
+ * session (#591): a stuck process is the operator's to see either way.
+ */
+export function telegramStatusText(
+  session: StatusSession | null | undefined,
+  settings: { model?: string; security: { level: string } },
+  quarantine?: QuarantineInfo[],
+  now?: number,
+): string {
+  const lines = session
+    ? [
+        "📊 **Session Status**",
+        `Session: \`${session.sessionId.slice(0, 8)}\``,
+        `Turns: ${session.turnCount ?? 0}`,
+        `Model: ${settings.model || "default"}`,
+        `Security: ${settings.security.level}`,
+        `Created: ${session.createdAt}`,
+        `Last used: ${session.lastUsedAt}`,
+        `Compact warned: ${(session as any).compactWarned ? "yes" : "no"}`,
+      ]
+    : ["📊 No active session."];
+  lines.push(...formatQuarantineStatus(quarantine, now));
+  return lines.join("\n");
+}
+
+/** Final `/kill` reply, once every exit is confirmed or given up on (#591). */
+export function formatKillOutcome(o: KillOutcome): string {
+  if (o.failed) {
+    return "⚠️ Kill sent, but the exits could not be checked; see /status for quarantined sessions.";
+  }
+  if (o.confirmed === 0 && o.unconfirmed === 0) {
+    // A session still booting: a process that lands on it is disposed by its retirement.
+    return "Killed active agent (nothing was running yet).";
+  }
+  const confirmed = `${o.confirmed} exit${o.confirmed === 1 ? "" : "s"} confirmed`;
+  if (o.unconfirmed === 0) return `Killed active agent: ${confirmed}.`;
+  const parts = [`⚠️ Kill finished: ${confirmed}, ${o.unconfirmed} not confirmed.`];
+  if (o.quarantined > 0) {
+    parts.push(
+      "A PTY session whose exit is not confirmed stays quarantined (nothing starts on it) until the OS confirms it; see /status.",
+    );
+  }
+  const legacy = o.unconfirmed - o.quarantined;
+  if (legacy > 0) {
+    parts.push(
+      `${legacy === 1 ? "A `claude -p` process was" : `${legacy} \`claude -p\` processes were`} still running ${LEGACY_EXIT_CONFIRM_DEFAULT_MS / 1000} s after the signal.`,
+    );
+  }
+  return parts.join(" ");
+}
+
+/**
+ * `/kill` (#591): "pending" as soon as something is being killed, the result only after the
+ * retirement is over — never "Killed" for a process that may still be running.
+ */
+export async function replyToKill(send: (text: string) => Promise<unknown>): Promise<void> {
+  const { killed, settled } = killActiveReport();
+  if (!killed) {
+    await send("No active agent running.");
+    return;
+  }
+  try {
+    await send("⏳ Kill pending: waiting for the OS to confirm the exit…");
+  } catch (err) {
+    // The outcome still goes out: a lost notice must not leave the operator at "pending".
+    console.error(`[Telegram] /kill pending notice failed: ${err}`);
+  }
+  await send(formatKillOutcome(await settled));
+}
+
 async function handleMessage(message: TelegramMessage): Promise<void> {
   const config = getSettings().telegram;
   const userId = message.from?.id;
@@ -1213,22 +1295,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
 
   if (command === "/status") {
     const session = sessionKey ? await peekThreadSession(sessionKey) : await peekSession();
-    const settings = getSettings();
-    if (!session) {
-      await sendMessage(config.token, chatId, "📊 No active session.", threadId);
-      return;
-    }
-    const lines = [
-      "📊 **Session Status**",
-      `Session: \`${session.sessionId.slice(0, 8)}\``,
-      `Turns: ${session.turnCount ?? 0}`,
-      `Model: ${settings.model || "default"}`,
-      `Security: ${settings.security.level}`,
-      `Created: ${session.createdAt}`,
-      `Last used: ${session.lastUsedAt}`,
-      `Compact warned: ${(session as any).compactWarned ? "yes" : "no"}`,
-    ];
-    await sendMessage(config.token, chatId, lines.join("\n"), threadId);
+    await sendMessage(config.token, chatId, telegramStatusText(session, getSettings()), threadId);
     return;
   }
 
@@ -1336,13 +1403,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
   }
 
   if (command === "/kill") {
-    const killed = killActive();
-    await sendMessage(
-      config.token,
-      chatId,
-      killed ? "Killed active agent." : "No active agent running.",
-      threadId,
-    );
+    await replyToKill((text) => sendMessage(config.token, chatId, text, threadId));
     return;
   }
 

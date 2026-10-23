@@ -671,7 +671,11 @@ describe("killActive reaches a PTY session that is still booting (#394)", () => 
       ptys: [],
       quarantined: [],
     });
-    const kill = spyOn(sup, "killAllPtys").mockResolvedValue(0);
+    const kill = spyOn(sup, "killAllPtysReport").mockResolvedValue({
+      killed: 0,
+      confirmed: 0,
+      unconfirmed: 0,
+    });
     try {
       expect(runnerMod.killActive()).toBe(true);
       expect(kill).toHaveBeenCalledTimes(1);

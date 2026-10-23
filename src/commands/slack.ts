@@ -16,6 +16,8 @@ import { isWizardTrigger, hasActiveWizard, handleWizardInput } from "./plugin-wi
 import { mkdir, realpath } from "node:fs/promises";
 import { extname, join, resolve, isAbsolute, sep } from "node:path";
 import { existsSync } from "node:fs";
+import type { QuarantineInfo } from "../runner/pty-quarantine";
+import { formatQuarantineStatus } from "../runner/quarantine-status";
 
 // Slack-specific directives prompt (loaded once)
 const SLACK_DIRECTIVES_PATH = join(
@@ -1568,6 +1570,49 @@ async function handleBlockAction(payload: any): Promise<void> {
 
 // --- Slash command handler ---
 
+/**
+ * `/status` body, with the quarantined sessions (#591).
+ */
+export function slackStatusText(
+  session: { sessionId: string; turnCount: number; lastUsedAt: string } | null | undefined,
+  threadSessions: { threadId: string; turnCount: number }[],
+  security: string,
+  quarantine?: QuarantineInfo[],
+  now?: number,
+): string {
+  const lines: string[] = [];
+
+  if (session) {
+    lines.push(`*Global session*`);
+    lines.push(`  ID: \`${session.sessionId.slice(0, 8)}...\``);
+    lines.push(`  Turns: ${session.turnCount}`);
+    lines.push(`  Last used: ${new Date(session.lastUsedAt).toLocaleString()}`);
+  } else {
+    lines.push("No active global session.");
+  }
+
+  const slackThreads = threadSessions.filter((ts) => ts.threadId.startsWith("slk:"));
+  if (slackThreads.length > 0) {
+    lines.push("");
+    lines.push(`*Thread sessions* (${slackThreads.length})`);
+    const shown = slackThreads.slice(0, 5);
+    for (const ts of shown) {
+      const parts = ts.threadId.split(":");
+      const label = parts.length === 3 ? `#${parts[1]}:${parts[2]}` : ts.threadId;
+      lines.push(`  ${label} — ${ts.turnCount} turns`);
+    }
+    if (slackThreads.length > 5) {
+      lines.push(`  ... and ${slackThreads.length - 5} more`);
+    }
+  }
+
+  lines.push("");
+  lines.push(...formatQuarantineStatus(quarantine, now));
+  lines.push(`Security: \`${security}\``);
+
+  return lines.join("\n");
+}
+
 async function handleSlashCommand(
   _token: string,
   command: string,
@@ -1604,38 +1649,11 @@ async function handleSlashCommand(
     }
 
     case "/status": {
-      const session = await peekSession();
-      const threadSessions = await listThreadSessions();
-      const lines: string[] = [];
-
-      if (session) {
-        lines.push(`*Global session*`);
-        lines.push(`  ID: \`${session.sessionId.slice(0, 8)}...\``);
-        lines.push(`  Turns: ${session.turnCount}`);
-        lines.push(`  Last used: ${new Date(session.lastUsedAt).toLocaleString()}`);
-      } else {
-        lines.push("No active global session.");
-      }
-
-      const slackThreads = threadSessions.filter((ts) => ts.threadId.startsWith("slk:"));
-      if (slackThreads.length > 0) {
-        lines.push("");
-        lines.push(`*Thread sessions* (${slackThreads.length})`);
-        const shown = slackThreads.slice(0, 5);
-        for (const ts of shown) {
-          const parts = ts.threadId.split(":");
-          const label = parts.length === 3 ? `#${parts[1]}:${parts[2]}` : ts.threadId;
-          lines.push(`  ${label} — ${ts.turnCount} turns`);
-        }
-        if (slackThreads.length > 5) {
-          lines.push(`  ... and ${slackThreads.length - 5} more`);
-        }
-      }
-
-      lines.push("");
-      lines.push(`Security: \`${config.allowAllUsers ? "open" : "restricted"}\``);
-
-      return lines.join("\n");
+      return slackStatusText(
+        await peekSession(),
+        await listThreadSessions(),
+        config.allowAllUsers ? "open" : "restricted",
+      );
     }
 
     default:

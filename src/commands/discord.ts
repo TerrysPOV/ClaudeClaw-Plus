@@ -19,6 +19,8 @@ import type { spawn } from "node:child_process";
 import { runOneShot } from "../oneshot/engine.js";
 import { withPrintRuntime } from "../oneshot/print.js";
 import { transcribeAudioToText } from "../whisper";
+import type { QuarantineInfo } from "../runner/pty-quarantine";
+import { formatQuarantineStatus } from "../runner/quarantine-status";
 import { resolveSkillPrompt } from "../skills";
 import { cacheSkillOverlayFromContent } from "../policy/skill-overlays";
 import { fireJob, parseFireArgs } from "./fire";
@@ -1463,6 +1465,45 @@ export function interactionSessionKey(
   return interaction.guild_id ? interaction.channel_id : undefined;
 }
 
+/**
+ * `/status` body. The quarantined sessions are listed whether or not there is an active
+ * session (#591).
+ */
+export function discordStatusText(
+  session: any,
+  threadSessions: { threadId: string; sessionId: string; turnCount: number }[],
+  settings: { model?: string; security: { level: string } },
+  quarantine?: QuarantineInfo[],
+  now?: number,
+): string {
+  if (!session) {
+    return ["📊 No active session.", ...formatQuarantineStatus(quarantine, now)].join("\n");
+  }
+  const lines = [
+    "📊 **Session Status**",
+    `Session: \`${session.sessionId.slice(0, 8)}\``,
+    `Turns: ${session.turnCount ?? 0}`,
+    `Model: ${settings.model || "default"}`,
+    `Security: ${settings.security.level}`,
+    `Created: ${session.createdAt}`,
+    `Last used: ${session.lastUsedAt}`,
+    `Compact warned: ${session.compactWarned ? "yes" : "no"}`,
+  ];
+  if (threadSessions.length > 0) {
+    lines.push("", `**Thread Sessions:** ${threadSessions.length}`);
+    for (const ts of threadSessions.slice(0, 5)) {
+      lines.push(
+        `  Thread \`${ts.threadId.slice(0, 8)}\` → Session \`${ts.sessionId.slice(0, 8)}\` (${ts.turnCount} turns)`,
+      );
+    }
+    if (threadSessions.length > 5) {
+      lines.push(`  ... and ${threadSessions.length - 5} more`);
+    }
+  }
+  lines.push(...formatQuarantineStatus(quarantine, now));
+  return lines.join("\n");
+}
+
 async function handleInteractionCreate(
   token: string,
   interaction: DiscordInteraction,
@@ -1524,34 +1565,10 @@ async function handleInteractionCreate(
     if (interaction.data.name === "status") {
       const statusKey = interactionSessionKey(interaction);
       const session = statusKey ? await peekThreadSession(statusKey) : await peekSession();
-      const settings = getSettings();
-      if (!session) {
-        await respondToInteraction(interaction, { content: "📊 No active session." });
-        return;
-      }
-      const threadSessions = await listThreadSessions();
-      const lines = [
-        "📊 **Session Status**",
-        `Session: \`${session.sessionId.slice(0, 8)}\``,
-        `Turns: ${(session as any).turnCount ?? 0}`,
-        `Model: ${settings.model || "default"}`,
-        `Security: ${settings.security.level}`,
-        `Created: ${session.createdAt}`,
-        `Last used: ${session.lastUsedAt}`,
-        `Compact warned: ${(session as any).compactWarned ? "yes" : "no"}`,
-      ];
-      if (threadSessions.length > 0) {
-        lines.push("", `**Thread Sessions:** ${threadSessions.length}`);
-        for (const ts of threadSessions.slice(0, 5)) {
-          lines.push(
-            `  Thread \`${ts.threadId.slice(0, 8)}\` → Session \`${ts.sessionId.slice(0, 8)}\` (${ts.turnCount} turns)`,
-          );
-        }
-        if (threadSessions.length > 5) {
-          lines.push(`  ... and ${threadSessions.length - 5} more`);
-        }
-      }
-      await respondToInteraction(interaction, { content: lines.join("\n") });
+      const threadSessions = session ? await listThreadSessions() : [];
+      await respondToInteraction(interaction, {
+        content: discordStatusText(session, threadSessions, getSettings()),
+      });
       return;
     }
 

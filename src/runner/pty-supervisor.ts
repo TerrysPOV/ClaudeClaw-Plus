@@ -89,6 +89,7 @@ import {
   liftFence,
   PtyQuarantinedError,
   quarantinedKeys,
+  quarantinedProcesses,
   quarantineSession,
   type QuarantineInfo,
   quarantineSnapshot,
@@ -763,19 +764,30 @@ export async function killAllPtys(): Promise<number> {
 /**
  * `killAllPtys` plus the quarantined processes (#562 round 8): after the entries are retired,
  * every quarantined process is asked to prove its exit again, and `unconfirmed` is how many
- * still cannot. Logged when not zero (the sync `/kill` boolean has no room for it).
+ * still cannot. Logged when not zero.
+ *
+ * `confirmed` (#591) is how many of the processes this call asked to end — the live ones it
+ * retired and the ones already quarantined — are now proven gone.
  */
-export async function killAllPtysReport(): Promise<{ killed: number; unconfirmed: number }> {
+export async function killAllPtysReport(): Promise<{
+  killed: number;
+  confirmed: number;
+  unconfirmed: number;
+}> {
   const entries = [...state.ptys.values()].filter((e) => !e.scope.survivesKill);
+  const asked = new Set<PtyProcess>(quarantinedProcesses());
+  for (const e of entries) if (e.pty) asked.add(e.pty);
   const killed = entries.filter((e) => e.pty).length;
   await Promise.allSettled(entries.map(retireEntry));
   const unconfirmed = await confirmAllQuarantined();
+  const stillQuarantined = new Set(quarantinedProcesses());
+  const confirmed = [...asked].filter((p) => !stillQuarantined.has(p)).length;
   if (unconfirmed > 0) {
     console.warn(
       `[pty-supervisor] /kill: ${unconfirmed} process exit(s) still unconfirmed (quarantined)`,
     );
   }
-  return { killed, unconfirmed };
+  return { killed, confirmed, unconfirmed };
 }
 
 /**
