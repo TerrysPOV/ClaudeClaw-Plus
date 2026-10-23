@@ -90,6 +90,7 @@ async function connectAgent(bus: BusCore, socketPath: string, agent_id: string) 
   }
   return {
     prompts: () => inbound.filter((m) => m.type === "prompt"),
+    frames: () => inbound,
     close: () => socket.end(),
   };
 }
@@ -125,7 +126,7 @@ function manual<T = void>() {
 
 let tempDir: string;
 let bus: BusCore | null = null;
-let client: { prompts(): IpcMessage[]; close(): void } | null = null;
+let client: { prompts(): IpcMessage[]; frames(): IpcMessage[]; close(): void } | null = null;
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), "bus-595r5-"));
@@ -141,7 +142,9 @@ afterEach(async () => {
   rmSync(tempDir, { recursive: true, force: true });
 });
 
-async function startBus(over: { deliveryBackstopMs?: number } = {}) {
+async function startBus(
+  over: { deliveryBackstopMs?: number; onError?: (err: unknown, ctx?: unknown) => void } = {},
+) {
   const sockPath = join(tempDir, "bus.sock");
   bus = createBusCore({
     eventLogAppend: mockEventLog(),
@@ -149,6 +152,7 @@ async function startBus(over: { deliveryBackstopMs?: number } = {}) {
     socketPath: sockPath,
     // The 4 s default races a loaded machine; the one test of the backstop passes its own.
     deliveryBackstopMs: 120_000,
+    onError: () => {},
     ...over,
   });
   await bus.start();
@@ -418,5 +422,259 @@ describe("recording pending, end to end with a real SessionManager (#595 r5)", (
     await sleep(150);
     expect(client?.prompts()).toEqual([]);
     expect(typed).toEqual([]);
+  }, 30_000);
+});
+
+/**
+ * #595 round 6: the two delivery paths round 5 missed. A queued prompt is admitted by `admitNext`,
+ * and the reply nudge sends its own IPC frame; neither goes through `sendPrompt`'s pending check.
+ * Real BusCore on a real Unix socket with a real hello, as in Codex's r5 probe.
+ *
+ * Absence is proven with a barrier, not a sleep: the bus writes one socket in order, so once a
+ * later `ask_answer` frame has arrived every earlier frame has too.
+ */
+let barrierSeq = 0;
+async function barrier(b: BusCore, agent_id: string): Promise<void> {
+  const ask_id = `barrier-${++barrierSeq}`;
+  b.ingestAskAnswer({ agent_id, ask_id, answer: "x" });
+  await until(() =>
+    (client?.frames() ?? []).some(
+      (m) => m.type === "ask_answer" && (m as { ask_id?: string }).ask_id === ask_id,
+    ),
+  );
+}
+
+function endTurn(b: BusCore, agent_id: string, text = ""): void {
+  b.ingestSessionEvent({
+    ts: Date.now(),
+    agent_id,
+    session_id: "old",
+    topic: "response.turn_end",
+    payload: { text, message_id: randomUUID() },
+  });
+}
+
+/** The agent has a first prompt in flight and a second queued behind it. */
+async function queuedBehindATurn(b: BusCore, sockPath: string) {
+  const typed: string[] = [];
+  b.setStreamPromptHandler(async (_a, text) => {
+    typed.push(text);
+  });
+  b.setPtyReachableHandler?.(() => false);
+  client = await connectAgent(b, sockPath, "alpha");
+  await b.sendPrompt(prompt("first"));
+  await until(() => client?.prompts().length === 1);
+  const ack = await b.sendPrompt(prompt("queued-before-restart"));
+  expect(ack.queued).toBe(true);
+  return { typed, queuedId: ack.promise_id };
+}
+
+describe("a queued prompt waits for the record too (#595 r6), at the bus", () => {
+  it("held while the record is pending: no frame and no typing, the prompt keeps its id and its place", async () => {
+    // Fault (site: `admitNext`'s pending check, removed): the turn's release admits the queued prompt
+    // straight to IPC. Predicted result: the frame is in `prompts()` before the record exists.
+    const { bus: b, sockPath } = await startBus();
+    const { typed, queuedId } = await queuedBehindATurn(b, sockPath);
+    const events: Array<{ promise_id?: string; text: string }> = [];
+    b.subscribe({ agent_id: "alpha", topics: ["prompt"] }, (e) =>
+      events.push({
+        promise_id: e.promise_id,
+        text: (e.payload as { text: string }).text,
+      }),
+    );
+    const pending = manual();
+    b.setRecordingPendingHandler?.(() => pending.promise);
+
+    endTurn(b, "alpha");
+    await barrier(b, "alpha");
+
+    expect(client?.prompts()).toHaveLength(1);
+    expect(typed.some((t) => t.includes("queued-before-restart"))).toBe(false);
+    expect(events).toEqual([]);
+    expect(b.queuedPrompts("alpha").map((q) => q.promise_id)).toEqual([queuedId]);
+
+    b.setRecordingPendingHandler?.(null);
+    pending.resolve();
+    await until(() => client?.prompts().length === 2);
+    await barrier(b, "alpha");
+    // Delivered once, with the id it was acknowledged under.
+    expect(client?.prompts()).toHaveLength(2);
+    expect((client?.prompts()[1] as { text: string }).text).toBe("queued-before-restart");
+    expect(events).toEqual([{ promise_id: queuedId, text: "queued-before-restart" }]);
+    expect(b.queuedPrompts("alpha")).toEqual([]);
+  }, 30_000);
+
+  it("a newcomer during the hold queues behind the held prompt, never ahead of it", async () => {
+    const { bus: b, sockPath } = await startBus();
+    await queuedBehindATurn(b, sockPath);
+    const pending = manual();
+    b.setRecordingPendingHandler?.(() => pending.promise);
+    endTurn(b, "alpha");
+    const newcomer = b.sendPrompt({ ...prompt("newcomer"), origin_id: "other" });
+
+    b.setRecordingPendingHandler?.(null);
+    pending.resolve();
+    await newcomer;
+    await until(() => client?.prompts().length === 2);
+    await barrier(b, "alpha");
+    // The held prompt took the slot; the newcomer waits for its turn to end.
+    expect(client?.prompts().map((m) => (m as { text: string }).text)).toEqual([
+      "first",
+      "queued-before-restart",
+    ]);
+    endTurn(b, "alpha");
+    await until(() => client?.prompts().length === 3);
+    expect((client?.prompts()[2] as { text: string }).text).toBe("newcomer");
+  }, 30_000);
+
+  it("a record that failed: the queued prompt fails with its reason and id, and no frame is ever sent", async () => {
+    const errors: Array<{ err: unknown; ctx: unknown }> = [];
+    const { bus: b, sockPath } = await startBus({
+      onError: (err, ctx) => errors.push({ err, ctx }),
+    });
+    const { typed, queuedId } = await queuedBehindATurn(b, sockPath);
+    const pending = manual();
+    pending.promise.catch(() => {});
+    b.setRecordingPendingHandler?.(() => pending.promise);
+
+    endTurn(b, "alpha");
+    pending.reject(new Error("ENOSPC"));
+    await until(() => errors.length > 0);
+    await barrier(b, "alpha");
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.err).toBeInstanceOf(AgentNotRecordedError);
+    expect((errors[0]?.err as AgentNotRecordedError).reason).toBe("recording-failed");
+    expect((errors[0]?.ctx as { promise_id?: string }).promise_id).toBe(queuedId);
+    expect(client?.prompts()).toHaveLength(1);
+    expect(typed.some((t) => t.includes("queued-before-restart"))).toBe(false);
+    expect(b.queuedPrompts("alpha")).toEqual([]);
+  }, 30_000);
+
+  it("a record that never settles: the queue fails at the backstop with recording-timeout", async () => {
+    const errors: Array<{ err: unknown; ctx: unknown }> = [];
+    const { bus: b, sockPath } = await startBus({
+      deliveryBackstopMs: 100,
+      onError: (err, ctx) => errors.push({ err, ctx }),
+    });
+    const { typed, queuedId } = await queuedBehindATurn(b, sockPath);
+    b.setRecordingPendingHandler?.(() => new Promise<void>(() => {}));
+
+    endTurn(b, "alpha");
+    await until(() => errors.length > 0);
+    await barrier(b, "alpha");
+
+    expect((errors[0]?.err as AgentNotRecordedError).reason).toBe("recording-timeout");
+    expect((errors[0]?.ctx as { promise_id?: string }).promise_id).toBe(queuedId);
+    expect(client?.prompts()).toHaveLength(1);
+    expect(typed.some((t) => t.includes("queued-before-restart"))).toBe(false);
+  }, 30_000);
+
+  it("a PTY-reachable agent: the drained prompt is not typed before the record either", async () => {
+    const { bus: b, sockPath } = await startBus();
+    const typed: string[] = [];
+    b.setStreamPromptHandler(async (_a, text) => {
+      typed.push(text);
+    });
+    b.setPtyReachableHandler?.(() => true);
+    client = await connectAgent(b, sockPath, "alpha");
+    await b.sendPrompt(prompt("first"));
+    await b.sendPrompt(prompt("queued-before-restart"));
+    const typedBefore = typed.length;
+    const pending = manual();
+    b.setRecordingPendingHandler?.(() => pending.promise);
+
+    endTurn(b, "alpha");
+    await barrier(b, "alpha");
+    expect(typed).toHaveLength(typedBefore);
+    expect(client?.prompts()).toEqual([]);
+
+    b.setRecordingPendingHandler?.(null);
+    pending.resolve();
+    await until(() => typed.length === typedBefore + 1);
+    expect(typed[typedBefore]).toContain("queued-before-restart");
+  }, 30_000);
+});
+
+describe("the reply nudge waits for nothing and sends nothing while pending (#595 r6), at the bus", () => {
+  const channelPrompt = {
+    agent_id: "alpha",
+    origin: "telegram" as const,
+    origin_id: "chat",
+    user_id: "u",
+    text: "first",
+  };
+
+  /** Run one turn end carrying text with no reply tool call, while `pending` holds the record. */
+  async function turnEndsWithoutReply(pending: Promise<void>) {
+    const { bus: b, sockPath } = await startBus();
+    client = await connectAgent(b, sockPath, "alpha");
+    await b.sendPrompt(channelPrompt);
+    await until(() => client?.prompts().length === 1);
+    const texts: string[] = [];
+    b.subscribe({ agent_id: "alpha", topics: ["response.text"] }, (e) =>
+      texts.push((e.payload as { text: string }).text),
+    );
+    const lines: string[] = [];
+    const warn = console.warn;
+    const error = console.error;
+    const capture = (...a: unknown[]) => void lines.push(a.map((x) => JSON.stringify(x)).join(" "));
+    console.warn = capture;
+    console.error = capture;
+    try {
+      b.setRecordingPendingHandler?.(() => pending);
+      endTurn(b, "alpha", "old answer");
+      await barrier(b, "alpha");
+    } finally {
+      console.warn = warn;
+      console.error = error;
+    }
+    return { b, texts, lines };
+  }
+
+  it("pending: no nudge frame, the turn's text is delivered by synthesis, one reason-coded line", async () => {
+    // Fault (site: `nudgeForReply`'s pending check, removed): the reminder goes out as an IPC frame.
+    // Predicted result: a prompt frame with metadata.nudge = "reply-tool" while the record is pending.
+    const pending = manual();
+    const { b, texts, lines } = await turnEndsWithoutReply(pending.promise);
+
+    expect(client?.prompts()).toHaveLength(1);
+    expect(texts).toEqual(["old answer"]);
+    const undeliverable = lines.filter((l) => l.includes("reply nudge undeliverable"));
+    expect(undeliverable).toHaveLength(1);
+    expect(undeliverable[0]).toContain("recording-pending");
+    expect(undeliverable[0]).not.toContain("old answer");
+
+    // Recorded afterwards: the dropped nudge is not sent late.
+    b.setRecordingPendingHandler?.(null);
+    pending.resolve();
+    await barrier(b, "alpha");
+    expect(client?.prompts()).toHaveLength(1);
+  }, 30_000);
+
+  it("a record that failed: still no nudge frame, ever", async () => {
+    const pending = manual();
+    pending.promise.catch(() => {});
+    const { b, texts } = await turnEndsWithoutReply(pending.promise);
+    b.setRecordingPendingHandler?.(null);
+    pending.reject(new Error("ENOSPC"));
+    await barrier(b, "alpha");
+
+    expect(client?.prompts()).toHaveLength(1);
+    expect(texts).toEqual(["old answer"]);
+  }, 30_000);
+
+  it("nothing pending: the nudge is sent as before", async () => {
+    const { bus: b, sockPath } = await startBus();
+    client = await connectAgent(b, sockPath, "alpha");
+    await b.sendPrompt(channelPrompt);
+    await until(() => client?.prompts().length === 1);
+    b.setRecordingPendingHandler?.(() => null);
+
+    endTurn(b, "alpha", "old answer");
+    await until(() => client?.prompts().length === 2);
+    expect((client?.prompts()[1] as { metadata?: { nudge?: string } }).metadata?.nudge).toBe(
+      "reply-tool",
+    );
   }, 30_000);
 });
