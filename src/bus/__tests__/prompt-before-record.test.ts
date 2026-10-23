@@ -431,15 +431,19 @@ describe("recording pending, end to end with a real SessionManager (#595 r5)", (
  * Real BusCore on a real Unix socket with a real hello, as in Codex's r5 probe.
  *
  * Absence is proven with a barrier, not a sleep: the bus writes one socket in order, so once a
- * later `ask_answer` frame has arrived every earlier frame has too.
+ * later frame has arrived every earlier frame has too. The barrier is a `permission_response`: a
+ * CONTROL frame (it answers a permission request the claude made and starts no turn), which the bus
+ * never holds. Round 6 used an `ask_answer`, which is model input and is now held itself (r7).
  */
 let barrierSeq = 0;
 async function barrier(b: BusCore, agent_id: string): Promise<void> {
-  const ask_id = `barrier-${++barrierSeq}`;
-  b.ingestAskAnswer({ agent_id, ask_id, answer: "x" });
+  const request_id = `barrier-${++barrierSeq}`;
+  b.ingestPermissionDecision({ agent_id, request_id, behavior: "allow" });
   await until(() =>
     (client?.frames() ?? []).some(
-      (m) => m.type === "ask_answer" && (m as { ask_id?: string }).ask_id === ask_id,
+      (m) =>
+        m.type === "permission_response" &&
+        (m as { response?: { request_id?: string } }).response?.request_id === request_id,
     ),
   );
 }

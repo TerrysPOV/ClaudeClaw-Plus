@@ -45,9 +45,11 @@ import type {
   BusEvent,
   BusEventTopic,
   BusOrigin,
+  IpcAskAnswer,
   IpcJobRequest,
   IpcJobResult,
   IpcMessage,
+  IpcPermissionResponse,
   IpcPrompt,
   PermissionRequest,
   PermissionResponse,
@@ -241,19 +243,38 @@ export type PtyReachableCheck = (agent_id: string) => boolean;
 export type RecordingPendingCheck = (agent_id: string) => Promise<void> | null;
 
 /**
- * A prompt was not delivered because its agent's claude was not recorded (#595 r5): the record write
- * failed (`recording-failed`, the agent is being retired) or did not settle within the delivery
- * backstop (`recording-timeout`). The prompt reached neither transport.
+ * Model input was not delivered because its agent's claude was not recorded (#595 r5): the record
+ * write failed (`recording-failed`, the agent is being retired), did not settle within the delivery
+ * backstop (`recording-timeout`), or the sender could not wait (`recording-pending`, the typed
+ * refusal). It reached neither transport.
  */
 export class AgentNotRecordedError extends Error {
   constructor(
     readonly agent_id: string,
-    readonly reason: "recording-failed" | "recording-timeout",
+    readonly reason: "recording-failed" | "recording-timeout" | "recording-pending",
   ) {
-    super(`prompt not delivered to agent_id=${agent_id}: reason=${reason}`);
+    super(`model input not delivered to agent_id=${agent_id}: reason=${reason}`);
     this.name = "AgentNotRecordedError";
   }
 }
+
+/**
+ * #595 r7: the frames Bus core sends the MCP server, split by what the MCP server does with them.
+ * A MODEL-INPUT frame becomes a `notifications/claude/channel` notification (or the next thing the
+ * model reads) and can start a turn, so it must not reach a claude that is not yet recorded as ours:
+ * `emitModelInput` is the only sender of these. A CONTROL frame answers a request the claude itself
+ * made (a permission prompt, a job call) and starts nothing: `emitControl` sends those. Adding a
+ * Bus-core-to-MCP frame type means choosing one of the two here; `IpcServer.send` is called from
+ * nowhere else.
+ */
+export type ModelInputFrame = IpcPrompt | IpcAskAnswer;
+export type ControlFrame = IpcPermissionResponse | IpcJobResult;
+
+/** What `emitModelInput` did. `recording-pending` carries the promise a caller that can wait waits on. */
+export type ModelInputSend =
+  | { status: "sent" }
+  | { status: "no-connection" }
+  | { status: "recording-pending"; pending: Promise<void> };
 
 export interface BusCoreOptions {
   /** Path to bind the UDS server. If omitted, no IPC server is started. */
@@ -1248,7 +1269,7 @@ export class BusCoreImpl implements BusCore {
     // #595 r5: a claude not yet recorded as ours gets the prompt on NEITHER transport. Checked before
     // anything else, and only a pending agent leaves the synchronous path (the ack's tick count for
     // every other agent is unchanged).
-    const pendingRecord = this.recordingPending?.(req.agent_id) ?? null;
+    const pendingRecord = this.modelInputPending(req.agent_id);
     if (pendingRecord) return this.sendWhenRecorded(req, pendingRecord);
     const promise_id = randomUUID();
     // #239: one active turn per agent. The slot is free when the agent owes no
@@ -1334,6 +1355,34 @@ export class BusCoreImpl implements BusCore {
     if (outcome !== "recorded")
       this.logIpc("undeliverable", { agent: agent_id, ctx, reason: outcome });
     return outcome;
+  }
+
+  /**
+   * #595 r7: the ONLY reader of `recordingPending`. Non-null while the agent's claude is spawned but
+   * not yet recorded as ours; every path that is about to hand the model input asks here (a path
+   * that can wait waits on the promise via `awaitRecorded`, one that cannot refuses).
+   */
+  private modelInputPending(agent_id: string): Promise<void> | null {
+    return this.recordingPending?.(agent_id) ?? null;
+  }
+
+  /**
+   * #595 r7: the ONLY place Bus core sends an IPC frame the MCP server turns into model input (a
+   * `prompt`, an `ask_answer`: both become `notifications/claude/channel`). It fails closed: a frame
+   * for an agent whose claude is not yet recorded is not written, and the caller gets the pending
+   * promise back to wait on, or to refuse with. A caller that checked earlier (to also hold the PTY
+   * leg, or to wait) is checked again here, in the same tick, so no path can send around the gate.
+   */
+  private emitModelInput(frame: ModelInputFrame): ModelInputSend {
+    const pending = this.modelInputPending(frame.agent_id);
+    if (pending) return { status: "recording-pending", pending };
+    const sent = this.ipcServer?.send(frame.agent_id, frame) === true;
+    return { status: sent ? "sent" : "no-connection" };
+  }
+
+  /** #595 r7: the only other sender. A control frame answers a request the claude made and starts no turn. */
+  private emitControl(agent_id: string, frame: ControlFrame): boolean {
+    return this.ipcServer?.send(agent_id, frame) === true;
   }
 
   /** #239: no bus-opened turn in flight, no turn streaming, no nudge pending. */
@@ -1501,7 +1550,7 @@ export class BusCoreImpl implements BusCore {
     // #595 r6: a queued prompt is delivered here, not through `sendPrompt`, so it needs its own
     // check. The head stays queued (its promise id and place in the rotation intact; a newcomer
     // queues behind it) until the claude is recorded; a failed or late record fails the queue.
-    const pending = this.recordingPending?.(agent_id) ?? null;
+    const pending = this.modelInputPending(agent_id);
     if (pending) {
       this.recordHold.add(agent_id);
       void this.awaitRecorded(agent_id, pending, "admitNext:recording-pending").then((outcome) => {
@@ -1610,6 +1659,11 @@ export class BusCoreImpl implements BusCore {
   }
 
   private async admitPrompt(req: SendPromptRequest, promise_id: string): Promise<SendPromptAck> {
+    // #595 r7: both callers have just waited out (or found no) pending record, in this same tick; this
+    // is the typed refusal for any path that reaches admission without having done so. It runs before
+    // the turn is opened, so a refusal leaves no slot held.
+    if (this.modelInputPending(req.agent_id))
+      throw new AgentNotRecordedError(req.agent_id, "recording-pending");
     // Emit a `prompt` BusEvent so subscribers see the inbound message and
     // the audit log records it. We do this before forwarding so the event
     // is durable even if the IPC send fails.
@@ -1759,7 +1813,7 @@ export class BusCoreImpl implements BusCore {
       const ptyDelivers = this.streamPromptHandler !== null && this.ptyReachable(req.agent_id);
       const sent = ptyDelivers
         ? this.ipcServer.hasConnection(req.agent_id)
-        : this.ipcServer.send(req.agent_id, ipcMsg);
+        : this.emitModelInput(ipcMsg).status === "sent";
       if (!sent) {
         ipcSendFailed = true;
         this.onError(new Error(`No MCP connection for agent_id=${req.agent_id}`), {
@@ -3123,7 +3177,7 @@ export class BusCoreImpl implements BusCore {
       // #261/#222: neither IPC nor PTY received the nudge (deaf agent) — don't
       // strand the user waiting for a turn that will never start. Fall through to
       // synthesize immediately (zero-delay, exactly as the pre-#215 path did).
-      const why = this.recordingPending?.(agentId) ? "recording-pending" : "no IPC/PTY transport";
+      const why = this.modelInputPending(agentId) ? "recording-pending" : "no IPC/PTY transport";
       console.warn(
         `[bus] reply nudge undeliverable for agent=${agentId} (${why}) — ` +
           `synthesizing immediately instead of waiting. See #261/#222.`,
@@ -3182,7 +3236,7 @@ export class BusCoreImpl implements BusCore {
     // notification that starts a turn). It cannot wait: it is about a turn that has already ended,
     // and the claude it would reach is a replacement that has no part in it. Drop it (the caller logs
     // the reason code) and it synthesizes the delivery as for any agent no transport reaches.
-    if (this.recordingPending?.(agentId)) return false;
+    if (this.modelInputPending(agentId)) return false;
     this.currentTurnReplied.set(agentId, false);
     this.currentTurnFinalPublished.set(agentId, false);
     this.currentTurnFinalOrigins.delete(agentId);
@@ -3196,7 +3250,7 @@ export class BusCoreImpl implements BusCore {
     let ipcDelivered = false;
     try {
       ipcDelivered =
-        this.ipcServer?.send(agentId, {
+        this.emitModelInput({
           type: "prompt",
           agent_id: agentId,
           origin: origin.origin,
@@ -3204,7 +3258,7 @@ export class BusCoreImpl implements BusCore {
           user_id: "system",
           text,
           metadata: { nudge: "reply-tool" },
-        }) === true;
+        }).status === "sent";
     } catch {
       /* best-effort: the PTY path + synthesize fallback still cover delivery */
     }
@@ -3524,13 +3578,11 @@ export class BusCoreImpl implements BusCore {
       payload: { request_id: req.request_id, behavior: req.behavior },
     };
     this.publish(event);
-    if (this.ipcServer) {
-      this.ipcServer.send(req.agent_id, {
-        type: "permission_response",
-        agent_id: req.agent_id,
-        response: { request_id: req.request_id, behavior: req.behavior },
-      });
-    }
+    this.emitControl(req.agent_id, {
+      type: "permission_response",
+      agent_id: req.agent_id,
+      response: { request_id: req.request_id, behavior: req.behavior },
+    });
   }
 
   /**
@@ -3548,14 +3600,31 @@ export class BusCoreImpl implements BusCore {
    * (and Discord/Telegram in Sprint 3) can wire it up immediately.
    */
   ingestAskAnswer(req: { agent_id: string; ask_id: string; answer: string }): void {
-    if (this.ipcServer) {
-      this.ipcServer.send(req.agent_id, {
-        type: "ask_answer",
-        agent_id: req.agent_id,
-        ask_id: req.ask_id,
-        answer: req.answer,
-      });
-    }
+    if (!this.ipcServer) return;
+    const frame: IpcAskAnswer = {
+      type: "ask_answer",
+      agent_id: req.agent_id,
+      ask_id: req.ask_id,
+      answer: req.answer,
+    };
+    const first = this.emitModelInput(frame);
+    if (first.status !== "recording-pending") return;
+    // #595 r7: an answer is model input (the MCP server turns a non-blocking one into a channel
+    // notification), so it waits, at most the delivery backstop, for the claude to be recorded. It
+    // keeps its `ask_id` through the wait and into any failure report; nothing is sent on failure.
+    void this.awaitRecorded(req.agent_id, first.pending, "ingestAskAnswer:recording-pending").then(
+      (outcome) => {
+        const again = outcome === "recorded" ? this.emitModelInput(frame) : null;
+        if (again && again.status !== "recording-pending") return;
+        this.onError(
+          new AgentNotRecordedError(
+            req.agent_id,
+            outcome === "recorded" ? "recording-pending" : outcome,
+          ),
+          { ctx: "ingestAskAnswer:recording-pending", agent_id: req.agent_id, ask_id: req.ask_id },
+        );
+      },
+    );
   }
 
   state(): BusState {
@@ -3793,7 +3862,6 @@ export class BusCoreImpl implements BusCore {
     reqId: string,
     r: { ok: boolean; result?: unknown; error?: string },
   ): void {
-    if (!this.ipcServer) return;
     const msg: IpcJobResult = {
       type: "job_result",
       req_id: reqId,
@@ -3801,7 +3869,7 @@ export class BusCoreImpl implements BusCore {
       ...(r.result !== undefined ? { result: r.result } : {}),
       ...(r.error !== undefined ? { error: r.error } : {}),
     };
-    this.ipcServer.send(agentId, msg);
+    this.emitControl(agentId, msg);
   }
 
   /**

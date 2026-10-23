@@ -651,7 +651,16 @@ export class BusMcpServer {
 
   private deliverAskAnswer(msg: IpcAskAnswer): void {
     const pending = this.pendingAnswers.get(msg.ask_id);
-    if (pending?.blocking) {
+    if (!pending) {
+      // #595 r7: an answer for a question THIS process never asked (a replacement process, after a
+      // restart, is handed the old one's answer). Never an unsolicited channel notification: that
+      // would start a turn from input the model has no question for.
+      process.stderr.write(
+        `Bus MCP: ask_answer dropped: reason=no-pending-ask ask_id=${msg.ask_id} agent=${this.agentId}\n`,
+      );
+      return;
+    }
+    if (pending.blocking) {
       // request_human resolves the awaiting tool-call promise.
       this.pendingAnswers.delete(msg.ask_id);
       pending.resolve(msg.answer);
@@ -661,7 +670,7 @@ export class BusMcpServer {
     // Non-blocking `ask`: deliver the answer through the same channel
     // notification the model is already listening to, tagged with ask_id.
     // The model correlates by id to its earlier ask() call.
-    if (pending) this.pendingAnswers.delete(msg.ask_id);
+    this.pendingAnswers.delete(msg.ask_id);
     void this.mcp
       .notification({
         method: "notifications/claude/channel",
