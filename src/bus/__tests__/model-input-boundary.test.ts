@@ -6,7 +6,8 @@
  * Part 1 drives a real BusCore and a raw Unix-socket client (`ask_answer` held, failed, timed out).
  * Part 2 puts a real `BusMcpServer` and an MCP SDK client behind the same socket, as in Codex's r6
  * probe, and covers pending, success, failure, timeout and a stale ask id end to end.
- * Part 3 pins the shape: `IpcServer.send` has two callers, `recordingPending` one reader.
+ * Part 3 pins the shape from the syntax tree (model-input-shape.ts): `IpcServer.send` has two callers,
+ * `recordingPending` one reader, and no alias, destructure or second sender can exist.
  *
  * Absence is proven with a barrier, not a sleep: the bus writes one socket in order, so once a later
  * CONTROL frame (`permission_response`: it answers a request the claude made and starts no turn, and
@@ -14,7 +15,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -26,6 +27,7 @@ import { AgentNotRecordedError, type BusCore, createBusCore, encodeFrame } from 
 import { FrameDecoder } from "../core-ipc";
 import { BusMcpServer, buildMcpServer } from "../mcp-server";
 import type { IpcMessage } from "../types";
+import { type BusSource, checkModelInputBoundary } from "./model-input-shape";
 
 function mockEventLog() {
   let seq = 0;
@@ -397,31 +399,220 @@ describe("ask_answer socket-to-MCP (#595 r7)", () => {
   }, 30_000);
 });
 
-describe("one boundary for model input (#595 r7), shape", () => {
-  const src = readFileSync(join(import.meta.dir, "../core.ts"), "utf8");
-  const start = (name: string): number => {
-    const at = src.indexOf(`private ${name}(`);
-    expect(at).toBeGreaterThan(-1);
-    return at;
-  };
-  const body = (name: string): string => {
-    const at = start(name);
-    return src.slice(at, src.indexOf("\n  }\n", at));
-  };
+/** Every non-test `.ts` file under `src/bus/`, named relative to it. */
+function readBusSources(dir = join(import.meta.dir, ".."), prefix = ""): BusSource[] {
+  const out: BusSource[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      if (entry.name !== "__tests__") {
+        out.push(...readBusSources(join(dir, entry.name), `${prefix}${entry.name}/`));
+      }
+    } else if (entry.name.endsWith(".ts") && !entry.name.endsWith(".test.ts")) {
+      out.push({
+        name: `${prefix}${entry.name}`,
+        text: readFileSync(join(dir, entry.name), "utf8"),
+      });
+    }
+  }
+  return out;
+}
 
-  it("IpcServer.send is called from emitModelInput and emitControl and nowhere else", () => {
-    const callSites = [...src.matchAll(/ipcServer\??\.send\(/g)].map((m) => m.index ?? -1);
-    expect(callSites).toHaveLength(2);
-    const inside = (name: string) =>
-      callSites.filter((i) => i > start(name) && i < start(name) + body(name).length);
-    expect(inside("emitModelInput")).toHaveLength(1);
-    expect(inside("emitControl")).toHaveLength(1);
+/** A BusCoreImpl cut down to the shapes the real one uses; `ingestAskAnswer` takes the injected code. */
+const BASELINE_CORE = `
+export class BusCoreImpl {
+  private ipcServer: IpcServer | null = null;
+  private recordingPending: RecordingPendingCheck | null = null;
+  async start() {
+    if (this.ipcServer || !this.socketPath) return;
+    this.ipcServer = await bindUdsServer(this.socketPath, {});
+  }
+  async stop() {
+    if (this.ipcServer) {
+      await this.ipcServer.stop();
+      this.ipcServer = null;
+    }
+  }
+  status(id: string) {
+    const n = this.ipcServer?.connectionCount() ?? 0;
+    const gated = this.parked.has(id) && this.ipcServer && !this.ipcServer.hasConnection(id);
+    return { n, gated, up: this.ipcServer ? true : undefined, live: this.ipcServer?.hasConnection(id) ?? false };
+  }
+  setRecordingPendingHandler(handler: RecordingPendingCheck | null) {
+    this.recordingPending = handler;
+  }
+  private modelInputPending(agent_id: string) {
+    return this.recordingPending?.(agent_id) ?? null;
+  }
+  private emitModelInput(frame: Frame) {
+    const pending = this.modelInputPending(frame.agent_id);
+    if (pending) return { status: "recording-pending", pending };
+    const sent = this.ipcServer?.send(frame.agent_id, frame) === true;
+    return { status: sent ? "sent" : "no-connection" };
+  }
+  private emitControl(agent_id: string, frame: Frame) {
+    return this.ipcServer?.send(agent_id, frame) === true;
+  }
+  ingestAskAnswer(req: Req) {
+    /*INJECT*/
+  }
+}
+`;
+
+const coreWith = (inject: string): BusSource => ({
+  name: "core.ts",
+  text: BASELINE_CORE.replace("/*INJECT*/", inject),
+});
+
+describe("one boundary for model input (#595 r7b), shape, read from the syntax tree", () => {
+  it("the real src/bus passes: two send sites, one recordingPending reader, no other shape", () => {
+    const sources = readBusSources();
+    expect(sources.map((s) => s.name)).toContain("core.ts");
+    const report = checkModelInputBoundary(sources);
+    expect(report.violations).toEqual([]);
+    expect(report.sendSites).toEqual([
+      "core.ts#BusCoreImpl.emitControl",
+      "core.ts#BusCoreImpl.emitModelInput",
+    ]);
+    expect(report.pendingReaders).toEqual(["core.ts#BusCoreImpl.modelInputPending"]);
+    // A floor, so a scan that saw nothing cannot pass: core.ts names ipcServer ~17 times.
+    expect(report.ipcServerReferences).toBeGreaterThanOrEqual(10);
   });
 
-  it("recordingPending has one reader, modelInputPending, and emitModelInput consults it", () => {
-    const reads = [...src.matchAll(/this\.recordingPending\?\.\(/g)];
-    expect(reads).toHaveLength(1);
-    expect(body("modelInputPending")).toContain("this.recordingPending?.(");
-    expect(body("emitModelInput")).toContain("this.modelInputPending(");
+  it("the baseline fixture passes, with every allowed shape in it", () => {
+    const report = checkModelInputBoundary([coreWith("return;")]);
+    expect(report.violations).toEqual([]);
+    expect(report.sendSites).toHaveLength(2);
+    expect(report.pendingReaders).toHaveLength(1);
   });
+
+  // Each injects one bypass into ingestAskAnswer (or another file) and must be rejected for the
+  // stated reason. `regexBlind` marks the ones the round-7 regex could not see.
+  const round7Regex = /ipcServer\??\.send\(/;
+  const rejected: Array<{
+    label: string;
+    sources: BusSource[];
+    reason: string;
+    regexBlind?: string;
+  }> = [
+    {
+      label: "a comment between send and (",
+      sources: [coreWith("this.ipcServer?.send /* added bypass */ (req.agent_id, frame);")],
+      reason: "ipcServer.send called from core.ts#BusCoreImpl.ingestAskAnswer",
+      regexBlind: "this.ipcServer?.send /* added bypass */ (req.agent_id, frame);",
+    },
+    {
+      label: "a newline between send and (",
+      sources: [coreWith("this.ipcServer?.send\n(req.agent_id, frame);")],
+      reason: "ipcServer.send called from core.ts#BusCoreImpl.ingestAskAnswer",
+      regexBlind: "this.ipcServer?.send\n(req.agent_id, frame);",
+    },
+    {
+      label: "an alias variable",
+      sources: [coreWith("const s = this.ipcServer; s?.send(req.agent_id, frame);")],
+      reason: "ipcServer escapes",
+    },
+    {
+      label: "a destructured send",
+      sources: [coreWith("const { send } = this.ipcServer!; send(req.agent_id, frame);")],
+      reason: "ipcServer escapes",
+    },
+    {
+      label: "the field destructured out of this",
+      sources: [coreWith("const { ipcServer } = this; ipcServer?.send(req.agent_id, frame);")],
+      reason: "ipcServer destructured out of an object",
+    },
+    {
+      label: "an element access",
+      sources: [coreWith('this["ipcServer"]?.send(req.agent_id, frame);')],
+      reason: "ipcServer.send called from core.ts#BusCoreImpl.ingestAskAnswer",
+    },
+    {
+      label: "a cast around the receiver",
+      sources: [coreWith("(this.ipcServer as any).send(req.agent_id, frame);")],
+      reason: "ipcServer.send called from core.ts#BusCoreImpl.ingestAskAnswer",
+    },
+    {
+      label: "send.call",
+      sources: [coreWith("this.ipcServer?.send.call(this, req.agent_id, frame);")],
+      reason: "ipcServer.send used other than as a call",
+    },
+    {
+      label: "the server passed to another function",
+      sources: [coreWith("leak(this.ipcServer);")],
+      reason: "ipcServer escapes",
+    },
+    {
+      label: "the string name used for reflection",
+      sources: [coreWith('Reflect.get(this, "ipcServer");')],
+      reason: 'the string "ipcServer" outside',
+    },
+    {
+      label: "a third send, in emitControl",
+      sources: [
+        {
+          name: "core.ts",
+          text: BASELINE_CORE.replace(
+            "return this.ipcServer?.send(agent_id, frame) === true;",
+            "this.ipcServer?.send(agent_id, frame); return this.ipcServer?.send(agent_id, frame) === true;",
+          ),
+        },
+      ],
+      reason: "expected exactly",
+    },
+    {
+      label: "an extra sender in another bus file",
+      sources: [
+        coreWith("return;"),
+        {
+          name: "other.ts",
+          text: "export class Other { private ipcServer: any; go(a: string, b: unknown) { this.ipcServer?.send(a, b); } }",
+        },
+      ],
+      reason: "ipcServer.send called from other.ts#Other.go",
+    },
+    {
+      label: "a second server built in another bus file",
+      sources: [
+        coreWith("return;"),
+        {
+          name: "other.ts",
+          text: "export async function go(p: string) { const s = await bindUdsServer(p, {}); s.send('a', {}); }",
+        },
+      ],
+      reason: "bindUdsServer outside core.ts / core-ipc.ts",
+    },
+    {
+      label: "a second recordingPending reader",
+      sources: [coreWith("this.recordingPending?.(req.agent_id);")],
+      reason: "only modelInputPending may read it",
+    },
+    {
+      label: "recordingPending aliased",
+      sources: [coreWith("const r = this.recordingPending; r?.(req.agent_id);")],
+      reason: "recordingPending escapes",
+    },
+    {
+      label: "recordingPending destructured",
+      sources: [coreWith("const { recordingPending } = this;")],
+      reason: "recordingPending destructured out of an object",
+    },
+    {
+      label: "emitModelInput that no longer consults modelInputPending",
+      sources: [
+        {
+          name: "core.ts",
+          text: BASELINE_CORE.replace("this.modelInputPending(frame.agent_id)", "null"),
+        },
+      ],
+      reason: "emitModelInput does not call this.modelInputPending()",
+    },
+  ];
+
+  for (const c of rejected) {
+    it(`rejects ${c.label}`, () => {
+      if (c.regexBlind !== undefined) expect(round7Regex.test(c.regexBlind)).toBe(false);
+      const { violations } = checkModelInputBoundary(c.sources);
+      expect(violations.some((v) => v.includes(c.reason))).toBe(true);
+    });
+  }
 });
