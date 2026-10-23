@@ -753,3 +753,68 @@ Reviewed `d2e3dc50` line by line. One defect found: the test "the read is handed
 - The seam does not make the real `ps`/`/proc` readers fast; the real-process tests still spawn real stand-ins and read real process state. They no longer have a bound a loaded machine can miss: every bound they depend on is 60-120 s and a miss fails loudly.
 - Three of the new RED lines (D1, D4, injection 7) are test timeouts, not assertion messages. A hung guard cannot be told apart from a slow one except by a bound; the bounds are 10-30 s.
 - `inject-turn-net`, `host-telemetry-provider` and `skills-fitness` flake on this machine independent of #595; the first is a bus test and worth its own issue.
+
+# Round 6
+
+Branch `fix/595-bus-session-resume`, on top of `38a8d565`. Code and tests: `50ec7d2e`; this report is a second commit. Nothing is pushed to `feat/550-pty-default`. Version stays 2.2.355. Closes Codex r5 item 3 (the only open item; items 1 and 2 stay closed).
+
+## The finding (MEDIUM)
+
+The recording-pending check lived only in fresh `sendPrompt`. Two other paths put a prompt on a transport without it:
+
+- `admitNext` (`core.ts`) drains the admission queue by calling `admitPrompt`, which sends the IPC `prompt` frame (or types into the PTY). A prompt queued behind a turn could be admitted by the turn's release while the replacement's ownership write was still pending.
+- `nudgeForReply` sends its own IPC `type: "prompt"` frame (and a PTY copy) after a turn ends with text and no `reply`.
+
+Both frames become channel notifications in the MCP server, which start a turn. The r5 statement "only `sendPrompt` is gated; the nudge follows a turn so nothing is outstanding" (Round 5 residuals) was wrong for a replacement that is still unrecorded; it is withdrawn.
+
+## The fix
+
+One bounded wait, `awaitRecorded(agent_id, pending, ctx)`, extracted from `sendWhenRecorded`. It races the pending promise against `deliveryBackstopMs` and returns `recorded | recording-failed | recording-timeout`, logging a `[bus-ipc] undeliverable` line with the reason code (never the prompt) for the last two. `sendWhenRecorded` now calls it; so does the queue drain.
+
+| Path | Site | Behaviour while pending |
+|---|---|---|
+| Fresh prompt | `sendPrompt` -> `sendWhenRecorded` (unchanged) | waits, then re-enters `sendPrompt`; fails with `AgentNotRecordedError` |
+| Queued prompt | `admitNext`, `core.ts` ~1500 | the head **stays queued** (same `promise_id`, same place in the lane rotation); `recordHold` marks the agent so a second `admitNext` cannot start a second wait. Recorded: `admitNext` runs again and admits it through `admitPrompt` as before (slot accounting, ack, `promise_id` untouched). Failed or timed out: every queued prompt for the agent is dequeued and fails through `onError` with an `AgentNotRecordedError` (reason code) and its `promise_id`; no frame, no typing, no slot taken |
+| Reply nudge | `nudgeForReply`, `core.ts` ~3185 | cannot wait (it is about a turn that already ended, and the claude it would reach is a replacement). Returns `false` before any state change or send; the caller's existing "undeliverable" branch logs `reply nudge undeliverable for agent=… (recording-pending)` (one line, reason code, no text) and synthesizes the delivery |
+
+Not resubmitted through `sendPrompt`: the queued prompt keeps its id and its slot accounting. A newcomer arriving during the hold queues behind it (`sendPrompt` sees a non-empty queue), so order is kept.
+
+`failQueuedUnrecorded` fails the whole queue, not just the head: the record is per agent, so every queued prompt has the same fate, and leaving them would just re-run the wait for each.
+
+## Tests (`prompt-before-record.test.ts`, 9 new, 16 total)
+
+Real `BusCore` on a real Unix socket with a real MCP hello, as in Codex's probe (the existing helper `connectAgent` already does this, so no fakes beyond the manual pending promise). Absence of a frame is proven with a **barrier**, not a sleep: after the action the test makes the bus write an `ask_answer` frame to the same socket and waits for it; frames arrive in order, so every earlier frame has arrived. No fixed sleeps, no wall-clock race; the only wait is `until(cond)` (90 s, throws on a miss).
+
+- Queued prompt, record pending, prior turn released: no IPC frame, no typed text, no `prompt` bus event, still in `queuedPrompts` with its id. Record succeeds: delivered once, same `promise_id` on the `prompt` event.
+- A newcomer during the hold queues behind the held prompt; it is delivered only after the held prompt's turn ends.
+- Record fails: one `onError` with `AgentNotRecordedError` `recording-failed` and the queued `promise_id`; no frame ever; queue empty.
+- Record never settles: `recording-timeout` at a 100 ms backstop, same.
+- PTY-reachable agent: the drained prompt is not typed before the record (typed after).
+- Nudge, record pending: no nudge frame; the turn's text is delivered by synthesis (`response.text`); exactly one `reply nudge undeliverable … recording-pending` line, which does not contain the turn text; releasing the record afterwards sends nothing late.
+- Nudge, record failed: still no frame.
+- Nudge, nothing pending: sent as before (`metadata.nudge = "reply-tool"`), so the gate does not break the normal nudge.
+
+Codex's two probe scenarios are the first and sixth tests (queue: first prompt, queued second, never-settling record, `response.turn_end`; nudge: channel prompt, same pending state, text-bearing turn end).
+
+## Fault injections (one site, one `git archive` copy of `50ec7d2e`, whole file run)
+
+| Injection | RED (verbatim) |
+|---|---|
+| Drain: `admitNext`'s `const pending = this.recordingPending?.(agent_id) ?? null;` -> `const pending = null as Promise<void> \| null;` | `expect(client?.prompts()).toHaveLength(1);` / `Expected length: 1` / `Received length: 2` at `prompt-before-record.test.ts:491` in `(fail) a queued prompt waits for the record too (#595 r6), at the bus > held while the record is pending: no frame and no typing, the prompt keeps its id and its place`. Also red: `… > a PTY-reachable agent: the drained prompt is not typed before the record either`, and (30 s test timeouts, the queue is never failed) `… > a record that failed: the queued prompt fails with its reason and id, and no frame is ever sent` and `… > a record that never settles: the queue fails at the backstop with recording-timeout`. 12 pass / 4 fail |
+| Nudge: `if (this.recordingPending?.(agentId)) return false;` removed | `expect(client?.prompts()).toHaveLength(1);` / `Expected length: 1` / `Received length: 2` at `prompt-before-record.test.ts:641` in `(fail) the reply nudge waits for nothing and sends nothing while pending (#595 r6), at the bus > pending: no nudge frame, the turn's text is delivered by synthesis, one reason-coded line`. Also red: `… > a record that failed: still no nudge frame, ever`. 14 pass / 2 fail |
+
+Each test's predicted result was written before the injection (see the `Fault (site: …)` comments), and the injected line was the only difference from `50ec7d2e`.
+
+## Gates
+
+- Ownership + prompt-before-record + resume files (`session-ownership`, `session-ownership-manager`, `prompt-before-record`, `session-resume`), **5 runs in a row: 5 of 5 exit 0, 103 pass / 0 fail / 394 expect() calls each** (r5 was 95 pass; +9 new tests, +1 elsewhere counted from this file set).
+- `env -u ANTHROPIC_BASE_URL bun test src > /tmp/595r6-src.txt 2>&1`: **exit 0, 5121 pass, 5 skip, 0 fail** (5126 tests, 275 files, 449.76 s). The three known flaky files (tuner host-telemetry-provider, skills-fitness, bus inject-turn-net) passed on this run.
+- `bun run lint`: exit 0. `bun run typecheck`: **149 errors, baseline 149**.
+- Version: `plugin.json` 2.2.355, unchanged.
+
+## Residuals
+
+- A nudge dropped while the record is pending is not retried. The caller synthesizes the delivery instead, so the user still gets the turn's text; they lose the chance of a curated reply for that turn.
+- The queue-drain wait fails **every** queued prompt for the agent on one failed record, through `onError`. A queued prompt's caller was already answered `queued: true` at enqueue time, so the failure surfaces in logs/`onError`, as any queued delivery failure does, not to the original caller.
+- While the head is held, the per-agent queue caps still apply to newcomers (the held prompt is still in the queue); the wait is bounded by `deliveryBackstopMs`.
+- Other IPC sends (`ask_answer`, `permission_response`, `job_result`) are replies to the child's own requests, not prompts; unchanged.
