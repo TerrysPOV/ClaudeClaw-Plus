@@ -56,6 +56,17 @@ export const PROBE_TIMEOUT_MS = 1500;
  * read: a record that is late is a spawn that fails (#595 r4), so a loaded machine gets a margin.
  */
 export const RECORD_STEP_MS = 4000;
+/**
+ * The most ONE operation of the file ownership store may take (#595 r10). Shorter than every caller's
+ * bound (`RECORD_STEP_MS`, `GUARD_DEADLINE_MS`), so the operation queued behind a stalled one still has
+ * time to run once the stalled one is let go. A local file read or write takes milliseconds.
+ */
+export const STORE_OP_MS = 2000;
+/**
+ * The most a retirement waits for `store.clear`, whatever store it is given: one stalled predecessor
+ * (`STORE_OP_MS`), its own operation (`STORE_OP_MS`), and a margin.
+ */
+export const CLEAR_BOUND_MS = 3 * STORE_OP_MS;
 const POLL_MS = 100;
 
 /* ── Ownership record ───────────────────────────────────────────────────── */
@@ -110,18 +121,84 @@ const isRecord = (v: unknown): v is OwnershipRecord => {
   );
 };
 
+/** A file operation of the ownership store did not settle within `STORE_OP_MS`. Always an error, never "no record". */
+export class OwnershipStoreTimeoutError extends Error {
+  readonly code = "ownership-store-timeout";
+  constructor(readonly opMs: number) {
+    super(`ownership store operation did not settle within ${opMs} ms`);
+    this.name = "OwnershipStoreTimeoutError";
+  }
+}
+
+/** The file system calls the store makes. TEST SEAM: production uses `node:fs/promises`. */
+export interface StoreFs {
+  readFile(path: string, encoding: "utf8"): Promise<string>;
+  writeFile(path: string, data: string, opts: { mode: number; flag: string }): Promise<void>;
+  mkdir(path: string, opts: { recursive: true }): Promise<unknown>;
+  rename(from: string, to: string): Promise<void>;
+  rm(path: string, opts: { force: true }): Promise<void>;
+}
+
+const REAL_FS: StoreFs = {
+  readFile: (path, encoding) => readFile(path, encoding),
+  writeFile: (path, data, opts) => writeFile(path, data, opts),
+  mkdir: (path, opts) => mkdir(path, opts),
+  rename: (from, to) => rename(from, to),
+  rm: (path, opts) => rm(path, opts),
+};
+
 /**
  * The daemon's own state, next to the agent's `session.json`: `<agents>/<id>/owner.json`, mode 0600,
  * written atomically (temp file + rename). Operations on one agent are serialised.
+ *
+ * Each operation is bounded on its own by `opMs` (#595 r10). The agent's queue advances when the
+ * operation settles OR that bound passes, so a file operation that never settles costs the operations
+ * behind it at most one bound each and never holds them for good. A timed-out operation rejects with
+ * `OwnershipStoreTimeoutError` (an error: callers treat it as unreadable / not recorded, never as "no
+ * record"), and whatever it does afterwards is discarded: it publishes (renames) and deletes nothing,
+ * so a late result cannot overwrite newer state. (A single `rename` or `rm` already handed to the
+ * kernel when the bound passes cannot be recalled; that is the one residual.)
  */
 export function createFileOwnershipStore(
   agentsDir: () => string = getAgentsDir,
   /** TEST SEAM: the temp-file name suffix. Production uses a fresh random one per write. */
   tmpSuffix: () => string = randomUUID,
+  /** TEST SEAM: the per-operation bound, the timer it runs on and the file system. Inert when unset. */
+  seams: { opMs?: number; clock?: GuardClock; fs?: StoreFs } = {},
 ): OwnershipStore {
+  const opMs = seams.opMs ?? STORE_OP_MS;
+  const clock = seams.clock ?? REAL_CLOCK;
+  const fs = seams.fs ?? REAL_FS;
+  /** Handed to a running operation: false once its bound has passed. */
+  interface Gate {
+    assertLive(): void;
+  }
+  const bounded = <T>(run: (gate: Gate) => Promise<T>): Promise<T> =>
+    new Promise<T>((resolve, reject) => {
+      let open = true;
+      const timer = clock.setTimeout(() => {
+        open = false;
+        reject(new OwnershipStoreTimeoutError(opMs));
+      }, opMs);
+      const settle = (done: () => void): void => {
+        if (!open) return; // timed out: the late outcome is discarded
+        open = false;
+        clock.clearTimeout(timer);
+        done();
+      };
+      run({
+        assertLive: () => {
+          if (!open) throw new OwnershipStoreTimeoutError(opMs);
+        },
+      }).then(
+        (v) => settle(() => resolve(v)),
+        (e) => settle(() => reject(e)),
+      );
+    });
   const chains = new Map<string, Promise<unknown>>();
-  const serial = <T>(agentId: string, run: () => Promise<T>): Promise<T> => {
-    const next = (chains.get(agentId) ?? Promise.resolve()).then(run, run);
+  const serial = <T>(agentId: string, run: (gate: Gate) => Promise<T>): Promise<T> => {
+    const next = (chains.get(agentId) ?? Promise.resolve()).then(() => bounded(run));
+    // `next` settles at the latest when its bound passes, so the queue never waits on a stalled file call.
     chains.set(
       agentId,
       next.catch(() => {}),
@@ -137,7 +214,7 @@ export function createFileOwnershipStore(
   const load = async (agentId: string): Promise<OwnershipRecord | null> => {
     let raw: string;
     try {
-      raw = await readFile(pathFor(agentId), "utf8");
+      raw = await fs.readFile(pathFor(agentId), "utf8");
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw err;
@@ -152,26 +229,29 @@ export function createFileOwnershipStore(
   return {
     read: (agentId) => serial(agentId, () => load(agentId)),
     write: (record) =>
-      serial(record.agentId, async () => {
+      serial(record.agentId, async (gate) => {
         const file = pathFor(record.agentId);
-        await mkdir(dirname(file), { recursive: true });
+        await fs.mkdir(dirname(file), { recursive: true });
+        gate.assertLive();
         // Unpredictable name, created exclusively ("wx": O_EXCL fails on anything already there, a
         // planted symlink included, and never follows one). A failed create fails the record write,
         // which already ends the spawn (#595 r4) (#595 r7c).
         const tmp = `${file}.${tmpSuffix()}.tmp`;
         try {
-          await writeFile(tmp, `${JSON.stringify(record)}\n`, { mode: 0o600, flag: "wx" });
-          await rename(tmp, file);
+          await fs.writeFile(tmp, `${JSON.stringify(record)}\n`, { mode: 0o600, flag: "wx" });
+          gate.assertLive(); // a write that outlived its bound must not publish over newer state
+          await fs.rename(tmp, file);
         } catch (err) {
-          await rm(tmp, { force: true }).catch(() => {});
+          await fs.rm(tmp, { force: true }).catch(() => {});
           throw err;
         }
       }),
     clear: (agentId, expect) =>
-      serial(agentId, async () => {
+      serial(agentId, async (gate) => {
         const current = await load(agentId).catch(() => null);
+        gate.assertLive(); // a read that outlived its bound must not delete a newer record
         if (current && (current.pid !== expect.pid || current.identity !== expect.identity)) return;
-        await rm(pathFor(agentId), { force: true });
+        await fs.rm(pathFor(agentId), { force: true });
       }),
   };
 }
@@ -727,10 +807,18 @@ export async function confirmGoneAndClear(a: {
   probe: ProcessProbe;
   record: OwnershipRecord;
   withinMs?: number;
+  /** The most `store.clear` may take (default `CLEAR_BOUND_MS`); past it the answer is "unknown". */
+  clearMs?: number;
+  /** TEST SEAM (`GuardClock`): inert when unset. */
+  clock?: GuardClock;
 }): Promise<"cleared" | "alive" | "unknown"> {
   try {
     if (!(await pollDeparted(a.probe, a.record, a.withinMs ?? 2000))) return "alive";
-    await a.store.clear(a.record.agentId, a.record);
+    await withDeadline(
+      a.store.clear(a.record.agentId, a.record),
+      a.clearMs ?? CLEAR_BOUND_MS,
+      a.clock,
+    );
     return "cleared";
   } catch {
     return "unknown";
@@ -751,6 +839,10 @@ export async function confirmRetired(a: {
   graceMs?: number;
   killMs?: number;
   uid?: number;
+  /** The most `store.clear` may take (default `CLEAR_BOUND_MS`); past it the process counts as unconfirmed. */
+  clearMs?: number;
+  /** TEST SEAM (`GuardClock`): inert when unset. */
+  clock?: GuardClock;
 }): Promise<boolean> {
   const { probe, record } = a;
   const uid = a.uid ?? process.getuid?.() ?? -1;
@@ -771,7 +863,13 @@ export async function confirmRetired(a: {
       }
       gone = await pollDeparted(probe, record, a.killMs ?? 2000);
     }
-    if (gone) await a.store.clear(record.agentId, record);
+    if (gone) {
+      await withDeadline(
+        a.store.clear(record.agentId, record),
+        a.clearMs ?? CLEAR_BOUND_MS,
+        a.clock,
+      );
+    }
     return gone;
   } catch {
     return false;
