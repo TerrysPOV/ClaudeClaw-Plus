@@ -818,3 +818,64 @@ Each test's predicted result was written before the injection (see the `Fault (s
 - The queue-drain wait fails **every** queued prompt for the agent on one failed record, through `onError`. A queued prompt's caller was already answered `queued: true` at enqueue time, so the failure surfaces in logs/`onError`, as any queued delivery failure does, not to the original caller.
 - While the head is held, the per-agent queue caps still apply to newcomers (the held prompt is still in the queue); the wait is bounded by `deliveryBackstopMs`.
 - Other IPC sends (`ask_answer`, `permission_response`, `job_result`) are replies to the child's own requests, not prompts; unchanged.
+
+# Round 7
+
+Codex r6 (MEDIUM): `ingestAskAnswer` sent `ask_answer` without consulting the recording gate, and `deliverAskAnswer` turned an answer for an ask the process never made into a `notifications/claude/channel`, the same method an ordinary prompt uses. Rounds 5, 6 and 7 each found one more caller that hands the model input before the ownership record exists, so this round fixes the boundary, not the caller.
+
+## The boundary
+
+`BusCore` sends frames to the MCP server in exactly two places, and `IpcServer.send` has no other caller in `core.ts`:
+
+- `emitModelInput(frame)` (`core.ts:1376`): the only sender of a frame the MCP server turns into model input. It asks `modelInputPending` (`:1365`, the only reader of `recordingPending`) and, while the claude is unrecorded, writes nothing and returns `{ status: "recording-pending", pending }`. Types: `ModelInputFrame = IpcPrompt | IpcAskAnswer`.
+- `emitControl(agent_id, frame)` (`:1384`): everything else. `ControlFrame = IpcPermissionResponse | IpcJobResult`.
+
+A caller that can wait waits on `pending` with the existing `awaitRecorded` (bounded by `deliveryBackstopMs`). A caller that cannot wait gets the typed refusal (`AgentNotRecordedError`, reason `recording-pending`, new) or the `recording-pending` status.
+
+## Audit: every frame type Bus core sends, and what the MCP server does with it
+
+| Frame (`types.ts`) | Sent from (`core.ts`) | MCP server (`mcp-server.ts`) | Model input? | Path now |
+|---|---|---|---|---|
+| `prompt` (admission) | `admitPrompt`, `:1816` | `deliverPrompt` `:621`, `notifications/claude/channel` `:637` | **yes** | `emitModelInput`; callers `sendPrompt` `:1272` and `admitNext` `:1553` wait first, `admitPrompt` `:1665` refuses with the typed error before opening the turn |
+| `prompt` (reply nudge, `metadata.nudge`) | `nudgeForReply`, `:3253` | same | **yes** | `emitModelInput`; the caller cannot wait, asks `modelInputPending` first (`:3239`) and drops, as in r6 |
+| `ask_answer` | `ingestAskAnswer`, `:3610` (was `:3552`) | `deliverAskAnswer` `:652`; blocking `request_human` resolves the awaiting tool call, non-blocking `ask` emits `notifications/claude/channel` `:676` | **yes** | `emitModelInput`; waits via `awaitRecorded`, then retries once through the same boundary; failure/timeout report through `onError` with `ask_id` |
+| `permission_response` | `ingestPermissionDecision`, `:3581` | `deliverPermissionResponse` `:687`, `notifications/claude/channel/permission` `:692` | no: carries a decision (`request_id`, `behavior`) for a permission request the claude itself made; no text for the model, no turn of its own | `emitControl` |
+| `job_result` | `sendJobResult` | `deliverJobResult` `:700`: resolves a pending `req_id`, an unknown one is dropped | no: the result of a tool call already in flight | `emitControl` |
+| `error` (`missing_capability`) | `core-ipc.ts:259`, at the handshake, before the agent is registered | the `default:` branch of `wireIpc`, ignored | no | not a Bus-core send; unchanged |
+
+PTY typing is the other way a prompt reaches the model. It is gated where it always was (`sendPrompt`, `admitNext`, the nudge), before either transport is touched; this round does not move it.
+
+Shape guard (`model-input-boundary.test.ts`, last describe): `IpcServer.send` is called from exactly `emitModelInput` and `emitControl`, and `recordingPending` is read in exactly one place. A new `ipcServer.send(` anywhere else, or a second reader, fails the build.
+
+## `deliverAskAnswer` drops an answer it never asked for
+
+`mcp-server.ts:652`. An answer whose `ask_id` has no pending ask in this MCP process is dropped with one line, `Bus MCP: ask_answer dropped: reason=no-pending-ask ask_id=<id> agent=<id>`. It is never a channel notification. This also covers a second answer to an ask already answered (the pending entry is removed on the first).
+
+## Tests
+
+New file `src/bus/__tests__/model-input-boundary.test.ts`, 11 tests:
+
+- At the bus, raw socket: held then sent once with its `ask_id`; record failed (nothing sent, `onError` carries `AgentNotRecordedError` `recording-failed` and the `ask_id`); record never settles (`recording-timeout`); nothing pending (sent at once).
+- Socket-to-MCP, a real `BusMcpServer` and an MCP SDK client behind the bus's socket, as in Codex's probe: **pending** (no frame, no notification, ask still outstanding; then exactly one notification), **pending, `request_human`** (the tool call stays blocked, then returns the answer), **failure**, **timeout**, **stale ask id** (an answer from a prior process, and a second answer to an ask already answered: no notification, one reason-coded line each).
+- Shape: the two tests above.
+
+**The barrier.** The round-6 tests used `ask_answer` to order frames, which is itself model input and is now held. Barrier is now a `permission_response` (`ingestPermissionDecision`): a control frame, never held, which starts no turn. The bus writes one socket in order, so once it arrives every earlier frame has. `prompt-before-record.test.ts` and the new file both use it.
+
+## Fault injections (one site, one `git archive` copy of `ea14e399`)
+
+| Injection | RED (verbatim) |
+|---|---|
+| **Gate removed**, the single reader: `modelInputPending`'s `return this.recordingPending?.(agent_id) ?? null;` -> `return null;` | 21 fail / 60 pass over `prompt-before-record`, `model-input-boundary`, `prompt-queue`. Prompt: `(fail) recording pending holds prompts on both transports (#595 r5), at the bus > an IPC-only agent: no frame and no typing until the record exists, then the frame`. Queue: `(fail) a queued prompt waits for the record too (#595 r6), at the bus > held while the record is pending: no frame and no typing, the prompt keeps its id and its place` (`expect(client?.prompts()).toHaveLength(1);` / `Expected length: 1` / `Received length: 2` at `prompt-before-record.test.ts:495`). Nudge: `(fail) the reply nudge waits for nothing and sends nothing while pending (#595 r6), at the bus > pending: no nudge frame, the turn's text is delivered by synthesis, one reason-coded line` (same assertion, `:645`). ask_answer: `(fail) ask_answer waits for the record (#595 r7), at the bus > held while the record is pending, then sent once with the ask_id it was given` and the four socket-to-MCP tests (`pending`, `pending request_human`, `failure`, `timeout`). Also `(fail) one boundary for model input (#595 r7), shape > recordingPending has one reader, modelInputPending, and emitModelInput consults it` |
+| **Boundary check only**: delete `if (pending) return { status: "recording-pending", pending };` from `emitModelInput` | 7 fail / 20 pass: `held while the record is pending, then sent once with the ask_id it was given` (`Expected  - 1` / `Received  + 8`, a frame in `askAnswers(frames)` before the record), `a record that failed: nothing is sent, and the failure names the ask_id`, `a record that never settles: the backstop fails it with recording-timeout`, and the four socket-to-MCP tests. The prompt, queue and nudge tests stay green here, by design: their callers check before `emitModelInput` does, and the second check is the backstop that `ask_answer`, which has no earlier caller, depends on |
+| **Unknown-ask-id drop removed** in `deliverAskAnswer` | 1 fail / 52 pass over `model-input-boundary`, `mcp-server`: `(fail) ask_answer socket-to-MCP (#595 r7) > stale ask id: dropped at the MCP boundary with a reason-coded line, never a channel notification` (`Expected  - 1` / `Received  + 12`: the channel notification with `meta: { ask_id: "ask-from-prior-process", kind: "ask_answer" }`). The existing `mcp-server.test.ts` ask tests stay green: they ask first |
+
+Each prediction is in the test's `Fault (site: ...)` comment, written before the run. Line numbers are in the archive.
+
+## Merge onto main
+
+`git merge povai/main` (no rebase, no force-push): two conflicts, both mechanical. `session-manager.ts` imports: kept this branch's `pty-quarantine` / `pty-process` import block (a superset of main's one line). `pty-process.test.ts` `fakeMcpDialogCli`: took main's signature (`beforeRead`), which this branch never touched. The branch is 0 behind `povai/main`. Version 2.2.355 -> **2.2.356**, `plugin.json`, marketplace `plugins[0]` and marketplace top level all equal.
+
+## Residuals
+
+- A held `ask_answer` that fails or times out is reported through `onError` only. The adapter that called `ingestAskAnswer` already returned (it is `void`, as before); the human does not hear that their answer was not delivered. The claude's `ask` stays outstanding in its MCP process.
+- Defence in depth is real but has a cost: `modelInputPending` is called up to three times for one admitted prompt (`sendPrompt`, `admitPrompt`, `emitModelInput`), each a map lookup.
