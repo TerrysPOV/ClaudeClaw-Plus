@@ -231,6 +231,30 @@ export type StreamPromptHandler = (
  */
 export type PtyReachableCheck = (agent_id: string) => boolean;
 
+/**
+ * Whether the agent's claude is spawned but not yet recorded as ours (#595 r5). Non-null while it
+ * is: the promise resolves once the agent can be given a prompt and REJECTS if it could not be
+ * recorded (the spawn is failing). This is a state of its own, not "unreachable": an unreachable PTY
+ * sends the prompt over IPC instead, and an unrecorded claude must receive it on neither transport.
+ * Wired by the daemon to `SessionManager.recordingPending`; null means nothing is pending.
+ */
+export type RecordingPendingCheck = (agent_id: string) => Promise<void> | null;
+
+/**
+ * A prompt was not delivered because its agent's claude was not recorded (#595 r5): the record write
+ * failed (`recording-failed`, the agent is being retired) or did not settle within the delivery
+ * backstop (`recording-timeout`). The prompt reached neither transport.
+ */
+export class AgentNotRecordedError extends Error {
+  constructor(
+    readonly agent_id: string,
+    readonly reason: "recording-failed" | "recording-timeout",
+  ) {
+    super(`prompt not delivered to agent_id=${agent_id}: reason=${reason}`);
+    this.name = "AgentNotRecordedError";
+  }
+}
+
 export interface BusCoreOptions {
   /** Path to bind the UDS server. If omitted, no IPC server is started. */
   socketPath?: string;
@@ -381,6 +405,11 @@ export interface BusCore {
    */
   setPtyReachableHandler?(handler: PtyReachableCheck | null): void;
   /**
+   * Install or replace the {@link RecordingPendingCheck}. Pass `null` to detach. Optional: mocks
+   * need not implement it.
+   */
+  setRecordingPendingHandler?(handler: RecordingPendingCheck | null): void;
+  /**
    * Install or replace the agent-job handler (#296 PR 3). The daemon wires
    * this once the `AgentJobRunner` is constructed (which needs `sendPrompt`,
    * so it can't be a constructor-only option). Pass `null` to detach on
@@ -448,6 +477,7 @@ export class BusCoreImpl implements BusCore {
   private streamPromptHandler: StreamPromptHandler | null;
   private readonly defaultPtyReachable: PtyReachableCheck = () => this.streamPromptHandler !== null;
   private ptyReachable: PtyReachableCheck;
+  private recordingPending: RecordingPendingCheck | null = null;
   // Settable post-hoc (like streamPromptHandler): the AgentJobRunner needs
   // `sendPrompt` for result delivery, so the daemon constructs it after the
   // bus and wires it via setJobHandler (#296 PR 3).
@@ -1212,6 +1242,11 @@ export class BusCoreImpl implements BusCore {
   /* ─────────────────────────────── prompts ─────────────────────────────── */
 
   sendPrompt(req: SendPromptRequest): Promise<SendPromptAck> {
+    // #595 r5: a claude not yet recorded as ours gets the prompt on NEITHER transport. Checked before
+    // anything else, and only a pending agent leaves the synchronous path (the ack's tick count for
+    // every other agent is unchanged).
+    const pendingRecord = this.recordingPending?.(req.agent_id) ?? null;
+    if (pendingRecord) return this.sendWhenRecorded(req, pendingRecord);
     const promise_id = randomUUID();
     // #239: one active turn per agent. The slot is free when the agent owes no
     // terminator for a bus-opened turn, no turn is streaming in its transcript
@@ -1253,6 +1288,39 @@ export class BusCoreImpl implements BusCore {
     // `sendPrompt` had before #239, and callers that race its ack against a
     // fast `final` (the webui bridge's receipt notes) rely on its tick count.
     return this.admitPrompt(req, promise_id);
+  }
+
+  /**
+   * #595 r5: hold a prompt until its agent's claude is recorded, for at most `deliveryBackstopMs`,
+   * then send it through the normal path (so both transports see an agent that is deliverable).
+   * Prompts held for one agent resume in arrival order. If the record failed or is late, the prompt
+   * is not delivered anywhere and the caller gets a reason code.
+   */
+  private async sendWhenRecorded(
+    req: SendPromptRequest,
+    pending: Promise<void>,
+  ): Promise<SendPromptAck> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      pending.then(
+        () => "recorded" as const,
+        () => "recording-failed" as const,
+      ),
+      new Promise<"recording-timeout">((resolve) => {
+        timer = setTimeout(() => resolve("recording-timeout"), this.deliveryBackstopMs);
+        (timer as { unref?: () => void }).unref?.();
+      }),
+    ]);
+    clearTimeout(timer);
+    if (outcome !== "recorded") {
+      this.logIpc("undeliverable", {
+        agent: req.agent_id,
+        ctx: "sendPrompt:recording-pending",
+        reason: outcome,
+      });
+      throw new AgentNotRecordedError(req.agent_id, outcome);
+    }
+    return this.sendPrompt(req);
   }
 
   /** #239: no bus-opened turn in flight, no turn streaming, no nudge pending. */
@@ -2485,6 +2553,10 @@ export class BusCoreImpl implements BusCore {
 
   setPtyReachableHandler(handler: PtyReachableCheck | null): void {
     this.ptyReachable = handler ?? this.defaultPtyReachable;
+  }
+
+  setRecordingPendingHandler(handler: RecordingPendingCheck | null): void {
+    this.recordingPending = handler;
   }
 
   setJobHandler(handler: AgentJobHandler | null): void {

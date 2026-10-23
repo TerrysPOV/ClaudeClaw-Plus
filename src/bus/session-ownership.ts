@@ -20,7 +20,8 @@
  *     revalidated immediately before each signal (same start identity, same uid, argv still the
  *     executable we launched and the session id), SIGTERM, SIGKILL after a bound, then confirmed gone.
  *   - anything that cannot be proved (the record or the process cannot be read, the argv does not
- *     match, the process will not die, the deadline passes): signal nothing more and rotate.
+ *     match, the start identity is only second-precise on either side, the process will not die, the
+ *     deadline passes): signal nothing more and rotate.
  * A claude that names the id but has no matching record is never looked for and never signalled.
  *
  * One deadline bounds the whole guard, subprocess time included.
@@ -30,6 +31,15 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import { getAgentsDir } from "../config";
+
+/**
+ * Whether the ownership guard applies on this platform (#595 r5). It reads POSIX process state
+ * (`/proc`, `ps`, libproc), which win32 has none of, and the bus PTY is off by default there. One
+ * predicate for both halves, so the restart-time decision and the spawn-time record cannot disagree:
+ * a platform that records nothing must not be asked to decide from a record, and the reverse.
+ */
+export const ownershipGuardApplies = (platform: NodeJS.Platform = process.platform): boolean =>
+  platform !== "win32";
 
 /** Minted once per daemon start: a record carrying another boot id was written by a dead daemon. */
 export const DAEMON_BOOT_ID = randomUUID();
@@ -328,6 +338,8 @@ function startIdentity(
  * Whether two start identities name the same process birth. Equal strings do. Otherwise they match
  * only at second precision, and only when one side has no microseconds (libproc was unavailable when
  * that side was read): `<lstart>` against `<lstart>+<usec>`. Two microsecond identities must be equal.
+ * A second-precise match answers 'gone or reused?' (so: alive, rotate rather than resume beside it)
+ * and never authorises a signal: `decideResume` refuses to kill on it (#595 r5).
  */
 export function sameStart(a: string, b: string): boolean {
   if (a === b) return true;
@@ -632,10 +644,11 @@ export type RotateReason =
   | "owner-uid-mismatch"
   | "owner-argv-mismatch"
   | "orphan-unconfirmed"
+  | "resume-identity-low-precision"
   | "guard-deadline";
 
 export type ResumeDecision =
-  | { kind: "resume"; reason: ResumeReason; reapedPid?: number; lowPrecision?: boolean }
+  | { kind: "resume"; reason: ResumeReason; reapedPid?: number }
   | { kind: "rotate"; reason: RotateReason };
 
 class RotateSignal extends Error {
@@ -708,9 +721,6 @@ export async function decideResume(a: {
 
     // A previous boot's process: our orphan. Signal only after revalidating, each time.
     let gone = false;
-    // Second-precise identity (either side) authorises nothing by itself: the uid and argv
-    // revalidation below is what stands between a same-second pid reuse and a signal.
-    let lowPrecision = false;
     for (const signal of ["SIGTERM", "SIGKILL"] as const) {
       const now = await read();
       if (departed(now, owned)) {
@@ -718,9 +728,15 @@ export async function decideResume(a: {
         break;
       }
       const live = now as ProcessInfo;
-      lowPrecision ||=
+      // A signal rests on a microsecond birth identity on BOTH sides (#595 r5). A second-precise
+      // match (macOS without libproc, on the live read or the record) can still be a pid reused in
+      // the same second, and uid + argv cannot tell those apart: rotate, signal nothing. The
+      // second-precise match was good enough to say 'alive, not ours to resume beside', never to kill.
+      if (
         live.lowPrecision === true ||
-        (live.identity.includes("+") && !owned.identity.includes("+"));
+        live.identity.includes("+") !== owned.identity.includes("+")
+      )
+        throw new RotateSignal("resume-identity-low-precision");
       if (live.uid !== uid) throw new RotateSignal("owner-uid-mismatch");
       if (!namesOwnedClaude(live, owned)) throw new RotateSignal("owner-argv-mismatch");
       try {
@@ -743,7 +759,7 @@ export async function decideResume(a: {
     }
     if (!gone) throw new RotateSignal("orphan-unconfirmed");
     await clearRecord();
-    return { kind: "resume", reason: "orphan-reaped", reapedPid: owned.pid, lowPrecision };
+    return { kind: "resume", reason: "orphan-reaped", reapedPid: owned.pid };
   } catch (err) {
     if (err instanceof RotateSignal) return { kind: "rotate", reason: err.reason };
     if (err instanceof GuardDeadlineError) return { kind: "rotate", reason: "guard-deadline" };

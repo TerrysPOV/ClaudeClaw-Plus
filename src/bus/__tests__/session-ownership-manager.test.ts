@@ -126,6 +126,7 @@ exec sleep 60
       store?: boolean;
       guardMs?: number;
       stageMs?: number;
+      platform?: NodeJS.Platform;
     } = {},
   ): SessionManager {
     mgr = new SessionManager({
@@ -136,6 +137,7 @@ exec sleep 60
       postMortemDir: join(dir, "post-mortem"),
       ownershipStore: over.store === false ? undefined : store,
       processProbe: over.probe,
+      platform: over.platform,
       bootId: BOOT,
       ownershipGuardMs: over.guardMs ?? 4000,
       ownershipTermMs: over.stageMs ?? 2500,
@@ -314,6 +316,30 @@ exec sleep 60
     await manager({ store: false }).spawnAgent(agentConfig(), "cli");
     expect(flagValue(argvOf(1), "--resume")).toBe(SID);
     expect(store.rec.size).toBe(0);
+  }, 30_000);
+
+  it("win32 keeps its pre-#595 behaviour: no record is written, none is read, the spawn succeeds and the session is resumed", async () => {
+    // Fault (site: `ownershipGuardApplies` in `recordSpawnOwnership`, removed): on Windows the POSIX
+    // `ps` read fails and the (now fatal) record failure retires every child. Predicted result: the
+    // spawn rejects with `SpawnUnrecordedError`.
+    writeTranscript(SID);
+    store.readError = new Error("must not be read on win32");
+    let writes = 0;
+    store.write = async () => {
+      writes += 1;
+    };
+    const probe = new FakeProbe();
+    probe.failure = new Error("ps: command not found");
+    const proc = await manager({ probe, platform: "win32" }).spawnAgent(agentConfig(), "cli");
+
+    expect(proc.pid).toBeGreaterThan(0);
+    expect(flagValue(argvOf(1), "--resume")).toBe(SID);
+    expect(persisted).toHaveLength(0);
+    expect(writes).toBe(0);
+    expect(probe.reads).toEqual([]);
+    expect(errored.filter((l) => l.includes("ownership-record-failed"))).toEqual([]);
+    expect(isSessionQuarantined({ sessionId: SID })).toBe(false);
+    expect(mgr?.getAgent("a")?.pid).toBe(proc.pid);
   }, 30_000);
 
   /* ── the record itself ────────────────────────────────────────────── */

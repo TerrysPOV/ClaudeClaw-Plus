@@ -69,12 +69,7 @@ describe("decideResume — what a restart may do (#595 r3)", () => {
 
     const d = await decide();
 
-    expect(d).toEqual({
-      kind: "resume",
-      reason: "orphan-reaped",
-      reapedPid: 900,
-      lowPrecision: false,
-    });
+    expect(d).toEqual({ kind: "resume", reason: "orphan-reaped", reapedPid: 900 });
     expect(events).toEqual([
       "store.read",
       "read:900", // does the process the record names still exist?
@@ -572,29 +567,69 @@ describe("decideResume — identity precision (#595 r4)", () => {
     expect(probe.kills).toEqual([]);
   });
 
-  it("a second-precise read of the recorded process still matches it, and the reap says so", async () => {
+  // #595 r5: a signal rests on a microsecond identity on BOTH sides. A second-precise match can
+  // still be a pid reused in the same second, and uid + argv cannot tell those apart.
+
+  it("a second-precise LIVE read of a process recorded at microsecond precision is not signalled: rotate", async () => {
+    // Fault (site: the low-precision refusal in `decideResume`, removed, the round-4 behaviour that
+    // logged it and signalled anyway): the process is killed. Predicted result: a SIGTERM and a
+    // `resume`, not a `rotate`.
     store.rec.set("a", recordFor({ identity: `${S}+111111` }));
     probe.table.set(900, claudeInfo({ identity: S, lowPrecision: true }));
     probe.onKill = (pid) => probe.table.delete(pid);
-    const d = await decide();
-    expect(d).toEqual({
-      kind: "resume",
-      reason: "orphan-reaped",
-      reapedPid: 900,
-      lowPrecision: true,
-    });
+    expect(await decide()).toEqual({ kind: "rotate", reason: "resume-identity-low-precision" });
+    expect(probe.kills).toEqual([]);
+  });
+
+  it("a second-precise RECORD against a microsecond live read is not signalled either: rotate", async () => {
+    // Fault (site: the `includes("+")` mismatch clause, removed): a record written when libproc was
+    // unavailable is matched on the second alone and its process killed. Predicted result: a SIGTERM.
+    store.rec.set("a", recordFor({ identity: S }));
+    probe.table.set(900, claudeInfo({ identity: `${S}+222222` }));
+    probe.onKill = (pid) => probe.table.delete(pid);
+    expect(await decide()).toEqual({ kind: "rotate", reason: "resume-identity-low-precision" });
+    expect(probe.kills).toEqual([]);
+  });
+
+  it("second precision on both sides is not signalled", async () => {
+    store.rec.set("a", recordFor({ identity: S }));
+    probe.table.set(900, claudeInfo({ identity: S, lowPrecision: true }));
+    probe.onKill = (pid) => probe.table.delete(pid);
+    expect(await decide()).toEqual({ kind: "rotate", reason: "resume-identity-low-precision" });
+    expect(probe.kills).toEqual([]);
+  });
+
+  it("second precision refuses before uid and argv are even weighed", async () => {
+    store.rec.set("a", recordFor({ identity: S }));
+    probe.table.set(900, claudeInfo({ identity: S, lowPrecision: true, uid: UID + 1 }));
+    expect(await decide()).toEqual({ kind: "rotate", reason: "resume-identity-low-precision" });
+    expect(probe.kills).toEqual([]);
+  });
+
+  it("microsecond identity on both sides and matching: the orphan is signalled, as before", async () => {
+    store.rec.set("a", recordFor({ identity: `${S}+111111` }));
+    probe.table.set(900, claudeInfo({ identity: `${S}+111111` }));
+    probe.onKill = (pid) => probe.table.delete(pid);
+    expect(await decide()).toEqual({ kind: "resume", reason: "orphan-reaped", reapedPid: 900 });
     expect(probe.kills.map((k) => k.signal)).toEqual(["SIGTERM"]);
   });
 
-  it("a second-precise match is still gated on uid and argv: a foreign uid is not signalled", async () => {
-    store.rec.set("a", recordFor({ identity: S }));
-    probe.table.set(900, claudeInfo({ identity: S, lowPrecision: true, uid: UID + 1 }));
+  it("a microsecond match is still gated on uid and argv: a foreign uid is not signalled", async () => {
+    store.rec.set("a", recordFor({ identity: `${S}+111111` }));
+    probe.table.set(900, claudeInfo({ identity: `${S}+111111`, uid: UID + 1 }));
     expect(await decide()).toEqual({ kind: "rotate", reason: "owner-uid-mismatch" });
     probe.table.set(
       900,
-      claudeInfo({ identity: S, lowPrecision: true, argv: ["claude", "--resume", "other"] }),
+      claudeInfo({ identity: `${S}+111111`, argv: ["claude", "--resume", "other"] }),
     );
     expect(await decide()).toEqual({ kind: "rotate", reason: "owner-argv-mismatch" });
+    expect(probe.kills).toEqual([]);
+  });
+
+  it("second precision still answers 'reused or gone?': a different second resumes without a signal", async () => {
+    store.rec.set("a", recordFor({ identity: S }));
+    probe.table.set(900, claudeInfo({ identity: "Thu Oct 23 10:00:09 2026", lowPrecision: true }));
+    expect(await decide()).toEqual({ kind: "resume", reason: "pid-reused" });
     expect(probe.kills).toEqual([]);
   });
 });

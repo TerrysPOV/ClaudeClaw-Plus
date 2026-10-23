@@ -56,6 +56,7 @@ import {
   decideResume,
   type OwnershipRecord,
   OwnershipRecordError,
+  ownershipGuardApplies,
   type OwnershipStore,
   type ProcessProbe,
   recordOwnership,
@@ -145,6 +146,8 @@ export interface SessionManagerOptions {
   bootId?: string;
   ownershipGuardMs?: number;
   ownershipTermMs?: number;
+  /** Test seam for the platform the ownership guard keys on (default: `process.platform`). */
+  platform?: NodeJS.Platform;
   /**
    * Optional logger override. Defaults to `console`.
    */
@@ -845,6 +848,14 @@ interface AgentRecord {
    */
   deliverable: boolean;
   /**
+   * Settles with `deliverable` (#595 r5): resolves once the ownership write has settled, rejects when
+   * it failed (the spawn is being failed). `recordingPending()` hands it to the bus, which holds
+   * every prompt for this agent on it, on both transports, rather than reading `getAgent()`'s
+   * undefined as 'unreachable' and sending the prompt over IPC to a claude that is not yet recorded.
+   */
+  recorded: Promise<void>;
+  settleRecorded: { ok: () => void; fail: (err: unknown) => void };
+  /**
    * Live session JSONL tailer (issue #215). Present when `options.bus`
    * is set; feeds `response.turn_end` events so the bus can synthesize a
    * reply the agent forgot to send. Stopped on agent exit / stop().
@@ -1149,8 +1160,8 @@ export class SessionManager {
     // ONLY at the ownership record written when the bus spawned that claude, and signals only a
     // process that record proves ours (previous boot, same start identity). Anything it cannot
     // prove rotates to a fresh id instead (the conversation is lost, nothing is signalled).
-    // win32: the bus PTY is off by default there, and the probe reads POSIX process state.
-    if (resume && this.options.ownershipStore && process.platform !== "win32") {
+    // win32 has no guard and no record (`ownershipGuardApplies`): it keeps its pre-#595 behaviour.
+    if (resume && this.options.ownershipStore && ownershipGuardApplies(this.options.platform)) {
       const decision = await decideResume({
         agentId: agent.id,
         sessionId: agent.session_id,
@@ -1167,7 +1178,7 @@ export class SessionManager {
       }
       if (decision.reason === "orphan-reaped") {
         (this.options.logger ?? console).warn(
-          `[bus-session] agent=${agent.id} reason=resume-orphan-reaped session_id=${agent.session_id} pid=${decision.reapedPid} identity_precision=${decision.lowPrecision ? "low-1s(uid+argv revalidated)" : "high"} — ended a claude this daemon spawned in an earlier boot before resuming its session`,
+          `[bus-session] agent=${agent.id} reason=resume-orphan-reaped session_id=${agent.session_id} pid=${decision.reapedPid} — ended a claude this daemon spawned in an earlier boot before resuming its session`,
         );
       }
     }
@@ -1241,6 +1252,12 @@ export class SessionManager {
     // correctness guard for the detector below, which may resolve inside
     // its own `onExit` call.) Registering after the await used to leave a
     // dead entry in `this.agents` that broke the next `already spawned` guard.
+    let settleRecorded!: AgentRecord["settleRecorded"];
+    const recorded = new Promise<void>((ok, fail) => {
+      settleRecorded = { ok, fail };
+    });
+    // A waiter reads the rejection; with none waiting it must not surface as an unhandled one.
+    recorded.catch(() => {});
     const record: AgentRecord = {
       agent,
       origin,
@@ -1249,6 +1266,8 @@ export class SessionManager {
       mcpConfigCwd,
       spawnedAt: Date.now(),
       deliverable: false,
+      recorded,
+      settleRecorded,
     };
     // #402/#412: number this process's tailer generation and announce it to
     // the bus BEFORE the record goes live — from `agents.set` on, the bus's
@@ -1380,9 +1399,12 @@ export class SessionManager {
         err instanceof OwnershipRecordError ? err : new OwnershipRecordError("write", null, err),
     );
     if (recordFailure) {
+      // Held prompts fail now with their reason code; none is ever delivered to this process.
+      record.settleRecorded.fail(recordFailure);
       await this.failUnrecordedSpawn(agent, record, recordFailure, mcpConfigCwd);
     }
     record.deliverable = true;
+    record.settleRecorded.ok();
     const collision = await collisionVerdict;
     if (collision && retry === 0) {
       const fresh = randomUUID();
@@ -1489,7 +1511,7 @@ export class SessionManager {
 
   /**
    * Write the ownership record for a just-spawned process (#595 r3). Resolves null when there is
-   * nothing to record (no store, tmux, the process already gone); REJECTS with `OwnershipRecordError`
+   * nothing to record (no store, tmux, win32, the process already gone); REJECTS with `OwnershipRecordError`
    * when the process is alive and could not be recorded (#595 r4), which fails the spawn. tmux is not
    * recorded: the pid is a client that exits at once while the claude lives on in the tmux server.
    */
@@ -1499,7 +1521,13 @@ export class SessionManager {
     proc: AgentProcess,
   ): Promise<OwnershipRecord | null> {
     const store = this.options.ownershipStore;
-    if (!store || mode === "tmux" || !(proc.pid > 0)) return Promise.resolve(null);
+    if (
+      !store ||
+      mode === "tmux" ||
+      !(proc.pid > 0) ||
+      !ownershipGuardApplies(this.options.platform)
+    )
+      return Promise.resolve(null);
     return recordOwnership({
       store,
       probe: this.options.processProbe ?? createSystemProbe(),
@@ -1929,6 +1957,16 @@ export class SessionManager {
   getAgent(agent_id: string): AgentProcess | undefined {
     const record = this.agents.get(agent_id);
     return record?.deliverable === false ? undefined : record?.proc;
+  }
+
+  /**
+   * Non-null while `agent_id`'s claude is spawned but its ownership record is not yet written
+   * (#595 r5): a state of its own, distinct from 'no such agent'. The promise resolves when the
+   * agent becomes deliverable and rejects if it could not be recorded. The bus holds prompts on it.
+   */
+  recordingPending(agent_id: string): Promise<void> | null {
+    const record = this.agents.get(agent_id);
+    return record && !record.deliverable ? record.recorded : null;
   }
 
   /** Test helper: list spawned agent_ids. Not part of the public spec. */

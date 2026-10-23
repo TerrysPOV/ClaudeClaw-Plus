@@ -418,6 +418,9 @@ export async function mountBusRuntime(
     // `prompt` frame; a `process` / `tmux` agent (its PTY write only rejects)
     // keeps the frame as its delivery.
     bus.setPtyReachableHandler?.(canStreamToAgent((agentId) => sessionManager.getAgent(agentId)));
+    // #595 r5: an agent whose claude is not yet recorded as ours is neither reachable nor
+    // unreachable: its prompts wait for the record, on both transports.
+    bus.setRecordingPendingHandler?.((agentId) => sessionManager.recordingPending(agentId));
 
     // #222 reconciliation: when an IPC send fails because the agent's MCP
     // registration is gone but its process is still alive (the recurring
@@ -739,6 +742,7 @@ export async function mountBusRuntime(
           bus.setSlashCommandHandler(null);
           bus.setStreamPromptHandler(null);
           bus.setPtyReachableHandler?.(null);
+          bus.setRecordingPendingHandler?.(null);
           bus.setMcpSendFailedHandler(null);
         } catch (err) {
           logger.error("[bus-runtime] setSlashCommandHandler(null) failed", err);
@@ -771,6 +775,7 @@ export async function mountBusRuntime(
         bus.setSlashCommandHandler(null);
         bus.setStreamPromptHandler(null);
         bus.setPtyReachableHandler?.(null);
+        bus.setRecordingPendingHandler?.(null);
         bus.setMcpSendFailedHandler(null);
       } catch {
         /* ignore — surfacing the original error matters more. */
