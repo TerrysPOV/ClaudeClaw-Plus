@@ -52,6 +52,7 @@ export function wireSlashCommands(bus: BusCore, sm: SessionManager): void {
     // relay: typing it moves the CLI to a transcript whose id the daemon never learns (and
     // `send_slash` can resolve without clearing anything in `process` mode). It resolves only once
     // the restart has happened, and rejects, quarantined, when the old claude cannot be retired.
+    // Where the ownership guard does not apply (win32) `clearSession` relays it as before #595.
     if (bareCmd.trim() === "clear") {
       await sm.clearSession(agent_id);
       return;

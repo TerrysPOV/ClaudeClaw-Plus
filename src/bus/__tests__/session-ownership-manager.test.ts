@@ -738,6 +738,47 @@ wait $p
     T,
   );
 
+  it(
+    "win32 keeps its pre-#595 /clear: relayed as a slash command, nothing quarantined, no ps probe, id unchanged",
+    async () => {
+      // Fault (site: the `ownershipGuardApplies` branch of `clearSession`, removed): on Windows the
+      // restart cannot be confirmed (no record, no POSIX `ps`), so every clear quarantines the
+      // session. Predicted result: `clear` rejects with "not confirmed gone" and nothing is relayed.
+      writeTranscript(SID);
+      const probe = new FakeProbe();
+      probe.failure = new Error("ps: command not found");
+      const m = manager({ probe, platform: "win32" });
+      const clear = wired(m);
+      const agent = agentConfig();
+      const proc = await m.spawnAgent(agent, "cli");
+      await started(proc.pid);
+      const relayed: string[] = [];
+      (m.getAgent("a") as { send_slash: (cmd: string) => Promise<void> }).send_slash = async (
+        cmd,
+      ) => {
+        relayed.push(cmd);
+      };
+
+      await clear("a", "/clear");
+
+      expect(relayed).toEqual(["clear"]);
+      expect(persisted).toHaveLength(0);
+      expect(agent.session_id).toBe(SID);
+      expect(probe.reads).toEqual([]);
+      expect(probe.kills).toEqual([]);
+      // The same process is still the live one: nothing was retired or restarted.
+      expect(m.getAgent("a")?.pid).toBe(proc.pid);
+      expect(isSessionQuarantined({ sessionId: SID })).toBe(false);
+      expect(errored.filter((l) => l.includes("reason=clear-retire-unconfirmed"))).toEqual([]);
+    },
+    T,
+  );
+
+  it("win32 /clear of an agent that is not running rejects instead of reporting success", async () => {
+    const m = manager({ platform: "win32" });
+    await expect(m.clearSession("a")).rejects.toThrow("no active agent");
+  });
+
   it("/clear of an agent that is not running rejects instead of reporting success", async () => {
     const m = manager();
     await expect(m.clearSession("a")).rejects.toThrow("no active agent");

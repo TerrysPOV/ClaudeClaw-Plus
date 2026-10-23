@@ -977,8 +977,14 @@ export class SessionManager {
    * if it cannot be, the session is quarantined, the stored id is left alone, and this rejects. It
    * never reports a clear that did not happen. Not available under tmux, where the daemon does not
    * own the claude.
+   *
+   * Where the ownership guard does not apply (win32, `ownershipGuardApplies`) nothing can prove the
+   * old process gone (no record, and the POSIX `ps` it would be confirmed with does not exist), so a
+   * restart would quarantine every clear. There `/clear` keeps its pre-#595 behaviour: it is relayed
+   * to the agent as a slash command.
    */
   clearSession(agent_id: string): Promise<void> {
+    if (!ownershipGuardApplies(this.options.platform)) return this.relayClear(agent_id);
     const inflight = this.clearInFlight.get(agent_id);
     if (inflight) return inflight;
     const p = this.enqueueLifecycle(agent_id, () => this.clearSessionInternal(agent_id)).finally(
@@ -988,6 +994,13 @@ export class SessionManager {
     );
     this.clearInFlight.set(agent_id, p);
     return p;
+  }
+
+  /** The pre-#595 `/clear`: typed into the agent's CLI; no restart, no new id, no exit confirmation. */
+  private async relayClear(agent_id: string): Promise<void> {
+    const record = this.agents.get(agent_id);
+    if (!record) throw new Error(`clear: no active agent for id=${agent_id}`);
+    await record.proc.send_slash("clear");
   }
 
   /**
