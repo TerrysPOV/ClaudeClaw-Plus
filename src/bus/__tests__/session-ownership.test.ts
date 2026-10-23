@@ -6,7 +6,17 @@
  * readers against a fake `/proc` tree and a fake `ps` executable.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -18,6 +28,7 @@ import {
   libprocStartTime,
   namesOwnedClaude,
   PROC_BSDINFO_SIZE,
+  PS_PATH,
   type ProcessInfo,
   readFromPs,
   sameStart,
@@ -678,5 +689,98 @@ describe("decideResume — identity precision (#595 r4)", () => {
     probe.table.set(900, claudeInfo({ identity: "Thu Oct 23 10:00:09 2026", lowPrecision: true }));
     expect(await decide()).toEqual({ kind: "resume", reason: "pid-reused" });
     expect(probe.kills).toEqual([]);
+  });
+});
+
+describe("ownership store hardening (#595 r7c)", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "ccaw-owner-r7c-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  const plant = (agent: string, body: unknown): void => {
+    mkdirSync(join(dir, agent), { recursive: true });
+    writeFileSync(join(dir, agent, "owner.json"), JSON.stringify(body));
+  };
+
+  it("the temp file is exclusive: a symlink already at the temp path is not written through", async () => {
+    // Fault (site: `flag: "wx"` in `write`, removed): writeFile follows the planted symlink and
+    // overwrites the victim. Predicted result: the victim holds the record and `write` resolves.
+    const victim = join(dir, "victim.txt");
+    writeFileSync(victim, "untouched");
+    mkdirSync(join(dir, "a"), { recursive: true });
+    symlinkSync(victim, join(dir, "a", "owner.json.fixed.tmp"));
+    const store = createFileOwnershipStore(
+      () => dir,
+      () => "fixed",
+    );
+    await expect(store.write(recordFor())).rejects.toThrow();
+    expect(readFileSync(victim, "utf8")).toBe("untouched");
+    expect(existsSync(join(dir, "a", "owner.json"))).toBe(false);
+  });
+
+  it("the temp name is not predictable: a symlink at the old pid-named path is never used", async () => {
+    // Fault (site: the temp name reverted to `owner.json.<pid>.tmp`): the write goes through the
+    // symlink planted at that name. Predicted result: the victim is overwritten.
+    const victim = join(dir, "victim.txt");
+    writeFileSync(victim, "untouched");
+    mkdirSync(join(dir, "a"), { recursive: true });
+    symlinkSync(victim, join(dir, "a", `owner.json.${process.pid}.tmp`));
+    const store = createFileOwnershipStore(() => dir);
+    await store.write(recordFor());
+    expect(readFileSync(victim, "utf8")).toBe("untouched");
+    expect((await store.read("a"))?.pid).toBe(900);
+  });
+
+  it("a record under one agent's directory that names another agent is unreadable and leaves theirs alone", async () => {
+    // Fault (site: the agentId compare in `load`, removed): b's guard reads a's record and may
+    // signal its process. Predicted result: `decideResume` for b does not rotate.
+    const store = createFileOwnershipStore(() => dir);
+    await store.write(recordFor({ agentId: "a", pid: 900 }));
+    plant("b", recordFor({ agentId: "a", pid: 900 }));
+    await expect(store.read("b")).rejects.toThrow();
+    const d = await decideResume({
+      agentId: "b",
+      sessionId: SID,
+      store,
+      probe: new FakeProbe(),
+      ...FAST,
+    });
+    expect(d).toEqual({ kind: "rotate", reason: "ownership-record-unreadable" });
+    expect((await store.read("a"))?.pid).toBe(900);
+  });
+
+  it("a pid that is 1, this daemon, or beyond pid_max is not a record", async () => {
+    // Fault (site: the pid bounds in `isRecord`, back to `pid > 0`): each is read back as a record
+    // a restart could aim a signal at. Predicted result: the reads resolve.
+    const store = createFileOwnershipStore(() => dir);
+    for (const pid of [1, process.pid, 2 ** 31, 4194305]) {
+      plant("a", recordFor({ pid }));
+      await expect(store.read("a")).rejects.toThrow();
+    }
+    for (const pid of [2, 4194304]) {
+      plant("a", recordFor({ pid }));
+      expect((await store.read("a"))?.pid).toBe(pid);
+    }
+  });
+
+  it("ps is run by absolute path: a poisoned PATH entry named ps is not used", async () => {
+    // Fault (site: the `psCommand` default, back to "ps"): the stand-in on PATH runs and its
+    // garbage fails the parse. Predicted result: readFromPs rejects.
+    expect(PS_PATH).toBe("/bin/ps");
+    const bin = join(dir, "bin");
+    mkdirSync(bin);
+    const poison = join(bin, "ps");
+    writeFileSync(poison, "#!/bin/sh\necho garbage\n");
+    chmodSync(poison, 0o755);
+    const saved = process.env.PATH;
+    process.env.PATH = `${bin}:${saved ?? ""}`;
+    try {
+      const info = await readFromPs(process.pid, LOADED, undefined, () => null);
+      expect(info?.pid).toBe(process.pid);
+    } finally {
+      process.env.PATH = saved;
+    }
   });
 });

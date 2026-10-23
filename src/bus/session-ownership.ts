@@ -81,6 +81,9 @@ export interface OwnershipStore {
   clear(agentId: string, expect: { pid: number; identity: string }): Promise<void>;
 }
 
+/** Linux `pid_max` ceiling (0x400000): no live process has a larger pid. */
+const MAX_PID = 4194304;
+
 const isRecord = (v: unknown): v is OwnershipRecord => {
   if (!v || typeof v !== "object") return false;
   const r = v as Record<string, unknown>;
@@ -89,7 +92,11 @@ const isRecord = (v: unknown): v is OwnershipRecord => {
     typeof r.sessionId === "string" &&
     typeof r.pid === "number" &&
     Number.isSafeInteger(r.pid) &&
-    r.pid > 0 &&
+    // Never pid 0/1 (a signal to them is a group / init), beyond Linux's pid_max ceiling (0x400000),
+    // or the daemon itself: a planted record must not aim a signal at any of those (#595 r7c).
+    r.pid > 1 &&
+    r.pid <= MAX_PID &&
+    r.pid !== process.pid &&
     typeof r.identity === "string" &&
     typeof r.bootId === "string" &&
     typeof r.exe === "string" &&
@@ -101,7 +108,11 @@ const isRecord = (v: unknown): v is OwnershipRecord => {
  * The daemon's own state, next to the agent's `session.json`: `<agents>/<id>/owner.json`, mode 0600,
  * written atomically (temp file + rename). Operations on one agent are serialised.
  */
-export function createFileOwnershipStore(agentsDir: () => string = getAgentsDir): OwnershipStore {
+export function createFileOwnershipStore(
+  agentsDir: () => string = getAgentsDir,
+  /** TEST SEAM: the temp-file name suffix. Production uses a fresh random one per write. */
+  tmpSuffix: () => string = randomUUID,
+): OwnershipStore {
   const chains = new Map<string, Promise<unknown>>();
   const serial = <T>(agentId: string, run: () => Promise<T>): Promise<T> => {
     const next = (chains.get(agentId) ?? Promise.resolve()).then(run, run);
@@ -127,6 +138,9 @@ export function createFileOwnershipStore(agentsDir: () => string = getAgentsDir)
     }
     const parsed: unknown = JSON.parse(raw);
     if (!isRecord(parsed)) throw new Error("ownership record: unrecognised shape");
+    // A record under this agent's directory that names another agent is not this agent's: treat it as
+    // unreadable (the guard rotates) and never let `clear` act on it (#595 r7c).
+    if (parsed.agentId !== agentId) throw new Error("ownership record: names another agent");
     return parsed;
   };
   return {
@@ -135,9 +149,17 @@ export function createFileOwnershipStore(agentsDir: () => string = getAgentsDir)
       serial(record.agentId, async () => {
         const file = pathFor(record.agentId);
         await mkdir(dirname(file), { recursive: true });
-        const tmp = `${file}.${process.pid}.tmp`;
-        await writeFile(tmp, `${JSON.stringify(record)}\n`, { mode: 0o600 });
-        await rename(tmp, file);
+        // Unpredictable name, created exclusively ("wx": O_EXCL fails on anything already there, a
+        // planted symlink included, and never follows one). A failed create fails the record write,
+        // which already ends the spawn (#595 r4) (#595 r7c).
+        const tmp = `${file}.${tmpSuffix()}.tmp`;
+        try {
+          await writeFile(tmp, `${JSON.stringify(record)}\n`, { mode: 0o600, flag: "wx" });
+          await rename(tmp, file);
+        } catch (err) {
+          await rm(tmp, { force: true }).catch(() => {});
+          throw err;
+        }
       }),
     clear: (agentId, expect) =>
       serial(agentId, async () => {
@@ -352,6 +374,9 @@ export function sameStart(a: string, b: string): boolean {
   return sa === sb && (ua === undefined || ub === undefined);
 }
 
+/** Absolute, so a `ps` earlier on a poisoned PATH is never run (#595 r7c). macOS and Linux both ship `/bin/ps`. */
+export const PS_PATH = "/bin/ps";
+
 /**
  * One targeted `ps` for ONE pid (never a table scan). The subprocess is killed at `timeoutMs`.
  * `ps` exits 1 with no output when the pid does not exist; any other failure rejects. `startTime`
@@ -360,7 +385,7 @@ export function sameStart(a: string, b: string): boolean {
 export function readFromPs(
   pid: number,
   timeoutMs: number,
-  psCommand = "ps",
+  psCommand = PS_PATH,
   startTime: (pid: number) => StartTime | null = libprocStartTime,
 ): Promise<ProcessInfo | null> {
   return new Promise((resolve, reject) => {
