@@ -702,20 +702,30 @@ describe("PtyProcess — Bypass Permissions boot dialog (issue #460)", () => {
 // "reject all" in the multi-select, and never exits. The fake CLI reads one
 // raw byte: anything but Esc exits 1, so the key has to come from settle. It
 // discards input received in its first 150 ms, as claude 2.1.300 does with
-// keys sent while the dialog paints.
+// keys sent while the dialog paints. The 150 ms run from the paint, read off
+// the clock: a window that ends whenever the next command gets to run grows
+// with the runner's load, and on a loaded CI runner it swallowed the Esc
+// settle sends 500 ms after the paint (#584). A byte counts from when it is
+// read, not when it arrived, so a loaded runner can let an early key through:
+// the window errs towards a missed early key, never towards a dropped answer.
 // Echo stays off until the next screen paints: a prompt typed too early
 // must not come back as the reply.
 
-function fakeMcpDialogCli(dialog: string, prompt: string, gapAfterAnswer = ""): string {
+function fakeMcpDialogCli(
+  dialog: string,
+  prompt: string,
+  gapAfterAnswer = "",
+  beforeRead = "",
+): string {
   return [
+    // perl, not `date +%s%N`: macOS's date has no %N.
+    "now() { perl -MTime::HiRes=time -e 'printf q(%d), time * 1000'; }",
+    "t0=$(now)",
     `printf '${dialog}'`,
     "stty raw -echo",
+    beforeRead,
     // Like the real CLI, drop what arrives while the dialog is painting.
-    "sleep 0.15",
-    "stty min 0 time 0",
-    "dd bs=4096 count=1 >/dev/null 2>&1",
-    "stty min 1",
-    "key=$(dd bs=1 count=1 2>/dev/null)",
+    "while :; do key=$(dd bs=1 count=1 2>/dev/null); [ $(($(now) - t0)) -lt 150 ] || break; done",
     "stty sane -echo",
     '[ "$key" = "$(printf "\\033")" ] || exit 1',
     gapAfterAnswer,
@@ -760,6 +770,26 @@ describe("PtyProcess — project MCP server approval dialog (issue #469)", () =>
       await proc.dispose();
     });
   }
+
+  test("a CLI slow to reach its key read still takes the Esc sent after the paint (#584)", async () => {
+    // A loaded runner can take longer than the 500ms answer delay to get from
+    // the paint to the read. The Esc is waiting by then and is the answer: a
+    // dropped Esc left the dialog up, and the ESC opening the first prompt's
+    // paste answered it instead, so the rest of the prompt was never read.
+    const proc = await spawnPty(
+      baseOpts({
+        _commandOverride: "/bin/sh",
+        _argsOverride: ["-c", fakeMcpDialogCli(MCP_DIALOG_SINGLE, "slow-read", "", "sleep 0.7")],
+        _skipReadySettle: false,
+        quietWindowMs: 200,
+        sentinelMaxWaitMs: 5000,
+      }),
+    );
+    const result = await proc.runTurn("slow-read", { timeoutMs: 5000 });
+    expect(proc.isAlive()).toBe(true);
+    expect(result.text).toContain("slow-read");
+    await proc.dispose();
+  }, 15_000);
 
   test("after rejecting, settle waits for the next screen instead of the next quiet gap", async () => {
     // The bypass dialog paints 600ms after the Esc — three quiet windows
