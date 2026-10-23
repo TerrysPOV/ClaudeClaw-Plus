@@ -781,7 +781,7 @@ Not resubmitted through `sendPrompt`: the queued prompt keeps its id and its slo
 
 `failQueuedUnrecorded` fails the whole queue, not just the head: the record is per agent, so every queued prompt has the same fate, and leaving them would just re-run the wait for each.
 
-## Tests (`prompt-before-record.test.ts`, 9 new, 16 total)
+## Tests (`prompt-before-record.test.ts`, 8 new, 16 total)
 
 Real `BusCore` on a real Unix socket with a real MCP hello, as in Codex's probe (the existing helper `connectAgent` already does this, so no fakes beyond the manual pending promise). Absence of a frame is proven with a **barrier**, not a sleep: after the action the test makes the bus write an `ask_answer` frame to the same socket and waits for it; frames arrive in order, so every earlier frame has arrived. No fixed sleeps, no wall-clock race; the only wait is `until(cond)` (90 s, throws on a miss).
 
@@ -807,7 +807,7 @@ Each test's predicted result was written before the injection (see the `Fault (s
 
 ## Gates
 
-- Ownership + prompt-before-record + resume files (`session-ownership`, `session-ownership-manager`, `prompt-before-record`, `session-resume`), **5 runs in a row: 5 of 5 exit 0, 103 pass / 0 fail / 394 expect() calls each** (r5 was 95 pass; +9 new tests, +1 elsewhere counted from this file set).
+- Ownership + prompt-before-record + resume files (`session-ownership`, `session-ownership-manager`, `prompt-before-record`, `session-resume`), **5 runs in a row: 5 of 5 exit 0, 103 pass / 0 fail / 394 expect() calls each** (Codex's r5 run of the same four files was 95 pass; +8 new tests).
 - `env -u ANTHROPIC_BASE_URL bun test src > /tmp/595r6-src.txt 2>&1`: **exit 0, 5121 pass, 5 skip, 0 fail** (5126 tests, 275 files, 449.76 s). The three known flaky files (tuner host-telemetry-provider, skills-fitness, bus inject-turn-net) passed on this run.
 - `bun run lint`: exit 0. `bun run typecheck`: **149 errors, baseline 149**.
 - Version: `plugin.json` 2.2.355, unchanged.
