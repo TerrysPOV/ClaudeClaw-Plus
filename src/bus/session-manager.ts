@@ -49,6 +49,7 @@ import { encodeCwdForProjectsDir } from "./jsonl-line-types";
 import { JsonlTailer } from "./jsonl-tailer";
 import { BUS_MCP_TOOLS } from "./mcp-tools";
 import { confirmTurnReceipt } from "./receipt-wiring";
+import { type ProcessProbe, reapSessionSurvivors } from "./session-survivor";
 import { capturePostMortem, type PostMortemOptions } from "./post-mortem";
 import type { ReceiptRecord } from "./receipt";
 import { assertSessionSpawnable, assertSessionWritable } from "../runner/pty-quarantine";
@@ -116,6 +117,13 @@ export interface SessionManagerOptions {
    * in tests to capture rotation without writing to disk.
    */
   persistRotatedSessionId?: (agentId: string, sessionId: string) => Promise<void>;
+  /**
+   * Test seams for the survivor guard (#595 round 2): the process table and signals it uses, and
+   * the SIGTERM / SIGKILL confirmation bounds in ms (defaults: 3000 / 2000).
+   */
+  processProbe?: ProcessProbe;
+  survivorTermMs?: number;
+  survivorKillMs?: number;
   /**
    * Optional logger override. Defaults to `console`.
    */
@@ -837,6 +845,43 @@ export class SessionManager {
   }
 
   /**
+   * Mint a fresh session id for `agent`, persist it, and adopt it on the live config. Used where
+   * a stored session cannot be resumed safely (#595 r2). `reason` is a fixed code: nothing the
+   * child printed is copied into the log line.
+   */
+  private async rotateStoredSession(agent: AgentConfig, reason: string): Promise<void> {
+    const fresh = randomUUID();
+    (this.options.logger ?? console).warn(
+      `[bus-session] agent=${agent.id} reason=${reason} session_id=${agent.session_id} — rotating to ${fresh} (the conversation of the old session is not carried over)`,
+    );
+    const persist =
+      this.options.persistRotatedSessionId ??
+      ((agentId: string, sessionId: string) => createSession(sessionId, agentId));
+    await persist(agent.id, fresh);
+    agent.session_id = fresh;
+  }
+
+  /**
+   * `/clear` was relayed to this agent's claude (#595 r2). The CLI now writes to a NEW transcript
+   * whose id this process never learns (the tailer stays on the old file), so the stored id names
+   * the pre-clear conversation and a restart would resume it. Store a fresh id instead: no
+   * transcript exists for it, so the next spawn creates a clean session, which is what the
+   * operator asked for. A persist failure is logged and leaves the old id (the pre-fix behaviour).
+   */
+  async noteSessionCleared(agent_id: string): Promise<void> {
+    const record = this.agents.get(agent_id);
+    if (!record) return;
+    try {
+      await this.rotateStoredSession(record.agent, "session-cleared");
+    } catch (err) {
+      (this.options.logger ?? console).warn(
+        `[bus-session] agent=${agent_id} reason=session-cleared-persist-failed`,
+        err,
+      );
+    }
+  }
+
+  /**
    * Internal spawn that supports a single session-id rotation retry.
    *
    * If claude rejects the supplied `--session-id` with "Session ID X is
@@ -879,6 +924,30 @@ export class SessionManager {
         env,
         projectsDir: this.options.projectsDir,
       });
+    // #595 r2: the CLI takes no lock on `--resume`, so a claude that outlived its daemon would
+    // append to the same transcript as the one about to be resumed. End it and prove it gone;
+    // if that cannot be proved, do not resume: rotate to a fresh id (the conversation is lost).
+    // win32: the bus PTY is off by default there, and the table read is POSIX `ps`.
+    if (resume && process.platform !== "win32") {
+      const survivors = await reapSessionSurvivors(agent.session_id, {
+        probe: this.options.processProbe,
+        termMs: this.options.survivorTermMs,
+        killMs: this.options.survivorKillMs,
+      });
+      if (survivors.kind === "reaped") {
+        (this.options.logger ?? console).warn(
+          `[bus-session] agent=${agent.id} reason=resume-survivor-reaped session_id=${agent.session_id} pids=${survivors.pids.join(",")} — ended a claude still holding the session before resuming it`,
+        );
+      } else if (survivors.kind === "unconfirmed" || survivors.kind === "table-unreadable") {
+        await this.rotateStoredSession(
+          agent,
+          survivors.kind === "unconfirmed"
+            ? "resume-survivor-unconfirmed"
+            : "resume-process-table-unreadable",
+        );
+        return this.spawnAgentInternal(agent, origin, retry);
+      }
+    }
     const args = this.options.argsOverride ?? buildClaudeArgs(agent, mode, { resume });
 
     // Issue #165: synthesize the multiplexer `--mcp-config` for this agent

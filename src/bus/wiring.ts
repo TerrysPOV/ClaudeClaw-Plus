@@ -49,5 +49,7 @@ export function wireSlashCommands(bus: BusCore, sm: SessionManager): void {
     // `send_slash` expects.
     const bareCmd = cmd.startsWith("/") ? cmd.slice(1) : cmd;
     await agentProcess.send_slash(bareCmd);
+    // #595 r2: `/clear` moves the CLI to a new transcript; the stored id must not keep naming the old one.
+    if (bareCmd.trim() === "clear") await sm.noteSessionCleared(agent_id);
   });
 }

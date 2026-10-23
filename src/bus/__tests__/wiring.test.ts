@@ -60,12 +60,17 @@ class FakeAgentProcess implements AgentProcess {
 }
 
 /**
- * Minimal SessionManager stand-in exposing only `getAgent`. We don't
- * extend `SessionManager` because that would drag in spawn lifecycle —
- * the wiring contract only depends on `getAgent`.
+ * Minimal SessionManager stand-in exposing only `getAgent` (and `noteSessionCleared`, #595 r2).
+ * We don't extend `SessionManager` because that would drag in spawn lifecycle —
+ * the wiring contract only depends on those two.
  */
 class FakeSessionManager {
   private readonly registry = new Map<string, FakeAgentProcess>();
+  readonly cleared: string[] = [];
+
+  async noteSessionCleared(agent_id: string): Promise<void> {
+    this.cleared.push(agent_id);
+  }
 
   register(p: FakeAgentProcess): void {
     this.registry.set(p.agent_id, p);
