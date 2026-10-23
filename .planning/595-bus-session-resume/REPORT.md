@@ -259,3 +259,247 @@ I7  expect(...).toEqual({ kind: "table-unreadable" })            (fail) ... unre
 - A survivor owned by a different uid is not touched (and so cannot be confirmed): the resume then goes ahead. The daemon and its agents run as one user.
 - No live end-to-end run with the real CLI (authentication is out of scope for this task). The real `ps` read, real signals and the real confirmation are exercised against a real process in the first manager test.
 - 2.1.220 refuses `--resume` for a session held by a live non-interactive claude with a message our resume-refusal detector does not recognise (see Check 3). Fix 1 removes the survivor first, so the case should not arise; if one slips past, that spawn exits without rotating. Not changed here.
+
+
+---
+
+# Round 3
+
+Branch `fix/595-bus-session-resume`, on top of `3fffb9f8`. Code + tests in `7949c109`; this report in the commit after it. Nothing is pushed to `feat/550-pty-default`. The #562 round-9 fence, quarantine and synchronous spawn-check design is unchanged: `assertSessionWritable` and the three `assertSessionSpawnable` calls are in the same places in the same order (`session-manager.ts`, `:1116` and the three spawn sites).
+
+Codex's round-2 review (2 HIGH, 3 MEDIUM, 1 LOW) was Not clean. Coordinator ruling: **the daemon kills only a process it can prove it spawned.** A session id is not permission to kill. `session-survivor.ts` (the process-table search) and its test file are deleted; nothing replaces the search.
+
+## The ownership model
+
+New module `src/bus/session-ownership.ts`.
+
+**At spawn.** `spawnAgentInternal` calls `recordSpawnOwnership` right after the process is registered (`session-manager.ts:1166`). It reads the process's start identity and writes `<agents>/<id>/owner.json` (mode 0600, temp file + rename, serialised per agent): agent id, session id, pid, start identity, **daemon boot id**, executable basename, spawn time. The boot id is `DAEMON_BOOT_ID`, a `randomUUID()` minted once per daemon start. A failed write is logged (`reason=ownership-record-failed`) and never fails the spawn. tmux is not recorded: its pid is a client that exits at once.
+
+**At exit.** The record is cleared only after the OS confirms the process gone (`confirmGoneAndClear`, polling the probe), not on bun-pty's exit event. `clear` compares pid and identity first, so a late exit of an old process cannot delete a newer spawn's record. A process still alive or unreadable keeps its record, so the next start examines it.
+
+**At restart, before resuming** (`decideResume`, only when the transcript exists, the store is wired and the platform is not win32). It reads only the record for that agent:
+
+| Record | Process | Action |
+|---|---|---|
+| none | - | resume (`no-record`) |
+| for another session id | - | resume (`record-other-session`) |
+| any | gone, a zombie, or alive with a **different** start identity | no signal, drop the record, resume (`owner-gone` / `pid-reused`) |
+| this boot | alive, same identity | **never signalled**, rotate (`current-boot-owner-alive`) |
+| previous boot | alive, same identity | our orphan: revalidate, SIGTERM, revalidate, SIGKILL if needed, confirm gone, then resume (`orphan-reaped`) |
+| unreadable / corrupt | - | rotate (`ownership-record-unreadable`) |
+| any | read fails | rotate (`owner-read-failed`) |
+| previous boot | uid differs / argv no longer names our claude + the id | no signal, rotate (`owner-uid-mismatch` / `owner-argv-mismatch`) |
+| previous boot | still there after SIGTERM and SIGKILL | rotate (`orphan-unconfirmed`) |
+| any | deadline passes | rotate (`guard-deadline`) |
+
+"Revalidate" means a fresh single-pid read immediately before **each** signal: same start identity, same uid, and the argv still names the executable recorded at spawn and the session id.
+
+**An unrecorded claude that names the id is never looked for and never signalled** (operator's interactive session, another tool). I took the optional detection out rather than keep a `ps args` parse that can be fooled (Codex HIGH 2). The cost: if such a process exists, the daemon resumes beside it, as it did before round 2. See residuals.
+
+**argv.** On Linux the probe reads `/proc/<pid>/cmdline`, so argument boundaries are real and `claude --print "explain --resume <id>"` is ONE argument and cannot match. On macOS `ps` prints flat text and the boundaries are guessed from spaces; there the argv check is only a confirming check on a process the record and start identity already prove ours, never what makes it ours. The program must be the recorded executable's basename (or an interpreter running a script of that name), not "anything containing `claude`".
+
+## Identity precision per platform
+
+| Platform | Source | Precision |
+|---|---|---|
+| Linux | `/proc/stat` `btime` + `/proc/<pid>/stat` field 22 (start time in clock ticks) | 10 ms on a normal kernel (`CONFIG_HZ=100`), boot-qualified |
+| macOS | `ps -ww -o stat=,uid=,lstart=,command= -p <pid>` | **1 s** (`lstart` has second resolution; `etime` has no better) |
+
+I found no higher-resolution source on macOS without a native read (`proc_pidinfo`), and the brief forbids a native dependency; nothing in the repo reads it. Because second precision alone cannot distinguish a pid reused within the same second, the macOS path leans on the extra checks the ruling asked for: the record (a pid with no record is never touched), the previous-boot rule (a current-boot process is never signalled, so a reuse can only matter for a process of a dead daemon), the uid check, and the argv check, all repeated immediately before each signal. The Linux identity is read with plain file reads, no subprocess.
+
+## The deadline
+
+**`GUARD_DEADLINE_MS = 5000`** for the whole guard: the record read, every process read, both signals and both confirmations share one deadline, checked **including subprocess time** (`withDeadline` wraps every await; Codex's finding was that each `ps` was awaited before the deadline was looked at). On expiry the session rotates (`guard-deadline`) and nothing more is signalled.
+
+Inside it: each `ps` is killed by `execFile`'s own `timeout` at `PROBE_TIMEOUT_MS = 1500` (capped by what is left of the deadline); SIGTERM gets `ORPHAN_TERM_MS = 3000`, then `ORPHAN_KILL_MS = 2000`, each capped by the deadline. **Worst case: 5.0 s plus timer slack, at most one probe overrun under 1.5 s, so ≤ 6.5 s hard ceiling and in practice ≤ 5.1 s; the brief's ≤ 6 s holds for the guard itself** (the unit test pins the constants; the stalled-read tests measure 300 ms deadlines returning in < 900 ms). The `/clear` retirement has its own bound, below.
+
+## `/clear` is a controlled restart
+
+`wiring.ts:55`: a relayed `/clear` calls `SessionManager.clearSession(agentId)` and **returns**; it no longer calls `send_slash` at all, so the `process`-mode case where `send_slash` resolves without clearing cannot report success. Everything else is relayed as before.
+
+`clearSession` (`session-manager.ts:908`, joined if one is already running):
+
+1. `fenceKey("bus:<id>", record, () => oldId)` as the first synchronous step: the #562 fence, so nothing spawns on the old session while it retires.
+2. `stop()` (`/quit`, then SIGTERM after 2 s), bounded at 8 s.
+3. The OS must confirm the old process gone: `confirmRetired` polls the probe, revalidates, and sends **one SIGKILL to the recorded process** (same identity) if it is still there. With no record it accepts only "pid no longer exists".
+4. **Unconfirmed:** `quarantineSession` (the fence becomes the quarantine record in one step, with a `confirmExit` that re-asks the OS), a logged `reason=clear-retire-unconfirmed`, and the call **rejects**. The stored id is unchanged and nothing is spawned. The existing `assertSessionWritable` gate then refuses the session until the OS confirms, and releases it when it does.
+5. **Confirmed:** mint a fresh id, persist it, set `agent.session_id`, log `reason=session-cleared`, and `spawnAgent` again. The new process starts with `--session-id <fresh>` (no transcript exists for it, so it is a create), so **the stored id equals the live transcript's id**. If persisting fails, the old session is restarted and the call rejects (`clear-persist-failed`): the agent is not left down and success is not reported.
+
+Not available under tmux (the daemon does not own that claude): it rejects. Residual below.
+
+## LOW — each gate gets its own fixture
+
+`session-resume.test.ts`: the old test was satisfied by either gate. Now:
+- **Gate 1** (`assertSessionWritable`): a quarantined writer whose confirmation now succeeds. Only the async gate re-asks the writer, so the spawn succeeds and `confirmCalls === 1`. Without the gate, the unchanged synchronous check still sees the record and the spawn rejects.
+- **Gate 2** (`assertSessionSpawnable`): a **fence** with nothing quarantined. `assertSessionWritable` ignores fences, so only the synchronous check refuses the spawn.
+- A writer that stays unconfirmed is closed by either gate (kept as a third test, no mutation claim).
+
+## Sites changed
+
+| Site | Change |
+|---|---|
+| `src/bus/session-ownership.ts` (new) | ownership record + file store, probes (`/proc`, targeted `ps`), `decideResume`, `confirmGoneAndClear`, `confirmRetired`, `namesOwnedClaude`, deadlines |
+| `src/bus/session-manager.ts:1056` | `decideResume` replaces `reapSessionSurvivors`; `rotate` -> `rotateStoredSession` + re-enter |
+| `session-manager.ts:1166`, `:1375` | `recordSpawnOwnership` at spawn |
+| `session-manager.ts:~1227` | exit handler: `confirmGoneAndClear` |
+| `session-manager.ts:908-1010` | `clearSession` / `clearSessionInternal` (replaces `noteSessionCleared`) |
+| `session-manager.ts` options | `ownershipStore`, `processProbe`, `bootId`, `ownershipGuardMs`, `ownershipTermMs` |
+| `src/bus/wiring.ts:55` | `/clear` -> `clearSession`, no keystroke relay |
+| `src/commands/start.ts:~660` | the daemon wires `createFileOwnershipStore()` |
+| deleted | `src/bus/session-survivor.ts`, `__tests__/session-survivor.test.ts` |
+
+## Tests (new)
+
+`session-ownership.test.ts` (36): decisions (no record; unrecorded claude never touched; previous-boot orphan with the **event order** `read, read, kill SIGTERM, read, clear`; SIGKILL stage; unconfirmed; pid reused; dead; zombie; other-session record; identity changing between the read and the signal; current-boot never signalled; current-boot exited; unreadable record; read failure; other uid; argv mismatch), deadlines (stalled process read, stalled record read, stall after SIGTERM, shipped constants), `namesOwnedClaude` (decoy prompt, id prefix, impostor program, interpreter, flat text), the file store (round trip + 0600, guarded clear, corrupt file, path-shaped agent id), and the real readers (fake `/proc` tree incl. `comm` with `) (`, zombie, this very process, fake `ps`: parse, exit 1, failure, stall).
+
+`session-ownership-manager.test.ts` (16): real orphan processes read by the production probe: reaped before the resume (`orphan.state.1` is `gone`), pid reuse, current-boot, unrecorded claude, unreadable record, stalled read, first boot, no store, record written/cleared, unwritable record, same-boot restart; `/clear`: old process gone before the new spawn (`prev.state.2`), `--session-id <new id>`, stored id equals it; unconfirmed -> rejects, quarantined, id unchanged, no second spawn, lifts once the OS confirms; persist failure restores the old session; not-running rejects; other commands untouched.
+
+`wiring.test.ts` (+3): `/clear` goes to `clearSession` and never to `send_slash`; a failed clear rejects to the caller; other commands relay. `session-resume.test.ts`: the two gate fixtures.
+
+## Fault injections (one site, one `git archive` copy of `7949c109`, pristine file restored after each)
+
+Predictions were written into the tests before the run (each test carries its `Fault ... Predicted result` comment). All matched; no injection went RED in a test other than the ones named. Verbatim from the run output (`error:` line is the assertion that failed, `(fail)` the test):
+
+| Injection | RED |
+|---|---|
+| signal without the ownership check (the boot-id / record gate: guard call removed, `session-manager.ts:1055` -> `if (false)`) | M3: 4 fail / 12 pass |
+| signal a current-boot record (the `bootId` rotate line removed) | I2: 1 fail / 35 pass; M2: 1 fail / 15 pass |
+| skip revalidation (per-signal `read()` replaced by the first read) | I3: 2 fail / 34 pass |
+| drop the subprocess timeout (`ps`: `timeout:` removed) | I4b: 1 fail / 35 pass |
+| drop the guard deadline (`bounded` = identity) | I4a: 3 fail / 33 pass |
+| `/clear` without the restart (round-2 behaviour: the wiring branch removed) | M4: 5 fail / 23 pass |
+| gate 1 alone (`assertSessionWritable` removed) | G1: 1 fail / 12 pass |
+| gate 2 alone (one `assertSessionSpawnable` removed, `spawnChild`) | G2: 1 fail / 12 pass |
+| extras: identity compare, uid check, argv check, `clear` guard, record not written, clear confirmation ignored | I1, I7, I8, I9, M6, M5: 1-3 fail each |
+
+```
+--- G1-assertSessionWritable-removed
+    error: (timeout)
+    (fail) SessionManager.spawnAgent — resume on restart (#595) > gate 1 (`assertSessionWritable`): a quarantined writer whose exit the OS now confirms is released, then the session starts [8.19ms]
+    12 pass
+    1 fail
+--- G2-assertSessionSpawnable-removed-spawnChild
+    error: expect(received).rejects.toThrow(expected)
+    (fail) SessionManager.spawnAgent — resume on restart (#595) > gate 2 (`assertSessionSpawnable`): a retirement in progress on the session refuses the spawn, though nothing is quarantined [3507.78ms]
+    12 pass
+    1 fail
+--- I1-identity-compare-removed
+    error: expect(received).toEqual(expected)
+    (fail) decideResume — what a restart may do (#595 r3) > pid reused (alive with a different start identity): not signalled, resumed [315.54ms]
+    error: expect(received).toEqual(expected)
+    (fail) decideResume — what a restart may do (#595 r3) > the identity changes between the read and the signal: no signal is sent [304.76ms]
+    34 pass
+    2 fail
+--- I2-current-boot-signalled
+    error: expect(received).toEqual(expected)
+    (fail) decideResume — what a restart may do (#595 r3) > a record from THIS boot whose process is alive is never signalled: rotate [0.30ms]
+    35 pass
+    1 fail
+--- I3-revalidation-skipped
+    error: expect(received).toEqual(expected)
+    (fail) decideResume — what a restart may do (#595 r3) > a previous-boot orphan with the same identity: revalidated, killed, confirmed gone, THEN resumed [0.41ms]
+    error: expect(received).toEqual(expected)
+    (fail) decideResume — what a restart may do (#595 r3) > the identity changes between the read and the signal: no signal is sent [0.21ms]
+    34 pass
+    2 fail
+--- I4a-guard-deadline-dropped
+    error: (timeout)
+    (fail) decideResume — one deadline for the whole guard (#595 r3) > a process read that never returns: rotates within the bound, nothing signalled [5000.01ms]
+    error: (timeout)
+    (fail) decideResume — one deadline for the whole guard (#595 r3) > a record read that never returns is bounded too [5000.01ms]
+    error: (timeout)
+    (fail) decideResume — one deadline for the whole guard (#595 r3) > a stall AFTER the SIGTERM is bounded by the same deadline [5000.02ms]
+    33 pass
+    3 fail
+--- I4b-ps-timeout-dropped
+    error: expect(received).toBeLessThan(expected)
+    (fail) the real process readers (#595 r3) > ps: a stalled subprocess is killed at its timeout and rejects [8167.25ms]
+    35 pass
+    1 fail
+--- I7-uid-check-removed
+    error: expect(received).toEqual(expected)
+    (fail) decideResume — what a restart may do (#595 r3) > another user's process under a recorded pid: not signalled, rotate [301.84ms]
+    35 pass
+    1 fail
+--- I8-argv-check-removed
+    error: expect(received).toEqual(expected)
+    (fail) decideResume — what a restart may do (#595 r3) > a recorded pid whose argv no longer names our claude and the session: not signalled, rotate [302.34ms]
+    35 pass
+    1 fail
+--- I9-store-clear-compare-removed
+    error: expect(received).toBe(expected)
+    (fail) createFileOwnershipStore (#595 r3) > clear drops the record it was asked about but keeps a newer spawn's [2.76ms]
+    35 pass
+    1 fail
+--- M1-identity-compare-removed
+    error: expect(received).toBe(expected)
+    (fail) SessionManager — ownership guard and /clear (#595 r3) > pid reused by another process (different start identity): not signalled, session resumed [3653.93ms]
+    15 pass
+    1 fail
+--- M2-current-boot-signalled
+    error: expect(received).toBe(expected)
+    (fail) SessionManager — ownership guard and /clear (#595 r3) > a record from THIS boot whose process is alive: never signalled, the session rotates [3665.61ms]
+    15 pass
+    1 fail
+--- M3-guard-call-removed
+    error: expect(received).toBe(expected)
+    (fail) SessionManager — ownership guard and /clear (#595 r3) > a previous-boot orphan is revalidated, ended and confirmed gone BEFORE the session is resumed [3027.00ms]
+    error: expect(received).toHaveLength(expected)
+    (fail) SessionManager — ownership guard and /clear (#595 r3) > a record from THIS boot whose process is alive: never signalled, the session rotates [3019.69ms]
+    error: expect(received).toHaveLength(expected)
+    (fail) SessionManager — ownership guard and /clear (#595 r3) > an unreadable record: nothing is signalled, the session rotates, the reason is logged [3027.04ms]
+    error: expect(received).toHaveLength(expected)
+    (fail) SessionManager — ownership guard and /clear (#595 r3) > a process read that times out: nothing is signalled, the session rotates within the guard deadline [2608.42ms]
+    12 pass
+    4 fail
+--- M4-clear-without-restart-r2
+    error: expect(received).toEqual(expected)
+    (fail) wireSlashCommands — /clear is a controlled restart (#595 r3) > /clear goes to SessionManager.clearSession, never to send_slash [5.64ms]
+    error: expect(received).rejects.toThrow(expected)
+    (fail) wireSlashCommands — /clear is a controlled restart (#595 r3) > a failed clear rejects to the caller: success is never reported for a clear that did not happen [0.51ms]
+    error: expect(received).toHaveLength(expected)
+    (fail) SessionManager — ownership guard and /clear (#595 r3) > /clear retires the old process BEFORE the new spawn, on `--session-id <new id>`, and stores that id [2617.24ms]
+    error: expect(received).rejects.toThrow(expected)
+    (fail) SessionManager — ownership guard and /clear (#595 r3) > /clear whose old process cannot be confirmed gone fails, quarantines the session, and leaves the stored id [2608.47ms]
+    error: expect(received).rejects.toThrow(expected)
+    (fail) SessionManager — ownership guard and /clear (#595 r3) > /clear whose new id cannot be stored fails and brings the old session back [2608.33ms]
+    23 pass
+    5 fail
+--- M5-clear-confirmation-ignored
+    error: expect(received).rejects.toThrow(expected)
+    (fail) SessionManager — ownership guard and /clear (#595 r3) > /clear whose old process cannot be confirmed gone fails, quarantines the session, and leaves the stored id [5521.56ms]
+    15 pass
+    1 fail
+--- M6-ownership-record-not-written
+    error: expect(received).toBe(expected)
+    (fail) SessionManager — ownership guard and /clear (#595 r3) > spawn writes an ownership record for the process it started, and it is cleared once the OS confirms the exit [7676.87ms]
+    error: expect(received).toHaveLength(expected)
+    (fail) SessionManager — ownership guard and /clear (#595 r3) > a record that cannot be written does not fail the spawn [7629.00ms]
+    error: expect(received).toEqual(expected)
+    (fail) SessionManager — ownership guard and /clear (#595 r3) > /clear whose old process cannot be confirmed gone fails, quarantines the session, and leaves the stored id [7667.74ms]
+    13 pass
+    3 fail
+```
+
+Notes on the lines: G1 and I4a read `error: (timeout)` because the failure is the rejection / the 5 s test timeout rather than an assertion (G1's rejection is `PtyQuarantinedError: ... is quarantined`, the spawn refused by the unchanged gate 2). I4b's `Expected: < 2000 / Received: 8164` is the stand-in `ps` running its full 8 s.
+
+## Gates
+
+- `env -u ANTHROPIC_BASE_URL bun test src > /tmp/595r3-src.txt 2>&1`: **exit 1, 5082 pass, 5 skip, 1 fail** (274 files, 5088 tests). The one failure is `startAt: 'end' (issue #215 runtime wiring) > does NOT replay historical turn_end, but live-tails new ones` (`waitFor timed out after 750ms`) in `jsonl-tailer.test.ts`, a file and a module (`jsonl-tailer.ts`) this branch does not touch (`git diff 3fffb9f8` shows neither). Same family as round 2's tailer timing flake. Rerun alone **3 of 3 passed, 52 pass / 0 fail**. Machine load average was 27 (other agents running) during the full run. Not caused by this change; reported, not fixed.
+- `src/bus` alone (the directory this change lives in): exit 0, 1043 pass, 0 fail, before the report commit.
+- `bun run lint`: exit 0 (no errors; the 1296 warnings and 323 infos are the repo's existing ones).
+- `bun run typecheck` equivalent (`tsc --noEmit -p .`): **154 errors in total = 149 in `src` + 5 in `node_modules/bun-types`; 154 at `3fffb9f8` as well.** No new error, none in a file this change touches except the pre-existing `wiring.test.ts` `FakeAgentProcess` `lastDataAt` one that was already there.
+- Versions: `plugin.json` and `marketplace.json` both 2.2.355 (unchanged).
+
+## Residuals
+
+- **The read-to-signal race remains.** Every signal is preceded by a fresh read of identity, uid and argv, but there is no identity-bound process handle on either platform (no `pidfd_send_signal` from Bun/Node, nothing equivalent on macOS), so a process can exit and its pid be reused between the last read and `kill`. On Linux the window is microseconds and the identity is 10 ms; on macOS the identity is 1 s, so a same-second reuse would pass the identity check and rest on the uid and argv checks. The signal can only ever reach a process that was this daemon's child in a previous boot at the moment of the read.
+- **macOS argv is flat text** (see above). A reused pid, same second, same uid, whose command line also names our executable and the session id would be signalled. That is a process that is, by construction, a claude on this session.
+- **A claude we did not spawn is no longer detected.** If an operator's interactive `claude --resume <id>`, or a tool, holds the session, the daemon resumes beside it (two writers) exactly as before round 2. The ruling prefers this to killing it. The optional rotate-on-detection was dropped because it needed the flattened `ps args` parse.
+- **No record -> resume.** After an upgrade, or if `owner.json` was deleted, an orphan from the previous daemon is not found. Orphans from here on are covered.
+- **`exe` is a basename** (`claude` in production, resolved through `PATH`). A launch through an interpreter is matched only for `node`, `bun` and POSIX shells.
+- **tmux** agents are neither recorded nor `/clear`-able; `/clear` rejects loudly.
+- **A `/clear` typed as ordinary prompt text** (not relayed through `bus.invokeSlashCommand`) still moves the CLI to a new transcript and is not seen; plain-text delivery would need the same hook.
+- **`clearSession` cannot make a hung `stop()` safe on its own:** it waits at most 8 s, then lets the OS confirmation (and one SIGKILL of the recorded process) decide; if that fails it quarantines, as designed.
+- The soak-version caveat from round 2 (2.1.220 refuses `--resume` for a live non-interactive claude with a message our detector does not match) still applies to a claude we did not spawn.
+- No live end-to-end run with the real CLI (authentication is out of scope). The real `/proc`/`ps` reads, real signals and real confirmation run against real processes in the manager tests.
