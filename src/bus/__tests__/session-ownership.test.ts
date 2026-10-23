@@ -26,11 +26,13 @@ import {
   decideResume,
   decodeBsdInfoStart,
   libprocStartTime,
+  LiveOwnerRecordError,
   namesOwnedClaude,
   PROC_BSDINFO_SIZE,
   PS_PATH,
   type ProcessInfo,
   readFromPs,
+  recordOwnership,
   sameStart,
 } from "../session-ownership";
 import {
@@ -782,5 +784,83 @@ describe("ownership store hardening (#595 r7c)", () => {
     } finally {
       process.env.PATH = saved;
     }
+  });
+});
+
+describe("recordOwnership never overwrites the record of a live process (#595 r10)", () => {
+  const NEW_PID = 777;
+  /** The spawn's own process as the probe reads it, and a previous boot's claude on the same session. */
+  const setup = (): { store: MemoryStore; probe: FakeProbe } => {
+    const store = new MemoryStore();
+    const probe = new FakeProbe();
+    probe.table.set(NEW_PID, claudeInfo({ pid: NEW_PID, identity: "T2+000002" }));
+    return { store, probe };
+  };
+  const record = (store: MemoryStore, probe: FakeProbe) =>
+    recordOwnership({ store, probe, agentId: "a", sessionId: SID, pid: NEW_PID, exe: "claude" });
+  const rejection = (p: Promise<unknown>): Promise<unknown> =>
+    p.then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+  it("a live record for another process of this session: the write is refused and the record stays", async () => {
+    // Fault (site: `refuseLiveRecord` in `recordOwnership`, removed): the orphan's record is
+    // replaced by the new pid. Predicted result: `store.rec.get("a")?.pid` is 777, not 900.
+    const { store, probe } = setup();
+    store.rec.set("a", recordFor({ pid: 900, identity: "T1+000001" }));
+    probe.table.set(900, claudeInfo({ pid: 900, identity: "T1+000001" }));
+
+    const err = (await rejection(record(store, probe))) as { stage?: string; cause?: unknown };
+    expect(err.stage).toBe("write");
+    expect(err.cause).toBeInstanceOf(LiveOwnerRecordError);
+    expect(store.rec.get("a")?.pid).toBe(900);
+    expect(probe.kills).toEqual([]);
+  });
+
+  it("a live record whose process cannot be read counts as live: refused", async () => {
+    const { store, probe } = setup();
+    store.rec.set("a", recordFor({ pid: 900, identity: "T1+000001" }));
+    probe.stallPid = 900;
+
+    const err = (await rejection(
+      recordOwnership({
+        store,
+        probe,
+        agentId: "a",
+        sessionId: SID,
+        pid: NEW_PID,
+        exe: "claude",
+        timeoutMs: 20,
+      }),
+    )) as { cause?: unknown };
+    expect(err.cause).toBeInstanceOf(LiveOwnerRecordError);
+    expect(store.rec.get("a")?.pid).toBe(900);
+  });
+
+  it("a record whose process is gone is replaced", async () => {
+    const { store, probe } = setup();
+    store.rec.set("a", recordFor({ pid: 900, identity: "T1+000001" }));
+
+    const written = await record(store, probe);
+    expect(written?.pid).toBe(NEW_PID);
+    expect(store.rec.get("a")?.pid).toBe(NEW_PID);
+  });
+
+  it("a record for another session, or none, is replaced", async () => {
+    const { store, probe } = setup();
+    store.rec.set("a", recordFor({ pid: 900, sessionId: "another-session" }));
+    probe.table.set(900, claudeInfo({ pid: 900, identity: "T1" }));
+
+    await record(store, probe);
+    expect(store.rec.get("a")?.pid).toBe(NEW_PID);
+  });
+
+  it("an unreadable record is replaced: a corrupt file heals", async () => {
+    const { store, probe } = setup();
+    store.readError = new Error("unrecognised shape");
+
+    expect((await record(store, probe))?.pid).toBe(NEW_PID);
+    expect(store.rec.get("a")?.pid).toBe(NEW_PID);
   });
 });

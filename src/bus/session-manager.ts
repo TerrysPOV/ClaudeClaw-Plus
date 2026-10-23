@@ -1159,6 +1159,12 @@ export class SessionManager {
     agent: AgentConfig,
     origin: BusOrigin,
     retry: number,
+    /**
+     * False for the start that follows a rotation in this same call: its id was minted a moment ago,
+     * so no record can name it, and running the guard again would rotate for ever on a store that
+     * cannot be read (#595 r10).
+     */
+    guard = true,
   ): Promise<AgentProcess> {
     if (this.agents.has(agent.id)) {
       throw new Error(`agent ${agent.id} is already spawned; call stop() or restart() first`);
@@ -1180,7 +1186,7 @@ export class SessionManager {
     // again, and claude refuses that ("already in use"), which used to rotate the id and lose the
     // conversation on every restart. The test seam (`argsOverride`) replaces the whole argv, so
     // nothing is resumed there.
-    const resume =
+    const transcriptExists = (): boolean =>
       this.options.argsOverride === undefined &&
       sessionTranscriptExists({
         cwd: realCwd,
@@ -1188,13 +1194,17 @@ export class SessionManager {
         env,
         projectsDir: this.options.projectsDir,
       });
+    let resume = transcriptExists();
     // #595 r3: the CLI takes no lock on `--resume`, so a claude of ours that outlived the previous
     // daemon would append to the same transcript as the one about to be resumed. The guard looks
     // ONLY at the ownership record written when the bus spawned that claude, and signals only a
     // process that record proves ours (previous boot, same start identity). Anything it cannot
     // prove rotates to a fresh id instead (the conversation is lost, nothing is signalled).
+    // It runs whenever the guard applies, transcript or not (#595 r10): a claude that died before
+    // its first transcript line leaves a record and no transcript, and `--session-id` on the same id
+    // beside that orphan is the same two writers. A session with no record decides `no-record`.
     // win32 has no guard and no record (`ownershipGuardApplies`): it keeps its pre-#595 behaviour.
-    if (resume && this.options.ownershipStore && ownershipGuardApplies(this.options.platform)) {
+    if (guard && this.options.ownershipStore && ownershipGuardApplies(this.options.platform)) {
       const decision = await decideResume({
         agentId: agent.id,
         sessionId: agent.session_id,
@@ -1207,12 +1217,16 @@ export class SessionManager {
       });
       if (decision.kind === "rotate") {
         await this.rotateStoredSession(agent, decision.reason);
-        return this.spawnAgentInternal(agent, origin, retry);
+        return this.spawnAgentInternal(agent, origin, retry, /* guard */ false);
       }
       if (decision.reason === "orphan-reaped") {
         (this.options.logger ?? console).warn(
-          `[bus-session] agent=${agent.id} reason=resume-orphan-reaped session_id=${agent.session_id} pid=${decision.reapedPid} — ended a claude this daemon spawned in an earlier boot before resuming its session`,
+          `[bus-session] agent=${agent.id} reason=resume-orphan-reaped session_id=${agent.session_id} pid=${decision.reapedPid} — ended a claude this daemon spawned in an earlier boot before starting its session again`,
         );
+        // The orphan is confirmed gone; it may have written its first transcript line while the guard
+        // waited, so the flag is chosen on what is there NOW: `--resume` if it exists, else
+        // `--session-id` on the same id (#595 r10).
+        resume = transcriptExists();
       }
     }
     const args = this.options.argsOverride ?? buildClaudeArgs(agent, mode, { resume });

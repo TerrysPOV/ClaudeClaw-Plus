@@ -652,11 +652,47 @@ export async function recordOwnership(a: {
     spawnedAt: new Date().toISOString(),
   };
   try {
-    await withDeadline(a.store.write(record), a.timeoutMs ?? RECORD_STEP_MS);
+    const ms = a.timeoutMs ?? RECORD_STEP_MS;
+    await refuseLiveRecord(a, record, info, ms);
+    await withDeadline(a.store.write(record), ms);
   } catch (err) {
     throw new OwnershipRecordError("write", record, err);
   }
   return record;
+}
+
+/** A record for a different process of the same session is still live: it is never overwritten (#595 r10). */
+export class LiveOwnerRecordError extends Error {
+  readonly code = "owner-record-live";
+  constructor(readonly livePid: number) {
+    super("an ownership record for another live process of this session exists");
+    this.name = "LiveOwnerRecordError";
+  }
+}
+
+/**
+ * Never overwrite the record of a live process: it is the only way a later start can find that
+ * process again, and the bus has just started a second one on the same session id (#595 r10).
+ * `decideResume` rotates or reaps before a spawn, so this is the backstop for whatever it could not
+ * see (a record written between its read and the spawn). A record that cannot be read is replaced
+ * (a corrupt file heals); a live process whose read fails is treated as live.
+ */
+async function refuseLiveRecord(
+  a: { store: OwnershipStore; probe: ProcessProbe; agentId: string; sessionId: string },
+  record: OwnershipRecord,
+  info: ProcessInfo,
+  ms: number,
+): Promise<void> {
+  let existing: OwnershipRecord | null;
+  try {
+    existing = await withDeadline(a.store.read(a.agentId), ms);
+  } catch {
+    return;
+  }
+  if (!existing || existing.sessionId !== a.sessionId) return;
+  if (existing.pid === record.pid && sameStart(existing.identity, info.identity)) return;
+  const live = await withDeadline(a.probe.read(existing.pid, ms), ms).catch(() => undefined);
+  if (live === undefined || !departed(live, existing)) throw new LiveOwnerRecordError(existing.pid);
 }
 
 /** True when the process the record names is no longer running (gone, a zombie, or the pid is reused). */

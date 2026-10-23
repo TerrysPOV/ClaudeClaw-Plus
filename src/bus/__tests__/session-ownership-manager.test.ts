@@ -433,19 +433,143 @@ wait $p
   }
 
   it(
-    "a first boot (no transcript) never reads the record",
+    "a first boot (no record, no transcript) starts on --session-id with nothing rotated or signalled",
     async () => {
-      store.readError = new Error("must not be read");
       const agent = agentConfig();
       const proc = await manager().spawnAgent(agent, "cli");
       await started(proc.pid);
 
-      expect(flagValue(argvOf(proc.pid), "--session-id")).toBe(SID);
+      const argv = argvOf(proc.pid);
+      expect(flagValue(argv, "--session-id")).toBe(SID);
+      expect(argv).not.toContain("--resume");
       expect(persisted).toHaveLength(0);
-      expect(warned.join("\n")).not.toContain("ownership-record-unreadable");
+      expect(os.kills).toEqual([]);
+      expect(warned).toEqual([]);
+      expect(store.rec.get("a")?.pid).toBe(proc.pid);
     },
     T,
   );
+
+  /* ── a record with no transcript (#595 r10) ───────────────────────── */
+
+  it(
+    "a previous-boot orphan that never wrote a transcript is reaped and confirmed gone, then the id is started again: one process, and the record names it",
+    async () => {
+      // Fault (site: `resume &&` restored in front of the `decideResume` guard in `spawnAgentInternal`):
+      // the decision is skipped without a transcript, the new claude starts beside the live orphan and
+      // overwrites its record. Predicted result: `aliveAtStart` is `[orphan.pid]` and `kills` is empty.
+      const o = await startOrphan();
+      seed(o);
+      const agent = agentConfig();
+      const proc = await manager().spawnAgent(agent, "cli");
+      await started(proc.pid);
+
+      expect(os.spawned).toHaveLength(1);
+      expect(os.spawned[0]?.aliveAtStart).toEqual([]);
+      expect(os.kills).toEqual([{ pid: o.pid, signal: "SIGTERM" }]);
+      await exited(o.pid);
+      const argv = argvOf(proc.pid);
+      expect(flagValue(argv, "--session-id")).toBe(SID);
+      expect(argv).not.toContain("--resume");
+      expect(persisted).toHaveLength(0);
+      expect(agent.session_id).toBe(SID);
+      expect(store.rec.get("a")?.pid).toBe(proc.pid);
+      expect(warned.filter((l) => l.includes("reason=resume-orphan-reaped"))).toHaveLength(1);
+    },
+    T,
+  );
+
+  it(
+    "the transcript is looked at again after the orphan is reaped: one it wrote while ending is resumed",
+    async () => {
+      // Fault (site: `resume = transcriptExists()` after a reap, removed): the id is started with
+      // `--session-id` over a transcript that now exists, which claude refuses as 'already in use'.
+      // Predicted result: `--session-id` is in the argv and `--resume` is not.
+      const o = await startOrphan();
+      seed(o);
+      const clear = store.clear.bind(store);
+      store.clear = async (agentId, expect) => {
+        writeTranscript(SID); // the orphan's first line lands while it is being ended
+        await clear(agentId, expect);
+      };
+      const proc = await manager().spawnAgent(agentConfig(), "cli");
+      await started(proc.pid);
+
+      const argv = argvOf(proc.pid);
+      expect(flagValue(argv, "--resume")).toBe(SID);
+      expect(argv).not.toContain("--session-id");
+      expect(persisted).toHaveLength(0);
+    },
+    T,
+  );
+
+  it(
+    "a record from THIS boot whose process is alive, with no transcript: never signalled, the session rotates",
+    async () => {
+      const o = await startOrphan();
+      seed(o, { bootId: BOOT });
+      const agent = agentConfig();
+      const proc = await manager().spawnAgent(agent, "cli");
+      await started(proc.pid);
+
+      expect(os.kills).toEqual([]);
+      expect(orphanAlive()).toBe(true);
+      expect(persisted).toHaveLength(1);
+      const fresh = persisted[0]?.sessionId as string;
+      expect(fresh).not.toBe(SID);
+      expect(flagValue(argvOf(proc.pid), "--session-id")).toBe(fresh);
+      expect(warned.filter((l) => l.includes("reason=current-boot-owner-alive"))).toHaveLength(1);
+    },
+    T,
+  );
+
+  describe("a previous-boot orphan that cannot be proven ours, with no transcript, rotates untouched (#595 r10)", () => {
+    /** The orphan's pid and record as a fake probe reads them; the new spawn's own pid is not in the table. */
+    async function rotatesAround(live: Partial<ProcessInfo>): Promise<void> {
+      const rec = {
+        agentId: "a",
+        sessionId: SID,
+        pid: 4242,
+        identity: "T1+000001",
+        bootId: "boot-old",
+        exe: "claude",
+        spawnedAt: "2026-10-23T10:00:00.000Z",
+      };
+      store.rec.set("a", rec);
+      const probe = new FakeProbe();
+      probe.table.set(
+        4242,
+        claudeInfo({
+          pid: 4242,
+          identity: "T1+000001",
+          uid: process.getuid?.() ?? -1,
+          argv: ["/usr/bin/claude", "--session-id", SID],
+          ...live,
+        }),
+      );
+      const agent = agentConfig();
+      const proc = await manager({ probe }).spawnAgent(agent, "cli");
+      await started(proc.pid);
+
+      expect(probe.kills).toEqual([]);
+      expect(store.rec.get("a")).toEqual(rec);
+      expect(persisted).toHaveLength(1);
+      expect(flagValue(argvOf(proc.pid), "--session-id")).toBe(persisted[0]?.sessionId);
+      expect(persisted[0]?.sessionId).not.toBe(SID);
+    }
+
+    it("a foreign uid", async () => {
+      await rotatesAround({ uid: (process.getuid?.() ?? 0) + 1 });
+      expect(warned.filter((l) => l.includes("reason=owner-uid-mismatch"))).toHaveLength(1);
+    });
+
+    it("a second-precise identity", async () => {
+      await rotatesAround({ identity: "T1", lowPrecision: true });
+      expect(warned.filter((l) => l.includes("reason=resume-identity-low-precision"))).toHaveLength(
+        1,
+      );
+    });
+  });
 
   it(
     "with no store configured the bus keeps no records and resumes as before",
