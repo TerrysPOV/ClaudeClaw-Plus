@@ -1,7 +1,8 @@
 import { engines } from "./registry.js";
 
 export interface OneShotSettings {
-  default: string;
+  /** Absent means the route's implicit default follows the runner PTY setting. */
+  default?: string;
   engines: Record<string, Record<string, unknown>>;
   routes: Record<string, string>;
 }
@@ -34,8 +35,17 @@ export function isUntrustedRoute(route: string): boolean {
   return route.startsWith("tuner.") || UNTRUSTED_ROUTES.includes(route);
 }
 
-export function resolveOneShotEngine(settings: OneShotSettings, route: string): string {
-  return settings.routes[route] ?? settings.routes[`${route.split(".")[0]}.*`] ?? settings.default;
+export function resolveOneShotEngine(
+  settings: OneShotSettings,
+  route: string,
+  ptyEnabled = false,
+): string {
+  return (
+    settings.routes[route] ??
+    settings.routes[`${route.split(".")[0]}.*`] ??
+    settings.default ??
+    (ptyEnabled && RESUME_ROUTES.includes(route) ? "pty" : "print")
+  );
 }
 
 /**
@@ -103,7 +113,7 @@ export function parseOneShotSettings(raw: unknown): OneShotSettings {
     );
   }
   const settings: OneShotSettings = {
-    default: defaultId,
+    ...(input.default == null ? {} : { default: defaultId }),
     engines: engineDeclarations,
     routes: routes as Record<string, string>,
   };

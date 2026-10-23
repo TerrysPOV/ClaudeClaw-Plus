@@ -98,7 +98,8 @@ let configDir: string;
 beforeEach(async () => {
   configDir = mkdtempSync(join(tmpdir(), "oneshot-test-"));
   const file = join(configDir, "settings.json");
-  writeFileSync(file, "{}");
+  // These are explicit print-engine contracts, independent of the runner default.
+  writeFileSync(file, JSON.stringify({ oneShot: { default: "print" } }));
   _setSettingsFileForTests(file);
   await loadSettings();
   injectOneShotTrustForTests(async () => {});
@@ -603,8 +604,8 @@ describe("one-shot configuration", () => {
       engines.delete("fake");
     }
   });
-  it("defaults every route to print", () =>
-    expect(parseOneShotSettings(undefined)).toEqual({ default: "print", engines: {}, routes: {} }));
+  it("preserves an absent default for runtime route resolution", () =>
+    expect(parseOneShotSettings(undefined)).toEqual({ engines: {}, routes: {} }));
   it("rejects resume routes on engines without resume capability", () => {
     engines.set("stateless", {
       id: "stateless",

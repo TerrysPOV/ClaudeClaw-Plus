@@ -85,15 +85,18 @@ export async function runOneShot(req: OneShotRequest): Promise<OneShotResult> {
   // falls back; invalid loaded configuration is never swallowed.
   let settings: ReturnType<typeof parseOneShotSettings> | undefined;
   let defaultModel = "";
+  let ptyEnabled = false;
   try {
-    settings = getSettings().oneShot;
-    defaultModel = getSettings().model;
+    const loaded = getSettings();
+    settings = loaded.oneShot;
+    defaultModel = loaded.model;
+    ptyEnabled = loaded.pty.enabled;
   } catch (error) {
     if (!(error instanceof Error) || !error.message.startsWith("Settings not loaded")) throw error;
   }
   const id = printRuntime()?.forcePrint
     ? "print"
-    : resolveOneShotEngine(settings ?? parseOneShotSettings(undefined), req.route);
+    : resolveOneShotEngine(settings ?? parseOneShotSettings(undefined), req.route, ptyEnabled);
   const declarations = settings?.engines ?? {};
   validateRouteEngine(
     id,

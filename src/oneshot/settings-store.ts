@@ -38,6 +38,8 @@ export interface EngineView {
 
 export interface OneShotView {
   default: string;
+  /** True when `oneShot.default` is absent: resume routes then follow `pty.enabled` (#572). */
+  defaultImplicit: boolean;
   routes: Record<string, string>;
   /** Route → engine a call on it uses now (explicit route, `<family>.*`, else default). */
   effective: Record<string, string>;
@@ -177,7 +179,7 @@ function accepted(raw: Record<string, unknown>, patch: OneShotPatch): boolean {
 }
 
 /** What the dashboard and `oneshot list` show; built from a block the loader accepts. */
-export function oneShotView(rawBlock: unknown): OneShotView {
+export function oneShotView(rawBlock: unknown, ptyEnabled = false): OneShotView {
   const raw = isObject(rawBlock) ? rawBlock : {};
   const settings = parseOneShotSettings(raw);
   const ids = [...new Set([...engines.keys(), ...Object.keys(settings.engines)])];
@@ -187,9 +189,11 @@ export function oneShotView(rawBlock: unknown): OneShotView {
   for (const route of KNOWN_ROUTES)
     choices[route] = ids.filter((id) => accepted(raw, { routes: { [route]: id } }));
   const effective: Record<string, string> = {};
-  for (const route of KNOWN_ROUTES) effective[route] = resolveOneShotEngine(settings, route);
+  for (const route of KNOWN_ROUTES)
+    effective[route] = resolveOneShotEngine(settings, route, ptyEnabled);
   return {
-    default: settings.default,
+    default: settings.default ?? "print",
+    defaultImplicit: settings.default === undefined,
     routes: { ...settings.routes },
     effective,
     choices,
@@ -206,7 +210,8 @@ export async function readOneShotSettings(): Promise<OneShotSettings> {
 }
 
 export async function readOneShotView(): Promise<OneShotView> {
-  return oneShotView((await readSettingsDoc()).oneShot);
+  const doc = await readSettingsDoc();
+  return oneShotView(doc.oneShot, agentEngineView(doc).pty.enabled);
 }
 
 /** Validate, then write settings.json atomically; nothing is written when validation fails. */
@@ -216,7 +221,7 @@ export function updateOneShotSettings(patch: OneShotPatch): Promise<OneShotView>
     const { raw } = applyOneShotPatch(doc.oneShot, patch);
     doc.oneShot = raw;
     await writeSettingsAtomic(getSettingsFile(), doc);
-    return oneShotView(raw);
+    return oneShotView(raw, agentEngineView(doc).pty.enabled);
   });
 }
 

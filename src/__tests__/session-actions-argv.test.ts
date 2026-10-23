@@ -6,10 +6,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { initConfig, loadSettings, reloadSettings } from "../config";
+import { _setSettingsFileForTests, initConfig, loadSettings, reloadSettings } from "../config";
 import { runOneShot } from "../oneshot/engine";
 import { withPrintRuntime } from "../oneshot/print";
 import { runCompact } from "../runner";
@@ -46,9 +46,15 @@ const flagValue = (args: string[], flag: string): string | undefined => {
   return i === -1 ? undefined : args[i + 1];
 };
 
+let settingsDir: string;
+
 beforeEach(async () => {
   __resetSupervisorForTests();
+  settingsDir = await mkdtemp(join(tmpdir(), "session-actions-argv-"));
+  const settingsPath = join(settingsDir, "settings.json");
+  _setSettingsFileForTests(settingsPath);
   await initConfig();
+  await writeFile(settingsPath, JSON.stringify({ oneShot: { default: "print" } }));
   await loadSettings();
   await reloadSettings();
   injectOneShotForTests(null); // the real runOneShot -> print engine
@@ -57,6 +63,8 @@ beforeEach(async () => {
 afterEach(async () => {
   await shutdownSupervisor();
   __resetSupervisorForTests();
+  _setSettingsFileForTests();
+  await rm(settingsDir, { recursive: true, force: true });
 });
 
 describe("compact fallback argv", () => {

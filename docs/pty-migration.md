@@ -48,6 +48,15 @@ and an `agent-job:` identifier and pass through the same loop.
 
 ## Keep print mode
 
+Trusted one-shot fallbacks follow `pty.enabled` too: `/compact`, rotation summaries,
+precompact memory saves and shutdown memory saves use ephemeral PTYs when no live
+PTY holds their session. With `pty.enabled: false` they default to print. Explicit
+`oneShot.routes` (including family wildcards) and `oneShot.default` settings take
+precedence; remove an existing `oneShot.default: "print"` to adopt these defaults.
+These choices follow the same approximately 30-second hot reload as runner turns.
+Untrusted classifier, tuner and memory-recall routes still default to print and
+cannot select PTY until its isolation spike is green. See [One-shot engines](oneshot-engines.md).
+
 `claude -p` remains supported. Set both the runner opt-out and explicit bus-agent
 supervision overrides in `.claude/claudeclaw/settings.json`:
 

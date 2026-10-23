@@ -2,11 +2,19 @@
 
 Utility calls use `runOneShot` from `src/oneshot/engine.ts`. Every request must
 declare `isolation: "untrusted"` or `isolation: "trusted-session"`, plus a positive
-`timeoutMs`. The default engine is `print`; `print` and `pty` are built in and
+`timeoutMs`. With no explicit one-shot setting, the trusted resume routes
+`compact`, `rotation.summary`, `memory.save.precompact` and `memory.save.stop`
+use `pty` when `pty.enabled` is true, and `print` when false. All other routes
+still default to `print`. `print` and `pty` are built in and
 need no declaration. The HTTP engines below are built in too, and need their
 settings.
 
-For example, this settings block selects ephemeral PTYs for trusted fallbacks:
+These defaults are resolved at each call from the current settings, including
+the daemon's approximately 30-second reload of `pty.enabled`. Parsed/generated
+settings preserve an absent `oneShot.default`; an existing explicit `"print"`
+default keeps print until you remove it or override its routes.
+
+For example, this settings block explicitly selects ephemeral PTYs for trusted fallbacks:
 
 ```json
 {
@@ -24,9 +32,16 @@ For example, this settings block selects ephemeral PTYs for trusted fallbacks:
 }
 ```
 
-These route settings apply when callers use `runOneShot`; migrating the trusted
-live-session callers belongs to #549. Exact routes override a namespace wildcard,
-then the default applies. Unknown engines and incompatible capabilities fail
+These route settings apply only to one-shot fallbacks: trusted session actions
+first ask the live PTY and resume one-shot only when no live process holds the
+session. Each ephemeral PTY resumes the supplied session id in its supplied working
+directory, uses an overall timeout, and is disposed afterwards. `/compact` is sent
+as an exact bare REPL command; ordinary slash-shaped prompts retain the PTY guard.
+The no-daemon shutdown save uses the stored global session id with a 30-second
+budget. Exact routes override a namespace wildcard, then an explicit
+`oneShot.default`, then the implicit route default applies. A default of `pty`
+must also explicitly route the untrusted families to an isolated engine such as
+`print`; validation otherwise rejects it. Unknown engines and incompatible capabilities fail
 settings load. Untrusted PTY routes fail both settings validation and execution
 until the interactive CLI isolation spike is reviewed green: the PTY engine
 advertises `caps.isolation: false`, and any untrusted route to an engine without
