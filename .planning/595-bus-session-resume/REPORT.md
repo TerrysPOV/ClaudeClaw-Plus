@@ -503,3 +503,95 @@ Notes on the lines: G1 and I4a read `error: (timeout)` because the failure is th
 - **`clearSession` cannot make a hung `stop()` safe on its own:** it waits at most 8 s, then lets the OS confirmation (and one SIGKILL of the recorded process) decide; if that fails it quarantines, as designed.
 - The soak-version caveat from round 2 (2.1.220 refuses `--resume` for a live non-interactive claude with a message our detector does not match) still applies to a claude we did not spawn.
 - No live end-to-end run with the real CLI (authentication is out of scope). The real `/proc`/`ps` reads, real signals and real confirmation run against real processes in the manager tests.
+
+---
+
+# Round 4
+
+Branch `fix/595-bus-session-resume`, on top of `f7e4c5ed`. Code + tests in `ee44b7a0`; this report in the commit after it. Nothing is pushed to `feat/550-pty-default`. The #562 round-9 fence, quarantine and synchronous spawn-check design is unchanged: `assertSessionWritable` and the three `assertSessionSpawnable` calls (`session-manager.ts:1583`, `:1610`, `:1651`) are in the same places with no await between each and its spawn. The five findings Codex closed in round 3 stay closed (no test of theirs changed except one assertion that now also carries `lowPrecision: false`).
+
+Codex's round-3 review: 1 HIGH, 2 MEDIUM, and the macOS identity precision still open.
+
+## Fix 1 — HIGH: an unrecorded child never runs
+
+Ruling: make "no record" mean "nothing of ours holds the session" TRUE, instead of rotating on every absent record (which would drop each agent's conversation on the first restart after the upgrade). `decideResume` still resumes on no record.
+
+- A spawn whose process cannot be recorded is **fatal**: the identity read or the write rejecting (`OwnershipRecordError`, stage `identity-read` or `write`; each step is bounded at 4 s, `RECORD_STEP_MS`) ends the child and fails the spawn with `SpawnUnrecordedError` (`code: "ownership-record-failed"`).
+- The child is ended through the **same retirement as `/clear`**: `retireLive` (extracted from `clearSessionInternal`, `session-manager.ts:984`). The session is fenced from the first synchronous step, `stop()` then the OS confirmation with one SIGKILL of the recorded process, and an exit that cannot be confirmed **quarantines** the session (`bus-spawn-unrecorded-exit-unconfirmed`) and the error says so (`retired: false`). When only the write failed the in-memory record (identity was read) is what the SIGKILL is bound to; when the identity read failed, only a pid that no longer exists counts as gone.
+- One log line, no screen text: `reason=ownership-record-failed stage=<stage> cause=<errno code> session_id= pid=` (`failUnrecordedSpawn`, `:1519`). The error's message is not logged. The test pins that a secret in the error message does not reach the line.
+- **Ordering.** The write starts in the very next statement after the process exists (`const recording = this.recordSpawnOwnership(...)`, `:1232`); the record is awaited right after the collision detector is armed (`:1382`), before `spawnAgent` returns. `getAgent()` hides the process (`deliverable: false`, `:846`, `:1929`) until the record exists, so the bus resolves no delivery target for it: no prompt reaches an unrecorded claude. `stop()` and the exit handler still see it.
+- **The remaining crash window**, stated plainly: from `fork` to the end of the atomic `rename` of `owner.json`. In it a daemon death (SIGKILL, power loss) leaves a claude with no record. What fills the window: the identity read (Linux: one `/proc` read, ~ms; macOS: one targeted `ps`, ~10-50 ms, bounded at 4 s) plus the write (`mkdir`, temp file, `rename`, ~ms). There is no `await` I/O between process creation and the start of the read: for PTY the only gap is the microtask hop of `await this.spawnPty(...)`. It cannot be zero (a pid does not exist before the fork, and the identity is read from the process). It could be closed by writing an intent record before the fork and treating "intent without pid" as unknown; I did not, because it changes the record schema and `decideResume`'s contract, which the coordinator ruling did not ask for.
+- **One-time upgrade residual:** a claude left by a **pre-upgrade** daemon has no record, so the first restart after the upgrade resumes beside it (the round-3 residual "no record -> resume", unchanged). Every claude spawned by this build is recorded or its spawn failed. tmux agents are never recorded (as before).
+
+## Fix 2 — MEDIUM: one lifecycle queue per agent
+
+`enqueueLifecycle` (`session-manager.ts:887`) chains operations per agent id. `spawnAgent` (`:930`), `clearSession` (`:965`) and `restart` (`:1778`) all run through it, so a second operation waits for the first; it does not run beside it. Inside a queued operation the internal `spawnAgentInternal` is called (never the queued public one: no re-entry, no deadlock). The existing coalescing is kept (a second `/clear` joins the first, a second `restart` joins the first). Each operation reads `this.agents` when it **runs**, not when it was queued, so a restart queued behind a clear retires the clear's replacement, not the process the clear already retired. After any interleaving the stored id equals the live process's id (tests below, both orders).
+
+## Fix 3 — MEDIUM: `/clear` succeeds only on a live replacement
+
+`clearSessionInternal` (`:1052`) no longer takes `spawnAgent()` completion as success. After the replacement's spawn returns (which is after the startup window: the collision detector waits up to `sessionCollisionDetectMs`, 2 s by default, and returns early on an exit), the clear checks that the replacement is still the registered, un-exited process. If not: `ClearReplacementExitedError` (`code: "clear-replacement-exited"`), one error line with that reason, and **no** `reason=session-cleared` line (that line moved to after the check). The persisted fresh id stays (it names a session that never started; the next start creates it), and the old session was retired, so the agent is down and the caller is told so.
+
+## Fix 4 — MEDIUM (macOS): sub-second birth identity
+
+`session-ownership.ts`. The macOS identity was `ps lstart` (1 s). It is now `<lstart>+<microseconds>` when libproc answers.
+
+- `proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof info)` through `bun:ffi` (built in, loaded lazily with `require`, like `runner.ts:259`; `libSystem.B.dylib`, then `/usr/lib/libSystem.B.dylib`). No new dependency.
+- **Struct layout and source.** `struct proc_bsdinfo` in the macOS SDK header `<sys/proc_info.h>` (read from `MacOSX26.5.sdk`): `PROC_PIDTBSDINFO` = 3, `PROC_PIDTBSDINFO_SIZE` = `sizeof(struct proc_bsdinfo)` = 136. Twelve 4-byte fields `pbi_flags .. rfu_1` = bytes 0..47 (so `pbi_status` at 4, **`pbi_pid` at 12**, `pbi_uid` at 20); `pbi_comm[16]` at 48; `pbi_name[32]` at 64; seven 4-byte fields `pbi_nfiles .. pbi_nice` at 96..119; **`pbi_start_tvsec` (uint64) at 120; `pbi_start_tvusec` (uint64) at 128**; total 136, naturally aligned, no padding. Little-endian (arm64 and x86_64 agree). Constants: `BSDINFO_OFFSETS = { pid: 12, startSec: 120, startUsec: 128 }`, `PROC_BSDINFO_SIZE = 136`.
+- **Checked on this machine** (Darwin 25.6, arm64) with a scratch script before the code: `proc_pidinfo` returned 136; `pbi_pid@12` equalled the pid, `pbi_uid@20` was 501, `pbi_start_tvsec@120` was 1792761049 against `date +%s` 1792761049 and `ps lstart` "14:10:49", `pbi_start_tvusec@128` was 464209; a nonexistent pid returned 0.
+- **Decode guards:** the struct is rejected (null) unless it is >= 136 bytes, its `pbi_pid` is the pid asked about, and `tvusec` is in `[0, 1e6)`. The identity uses it only when it also agrees with `ps` on the second (|diff| <= 1 s); a struct that disagrees leaves the identity second-precise.
+- **`ps` now runs with `TZ=UTC`** (`readFromPs`). Found while testing: under `bun test` the JS zone is UTC while `ps` printed local time, so libproc's epoch seconds could never be compared with `lstart`. UTC makes the string independent of the daemon's zone and of a DST change. Records written by a round-3 build (local-time `lstart`) would read as a reused pid after this change; round 3 is unmerged, so there are none in the field.
+- **FFI fails -> `lstart` alone, marked low-precision** (`ProcessInfo.lowPrecision`). `sameStart(a, b)` is the only comparison: equal strings match; otherwise they match at second precision **only** when one side has no microseconds; two microsecond identities must be equal. This is what tells a replacement born in the same second apart (test: `…+111111` vs `…+222222` -> `pid-reused`, nothing signalled).
+- **A low-precision identity may still authorise a signal, and only with the existing revalidation:** before every signal `decideResume` re-reads the process and requires the same uid and an argv/command that still names the executable we launched and the session id (`namesOwnedClaude`). Nothing about a low-precision match skips or weakens those. The reap log line says `identity_precision=low-1s(uid+argv revalidated)` when either side was second-precise. The macOS argv is still flat `ps` text (round-3 residual, unchanged): libproc supplies the start time, not the argument vector.
+- Linux unchanged (`/proc` btime + field 22, 10 ms).
+
+## Sites changed
+
+| Site | Change |
+|---|---|
+| `session-manager.ts:593`, `:609` | `SpawnUnrecordedError`, `ClearReplacementExitedError` (reason codes) |
+| `session-manager.ts:846`, `:1929` | `AgentRecord.deliverable`; `getAgent` hides an unrecorded process |
+| `session-manager.ts:887`, `:930`, `:965`, `:1778`, `:1900` | `enqueueLifecycle`; spawn, clear, restart queued; queued ops call `spawnAgentInternal` |
+| `session-manager.ts:984` | `retireLive` extracted from `clearSessionInternal` and shared with the failed spawn |
+| `session-manager.ts:1052-1105` | `/clear`: liveness check, success log after it |
+| `session-manager.ts:1232`, `:1382`, `:1496`, `:1519` | record starts right after creation; failure fatal; `recordSpawnOwnership` no longer swallows; `failUnrecordedSpawn` |
+| `session-ownership.ts:48`, `:492`, `:509` | `RECORD_STEP_MS`, `OwnershipRecordError`, `recordOwnership` throws it, steps bounded |
+| `session-ownership.ts:234-345` | `BSDINFO_OFFSETS`, `decodeBsdInfoStart`, lazy `bun:ffi` `proc_pidinfo`, `libprocStartTime`, `startIdentity`, `sameStart` |
+| `session-ownership.ts:348-365` | `readFromPs` takes the start-time reader; `TZ=UTC` |
+| `session-ownership.ts:545`, `:721` | `departed` uses `sameStart`; reap reports `lowPrecision` |
+| tests | `session-ownership-manager.test.ts` (+6 net: unwritable record x3, delivery gate, queue x2 orders, replacement exit; the old "does not fail the spawn" test is replaced), `session-ownership.test.ts` (+9: struct decode x2, ps+libproc, fallback x3 cases, `sameStart`, real libproc on darwin, same-second pid, low-precision reap, low-precision still gated), `ownership-fakes.ts` (`stallPid`) |
+
+## Fault injections (one site per `git archive` copy of `ee44b7a0`)
+
+Each test carries its `Fault … Predicted result` comment, written before the run. Verbatim from the run output:
+
+| Injection | RED |
+|---|---|
+| **write failure tolerated again** (`if (recordFailure)` -> `if (recordFailure && false)`) | `error: expect(received).toBeInstanceOf(expected)` x3: `(fail) … > a record that cannot be written ends the child and fails the spawn: no record, and nothing of ours left`, `… AND a child that is not confirmed gone: the session is quarantined`, `… an identity that cannot be read fails the spawn the same way`. 19 pass / 3 fail |
+| **lifecycle queue removed** (`prev.then(op, op)` -> `op()`) | `-  "fulfilled",` / `+  "rejected",` in `(fail) … /clear and restart issued together (clear-then-restart) run one after the other and leave one live process on the stored id` and in `(restart-then-clear)`. 0 pass / 2 fail |
+| **spawn completion accepted as clear success** (liveness check -> `if (false)`) | `error: expect(received).toBeInstanceOf(expected)` / `(fail) … > a /clear whose replacement exits during startup rejects with its reason, and logs no success`. 0 pass / 1 fail |
+| **tvusec decoded as 0** | `-   "usec": 464209,` / `+   "usec": 0,` in `(fail) … > libproc struct: the start time is read at offsets 120 and 128 (pid at 12) of a 136-byte struct`, and `Received: { sec: 1792761049, usec: 0 }` in `(fail) … another pid's struct, a short buffer and an out-of-range usec decode to null`. 43 pass / 2 fail |
+| delivery gate removed (`getAgent` returns the process while unrecorded) | `Expected: false` / `Received: true` in `(fail) … > the agent is not reported spawned, and gets no prompt, before its record exists`. 0 pass / 1 fail |
+| same-second identity (`departed` back to lstart-only equality, the round-3 behaviour) | `-"kind": "resume", -"reason": "pid-reused"` / `+"kind": "rotate", +"reason": "orphan-unconfirmed"` (the replacement was signalled) in `(fail) decideResume — identity precision … a replacement born in the SAME SECOND … is told apart by its microseconds`. 0 pass / 1 fail |
+| retirement confirmation ignored for the failed spawn | `error: expect(received).toBe(expected)` / `(fail) … AND a child that is not confirmed gone: the session is quarantined`. 0 pass / 1 fail |
+| libproc second-agreement check removed | `Expected: "Thu Oct 23 10:00:00 2026"` / `Received: "Thu Oct 23 10:00:00 2026+000001"` in `(fail) … libproc unavailable, throwing, or disagreeing with ps on the second`. 0 pass / 1 fail |
+
+The first four are the ones the coordinator required. A fifth-to-eighth row was added for the sites the new tests were written to guard. No injection went RED in a test other than the ones named.
+
+## Gates
+
+- `env -u ANTHROPIC_BASE_URL bun test src > /tmp/595r4-src.txt 2>&1`: **exit 0, 5098 pass, 5 skip, 0 fail** (274 files, 5103 tests). No load flake this run.
+- `src/bus` alone: exit 0, 1058 pass, 0 fail.
+- `bun run lint`: **exit 0** (warnings/infos are the repo's existing ones). The five touched files were also run through `biome check --write` first.
+- Typecheck (`tsc --noEmit -p .`): **154 errors, 154 at `f7e4c5ed`**; none in a file this change touches.
+- Versions: `plugin.json` and `marketplace.json` both 2.2.355 (unchanged).
+
+## Residuals
+
+- **Crash window (Fix 1):** fork to the end of the atomic `rename` of `owner.json` (identity read + write, ms on Linux, tens of ms on macOS). A daemon death inside it leaves an unrecorded claude. Closing it needs an intent record written before the fork; not done (schema and `decideResume` contract change).
+- **Pre-upgrade claude:** a child left by a pre-upgrade daemon has no record; the first restart after the upgrade resumes beside it. Later spawns are all recorded or failed.
+- **A failed unrecorded-spawn whose identity could not be read** can only be confirmed gone by the pid no longer existing (no record to bind a SIGKILL to); if that cannot be confirmed the session is quarantined.
+- **macOS low-precision identity** (libproc unavailable, e.g. a non-Bun runtime or a failed `dlopen`): second-precision `lstart`. It may still authorise a signal, only with the existing uid + argv revalidation immediately before each signal; the reap log says `identity_precision=low-1s`. macOS argv remains flat `ps` text (libproc gives the start time, not argv).
+- **Read-to-signal race** remains (no identity-bound handle on either platform); it is now microseconds wide on macOS too.
+- **A failed `/clear`** (replacement exited) leaves the agent down with the fresh id stored; recovery is the next start/restart, which creates that session. Not auto-retried: a crashing boot should not loop.
+- `getAgent()` returns undefined for the 0-4 s a new process is awaiting its record; callers treat that as "not spawned yet", which is the intent.
+- No live end-to-end run with the real CLI (authentication out of scope); real processes, real `ps`/libproc reads and real signals run in the manager tests.
