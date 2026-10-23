@@ -665,3 +665,91 @@ Each test carries its `Fault … Predicted result` comment, written before the r
 - Held prompts do not count against the per-agent queue caps while they wait (bounded by the 4 s window).
 - Round-4 residuals otherwise unchanged (crash window fork-to-`rename`, pre-upgrade claude, read-to-signal race, flat macOS argv).
 - Test timing: the machine was at load average 65 to 437 for this round (84+ users, other agents). Real-process manager tests and a few timer tests in `core.test.ts` / `jsonl-tailer.test.ts` flake under it; every flake named in the gate passed rerun alone.
+
+# Round 5b
+
+Branch `fix/595-bus-session-resume`, on top of `0b6d67d8` (round 5). Commits: `d2e3dc50` (the tests and seams, from the worker that hit a usage limit; reviewed here, not reset) and `e3d4d07b` (one test strengthened, see "What I changed in the draft"), plus this report. Nothing is pushed to `feat/550-pty-default`. Production bounds and behaviour are unchanged: `GUARD_DEADLINE_MS` 5000, `PROBE_TIMEOUT_MS` 1500, `RECORD_STEP_MS`, `deliveryBackstopMs` 4000 are the same values; no round-1 to round-5 fix moved.
+
+## The problem
+
+On a clean `git archive` of `0b6d67d8` at load average 25-60, `session-ownership-manager.test.ts` failed with no fault injected, a different test each run ("unreadable record: nothing signalled, session rotates" 3044 ms; "previous-boot orphan revalidated…" 3744 ms and "no store configured…" 2689 ms). Cause: the tests raced real time against the production bounds: a poll loop, two `setTimeout(400)` sleeps, `deadlineMs: 2000` and 300-400 ms deadlines asserted with `Date.now()` windows, and a real `ps` read bounded at 1500 ms that a loaded machine can exceed.
+
+## The seams (production code, both inert unless a test sets them)
+
+| Seam | Where | Default |
+|---|---|---|
+| `GuardClock` (`now`, `setTimeout`, `clearTimeout`) and `decideResume({ clock })` | `session-ownership.ts` (interface + `REAL_CLOCK`); `withDeadline` and `sleep` take the clock | unset: `REAL_CLOCK` is `Date.now` / `setTimeout` / `clearTimeout`, so the guard runs exactly as before |
+| `SessionManagerOptions.ownershipRecordMs` -> `recordOwnership({ timeoutMs })` | `session-manager.ts` | unset: `a.timeoutMs ?? RECORD_STEP_MS`, i.e. the same 4 s step |
+
+Both are named and documented as test seams at the declaration. No other production line changed (`git diff 0b6d67d8 -- src ':!src/**/__tests__/**'` is those two files, +38/-11).
+
+## How the tests stopped racing
+
+- **Deadline tests run on a `FakeClock`** moved by hand (`advance(ms)` fires due timers in order). They assert the guard rotates AT the bound and not before (`advance(299)` still pending, `advance(1)` settles), with no wall-clock reads. The wait for "the stalled read is out" is event-driven: `FakeProbe.readIssued(n)` and `FakeClock.armed()` resolve on cue.
+- **The `FakeProbe` records the timeout each read was handed** (`readTimeouts`), so "capped at the probe timeout" and "what is left of the deadline" are checked directly, not by elapsed time.
+- **Real-process manager tests use `OsProbe`**: the production `createSystemProbe` with the per-read timeout lifted to 120 s (the guard's own deadline and `ownershipRecordMs` are raised to match), so a loaded machine slows a read down instead of failing it. It logs, from what the OS reports, each process the manager spawned and which earlier ones were still alive at that moment, so "the previous process was gone BEFORE the next one existed" rests on the OS and not on a stand-in script that may not have started.
+- **No fixed sleeps remain.** The two `setTimeout(400)` sleeps and the poll loop are gone; the only waits left are `until(cond)` polls of a cheap local condition (file exists, event logged) with a 60-90 s bound that THROWS on a miss, and the stage bounds the tests mean to expire (`termMs`/`killMs` 150 ms against a fake probe that answers at once, so a longer wall clock only delays the stage ending). The guard deadline in those tests is 120 000 (`deadlineMs` in `session-ownership.test.ts`, `ownershipGuardMs` in the manager tests), so a loaded machine cannot turn "orphan unconfirmed" into "guard deadline".
+- **`prompt-before-record.test.ts`** (round 5, flaked the same way): `deliveryBackstopMs` 120 000 in the helper bus, `until` 90 s and throwing, and the real-`SessionManager` tests use `OsProbe` and `ownershipRecordMs` 120 000. The one test of the backstop passes its own small value.
+- **One wall-clock assertion is left, deliberately:** `ps: a stalled subprocess is killed at its timeout` runs a real `sleep 20` against a 400 ms `execFile` timeout and asserts elapsed < 15 s. The bound is far above a loaded `sh` start and far below the 20 s the stand-in would run, so only a timeout that is not applied can fail it (injection below goes red by test timeout).
+
+## What I changed in the draft
+
+Reviewed `d2e3dc50` line by line. One defect found: the test "the read is handed what is left of the deadline, capped at the probe timeout" used a 300 ms deadline, where `min(1500, left())` and `left()` are the same number, so dropping the cap could not turn it red (and its comment named the wrong direction). `e3d4d07b` adds a second case at `deadlineMs` 10 000 expecting 1500, and a comment naming both faults. Both directions now go red (D2, D3 below).
+
+## Proof
+
+**10 consecutive runs of `session-ownership-manager.test.ts` + `session-ownership.test.ts`** (`env -u ANTHROPIC_BASE_URL bun test <the two files> > file`), on `d2e3dc50`, load average 100 at the start falling to 8-30 during the loop (the machine eased; one probe run before the loop at load 80-150 also passed, 78 s):
+
+| run | exit | pass | fail |
+|---|---|---|---|
+| 1 | 0 | 74 | 0 |
+| 2 | 0 | 74 | 0 |
+| 3 | 0 | 74 | 0 |
+| 4 | 0 | 74 | 0 |
+| 5 | 0 | 74 | 0 |
+| 6 | 0 | 74 | 0 |
+| 7 | 0 | 74 | 0 |
+| 8 | 0 | 74 | 0 |
+| 9 | 0 | 74 | 0 |
+| 10 | 0 | 74 | 0 |
+
+**Because the load had eased, three more runs under synthetic load:** the same two files plus `prompt-before-record.test.ts`, with 24 `yes` CPU burners running (load average 163, 180, 221): **3 of 3 exit 0, 82 pass / 0 fail each**. The burners were killed afterwards (`pgrep -x yes` = 0).
+
+**Final 10 on `e3d4d07b`** (the commit above changed one test after the first ten), same two files, load average 71 at the start, 20-40 after: **10 of 10 exit 0, 74 pass / 0 fail each**.
+
+**The seven round-5 injections, one site per `git archive` copy of `d2e3dc50`** (all three of `session-ownership`, `session-ownership-manager`, `prompt-before-record` run on each; none went red in a test other than the ones round 5 named). Verbatim:
+
+| Injection | RED |
+|---|---|
+| 1 win32 gate dropped (`!ownershipGuardApplies(...)` removed from `recordSpawnOwnership`) | `SpawnUnrecordedError: agent a: the spawned claude could not be recorded (identity-read), so it was ended and the spawn failed; it is not confirmed gone, so its session is quarantined` in `(fail) SessionManager — ownership guard and /clear (#595 r3) > win32 keeps its pre-#595 behaviour: no record is written, none is read, the spawn succeeds and the session is resumed`. 81 pass / 1 fail |
+| 2 refusal removed | `-   "kind": "rotate",` `-   "reason": "resume-identity-low-precision",` / `+   "kind": "resume",` `+   "reapedPid": 900,` `+   "reason": "orphan-reaped",` in 4 tests: `a second-precise LIVE read of a process recorded at microsecond precision is not signalled: rotate`, `a second-precise RECORD against a microsecond live read is not signalled either: rotate`, `second precision on both sides is not signalled`, `second precision refuses before uid and argv are even weighed` (that one `+   "reason": "owner-uid-mismatch",`). 78 pass / 4 fail |
+| 3 only the `lowPrecision` flag kept (record-side clause dropped) | same `rotate` -> `resume` / `orphan-reaped` diff in `(fail) … > a second-precise RECORD against a microsecond live read is not signalled either: rotate`. 81 pass / 1 fail |
+| 4 only the `+` mismatch kept (live-side flag dropped) | `(fail) … > second precision on both sides is not signalled` (`resume` / `orphan-reaped`) and `(fail) … > second precision refuses before uid and argv are even weighed` (`+   "reason": "owner-uid-mismatch",`). 80 pass / 2 fail |
+| 5 pending treated as unavailable (`const pendingRecord = null`) | `error: expect(received).toEqual(expected)` in `(fail) … > a PTY-reachable agent: nothing is typed or sent until the record exists, then the PTY gets it`, `… > an IPC-only agent: no frame and no typing until the record exists, then the frame`, `… > prompts held for one agent are delivered in the order they arrived`, and `… > a prompt arriving while the ownership write is pending is not delivered until the write resolves`; `Expected constructor: [class AgentNotRecordedError extends Error]` / `Received value: null` in three more. 75 pass / 7 fail |
+| 6 manager reports nothing pending (`recordingPending` returns null) | `expect(mgr?.recordingPending("a")).not.toBeNull()` / `Received: null` in `(fail) … > a prompt arriving while the ownership write is pending is not delivered until the write resolves` and `(fail) … > the agent is not reported spawned, and gets no prompt, before its record exists`; `Expected constructor: [class AgentNotRecordedError extends Error]` / `Received value: null` in `… > a write that fails: the spawn fails, the waiting prompt fails with its reason, and nothing was delivered`. 79 pass / 3 fail |
+| 7 failure never settles held prompts (`settleRecorded.fail` removed) | `(fail) … > a write that fails: the spawn fails, the waiting prompt fails with its reason, and nothing was delivered [30032.03ms]` `^ this test timed out after 30000ms.` 81 pass / 1 fail. **Changed from round 5:** there it went red on `Expected: "recording-failed"` / `Received: "recording-timeout"` because the 4 s backstop fired first; with the backstop now 120 s the held prompt never settles and the test's own 30 s timeout is the red. Still deterministic, no longer an assertion message. |
+
+**Five more injections for the new deadline tests** (one site each, `git archive` of `e3d4d07b`, `session-ownership.test.ts` only):
+
+| Injection | RED |
+|---|---|
+| D1 `bounded(...)` removed from the process read in `decideResume` | `^ this test timed out after 10000ms.` in `… > a process read that never returns: rotates at the bound, not before it, nothing signalled`, `… > the read is handed what is left of the deadline, capped at the probe timeout` and `… > a stall AFTER the SIGTERM is bounded by the same deadline, not by the longer SIGTERM stage`. 48 pass / 3 fail |
+| D2 `Math.min(PROBE_TIMEOUT_MS, left())` -> `PROBE_TIMEOUT_MS` | `-   300,` / `+   1500,` in `… > the read is handed what is left of the deadline, capped at the probe timeout`. 50 pass / 1 fail |
+| D3 `Math.min(PROBE_TIMEOUT_MS, left())` -> `left()` | `-   1500,` / `+   10000,` in the same test. 50 pass / 1 fail |
+| D4 `bounded(...)` removed from the record read | `^ this test timed out after 10000ms.` in `… > a record read that never returns is bounded too`. 50 pass / 1 fail |
+| D5 deadline timer armed 1 ms early (`ms - 1`) | `Expected: false` / `Received: true` in `… > a process read that never returns: rotates at the bound, not before it, nothing signalled`. 50 pass / 1 fail |
+
+## Gates
+
+- `bun run lint`: **exit 0** (the repo's existing warnings and infos). `biome check` on the touched test file: exit 0.
+- Typecheck (`bun run typecheck`, the ratchet): **149 errors, baseline 149**, same as round 5 at `0b6d67d8`.
+- `env -u ANTHROPIC_BASE_URL bun test src > /tmp/595r5b-src.txt 2>&1`: **exit 1, 5103 pass, 5 skip, 10 fail** (5118 tests, 275 files), load average 32-50. All ten failures are in three files this change does not touch, and none is in `src/bus/__tests__/session-ownership*.test.ts` or `prompt-before-record.test.ts`:
+  - `src/tuner/__tests__/wisecron/host-telemetry-provider.test.ts` (6 fail, 5-25 s timeouts) and `src/tuner/__tests__/wisecron/subjects/skills-fitness.test.ts` (1 fail, "does not call the judge again within the failure cooldown", 5 s timeout): **both fail the same way on a `git archive` of `0b6d67d8` at load ~40** (host-telemetry 4 fail, skills-fitness 1 fail; 66 pass / 5 fail across the three files there).
+  - `src/bus/__tests__/inject-turn-net.test.ts` (3 fail, #215): flaky under load on both trees. Three alternating runs at load 46-53: `0b6d67d8` failed 3 of 3 (1, 2, 2 fails), `d2e3dc50` 2 of 3 (0, 2, 3 fails). It does not import anything ownership-related.
+- Versions: `plugin.json` 2.2.355 (unchanged; no bump in this round, the version guards compare against the merge base).
+
+## Residuals
+
+- The seam does not make the real `ps`/`/proc` readers fast; the real-process tests still spawn real stand-ins and read real process state. They no longer have a bound a loaded machine can miss: every bound they depend on is 60-120 s and a miss fails loudly.
+- Three of the new RED lines (D1, D4, injection 7) are test timeouts, not assertion messages. A hung guard cannot be told apart from a slow one except by a bound; the bounds are 10-30 s.
+- `inject-turn-net`, `host-telemetry-provider` and `skills-fitness` flake on this machine independent of #595; the first is a bus test and worth its own issue.
