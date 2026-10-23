@@ -595,3 +595,73 @@ The first four are the ones the coordinator required. A fifth-to-eighth row was 
 - **A failed `/clear`** (replacement exited) leaves the agent down with the fresh id stored; recovery is the next start/restart, which creates that session. Not auto-retried: a crashing boot should not loop.
 - `getAgent()` returns undefined for the 0-4 s a new process is awaiting its record; callers treat that as "not spawned yet", which is the intent.
 - No live end-to-end run with the real CLI (authentication out of scope); real processes, real `ps`/libproc reads and real signals run in the manager tests.
+
+# Round 5
+
+Branch `fix/595-bus-session-resume`, on top of `fc2e1fa5`. Code + tests in `1f3b788a`; this report in the commit after it. Nothing is pushed to `feat/550-pty-default`. The #562 round-9 fence, quarantine and synchronous spawn-check design is unchanged (no edit near `assertSessionWritable` / `assertSessionSpawnable`). The eight findings Codex closed in round 4 stay closed; the only existing assertions that changed are the three that encoded "a second-precise match may signal" (Fix 2) and one that carried `lowPrecision: false`.
+
+Codex's round-4 review: 1 HIGH (win32), 2 MEDIUM (macOS low precision still signals; prompt before the record exists).
+
+## Fix 1 — HIGH: no ownership record on win32
+
+The record is written on every platform, the probe reads POSIX state (`ps`), and since round 4 a failed write is fatal, so every Windows spawn would have been retired.
+
+Ruling applied: one shared predicate, `ownershipGuardApplies(platform)` (`session-ownership.ts:41`, false only for `win32`), used by BOTH halves: the restart-time decision (`session-manager.ts:1164`, which replaced the inline `process.platform !== "win32"`) and the spawn-time record (`recordSpawnOwnership`, `session-manager.ts:1528`). `SessionManagerOptions.platform` is the test seam. Windows keeps its pre-#595 behaviour: no record written, none read, no probe.
+
+## Fix 2 — MEDIUM: a second-precise identity never authorises a signal
+
+`decideResume` (`session-ownership.ts:735-739`) now throws `RotateSignal("resume-identity-low-precision")` before the uid and argv checks when the live read is flagged `lowPrecision`, or when exactly one of the record and the live identity carries microseconds. Both-high (Linux `btime:ticks`, or macOS `<lstart>+<usec>` on both sides) is the only path to a signal, and uid + argv are still weighed after it. `sameStart` is unchanged: a second-precise match still answers "gone or reused?" (a different second resumes as `pid-reused`), and a same-second one reads as alive, which now rotates instead of being killed. `ResumeDecision.lowPrecision` and the `identity_precision=low-1s` log text are gone (the case cannot occur); `RotateReason` gained the new code.
+
+## Fix 3 — MEDIUM: no prompt before the record exists
+
+"Recording pending" is a state of its own, not "unavailable".
+
+- `SessionManager.recordingPending(agentId)` (`session-manager.ts:1967`): non-null while the agent's claude is spawned and not yet `deliverable`; the promise (`AgentRecord.recorded`, `:857`) resolves with `deliverable` (`:1407`) and REJECTS when the record failed (`:1403`, before the retirement starts, so waiters fail at once). `getAgent()` still hides the process (slash relay and other callers unchanged).
+- `BusCore.sendPrompt` (`core.ts:1248-1249`) asks `RecordingPendingCheck` first. A pending agent goes to `sendWhenRecorded` (`core.ts:1299`): the prompt waits for the record, at most `deliveryBackstopMs` (the bus's existing delivery timer, 4 s default), then goes through the normal path, so BOTH transports (PTY typing and the IPC `prompt` frame) only ever see an agent that is recorded. Prompts held for one agent resume in arrival order. An agent with nothing pending takes the same synchronous path as before (ack tick count unchanged).
+- Recording fails, or the wait runs out: the prompt is delivered nowhere and rejects with `AgentNotRecordedError` (`core.ts:248`), `reason` `recording-failed` or `recording-timeout`; one `[bus-ipc] undeliverable` line carries the reason.
+- Wired in `runtime-mount.ts:423` (detached at both teardown sites, `:745`, `:778`).
+
+## Sites changed
+
+| Site | Change |
+|---|---|
+| `session-ownership.ts:41` | `ownershipGuardApplies` |
+| `session-ownership.ts:647`, `:735-739` | `resume-identity-low-precision` code; refusal before the uid/argv gate; `lowPrecision` removed from the resume decision |
+| `session-manager.ts:1164`, `:1528` | both halves keyed on the shared predicate; `options.platform` seam |
+| `session-manager.ts:857`, `:1255-1270`, `:1403-1407`, `:1967` | `recorded` / `settleRecorded`, settle points, `recordingPending()` |
+| `core.ts:241`, `:248`, `:411`, `:480`, `:1248-1249`, `:1299`, `:2558` | `RecordingPendingCheck`, `AgentNotRecordedError`, setter, gate in `sendPrompt`, `sendWhenRecorded` |
+| `runtime-mount.ts:423`, `:745`, `:778` | wiring and detach |
+| tests | `session-ownership.test.ts` (3 rewritten + 4 added: both-sides low precision, record-side low, live-side low, refusal ahead of uid/argv, both-high signals, both-high still uid/argv gated, different second still resumes), `session-ownership-manager.test.ts` (+1: win32), new `prompt-before-record.test.ts` (8: six at the bus with a manual pending promise, two end to end with a real `SessionManager` whose `store.write` is a manual promise and a real IPC client) |
+
+## Fault injections (one site per `git archive` copy of `1f3b788a`)
+
+Each test carries its `Fault … Predicted result` comment, written before the run. Verbatim from the run output:
+
+| Injection | RED |
+|---|---|
+| **win32 gate dropped** (`!ownershipGuardApplies(...)` removed from `recordSpawnOwnership`) | `SpawnUnrecordedError: agent a: the spawned claude could not be recorded (identity-read), so it was ended and the spawn failed; it is not confirmed gone, so its session is quarantined` in `(fail) … > win32 keeps its pre-#595 behaviour: no record is written, none is read, the spawn succeeds and the session is resumed`. 0 pass / 1 fail |
+| **seconds-only match authorises a signal** (the whole refusal removed) | `-"kind": "rotate", -"reason": "resume-identity-low-precision"` / `+"kind": "resume", +"reapedPid": 900, +"reason": "orphan-reaped"` in 4 tests: `a second-precise LIVE read of a process recorded at microsecond precision is not signalled`, `a second-precise RECORD against a microsecond live read is not signalled either`, `second precision on both sides is not signalled`, `second precision refuses before uid and argv are even weighed`. 46 pass / 4 fail |
+| record-side clause dropped (only the `includes("+")` mismatch) | `(fail) … > a second-precise RECORD against a microsecond live read is not signalled either: rotate`. 49 pass / 1 fail |
+| live-side flag dropped (only `lowPrecision === true`) | `(fail) … > second precision on both sides is not signalled` and `… > second precision refuses before uid and argv are even weighed`. 48 pass / 2 fail |
+| **pending treated as unavailable again** (bus: `pendingRecord = null`) | `expect(typed).toEqual([])` `- Expected - 1 / + Received + 3` (PTY typed at once) and `expect(client.prompts()).toEqual([])` `- Expected - 1 / + Received + 10` (IPC frame sent at once); also `expect(err).toBeInstanceOf(AgentNotRecordedError)` `Received value: null`. 1 pass / 7 fail |
+| manager reports nothing pending (`recordingPending` returns null) | `expect(mgr?.recordingPending("a")).not.toBeNull()` `Received: null`; the failing-write test gets `SpawnUnrecordedError` only. 6 pass / 2 fail |
+| failure never settles the held prompts (`settleRecorded.fail` removed) | `expect((sendErr as AgentNotRecordedError).reason).toBe("recording-failed")` `Expected: "recording-failed"` / `Received: "recording-timeout"`. 7 pass / 1 fail |
+
+## Gates
+
+- `env -u ANTHROPIC_BASE_URL bun test src > /tmp/595r5-src.txt 2>&1`: **NOT a clean exit 0 on this machine. Two full runs, both exit 1, all failures timing-dependent.** Run 1 (load 65 to 437): 5110 pass, 5 skip, 2 fail (`core.test.ts` stuck-compaction re-delivery, `jsonl-tailer` startAt live-tail). Run 2 (load ~90 falling to 33): 5102 pass, 5 skip, 10 fail (`pty-process` approval-dialog timer, two `session-ownership-manager` real-process tests that wait ~3 s for a stand-in `claude` to start, six `host-telemetry-provider` and one `skills-fitness` tuner test at their 5000 ms timeout). The failing set differs on every run.
+- **Rerun alone:** every `src/bus` and `pty-process` failure passed on rerun (`core.test.ts` file 157/0; the stuck-compaction test 2 of 2; `pty-process.test.ts` 0 fail; the named `session-ownership-manager` tests 3 of 3). The two tuner files (`host-telemetry-provider.test.ts`, `skills-fitness.test.ts`) still failed alone at load ~65, and **they fail the same way (5000 ms timeouts) on a `git archive` of `fc2e1fa5`**: unrelated to this change (nothing under `src/tuner` is touched).
+- `src/bus` alone (last run, load ~37): 1068 pass, 4 fail, all timing: `inject-turn-net` (#215), two `jsonl-tailer` `onTurnObserved`, one real-process ownership-manager test. `inject-turn-net.test.ts` is itself flaky on `fc2e1fa5`: 3 of 4 runs failed there with no change of mine. The seven files this round touches or sits beside (`session-ownership`, `session-ownership-manager`, `prompt-before-record`, `session-resume`, `core`, `session-manager`, `jsonl-tailer`) ran together once: 354 pass, 1 fail (a `core.test.ts` 256 ms timer test that passes alone, 3 of 3, on both trees).
+- The new `prompt-before-record.test.ts` (8) and the rewritten `session-ownership.test.ts` (50) were green on every run they were in. The win32 test passed alone.
+- `bun run lint`: **exit 0** (the repo's existing warnings; the seven touched files are clean). Typecheck (`bun run typecheck`): **149 errors, baseline 149**.
+- Versions: `plugin.json` 2.2.355 (unchanged).
+
+## Residuals
+
+- **win32 has no ownership guard at all** (named as required): no record, no orphan check, no `resume-identity-low-precision`. A claude left by a previous daemon can still be resumed beside. Same as before #595; the bus PTY is off by default there.
+- **macOS without libproc now rotates where it used to reap.** A second-precise identity (non-Bun runtime, failed `dlopen`, or a record written that way) is never killed, so that restart loses the conversation (fresh id) and the orphan is left running. The cost of "no signal on a second-precise match"; Linux and macOS-with-libproc are unaffected.
+- **Only `sendPrompt` is gated.** The other IPC sends (`ask_answer`, `permission_response`, `job_result`, the reply nudge) answer the child's own requests or follow a turn, so an unrecorded child has none outstanding; `getAgent()` callers (slash relay) still see "not spawned" during the window.
+- **The wait is bounded by `deliveryBackstopMs` (4 s), the record by two 4 s steps (`RECORD_STEP_MS`).** On a very slow disk or `ps` a prompt can fail with `recording-timeout` while the record is still pending; it is not delivered, a later prompt works once the record exists. Callers that need to retry must.
+- Held prompts do not count against the per-agent queue caps while they wait (bounded by the 4 s window).
+- Round-4 residuals otherwise unchanged (crash window fork-to-`rename`, pre-upgrade claude, read-to-signal race, flat macOS argv).
+- Test timing: the machine was at load average 65 to 437 for this round (84+ users, other agents). Real-process manager tests and a few timer tests in `core.test.ts` / `jsonl-tailer.test.ts` flake under it; every flake named in the gate passed rerun alone.
