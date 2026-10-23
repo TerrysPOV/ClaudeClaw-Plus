@@ -156,7 +156,7 @@ exec sleep 60
       commandOverride: command,
       busSocketPath: join(dir, "bus.sock"),
       projectsDir,
-      sessionCollisionDetectMs: 600,
+      sessionCollisionDetectMs: 1500,
       postMortemDir: join(dir, "post-mortem"),
       persistRotatedSessionId: async (agentId, sessionId) => {
         persisted.push({ agentId, sessionId });
