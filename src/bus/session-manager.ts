@@ -1072,10 +1072,25 @@ export class SessionManager {
       }
       // Let stop()'s own bookkeeping land before a new process takes the registry slot.
       await Promise.race([stopped, sleepMs(1000)]);
-      if (this.agents.get(agent_id) === record) this.agents.delete(agent_id);
+      if (this.agents.get(agent_id) === record) {
+        // stop()'s own bookkeeping has not landed. When it does it finds this record gone and leaves
+        // the agent id alone (#595 r9), so the old process's tailer and MCP config are released here.
+        void record.tailer?.stop();
+        this.cleanupAgentMcpConfig(record.mcpConfigCwd, agent_id);
+        this.agents.delete(agent_id);
+      }
     } finally {
       liftFence(record);
     }
+  }
+
+  /** Whether a retirement can be OS-confirmed for `record`: the ownership guard applies to it (#595 r9). */
+  private ownershipRetirementApplies(record: AgentRecord): boolean {
+    return (
+      this.options.ownershipStore !== undefined &&
+      ownershipGuardApplies(this.options.platform) &&
+      record.mode !== "tmux"
+    );
   }
 
   private async clearSessionInternal(agent_id: string): Promise<void> {
@@ -1750,16 +1765,22 @@ export class SessionManager {
       const finalise = (): void => {
         // Issue #215: tear down the session tailer.
         void record.tailer?.stop();
-        // Issue #165: release the multiplexer identity + delete the
-        // synthesized per-agent --mcp-config when this spawn had one.
-        this.cleanupAgentMcpConfig(record.mcpConfigCwd, agent_id);
-        // Drop from registry (the onExit handler installed in spawnAgent()
-        // will also do this; harmless to do twice).
-        this.agents.delete(agent_id);
-        // Drop the restart-budget entry too — otherwise a stopped-and-never-
-        // restarted agent leaves a stranded number[] for the life of the
-        // manager (slow leak in a primitive whose purpose is to bound growth).
-        this.restartHistory.delete(agent_id);
+        // Everything below is keyed by the agent id, so it belongs to whichever record holds the id
+        // NOW. This callback can arrive late (a `/clear` or restart confirmed the old pid gone through
+        // the OS and already spawned the replacement): then it must not drop the replacement's
+        // registry entry, revoke its MCP identity or reset its restart budget (#595 r9).
+        if (this.agents.get(agent_id) === record) {
+          // Issue #165: release the multiplexer identity + delete the
+          // synthesized per-agent --mcp-config when this spawn had one.
+          this.cleanupAgentMcpConfig(record.mcpConfigCwd, agent_id);
+          // Drop from registry (the onExit handler installed in spawnAgent()
+          // will also do this; harmless to do twice).
+          this.agents.delete(agent_id);
+          // Drop the restart-budget entry too — otherwise a stopped-and-never-
+          // restarted agent leaves a stranded number[] for the life of the
+          // manager (slow leak in a primitive whose purpose is to bound growth).
+          this.restartHistory.delete(agent_id);
+        }
         resolve();
       };
       if (record.proc._isExited()) {
@@ -1927,7 +1948,20 @@ export class SessionManager {
       log.warn(`[bus-session] agent=${agent_id} post-mortem capture failed`, err);
     }
 
-    await this.stop(agent_id);
+    if (opts.freshSession === false && this.ownershipRetirementApplies(record)) {
+      // The id is kept, so the old claude must be gone before the resume decision reads its record.
+      // `stop()` resolves on the wrapper's exit event, which is not proof the OS process ended (#562):
+      // a still-visible old pid reads as `current-boot-owner-alive` and would rotate a session the
+      // caller asked to preserve. Retire it as `/clear` does: OS-confirmed, quarantined if it will not
+      // go (#595 r9).
+      await this.retireLive(agent_id, record, record.ownership, {
+        quarantineReason: "bus-restart-exit-unconfirmed",
+        logReason: "restart-retire-unconfirmed",
+        failure: "restart failed",
+      });
+    } else {
+      await this.stop(agent_id);
+    }
 
     // Persist succeeded — adopt the fresh id on the live record now that the
     // old process is gone (so the respawn boots against the new session).

@@ -66,6 +66,11 @@ export interface OwnershipRecord {
   pid: number;
   /** Start identity of `pid` when it was spawned: see `ProcessInfo.identity`. */
   identity: string;
+  /**
+   * True when `identity` was only second-precise at spawn (macOS, libproc unavailable). Such a record
+   * can answer 'is it still there?' but never authorises a signal: see `mayAuthoriseSignal` (#595 r9).
+   */
+  lowPrecision?: boolean;
   bootId: string;
   /** Basename of the executable the daemon launched (what argv must still name). */
   exe: string;
@@ -98,6 +103,7 @@ const isRecord = (v: unknown): v is OwnershipRecord => {
     r.pid <= MAX_PID &&
     r.pid !== process.pid &&
     typeof r.identity === "string" &&
+    (r.lowPrecision === undefined || typeof r.lowPrecision === "boolean") &&
     typeof r.bootId === "string" &&
     typeof r.exe === "string" &&
     typeof r.spawnedAt === "string"
@@ -536,6 +542,62 @@ export function namesOwnedClaude(info: ProcessInfo, rec: OwnershipRecord): boole
   return false;
 }
 
+/* ── The one gate before any signal ─────────────────────────────────────── */
+
+/** Why a signal was refused. A subset of `RotateReason`, so `decideResume` rotates on it unchanged. */
+export type SignalRefusal =
+  | "resume-identity-low-precision"
+  | "owner-uid-mismatch"
+  | "owner-argv-mismatch";
+
+/**
+ * May the daemon signal `live` as the process `owned` names? `null` means yes; otherwise the reason it
+ * may not. EVERY signal this module sends goes through here (`signalOwned` is the only caller of
+ * `ProcessProbe.kill`), on a read taken immediately before the signal (#595 r5, r9):
+ *  - a microsecond birth identity on BOTH sides. A second-precise match (macOS without libproc, on the
+ *    live read or on the record) can still be a pid reused within that second, and uid + argv cannot
+ *    tell those apart. It was good enough to say 'still there', never to kill;
+ *  - the same uid as the daemon;
+ *  - an argv that still names the executable we launched and the session id.
+ */
+export function mayAuthoriseSignal(a: {
+  live: ProcessInfo;
+  owned: OwnershipRecord;
+  uid: number;
+}): SignalRefusal | null {
+  const { live, owned, uid } = a;
+  if (
+    live.lowPrecision === true ||
+    owned.lowPrecision === true ||
+    live.identity.includes("+") !== owned.identity.includes("+")
+  )
+    return "resume-identity-low-precision";
+  if (live.uid !== uid) return "owner-uid-mismatch";
+  if (!namesOwnedClaude(live, owned)) return "owner-argv-mismatch";
+  return null;
+}
+
+/**
+ * Signal `owned.pid` once `mayAuthoriseSignal` allows it. Returns the refusal (nothing was sent) or
+ * null (sent; an ESRCH because it exited in between is absorbed, the caller's confirmation decides).
+ */
+function signalOwned(a: {
+  probe: ProcessProbe;
+  signal: "SIGTERM" | "SIGKILL";
+  live: ProcessInfo;
+  owned: OwnershipRecord;
+  uid: number;
+}): SignalRefusal | null {
+  const refusal = mayAuthoriseSignal(a);
+  if (refusal) return refusal;
+  try {
+    a.probe.kill(a.owned.pid, a.signal);
+  } catch {
+    // ESRCH: it exited between the read and the signal.
+  }
+  return null;
+}
+
 /* ── Writing and clearing the record ────────────────────────────────────── */
 
 /**
@@ -584,6 +646,7 @@ export async function recordOwnership(a: {
     sessionId: a.sessionId,
     pid: a.pid,
     identity: info.identity,
+    ...(info.lowPrecision ? { lowPrecision: true } : {}),
     bootId: a.bootId ?? DAEMON_BOOT_ID,
     exe: a.exe,
     spawnedAt: new Date().toISOString(),
@@ -641,7 +704,9 @@ export async function confirmGoneAndClear(a: {
 /**
  * Retire a process the daemon is deliberately ending (a controlled restart): confirm with the OS
  * that it is gone, SIGKILLing it once if it is not. The signal goes only to the process the record
- * names, revalidated (same start identity) immediately before it. True only when the OS confirms.
+ * names, revalidated immediately before it and authorised by the same gate `decideResume` uses
+ * (`mayAuthoriseSignal`): a refused signal leaves the process unconfirmed. True only when the OS
+ * confirms.
  */
 export async function confirmRetired(a: {
   store: OwnershipStore;
@@ -649,18 +714,24 @@ export async function confirmRetired(a: {
   record: OwnershipRecord;
   graceMs?: number;
   killMs?: number;
+  uid?: number;
 }): Promise<boolean> {
   const { probe, record } = a;
+  const uid = a.uid ?? process.getuid?.() ?? -1;
   try {
     let gone = await pollDeparted(probe, record, a.graceMs ?? 2000);
     if (!gone) {
       // Revalidate immediately before the signal: only the process that was spawned.
-      if (!departed(await probe.read(record.pid, PROBE_TIMEOUT_MS), record)) {
-        try {
-          probe.kill(record.pid, "SIGKILL");
-        } catch {
-          // ESRCH: it exited between the read and the signal; the poll below decides.
-        }
+      const live = await probe.read(record.pid, PROBE_TIMEOUT_MS);
+      if (!departed(live, record)) {
+        const refused = signalOwned({
+          probe,
+          signal: "SIGKILL",
+          live: live as ProcessInfo,
+          owned: record,
+          uid,
+        });
+        if (refused) return false;
       }
       gone = await pollDeparted(probe, record, a.killMs ?? 2000);
     }
@@ -773,23 +844,14 @@ export async function decideResume(a: {
         gone = true;
         break;
       }
-      const live = now as ProcessInfo;
-      // A signal rests on a microsecond birth identity on BOTH sides (#595 r5). A second-precise
-      // match (macOS without libproc, on the live read or the record) can still be a pid reused in
-      // the same second, and uid + argv cannot tell those apart: rotate, signal nothing. The
-      // second-precise match was good enough to say 'alive, not ours to resume beside', never to kill.
-      if (
-        live.lowPrecision === true ||
-        live.identity.includes("+") !== owned.identity.includes("+")
-      )
-        throw new RotateSignal("resume-identity-low-precision");
-      if (live.uid !== uid) throw new RotateSignal("owner-uid-mismatch");
-      if (!namesOwnedClaude(live, owned)) throw new RotateSignal("owner-argv-mismatch");
-      try {
-        a.probe.kill(owned.pid, signal);
-      } catch {
-        // ESRCH: it exited between the read and the signal; the confirmation below decides.
-      }
+      const refused = signalOwned({
+        probe: a.probe,
+        signal,
+        live: now as ProcessInfo,
+        owned,
+        uid,
+      });
+      if (refused) throw new RotateSignal(refused);
       const stageMs =
         signal === "SIGTERM" ? (a.termMs ?? ORPHAN_TERM_MS) : (a.killMs ?? ORPHAN_KILL_MS);
       const until = Math.min(end, clock.now() + stageMs);

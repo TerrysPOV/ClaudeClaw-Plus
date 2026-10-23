@@ -50,7 +50,7 @@ import {
   type SessionManagerOptions,
   SpawnUnrecordedError,
 } from "../session-manager";
-import type { ProcessProbe } from "../session-ownership";
+import type { ProcessInfo, ProcessProbe } from "../session-ownership";
 import type { AgentConfig } from "../types";
 import { wireSlashCommands } from "../wiring";
 import {
@@ -267,6 +267,19 @@ wait $p
   };
 
   const orphanAlive = (): boolean => alive(orphan?.pid as number);
+
+  /**
+   * The stand-in as a fake probe reads it: microsecond identity, this daemon's uid, and the argv the
+   * manager launched (`sh claude.sh --session-id <id>`). Since #595 r9 a retirement signals only a
+   * process that passes the same gate as `decideResume`, so a fake that is to be SIGKILLed must be one.
+   */
+  const standInInfo = (over: Partial<ProcessInfo> = {}): ProcessInfo =>
+    claudeInfo({
+      identity: "T1+000001",
+      uid: process.getuid?.() ?? -1,
+      argv: ["sh", join(dir, "claude.sh"), "--session-id", SID],
+      ...over,
+    });
 
   /* ── ownership at restart ─────────────────────────────────────────── */
 
@@ -544,7 +557,7 @@ wait $p
         throw new Error("EROFS");
       };
       const probe = new FakeProbe();
-      probe.alwaysAlive = claudeInfo({ identity: "T1" });
+      probe.alwaysAlive = standInInfo();
       const m = manager({ probe, stageMs: 150 });
       const err = await m.spawnAgent(agentConfig(), "cli").then(
         () => null,
@@ -564,6 +577,47 @@ wait $p
     },
     T,
   );
+
+  describe("a failed ownership write signals only a process that passes the signal gate (#595 r9)", () => {
+    const S = "Thu Oct 23 10:00:00 2026";
+    /** Spawn with an unwritable record against a child the fake probe reads as `info`; return the signals sent. */
+    async function failedWriteSignals(info: ProcessInfo): Promise<string[]> {
+      store.write = async () => {
+        throw new Error("EROFS");
+      };
+      const probe = new FakeProbe();
+      probe.alwaysAlive = info;
+      const m = manager({ probe, stageMs: 150 });
+      const err = await m.spawnAgent(agentConfig(), "cli").then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(SpawnUnrecordedError);
+      expect((err as SpawnUnrecordedError).retired).toBe(false);
+      expect(isSessionQuarantined({ sessionId: SID })).toBe(true);
+      return probe.kills.map((k) => k.signal);
+    }
+
+    it("second precision: nothing is signalled, the session is quarantined", async () => {
+      // Fault (site: `confirmRetired`, the gate bypassed): a pid reused within the second is killed.
+      // Predicted result: `["SIGKILL"]`.
+      expect(await failedWriteSignals(standInInfo({ identity: S, lowPrecision: true }))).toEqual(
+        [],
+      );
+    });
+
+    it("a foreign uid: nothing is signalled", async () => {
+      expect(await failedWriteSignals(standInInfo({ uid: (process.getuid?.() ?? 0) + 1 }))).toEqual(
+        [],
+      );
+    });
+
+    it("an argv that is not the launched claude: nothing is signalled", async () => {
+      expect(
+        await failedWriteSignals(standInInfo({ argv: ["sh", "other.sh", "--resume", SID] })),
+      ).toEqual([]);
+    });
+  });
 
   it(
     "an identity that cannot be read fails the spawn the same way",
@@ -636,6 +690,69 @@ wait $p
     T,
   );
 
+  it(
+    "a preserving restart waits for the OS: an old pid still visible for a moment does not rotate the session",
+    async () => {
+      // Fault (site: the `retireLive` branch of `restartInternal`, back to a bare `stop()`): the
+      // resume decision reads the same-boot record while the old pid is still visible. Predicted
+      // result: `current-boot-owner-alive`, so `persisted` has one rotated id and `--resume` is absent.
+      writeTranscript(SID);
+      const probe = new FakeProbe();
+      probe.alwaysAlive = standInInfo();
+      // Read 1 of a pid is the spawn's identity read. Reads 2-4 find it still there: the exit event
+      // has fired and the OS has not finished with it, and BOTH the exit handler's own confirmation
+      // and the next start look. Fewer visible reads let the exit handler's poll clear the record
+      // before the start reads it, which hides the fault (an injection showed it). From read 5 on it
+      // is gone.
+      probe.intercept = (_pid, nth) => (nth >= 5 ? null : undefined);
+      const m = manager({ probe });
+      const agent = agentConfig();
+      const first = await m.spawnAgent(agent, "cli");
+      await started(first.pid);
+
+      await m.restart("a", { freshSession: false, reason: "manual" });
+      const second = livePid();
+      await started(second);
+
+      expect(second).not.toBe(first.pid);
+      expect(persisted).toHaveLength(0);
+      expect(agent.session_id).toBe(SID);
+      expect(flagValue(argvOf(second), "--resume")).toBe(SID);
+      expect(probe.reads.filter((p) => p === first.pid).length).toBeGreaterThanOrEqual(5);
+      expect(errored.filter((l) => l.includes("rotating"))).toHaveLength(0);
+    },
+    T,
+  );
+
+  it(
+    "a preserving restart whose old pid never leaves is the existing unconfirmed path: quarantined, same id, no rotation",
+    async () => {
+      // Fault (site: the same `retireLive` branch, a bare `stop()`): the restart rotates silently.
+      // Predicted result: the promise resolves and `persisted` has one entry.
+      writeTranscript(SID);
+      const probe = new FakeProbe();
+      probe.alwaysAlive = standInInfo();
+      const m = manager({ probe, stageMs: 150 });
+      const agent = agentConfig();
+      await m.spawnAgent(agent, "cli");
+
+      await expect(m.restart("a", { freshSession: false, reason: "manual" })).rejects.toThrow(
+        "not confirmed gone",
+      );
+
+      expect(persisted).toHaveLength(0);
+      expect(agent.session_id).toBe(SID);
+      // No second process: every spawn's identity is read before its `spawnAgent` resolves.
+      expect(new Set(probe.reads).size).toBe(1);
+      expect(isSessionQuarantined({ sessionId: SID })).toBe(true);
+      expect(errLines("restart-retire-unconfirmed")).toHaveLength(1);
+      probe.alwaysAlive = null;
+      await assertSessionWritable({ sessionId: SID });
+      expect(isSessionQuarantined({ sessionId: SID })).toBe(false);
+    },
+    T,
+  );
+
   /* ── /clear as a controlled restart ───────────────────────────────── */
 
   function wired(m: SessionManager): SlashHandler {
@@ -688,7 +805,7 @@ wait $p
       // persisted.
       writeTranscript(SID);
       const probe = new FakeProbe();
-      probe.alwaysAlive = claudeInfo({ identity: "T1" });
+      probe.alwaysAlive = standInInfo();
       const m = manager({ probe, stageMs: 150 });
       const clear = wired(m);
       const agent = agentConfig();
