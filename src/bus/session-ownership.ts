@@ -248,7 +248,10 @@ export function createFileOwnershipStore(
       }),
     clear: (agentId, expect) =>
       serial(agentId, async (gate) => {
-        const current = await load(agentId).catch(() => null);
+        // Only a true ENOENT (load -> null) is "no record". Any other failure (EIO, EACCES, a malformed
+        // record, the store timeout) rejects and deletes nothing: a failed compare-read must never read as
+        // absent, or a delayed clear from an old process deletes its replacement's record (#596 r11).
+        const current = await load(agentId);
         gate.assertLive(); // a read that outlived its bound must not delete a newer record
         if (current && (current.pid !== expect.pid || current.identity !== expect.identity)) return;
         await fs.rm(pathFor(agentId), { force: true });
@@ -797,6 +800,29 @@ async function pollDeparted(
   }
 }
 
+/** Where a failed `store.clear` is reported. `console` unless the caller passes its own. */
+export interface OwnershipLogger {
+  warn(message: string): void;
+}
+
+/**
+ * One reason-coded line for a `store.clear` that failed. The record is left in place (fail closed): the
+ * next start's guard sees it, re-checks the process and either reaps or rotates (#596 r11). Only the
+ * error's code or name is logged, never its message (which can carry a path).
+ */
+function warnClearFailed(
+  logger: OwnershipLogger | undefined,
+  agentId: string,
+  op: string,
+  err: unknown,
+): void {
+  const e = err as { code?: unknown; name?: unknown } | null;
+  const kind = String(e?.code ?? e?.name ?? "unknown");
+  (logger ?? console).warn(
+    `[bus-session] agent=${agentId} reason=ownership-clear-failed op=${op} error=${kind} — the ownership record is left in place; the next start re-checks the process`,
+  );
+}
+
 /**
  * After the process reported its exit: ask the OS (the exit event is not proof, bun-pty fires it at
  * once), and clear the record only when the OS confirms. Alive or unreadable keeps the record, so
@@ -811,14 +837,20 @@ export async function confirmGoneAndClear(a: {
   clearMs?: number;
   /** TEST SEAM (`GuardClock`): inert when unset. */
   clock?: GuardClock;
+  logger?: OwnershipLogger;
 }): Promise<"cleared" | "alive" | "unknown"> {
   try {
     if (!(await pollDeparted(a.probe, a.record, a.withinMs ?? 2000))) return "alive";
-    await withDeadline(
-      a.store.clear(a.record.agentId, a.record),
-      a.clearMs ?? CLEAR_BOUND_MS,
-      a.clock,
-    );
+    try {
+      await withDeadline(
+        a.store.clear(a.record.agentId, a.record),
+        a.clearMs ?? CLEAR_BOUND_MS,
+        a.clock,
+      );
+    } catch (err) {
+      warnClearFailed(a.logger, a.record.agentId, "confirm-gone", err);
+      return "unknown";
+    }
     return "cleared";
   } catch {
     return "unknown";
@@ -843,6 +875,7 @@ export async function confirmRetired(a: {
   clearMs?: number;
   /** TEST SEAM (`GuardClock`): inert when unset. */
   clock?: GuardClock;
+  logger?: OwnershipLogger;
 }): Promise<boolean> {
   const { probe, record } = a;
   const uid = a.uid ?? process.getuid?.() ?? -1;
@@ -864,11 +897,17 @@ export async function confirmRetired(a: {
       gone = await pollDeparted(probe, record, a.killMs ?? 2000);
     }
     if (gone) {
-      await withDeadline(
-        a.store.clear(record.agentId, record),
-        a.clearMs ?? CLEAR_BOUND_MS,
-        a.clock,
-      );
+      try {
+        await withDeadline(
+          a.store.clear(record.agentId, record),
+          a.clearMs ?? CLEAR_BOUND_MS,
+          a.clock,
+        );
+      } catch (err) {
+        // Gone, but the record could not be cleared (or compared): not cleanly recorded, so unconfirmed.
+        warnClearFailed(a.logger, record.agentId, "confirm-retired", err);
+        return false;
+      }
     }
     return gone;
   } catch {
@@ -922,6 +961,7 @@ export async function decideResume(a: {
   killMs?: number;
   /** TEST SEAM (`GuardClock`): inert when unset. */
   clock?: GuardClock;
+  logger?: OwnershipLogger;
 }): Promise<ResumeDecision> {
   const bootId = a.bootId ?? DAEMON_BOOT_ID;
   const uid = a.uid ?? process.getuid?.() ?? -1;
@@ -958,6 +998,7 @@ export async function decideResume(a: {
       } catch (err) {
         if (err instanceof GuardDeadlineError) throw err;
         // A record that will not clear is re-examined (and cleared) by the next start.
+        warnClearFailed(a.logger, owned.agentId, "decide-resume", err);
       }
     };
 

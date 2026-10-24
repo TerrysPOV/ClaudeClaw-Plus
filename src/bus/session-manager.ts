@@ -1040,6 +1040,7 @@ export class SessionManager {
             record: proven,
             graceMs: stageMs,
             killMs: stageMs,
+            logger: this.options.logger,
           });
         }
         // No record to prove identity with: only a pid that no longer exists counts as gone.
@@ -1214,6 +1215,7 @@ export class SessionManager {
         deadlineMs: this.options.ownershipGuardMs,
         termMs: this.options.ownershipTermMs,
         killMs: this.options.ownershipTermMs,
+        logger: this.options.logger,
       });
       if (decision.kind === "rotate") {
         await this.rotateStoredSession(agent, decision.reason);
@@ -1398,7 +1400,14 @@ export class SessionManager {
         if (ownershipStore && current.ownership) {
           const probe = this.options.processProbe ?? createSystemProbe();
           void current.ownership.then((rec) =>
-            rec ? confirmGoneAndClear({ store: ownershipStore, probe, record: rec }) : undefined,
+            rec
+              ? confirmGoneAndClear({
+                  store: ownershipStore,
+                  probe,
+                  record: rec,
+                  logger: this.options.logger,
+                })
+              : undefined,
           );
         }
         // Issue #215: tear down the session tailer on natural exit too.
