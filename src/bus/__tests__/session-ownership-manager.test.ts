@@ -45,6 +45,7 @@ import {
 import { encodeCwdForProjectsDir } from "../jsonl-line-types";
 import {
   ClearReplacementExitedError,
+  OtherSessionOwnerUnconfirmedError,
   resolveAgentCwd,
   SessionManager,
   type SessionManagerOptions,
@@ -232,7 +233,7 @@ wait $p
    * A real process "left behind": argv `sh fake-claude.sh --resume <id>`, ends on SIGTERM. It
    * reports `orphan.ready` once its trap is installed, so no test guesses how long `sh` takes.
    */
-  async function startOrphan(): Promise<{ pid: number; identity: string }> {
+  async function startOrphan(sid: string = SID): Promise<{ pid: number; identity: string }> {
     const script = join(dir, "fake-claude.sh");
     writeFileSync(
       script,
@@ -245,7 +246,7 @@ wait $p
 `,
     );
     chmodSync(script, 0o755);
-    orphan = spawn("/bin/sh", [script, "--resume", SID], { stdio: "ignore" });
+    orphan = spawn("/bin/sh", [script, "--resume", sid], { stdio: "ignore" });
     const pid = orphan.pid as number;
     os.watch(pid);
     await until(() => existsSync(join(dir, "orphan.ready")), "the orphan to start");
@@ -254,10 +255,13 @@ wait $p
     return { pid, identity: info.identity };
   }
 
-  const seed = (o: { pid: number; identity: string }, over: { bootId?: string } = {}): void => {
+  const seed = (
+    o: { pid: number; identity: string },
+    over: { bootId?: string; sessionId?: string } = {},
+  ): void => {
     store.rec.set("a", {
       agentId: "a",
-      sessionId: SID,
+      sessionId: over.sessionId ?? SID,
       pid: o.pid,
       identity: o.identity,
       bootId: over.bootId ?? "boot-old",
@@ -349,6 +353,101 @@ wait $p
     },
     T,
   );
+
+  describe("a record for an OLDER session of the agent (#596 r12)", () => {
+    // The daemon died mid fresh-session restart: the stored id is the new one, the record still
+    // names the live claude of the old one.
+    const OLDER = "0ld3r000-0000-4000-8000-0000000005a5";
+
+    it(
+      "previous boot, proven ours: the old claude is ended and confirmed gone BEFORE the new one starts; one process remains",
+      async () => {
+        // Fault (site: the early return for `record-other-session`, restored for every boot): the new
+        // claude starts beside the live old one and overwrites its record. Predicted result:
+        // `aliveAtStart` is `[old.pid]`, `kills` is empty.
+        const old = await startOrphan(OLDER);
+        seed(old, { sessionId: OLDER });
+        const agent = agentConfig();
+        const proc = await manager().spawnAgent(agent, "cli");
+        await started(proc.pid);
+
+        expect(os.kills).toEqual([{ pid: old.pid, signal: "SIGTERM" }]);
+        expect(os.spawned).toHaveLength(1);
+        expect(os.spawned[0]?.aliveAtStart).toEqual([]);
+        await exited(old.pid);
+        expect(orphanAlive()).toBe(false);
+        expect(alive(proc.pid)).toBe(true);
+        expect(agent.session_id).toBe(SID);
+        expect(persisted).toHaveLength(0);
+        expect(warned.filter((l) => l.includes("reason=other-session-orphan-reaped"))).toHaveLength(
+          1,
+        );
+      },
+      T,
+    );
+
+    it(
+      "previous boot, process already gone: its record is cleared and the spawn proceeds",
+      async () => {
+        seed({ pid: 2_000_000, identity: "gone" }, { sessionId: OLDER });
+        const proc = await manager().spawnAgent(agentConfig(), "cli");
+        await started(proc.pid);
+        expect(os.kills).toEqual([]);
+        expect(os.spawned).toHaveLength(1);
+        expect(persisted).toHaveLength(0);
+      },
+      T,
+    );
+
+    it(
+      "previous boot, alive but not provably ours: nothing signalled, no second claude, record kept, spawn fails with the reason code",
+      async () => {
+        // The live process's argv names SID, not the record's session (OLDER): it is not what the
+        // record describes. Fault (site: the refusal in `decideResume` turned into a rotate): a
+        // second claude starts and its record overwrites the survivor's. Predicted result:
+        // `os.spawned` has one entry and the promise resolves.
+        const survivor = await startOrphan(SID);
+        seed(survivor, { sessionId: OLDER });
+        const agent = agentConfig();
+        const err = await manager()
+          .spawnAgent(agent, "cli")
+          .then(
+            () => null,
+            (e: unknown) => e,
+          );
+
+        expect(err).toBeInstanceOf(OtherSessionOwnerUnconfirmedError);
+        expect((err as OtherSessionOwnerUnconfirmedError).code).toBe(
+          "other-session-owner-unconfirmed",
+        );
+        expect(os.kills).toEqual([]);
+        expect(orphanAlive()).toBe(true);
+        expect(os.spawned).toHaveLength(0);
+        expect(persisted).toHaveLength(0);
+        expect(agent.session_id).toBe(SID);
+        expect(store.rec.get("a")?.sessionId).toBe(OLDER);
+        expect(store.rec.get("a")?.pid).toBe(survivor.pid);
+        expect(
+          warned.filter((l) => l.includes("reason=other-session-owner-unconfirmed")),
+        ).toHaveLength(1);
+      },
+      T,
+    );
+
+    it(
+      "THIS boot: the old claude is never signalled and the spawn proceeds (unchanged)",
+      async () => {
+        const old = await startOrphan(OLDER);
+        seed(old, { sessionId: OLDER, bootId: BOOT });
+        const proc = await manager().spawnAgent(agentConfig(), "cli");
+        await started(proc.pid);
+        expect(os.kills).toEqual([]);
+        expect(orphanAlive()).toBe(true);
+        expect(persisted).toHaveLength(0);
+      },
+      T,
+    );
+  });
 
   it(
     "an unrecorded claude that names the session is never signalled; the session is resumed",

@@ -159,13 +159,110 @@ describe("decideResume — what a restart may do (#595 r3)", () => {
     expect(probe.kills).toEqual([]);
   });
 
-  it("a record for a different session id is not about this session", async () => {
-    store.rec.set("a", recordFor({ sessionId: "some-older-session" }));
-    probe.table.set(900, claudeInfo());
-    const d = await decide();
-    expect(d).toEqual({ kind: "resume", reason: "record-other-session" });
-    expect(probe.reads).toEqual([]);
-    expect(probe.kills).toEqual([]);
+  describe("a record for a DIFFERENT session id (#596 r12)", () => {
+    // The daemon died during a fresh-session restart: `session.json` holds the new id, `owner.json`
+    // still names the live claude of the older one. The new spawn will overwrite that record, so a
+    // survivor it names must be proved gone or ours BEFORE that, or it is left running untracked.
+    const OLDER = "0ld3r000-0000-4000-8000-0000000005a5";
+    const older = (over: Partial<ProcessInfo> = {}) =>
+      claudeInfo({
+        argv: ["/home/u/.local/bin/claude", "--resume", OLDER],
+        command: `/home/u/.local/bin/claude --resume ${OLDER}`,
+        ...over,
+      });
+    const refused = { kind: "refuse", reason: "other-session-owner-unconfirmed" } as const;
+
+    it("previous boot, alive and proven ours: reaped and confirmed gone, record cleared, spawn proceeds", async () => {
+      store.rec.set("a", recordFor({ sessionId: OLDER }));
+      probe.table.set(900, older());
+      probe.onKill = (pid) => probe.table.delete(pid);
+      const d = await decide();
+      expect(d).toEqual({
+        kind: "resume",
+        reason: "other-session-reaped",
+        reapedPid: 900,
+        reapedSessionId: OLDER,
+      });
+      expect(probe.kills.map((k) => k.signal)).toEqual(["SIGTERM"]);
+      expect(probe.table.has(900)).toBe(false);
+      expect(store.rec.has("a")).toBe(false);
+    });
+
+    it("previous boot, dead: nothing signalled, record cleared, spawn proceeds", async () => {
+      store.rec.set("a", recordFor({ sessionId: OLDER }));
+      const d = await decide();
+      expect(d).toEqual({ kind: "resume", reason: "owner-gone" });
+      expect(probe.reads).not.toEqual([]);
+      expect(probe.kills).toEqual([]);
+      expect(store.rec.has("a")).toBe(false);
+    });
+
+    it("previous boot, pid reused by a stranger: not signalled, record cleared, spawn proceeds", async () => {
+      store.rec.set("a", recordFor({ sessionId: OLDER }));
+      probe.table.set(900, older({ identity: "T2-SOMEONE-ELSE" }));
+      const d = await decide();
+      expect(d).toEqual({ kind: "resume", reason: "pid-reused" });
+      expect(probe.kills).toEqual([]);
+      expect(store.rec.has("a")).toBe(false);
+    });
+
+    it("previous boot, alive but only second-precise: nothing signalled, record kept, spawn refused", async () => {
+      store.rec.set("a", recordFor({ sessionId: OLDER, lowPrecision: true }));
+      probe.table.set(900, older());
+      const d = await decide();
+      expect(d).toEqual({ ...refused, cause: "resume-identity-low-precision" });
+      expect(probe.kills).toEqual([]);
+      expect(store.rec.get("a")?.sessionId).toBe(OLDER);
+    });
+
+    it("previous boot, alive under another uid: nothing signalled, record kept, spawn refused", async () => {
+      store.rec.set("a", recordFor({ sessionId: OLDER }));
+      probe.table.set(900, older({ uid: UID + 1 }));
+      const d = await decide();
+      expect(d).toEqual({ ...refused, cause: "owner-uid-mismatch" });
+      expect(probe.kills).toEqual([]);
+      expect(store.rec.get("a")?.sessionId).toBe(OLDER);
+    });
+
+    it("previous boot, alive but its argv does not name the RECORD's session: nothing signalled, record kept, spawn refused", async () => {
+      // The argv names the session being started, not the one the record is for.
+      store.rec.set("a", recordFor({ sessionId: OLDER }));
+      probe.table.set(900, claudeInfo());
+      const d = await decide();
+      expect(d).toEqual({ ...refused, cause: "owner-argv-mismatch" });
+      expect(probe.kills).toEqual([]);
+      expect(store.rec.get("a")?.sessionId).toBe(OLDER);
+    });
+
+    it("previous boot, proven but it survives SIGKILL: spawn refused, record kept", async () => {
+      store.rec.set("a", recordFor({ sessionId: OLDER }));
+      probe.table.set(900, older());
+      const d = await decide({ termMs: 150, killMs: 150 });
+      expect(d).toEqual({ ...refused, cause: "orphan-unconfirmed" });
+      expect(probe.kills.map((k) => k.signal)).toEqual(["SIGTERM", "SIGKILL"]);
+      expect(store.rec.get("a")?.sessionId).toBe(OLDER);
+    });
+
+    it("previous boot, the process read fails: nothing signalled, record kept, spawn refused", async () => {
+      store.rec.set("a", recordFor({ sessionId: OLDER }));
+      probe.failure = new Error("ps: operation not permitted");
+      const d = await decide();
+      expect(d).toEqual({ ...refused, cause: "owner-read-failed" });
+      expect(probe.kills).toEqual([]);
+      expect(store.rec.get("a")?.sessionId).toBe(OLDER);
+    });
+
+    it("THIS boot: never read, never signalled, spawn proceeds (unchanged)", async () => {
+      store.rec.set("a", recordFor({ sessionId: OLDER, bootId: BOOT }));
+      probe.table.set(900, older());
+      probe.onKill = (pid) => probe.table.delete(pid);
+      const d = await decide();
+      expect(d).toEqual({ kind: "resume", reason: "record-other-session" });
+      expect(probe.reads).toEqual([]);
+      expect(probe.kills).toEqual([]);
+      expect(probe.table.has(900)).toBe(true);
+      expect(store.rec.get("a")?.sessionId).toBe(OLDER);
+    });
   });
 
   it("the identity changes between the read and the signal: no signal is sent", async () => {

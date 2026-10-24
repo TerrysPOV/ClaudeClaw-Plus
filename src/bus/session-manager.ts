@@ -613,6 +613,25 @@ export class SpawnUnrecordedError extends Error {
   }
 }
 
+/**
+ * A spawn was refused (#596 r12): the ownership record names a claude of a DIFFERENT session from a
+ * previous boot that could be neither proved gone nor proved ours, so it was not signalled and its
+ * record was kept. Starting another claude for the agent would overwrite that record and leave the
+ * survivor untracked beside it, so the spawn fails and the next boot retries.
+ */
+export class OtherSessionOwnerUnconfirmedError extends Error {
+  readonly code = "other-session-owner-unconfirmed";
+  constructor(
+    agentId: string,
+    readonly detail: string,
+  ) {
+    super(
+      `agent ${agentId}: a claude recorded for an earlier session of this agent could not be proved gone (${detail}), so no second claude was started beside it`,
+    );
+    this.name = "OtherSessionOwnerUnconfirmedError";
+  }
+}
+
 /** The `/clear` replacement exited during startup: nothing is running, so the clear did not happen. */
 export class ClearReplacementExitedError extends Error {
   readonly code = "clear-replacement-exited";
@@ -1217,9 +1236,20 @@ export class SessionManager {
         killMs: this.options.ownershipTermMs,
         logger: this.options.logger,
       });
+      if (decision.kind === "refuse") {
+        (this.options.logger ?? console).warn(
+          `[bus-session] agent=${agent.id} reason=${decision.reason} cause=${decision.cause} session_id=${agent.session_id} — an earlier session's claude is not proved gone; not starting another beside it (its record is kept for the next boot)`,
+        );
+        throw new OtherSessionOwnerUnconfirmedError(agent.id, decision.cause);
+      }
       if (decision.kind === "rotate") {
         await this.rotateStoredSession(agent, decision.reason);
         return this.spawnAgentInternal(agent, origin, retry, /* guard */ false);
+      }
+      if (decision.reason === "other-session-reaped") {
+        (this.options.logger ?? console).warn(
+          `[bus-session] agent=${agent.id} reason=other-session-orphan-reaped session_id=${agent.session_id} reaped_session_id=${decision.reapedSessionId} pid=${decision.reapedPid} — ended a claude this daemon spawned in an earlier boot for an older session of this agent before starting this one`,
+        );
       }
       if (decision.reason === "orphan-reaped") {
         (this.options.logger ?? console).warn(

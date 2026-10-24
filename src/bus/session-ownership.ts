@@ -19,6 +19,13 @@
  *   - a record from a PREVIOUS boot whose process is alive with the same identity: our orphan. It is
  *     revalidated immediately before each signal (same start identity, same uid, argv still the
  *     executable we launched and the session id), SIGTERM, SIGKILL after a bound, then confirmed gone.
+ *   - a record of a PREVIOUS boot for a DIFFERENT session of the same agent (the daemon died mid-restart,
+ *     after the new id was stored and before the old claude was stopped) gets the same proof, against
+ *     the record's OWN session id: gone or reused clears it, proved ours is reaped and confirmed gone.
+ *     If it is alive and not proved ours the spawn REFUSES (`other-session-owner-unconfirmed`) instead of
+ *     rotating: the new spawn's record would overwrite it and leave the survivor untracked beside the
+ *     new claude. Nothing is signalled and the record is kept for the next boot (#596 r12). A record of
+ *     THIS boot for another session is never probed or signalled.
  *   - anything that cannot be proved (the record or the process cannot be read, the argv does not
  *     match, the start identity is only second-precise on either side, the process will not die, the
  *     deadline passes): signal nothing more and rotate.
@@ -922,7 +929,8 @@ export type ResumeReason =
   | "record-other-session"
   | "owner-gone"
   | "pid-reused"
-  | "orphan-reaped";
+  | "orphan-reaped"
+  | "other-session-reaped";
 
 export type RotateReason =
   | "ownership-record-unreadable"
@@ -934,9 +942,18 @@ export type RotateReason =
   | "resume-identity-low-precision"
   | "guard-deadline";
 
+/**
+ * Why a spawn must fail instead of rotating (#596 r12): the record names a DIFFERENT session's claude
+ * from a previous boot that could not be proved gone or proved ours. Rotating would start a new claude
+ * and overwrite that record, leaving the survivor untracked beside it; so nothing is signalled, the
+ * record is kept for the next boot to retry, and the spawn fails with this code.
+ */
+export type RefuseReason = "other-session-owner-unconfirmed";
+
 export type ResumeDecision =
-  | { kind: "resume"; reason: ResumeReason; reapedPid?: number }
-  | { kind: "rotate"; reason: RotateReason };
+  | { kind: "resume"; reason: ResumeReason; reapedPid?: number; reapedSessionId?: string }
+  | { kind: "rotate"; reason: RotateReason }
+  | { kind: "refuse"; reason: RefuseReason; cause: RotateReason };
 
 class RotateSignal extends Error {
   constructor(readonly reason: RotateReason) {
@@ -970,6 +987,9 @@ export async function decideResume(a: {
   const left = (): number => end - clock.now();
   const bounded = <T>(p: Promise<T>): Promise<T> => withDeadline(p, left(), clock);
 
+  // Set once a record for ANOTHER session of a previous boot is being examined: from then on a
+  // result short of 'gone' or 'reaped' refuses the spawn rather than rotating (#596 r12).
+  let otherSession = false;
   try {
     let rec: OwnershipRecord | null;
     try {
@@ -979,7 +999,14 @@ export async function decideResume(a: {
       throw new RotateSignal("ownership-record-unreadable");
     }
     if (!rec) return { kind: "resume", reason: "no-record" };
-    if (rec.sessionId !== a.sessionId) return { kind: "resume", reason: "record-other-session" };
+    // A record of THIS boot for another session names a claude the daemon manages: never probed,
+    // never signalled.
+    if (rec.sessionId !== a.sessionId && rec.bootId === bootId)
+      return { kind: "resume", reason: "record-other-session" };
+    // A PREVIOUS boot's record for another session (the daemon died mid-restart, after the new id was
+    // stored and before the old claude was stopped) gets the same proof as a same-session orphan.
+    // Its record is about to be replaced by the new spawn's, so an unproved survivor must not be let go.
+    otherSession = rec.sessionId !== a.sessionId;
     const owned: OwnershipRecord = rec;
 
     const read = async (): Promise<ProcessInfo | null> => {
@@ -1042,10 +1069,22 @@ export async function decideResume(a: {
     }
     if (!gone) throw new RotateSignal("orphan-unconfirmed");
     await clearRecord();
+    if (otherSession)
+      return {
+        kind: "resume",
+        reason: "other-session-reaped",
+        reapedPid: owned.pid,
+        reapedSessionId: owned.sessionId,
+      };
     return { kind: "resume", reason: "orphan-reaped", reapedPid: owned.pid };
   } catch (err) {
-    if (err instanceof RotateSignal) return { kind: "rotate", reason: err.reason };
-    if (err instanceof GuardDeadlineError) return { kind: "rotate", reason: "guard-deadline" };
-    return { kind: "rotate", reason: "owner-read-failed" };
+    const cause: RotateReason =
+      err instanceof RotateSignal
+        ? err.reason
+        : err instanceof GuardDeadlineError
+          ? "guard-deadline"
+          : "owner-read-failed";
+    if (otherSession) return { kind: "refuse", reason: "other-session-owner-unconfirmed", cause };
+    return { kind: "rotate", reason: cause };
   }
 }
