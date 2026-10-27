@@ -390,7 +390,7 @@ export interface IpcRequestHuman {
  * Agent-job control request — Bus MCP server → Bus core (issue #296 PR 3).
  *
  * The `AgentJobRunner` lives in the DAEMON (only it can spawn/track the
- * headless `claude -p` job processes), while the four job tools
+ * headless job processes, PTY by default), while the four job tools
  * (`dispatch_job` / `job_status` / `list_jobs` / `cancel_job`) are invoked in
  * the per-agent MCP SUBPROCESS. So the MCP server routes each call over the
  * socket as this one generic envelope and awaits the correlated

@@ -33,7 +33,7 @@ That reversal is reversible *now*, and specifically *additively*, for two reason
 
 - `SupervisionMode = "pty-stdin" | "process-stream-json" | "tmux" | "process"` (`src/bus/types.ts`).
 - `defaultSupervisionFor(origin)` → `pty-stdin` for every origin (#550), except that non-channel origins on win32 get `process-stream-json` (= `claude -p --input-format=stream-json --output-format=stream-json --verbose`).
-- **Per-agent override already wired:** `session-manager.ts:815` → `const mode = agent.supervision ?? defaultSupervisionFor(origin)`. So `AgentConfig.supervision: "process-stream-json"` already forces `claude -p` for that agent, including channel-driven ones.
+- **Per-agent override already wired:** `session-manager.ts:1192` → `const mode = agent.supervision ?? defaultSupervisionFor(origin)`. So `AgentConfig.supervision: "process-stream-json"` already forces `claude -p` for that agent, including channel-driven ones.
 
 So a power user can *technically* flip it today. This spec is about making it **safe, documented, and complete**.
 
