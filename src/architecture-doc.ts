@@ -106,10 +106,11 @@ export function renderArchitectureDoc(snapshot: ArchitectureSnapshot): string {
     lines.push("- Output is read by tailing Claude's own JSONL session log under");
     lines.push("  `~/.claude/projects/<cwd>/<session>.jsonl` — **not** by parsing stdout.");
   } else if (snapshot.runtime === "pty") {
-    lines.push("Mode: **`pty`** (legacy per-turn runner: PTY supervisor when `pty.enabled`).");
+    lines.push("Mode: **`pty`** (legacy per-event runner: PTY supervisor when `pty.enabled`).");
     lines.push("");
     lines.push("- One turn per inbound event through the PTY supervisor when `pty.enabled` is");
-    lines.push("  true (the default except on Windows); with `pty.enabled: false` it is one");
+    lines.push("  true (the default except on Windows), which keeps one long-lived PTY per");
+    lines.push("  session key across turns. With `pty.enabled: false` it is one");
     lines.push("  `claude -p` subprocess per event (no long-lived agent processes).");
     lines.push("- The `claude -p` route is API-billed via the Agent SDK credit pool");
     lines.push("  (post-2026-06-15 Anthropic split).");

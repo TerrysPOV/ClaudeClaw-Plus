@@ -285,8 +285,9 @@ const DEFAULT_SETTINGS: Settings = {
   },
   // Default runtime: `bus` (Sprint 5.4 flip after Hetzner staging soak ended
   // 2026-05-25). `runtime: "pty"` remains as a permanent first-class option
-  // for operators who want the one-process-per-turn runner. It runs on the PTY
-  // supervisor by default; with `pty.enabled: false` (or on win32) it is the
+  // for operators who want the legacy per-event runner. It runs on the PTY
+  // supervisor by default (a long-lived PTY per session key, reused across
+  // turns); with `pty.enabled: false` (or on win32) it is the
   // `claude -p` / API-billed path — particularly for enterprise deployments
   // where audit, cost-ceiling, or regulatory constraints make API billing the
   // safer or only viable route.
@@ -805,9 +806,10 @@ export interface Settings {
   /**
    * Daemon runtime selector. Defaults to `"bus"` (event-bus + per-agent
    * processes, multi-channel routing, MCP multiplexer) — subscription-billed
-   * interactive mode. `"pty"` selects the one-process-per-turn runner: the
-   * PTY supervisor by default, or the `claude -p` subprocess path when
-   * `pty.enabled` is false (or on win32) — API-billed (Agent SDK pool
+   * interactive mode. `"pty"` selects the legacy per-event runner: the
+   * PTY supervisor by default (a long-lived PTY per session key, reused
+   * across turns until retired or idle-reaped), or one `claude -p`
+   * subprocess per call when `pty.enabled` is false (or on win32) — API-billed (Agent SDK pool
    * post-2026-06-15). Kept as a permanent first-class option for enterprise
    * deployments where API billing is the safer or only viable route (audit
    * trails, predictable cost ceilings, regulatory constraints).
