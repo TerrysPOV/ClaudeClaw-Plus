@@ -12,6 +12,8 @@ import {
 import {
   __buildClaudeArgsForTests,
   collectSecretValues,
+  MCP_DIALOG_ANSWER_DELAY_MS,
+  READY_SETTLE_HARD_TIMEOUT_MS,
   redactSecretsInTail,
 } from "../runner/pty-process";
 import {
@@ -812,22 +814,46 @@ describe("PtyProcess — project MCP server approval dialog (issue #469)", () =>
   });
 
   test("a dialog that paints late gets a fresh hard-timeout window for the screen behind it", async () => {
-    // Boot output streams for ~2.5s (never a quiet window), so the dialog
-    // lands near the end of the 3s hard timeout; the bypass dialog follows
-    // 1s after the Esc. Without a fresh window, settle resolves at 3s and
-    // the first prompt lands in the bypass dialog.
-    const lateDialog =
-      "i=0; while [ $i -lt 25 ]; do printf .; sleep 0.1; i=$((i+1)); done; " +
-      fakeMcpDialogCli(MCP_DIALOG_SINGLE, "late-dialog", "sleep 1");
+    // "Late" means the boot window's hard timer comes due while the dialog is
+    // up. Racing a real 3s timer against shell sleeps flaked under load (#602),
+    // so settle's hard timers are held here and the boot window's is fired the
+    // moment settle sees the dialog (it schedules the Esc then). With a fresh
+    // window that timer is already cleared and firing it does nothing; without
+    // one it resolves settle and the first prompt lands in a dialog.
+    const held = new Set<ReturnType<typeof setTimeout>>();
+    let settling = true;
+    let bootWindow: { handle: ReturnType<typeof setTimeout>; cb: () => void } | null = null;
+    let bootWindowFired = false;
     const proc = await spawnPty(
       baseOpts({
         _commandOverride: "/bin/sh",
-        _argsOverride: ["-c", lateDialog],
+        _argsOverride: ["-c", fakeMcpDialogCli(MCP_DIALOG_SINGLE, "late-dialog", "sleep 1")],
         _skipReadySettle: false,
         quietWindowMs: 200,
         sentinelMaxWaitMs: 5000,
+        _setTimeout: (cb, ms) => {
+          if (settling && ms === READY_SETTLE_HARD_TIMEOUT_MS) {
+            const handle = {} as ReturnType<typeof setTimeout>;
+            held.add(handle);
+            bootWindow ??= { handle, cb };
+            return handle;
+          }
+          if (settling && ms === MCP_DIALOG_ANSWER_DELAY_MS && bootWindow) {
+            const boot = bootWindow;
+            setTimeout(() => {
+              bootWindowFired = true;
+              if (held.delete(boot.handle)) boot.cb();
+            }, 0);
+          }
+          return setTimeout(cb, ms);
+        },
+        _clearTimeout: (handle) => {
+          if (!held.delete(handle)) clearTimeout(handle);
+        },
       }),
     );
+    settling = false;
+    expect(bootWindowFired).toBe(true);
     const result = await proc.runTurn("late-dialog", { timeoutMs: 5000 });
     expect(proc.isAlive()).toBe(true);
     expect(result.text).toContain("late-dialog");
