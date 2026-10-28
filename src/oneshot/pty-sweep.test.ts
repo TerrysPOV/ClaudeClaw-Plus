@@ -361,10 +361,14 @@ describe("group survivors", () => {
     const root = leftover(`${ONESHOT_CONFIG_PREFIX}later`, OLD, own);
     markGroupSurvivor(root, 4242, { startMs: 1 });
     utimesSync(root, OLD, OLD); // recording the survivor wrote survivor.json into it
-    expect(sweep()).toBe(0);
+    // The escape scan is faked, as in the other sweeps of this file: left real, on Linux a leader
+    // start of 1 ms makes every process of the host a candidate, and one the scan cannot read holds
+    // the root, so the result would depend on what else runs on the machine.
+    const quiet = { scan: () => ({ pids: [], unknown: [] }) as EscapeScan };
+    expect(sweep(quiet)).toBe(0);
     await retrySurvivingGroups({ retire: retireFake(() => true), reap: async () => [] });
     expect(groupSurvivorCount()).toBe(0);
-    expect(sweep()).toBe(1);
+    expect(sweep(quiet)).toBe(1);
     expect(existsSync(root)).toBe(false);
   });
 });

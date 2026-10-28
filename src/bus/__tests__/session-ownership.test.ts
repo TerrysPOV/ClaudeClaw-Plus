@@ -558,6 +558,26 @@ describe("the real process readers (#595 r3)", () => {
     expect(info?.uid).toBe(statSync(join(root, "900")).uid);
   });
 
+  it("linux: the boot time is read per proc root, not once per process", async () => {
+    // Fault (site: `bootTime`, the cache keyed by nothing: one module-level value): a read of a
+    // second proc root returns the first root's `btime`, so the identity of a process on another
+    // root (a fake `/proc` here, an earlier real read in a full-suite run) carries the wrong boot.
+    // Predicted result: the second identity is "1790000000:555", not "1791111111:555".
+    const stat = (ticks: number) =>
+      `902 (claude) S 1 902 902 0 -1 4194560 100 0 0 0 1 1 0 0 20 0 1 0 ${ticks} 1000 100 1`;
+    const first = fakeProc(902, stat(555), "/bin/claude\0");
+    const second = join(dir, "proc2");
+    mkdirSync(join(second, "902"), { recursive: true });
+    writeFileSync(join(second, "stat"), "cpu 1 2 3\nbtime 1791111111\n");
+    writeFileSync(join(second, "902", "stat"), stat(555));
+    writeFileSync(join(second, "902", "cmdline"), "/bin/claude\0");
+
+    const a = await createSystemProbe({ platform: "linux", procRoot: first }).read(902, 1000);
+    const b = await createSystemProbe({ platform: "linux", procRoot: second }).read(902, 1000);
+    expect(a?.identity).toBe("1790000000:555");
+    expect(b?.identity).toBe("1791111111:555");
+  });
+
   it("linux: a zombie is reported as one, and a missing pid is null", async () => {
     const stat = `901 (claude) Z 1 901 901 0 -1 4194560 100 0 0 0 1 1 0 0 20 0 1 0 777 1000 100 1`;
     const root = fakeProc(901, stat, "");

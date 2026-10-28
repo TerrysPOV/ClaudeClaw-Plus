@@ -310,15 +310,17 @@ const isGone = (err: unknown): boolean => {
   return code === "ENOENT" || code === "ESRCH";
 };
 
-let cachedBtime: string | null = null;
+/** Boot time per proc root: a different root (a test's fake `/proc`) has its own `btime`. */
+const cachedBtime = new Map<string, string>();
 
 async function bootTime(procRoot: string): Promise<string> {
-  if (cachedBtime) return cachedBtime;
+  const known = cachedBtime.get(procRoot);
+  if (known) return known;
   const text = await readFile(join(procRoot, "stat"), "utf8");
   const m = /^btime\s+(\d+)/m.exec(text);
   if (!m) throw new Error("no btime in /proc/stat");
-  cachedBtime = m[1] as string;
-  return cachedBtime;
+  cachedBtime.set(procRoot, m[1] as string);
+  return m[1] as string;
 }
 
 async function readFromProc(pid: number, procRoot: string): Promise<ProcessInfo | null> {
