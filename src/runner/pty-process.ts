@@ -580,7 +580,9 @@ const PASTE_START = "\x1b[200~";
 const PASTE_END = "\x1b[201~";
 
 /** Delay between the project MCP server dialog showing and its Esc (#469). */
-const MCP_DIALOG_ANSWER_DELAY_MS = 500;
+export const MCP_DIALOG_ANSWER_DELAY_MS = 500;
+/** Ready-settle hard timeout: the boot window, and each fresh window a dialog opens. */
+export const READY_SETTLE_HARD_TIMEOUT_MS = 3000;
 /**
  * Hard cap on the tail ring buffer that captures pre-settle PTY output for
  * the issue #176 diagnostic snapshot. 8 KiB is enough to hold a typical
@@ -2135,7 +2137,7 @@ export function spawnPty(opts: PtyProcessOptions): Promise<PtyProcess> {
       return;
     }
 
-    proc._waitForReadySettle(3000).then(() => {
+    proc._waitForReadySettle(READY_SETTLE_HARD_TIMEOUT_MS).then(() => {
       if (!proc.isAlive()) {
         // Issue #176: include the captured exit info in the error message so
         // the supervisor's "respawn failed" path (and any operator tailing

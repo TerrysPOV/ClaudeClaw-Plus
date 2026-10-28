@@ -252,9 +252,21 @@ describe("pty-stdin supervision", () => {
     // The /bin/cat stand-in echoes whatever is written to its PTY, so the
     // prompt text shows up on the read side. Verifies the text reaches stdin
     // (the CR submit is sent separately to defeat bracketed-paste buffering).
-    await proc.send_prompt_stream("hello world");
+    //
+    // Wait on the echo, not on the delivery. After the write, the
+    // delivery-confirm loop looks for a REPL footer or transcript that
+    // /bin/cat never produces, so it spends every nudge (~3.2s) before it
+    // settles; awaiting it put this test within ~0.5s of the 5s limit (#602).
+    // Its outcome is not under test here.
+    const delivery = proc.send_prompt_stream("hello world");
+    delivery.catch(() => {});
     await waitFor(() => received.includes("hello world"));
     expect(received).toContain("hello world");
+    // End the process so the confirm loop stops at its next exit check. stop()
+    // alone would queue /quit behind that loop; the kill ends it now.
+    const stopped = mgr.stop(agent.id);
+    process.kill(proc.pid, "SIGTERM");
+    await stopped;
   });
 
   it("emits onExit after the pty exits and clears registry", async () => {

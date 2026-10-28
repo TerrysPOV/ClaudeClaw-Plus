@@ -15,7 +15,8 @@
  *   from a second process therefore resumes the same session as the daemon's
  *   cron tick — do not fire a job at the minute it is due.
  * - under `runtime: "bus"` the scheduled turn still comes from the 60 s job
- *   loop (`job-loop.ts`: a one-shot `claude -p` on the job's model, #506); a
+ *   loop (`job-loop.ts`: a one-shot `run()` turn on the job's model, PTY by
+ *   default, `claude -p` only with `pty.enabled: false` or on win32, #506); a
  *   fire through the web UI's bus runner sends the clock-prefixed prompt to the
  *   bus agent and bounds its wait with the job's timeout — the model stays the
  *   agent's.

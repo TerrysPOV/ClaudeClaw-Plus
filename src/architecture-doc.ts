@@ -106,10 +106,14 @@ export function renderArchitectureDoc(snapshot: ArchitectureSnapshot): string {
     lines.push("- Output is read by tailing Claude's own JSONL session log under");
     lines.push("  `~/.claude/projects/<cwd>/<session>.jsonl` — **not** by parsing stdout.");
   } else if (snapshot.runtime === "pty") {
-    lines.push("Mode: **`pty`** (legacy `claude -p` subprocess path).");
+    lines.push("Mode: **`pty`** (legacy per-event runner: PTY supervisor when `pty.enabled`).");
     lines.push("");
-    lines.push("- One `claude -p` subprocess per inbound event (no long-lived processes).");
-    lines.push("- API-billed via the Agent SDK credit pool (post-2026-06-15 Anthropic split).");
+    lines.push("- One turn per inbound event through the PTY supervisor when `pty.enabled` is");
+    lines.push("  true (the default except on Windows), which keeps one long-lived PTY per");
+    lines.push("  session key across turns. With `pty.enabled: false` it is one");
+    lines.push("  `claude -p` subprocess per event (no long-lived agent processes).");
+    lines.push("- The `claude -p` route is API-billed via the Agent SDK credit pool");
+    lines.push("  (post-2026-06-15 Anthropic split).");
     lines.push("- Kept as a permanent first-class option for enterprise deployments");
     lines.push("  where audit / cost-ceiling / regulatory constraints make API billing");
     lines.push("  the safer or only viable route.");
@@ -196,8 +200,9 @@ export function renderArchitectureDoc(snapshot: ArchitectureSnapshot): string {
   lines.push("   ```");
   lines.push("   Prompts firing with zero responses → agent isn't subscribed.");
   lines.push("4. **Do not guess at PTY timeouts or terminal parsing.** The bus runtime");
-  lines.push("   never parses stdout; the pty runtime is `claude -p` subprocesses, not a");
-  lines.push("   PTY. Always re-read this file before diagnosing.");
+  lines.push("   never parses stdout; the pty runtime runs on the PTY supervisor when");
+  lines.push("   `pty.enabled` is true and as `claude -p` subprocesses when it is false.");
+  lines.push("   Always re-read this file before diagnosing.");
   lines.push("");
 
   return lines.join("\n");
