@@ -72,6 +72,30 @@ describe("stop() and a late exit callback (#595 r9)", () => {
     expect(priv.restartHistory.get("a")).toEqual([1, 2]);
   });
 
+  it("the registry slot is already empty when the late finaliser runs: nothing keyed by the id is released", async () => {
+    // `retireLive` frees the slot (and releases the old config itself) once its bound ends, then
+    // the replacement synthesises its identity and config under the same agent id before it
+    // registers. Fault (site: the `current !== undefined &&` clause in `finalise`, which lets an
+    // EMPTY slot through): the finaliser releases the replacement's config and identity and clears
+    // its restart budget. Predicted result: `cleaned` is `[["/old/cwd", "a"]]` and the budget is gone.
+    const { mgr, priv, cleaned } = harness();
+    const old = fakeProc(100);
+    priv.agents.set("a", { proc: old.proc, mcpConfigCwd: "/old/cwd" });
+    const stopped = mgr.stop("a");
+    expect(old.handlers).toHaveLength(1);
+
+    priv.agents.delete("a");
+    priv.restartHistory.set("a", [1, 2]);
+
+    old.exited = true;
+    for (const h of old.handlers) h(0);
+    await stopped;
+
+    expect(mgr._list()).toEqual([]);
+    expect(cleaned).toEqual([]);
+    expect(priv.restartHistory.get("a")).toEqual([1, 2]);
+  });
+
   it("a stop() that still owns the id releases it, as before", async () => {
     const { mgr, priv, cleaned } = harness();
     const old = fakeProc(100);

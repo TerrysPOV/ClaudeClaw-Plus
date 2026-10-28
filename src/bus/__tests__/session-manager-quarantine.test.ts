@@ -120,6 +120,40 @@ describe("SessionManager.spawnAgent and the quarantine gate", () => {
     expect(existsSync(marker)).toBe(false);
   });
 
+  it("the retirement fence stays on the dying process's session when the agent takes a fresh id", async () => {
+    // `restartInternal` sets `agent.session_id = fresh` on the one shared `AgentConfig` after
+    // `stop()` resolves, even when the retirement just quarantined the old process. Fault (site:
+    // `fenceForRetirement`, `sessionId` read live from `record.agent` instead of captured when the
+    // fence is made): the fence and any quarantine follow the fresh, never-used id and leave the
+    // old transcript's live writer uncovered. Predicted result: the handle reads "sess-fresh".
+    const recorder = join(cwd, "alive.sh");
+    writeFileSync(recorder, "#!/bin/sh\ncat >/dev/null\n", { mode: 0o755 });
+    chmodSync(recorder, 0o755);
+    mgr = new SessionManager({ commandOverride: recorder, sessionCollisionDetectMs: 0 });
+    await mgr.spawnAgent(
+      {
+        id: "a",
+        cwd,
+        session_id: "sess-a",
+        permission_mode: "bypassPermissions",
+        supervision: "pty-stdin",
+      },
+      "cli",
+    );
+    const priv = mgr as unknown as {
+      agents: Map<string, { agent: { session_id: string } }>;
+      retirementHandles: Map<object, { sessionId: string }>;
+      fenceForRetirement: (record: object) => void;
+    };
+    const record = priv.agents.get("a");
+    expect(record).toBeDefined();
+    if (!record) return;
+    priv.fenceForRetirement(record);
+    record.agent.session_id = "sess-fresh";
+
+    expect(priv.retirementHandles.get(record)?.sessionId).toBe("sess-a");
+  });
+
   /** A stand-in that records that it was started, then exits. */
   function stand(name: string): { script: string; marker: string } {
     const marker = join(cwd, `${name}.txt`);

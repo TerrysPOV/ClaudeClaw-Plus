@@ -1855,11 +1855,11 @@ export class SessionManager {
       const finalise = (): void => {
         // Issue #215: tear down the session tailer.
         void record.tailer?.stop();
-        // Everything below is bound to THIS record. A late finaliser must not touch a replacement
-        // agent that took the id since: its registry slot, its multiplexer identity and config
-        // file, its restart budget (mirrors the registry-identity rule of #596).
-        const current = this.agents.get(agent_id);
-        if (current !== undefined && current !== record) {
+        // Everything below is bound to THIS record: it runs only while this record still holds the
+        // registry slot (#595 r9, as on main). An empty slot is not a way in: whoever emptied it (the
+        // exit callback, `retireLive`, a failed spawn) released this record's config and identity, and
+        // a replacement may already be synthesising its own under the same agent id.
+        if (this.agents.get(agent_id) !== record) {
           resolve();
           return;
         }
@@ -1932,12 +1932,14 @@ export class SessionManager {
   private fenceForRetirement(record: AgentRecord): void {
     const proc = record.proc;
     if (!(proc instanceof PtyAgentProcess) || this.retirementHandles.has(record)) return;
+    // Captured now, while the process is the one on this session: a restart sets the shared
+    // `AgentConfig`'s `session_id` to a fresh id once `stop()` resolves, and a fence or quarantine
+    // that followed it would cover the new, unused id instead of the dying process's transcript.
+    const sessionId = record.agent.session_id;
     const handle = {
       label: record.agent.id,
       pid: proc.pid,
-      get sessionId() {
-        return record.agent.session_id;
-      },
+      sessionId,
       dispose: () => proc.retire(),
       confirmExit: () => proc.retire(),
     } as unknown as PtyProcess;
