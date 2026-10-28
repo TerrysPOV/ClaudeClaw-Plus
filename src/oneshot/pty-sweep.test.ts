@@ -1290,7 +1290,7 @@ describe("a persisted record from another boot is gone", () => {
 
   it("a legacy owner file with no bootId key is a dead owner on Linux, however live its pid", () => {
     const { bootId: _dropped, ...legacy } = live();
-    const owner = { ...legacy, bootId: undefined } as OwnerRecord;
+    const owner = legacy as OwnerRecord; // the key is absent, not set to undefined
     expect(isOwnerDead(owner, { anotherBoot: onBoot("boot-B") })).toBe(true);
   });
 

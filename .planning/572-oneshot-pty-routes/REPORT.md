@@ -6,13 +6,13 @@ Implemented on feat/572-oneshot-pty-routes, stacked on povai/feat/550-pty-defaul
 
 | File | Change |
 | --- | --- |
-| [config.ts](/Users/terrenceyodaiken/orca/workspaces/claudeclaw-plus/Sol/src/oneshot/config.ts:4) | Preserve an absent explicit default rather than manufacture print; settings serialize without accidentally pinning print. |
-| [resolver](/Users/terrenceyodaiken/orca/workspaces/claudeclaw-plus/Sol/src/oneshot/config.ts:38) | Exact route, family wildcard, explicit default, then PTY for the four trusted resume routes only when enabled; otherwise print. |
-| [engine.ts](/Users/terrenceyodaiken/orca/workspaces/claudeclaw-plus/Sol/src/oneshot/engine.ts:60) | Read pty.enabled alongside the current loaded settings on each call, so daemon hot reload affects dispatch. Standalone unloaded tuner behavior stays print. |
-| [trusted-routes.test.ts](/Users/terrenceyodaiken/orca/workspaces/claudeclaw-plus/Sol/src/oneshot/trusted-routes.test.ts:32) | Four routes × both enable states, explicit overrides, wildcards, serialization, untrusted default/rejection, live reload, real not-live compact dispatch and shutdown deadline. |
-| [engine contracts](/Users/terrenceyodaiken/orca/workspaces/claudeclaw-plus/Sol/src/oneshot/engine.test.ts:99) | Explicit print settings for print-engine contracts; updated absent-default parser contract. |
-| [one-shot guide](/Users/terrenceyodaiken/orca/workspaces/claudeclaw-plus/Sol/docs/oneshot-engines.md:3) | New defaults, override precedence, existing explicit-print migration, resume/timeout/bare compact. |
-| [migration guide](/Users/terrenceyodaiken/orca/workspaces/claudeclaw-plus/Sol/docs/pty-migration.md:43) | Trusted utility defaults and hot reload, untrusted gate unchanged. |
+| [config.ts](src/oneshot/config.ts:4) | Preserve an absent explicit default rather than manufacture print; settings serialize without accidentally pinning print. |
+| [resolver](src/oneshot/config.ts:38) | Exact route, family wildcard, explicit default, then PTY for the four trusted resume routes only when enabled; otherwise print. |
+| [engine.ts](src/oneshot/engine.ts:60) | Read pty.enabled alongside the current loaded settings on each call, so daemon hot reload affects dispatch. Standalone unloaded tuner behavior stays print. |
+| [trusted-routes.test.ts](src/oneshot/trusted-routes.test.ts:32) | Four routes × both enable states, explicit overrides, wildcards, serialization, untrusted default/rejection, live reload, real not-live compact dispatch and shutdown deadline. |
+| [engine contracts](src/oneshot/engine.test.ts:99) | Explicit print settings for print-engine contracts; updated absent-default parser contract. |
+| [one-shot guide](docs/oneshot-engines.md:3) | New defaults, override precedence, existing explicit-print migration, resume/timeout/bare compact. |
+| [migration guide](docs/pty-migration.md:43) | Trusted utility defaults and hot reload, untrusted gate unchanged. |
 | Plugin and marketplace manifests | Plugin, marketplace plugin and marketplace top-level version all set to 2.2.344 as requested. |
 
 OneShotRequest, OneShotResult and engine capability contracts are unchanged. Only the internal OneShotSettings.default becomes optional to distinguish absence from explicit print. With existing explicit oneShot.default=print, print remains selected; remove that setting or add route overrides to opt into the new defaults.

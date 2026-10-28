@@ -655,7 +655,16 @@ describe("the real process readers (#595 r3)", () => {
     // Fault (site: `decodeBsdInfoStart`, tvusec decoded as 0): the microseconds are lost, so a
     // replacement born in the same second shares the identity. Predicted result: usec is 0.
     expect(PROC_BSDINFO_SIZE).toBe(136);
-    expect(BSDINFO_OFFSETS).toMatchObject({ pid: 12, startSec: 120, startUsec: 128 });
+    expect(BSDINFO_OFFSETS).toEqual({
+      status: 4,
+      pid: 12,
+      uid: 20,
+      comm: 48,
+      name: 64,
+      pgid: 100,
+      startSec: 120,
+      startUsec: 128,
+    });
     expect(decodeBsdInfoStart(bsdInfo(4242, 1792761049, 464209), 4242)).toEqual({
       sec: 1792761049,
       usec: 464209,

@@ -61,5 +61,5 @@ jobs:
       # runs them. Nothing here needs the token or a real claude. It runs after the integration
       # rows and whatever their result, so a red here never hides them.
       - name: Linux process tests (escape scan, group kill, start time)
-        if: always()
+        if: ${{ !cancelled() }}
         run: bun test src/runner/pty-escape-scan.test.ts src/runner/pty-proc-identity.test.ts src/runner/pty-group-kill.test.ts src/runner/pty-group-retire.test.ts
